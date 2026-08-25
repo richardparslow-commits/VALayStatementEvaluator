@@ -144,6 +144,8 @@ Optional metadata fields:
 When an API key is provided, the app sends both a bearer-token auth header and an `X-API-Key`
 header to maximize compatibility with different sandbox auth setups.
 
+For safety, imported document URLs must resolve to the same host as `FETCH_SANDBOX_BASE_URL`.
+
 ## Security notes
 
 - `.env`, `.venv/`, and `outputs/` are git-ignored.

@@ -6,7 +6,7 @@ import json
 from email.message import Message
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode, urljoin, urlparse
+from urllib.parse import ParseResult, quote, urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
 
 from .config import Settings
@@ -57,12 +57,12 @@ class FetchClient:
         encoded_id = quote(patient_id, safe="")
         if "{patient_id}" in template:
             path = template.replace("{patient_id}", encoded_id)
-            return urljoin(self._settings.fetch_base_url.rstrip("/") + "/", path.lstrip("/"))
+            return self._validated_url(path)
         base = urljoin(
             self._settings.fetch_base_url.rstrip("/") + "/", template.lstrip("/")
         )
         separator = "&" if "?" in base else "?"
-        return f"{base}{separator}{urlencode({'patient_id': patient_id})}"
+        return self._validated_url(f"{base}{separator}{urlencode({'patient_id': patient_id})}")
 
     def _headers(self) -> dict[str, str]:
         headers = {"Accept": "application/json"}
@@ -96,7 +96,7 @@ class FetchClient:
             ) from exc
 
     def _download_document(self, url: str) -> tuple[bytes, str, str]:
-        request = Request(url, headers=self._headers(), method="GET")
+        request = Request(self._validated_url(url), headers=self._headers(), method="GET")
         try:
             with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
                 data = response.read()
@@ -280,3 +280,23 @@ class FetchClient:
             if token.startswith("filename="):
                 return token.split("=", 1)[1].strip().strip('"')
         return ""
+
+    def _validated_url(self, url: str) -> str:
+        base = self._parsed_base_url()
+        resolved = urljoin(self._settings.fetch_base_url.rstrip("/") + "/", url)
+        parsed = urlparse(resolved)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise FetchSandboxError("Fetch Sandbox URLs must be absolute HTTP(S) endpoints.")
+        if (parsed.scheme, parsed.netloc) != (base.scheme, base.netloc):
+            raise FetchSandboxError(
+                "Fetch Sandbox document URLs must stay on the configured Fetch Sandbox host."
+            )
+        return resolved
+
+    def _parsed_base_url(self) -> ParseResult:
+        parsed = urlparse(self._settings.fetch_base_url.strip())
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise FetchSandboxError(
+                "Fetch Sandbox base URL must be an absolute HTTP(S) URL."
+            )
+        return parsed

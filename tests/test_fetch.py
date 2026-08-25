@@ -51,6 +51,11 @@ class TestFetchClient(unittest.TestCase):
         with self.assertRaises(FetchSandboxError):
             client.fetch_documents("   ")
 
+    def test_rejects_cross_host_download_urls(self):
+        client = FetchClient(self._settings())
+        with self.assertRaises(FetchSandboxError):
+            client._validated_url("https://other.example/record.pdf")
+
     def test_normalizes_text_documents(self):
         client = FetchClient(self._settings())
         documents = client._normalize_payload(
