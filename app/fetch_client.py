@@ -3,11 +3,9 @@ from __future__ import annotations
 
 import base64
 import json
-from email.message import Message
+from http.client import HTTPConnection, HTTPSConnection
 from typing import Any
-from urllib.error import HTTPError, URLError
 from urllib.parse import ParseResult, quote, urlencode, urljoin, urlparse
-from urllib.request import Request, urlopen
 
 from .config import Settings
 from .documents import (
@@ -74,42 +72,21 @@ class FetchClient:
         return headers
 
     def _request_json(self, url: str) -> Any:
-        request = Request(self._validated_url(url), headers=self._headers(), method="GET")
-        try:
-            with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
-                body = response.read().decode("utf-8", errors="replace")
-        except HTTPError as exc:
-            if exc.code == 401:
-                raise FetchSandboxError(
-                    "Fetch Sandbox rejected the request (401). Check the API key or sandbox auth mode."
-                ) from exc
-            raise FetchSandboxError(
-                f"Fetch Sandbox request failed with HTTP {exc.code}: {exc.reason}"
-            ) from exc
-        except URLError as exc:
-            raise FetchSandboxError(f"Could not reach Fetch Sandbox: {exc.reason}") from exc
+        body, _, _ = self._http_get(url)
+        text = body.decode("utf-8", errors="replace")
 
         try:
-            return json.loads(body)
+            return json.loads(text)
         except json.JSONDecodeError as exc:
             raise FetchSandboxError(
                 "Fetch Sandbox returned non-JSON data for the records endpoint."
             ) from exc
 
     def _download_document(self, url: str) -> tuple[bytes, str, str]:
-        request = Request(self._validated_url(url), headers=self._headers(), method="GET")
-        try:
-            with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
-                data = response.read()
-                content_type = response.headers.get_content_type()
-                filename = self._filename_from_headers(response.headers)
-                return data, content_type, filename
-        except HTTPError as exc:
-            raise FetchSandboxError(
-                f"Fetch Sandbox document download failed with HTTP {exc.code}: {exc.reason}"
-            ) from exc
-        except URLError as exc:
-            raise FetchSandboxError(f"Could not download Fetch Sandbox document: {exc.reason}") from exc
+        data, headers, _ = self._http_get(url)
+        content_type = self._content_type(headers.get("Content-Type", ""))
+        filename = self._filename_from_headers(headers.get("Content-Disposition", ""))
+        return data, content_type, filename
 
     def _normalize_payload(
         self, payload: Any, patient_id: str
@@ -274,8 +251,7 @@ class FetchClient:
         return bool(parsed.scheme and parsed.netloc)
 
     @staticmethod
-    def _filename_from_headers(headers: Message) -> str:
-        disposition = headers.get("Content-Disposition", "")
+    def _filename_from_headers(disposition: str) -> str:
         for token in disposition.split(";"):
             token = token.strip()
             if token.startswith("filename="):
@@ -309,3 +285,41 @@ class FetchClient:
                 "Fetch Sandbox base URL must point to fetchsandbox.com or one of its subdomains."
             )
         return parsed
+
+    def _http_get(self, url: str) -> tuple[bytes, dict[str, str], str]:
+        parsed = urlparse(self._validated_url(url))
+        connection_cls = HTTPSConnection if parsed.scheme == "https" else HTTPConnection
+        connection = connection_cls(
+            parsed.hostname,
+            parsed.port,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+        response = None
+        try:
+            connection.request("GET", path, headers=self._headers())
+            response = connection.getresponse()
+            data = response.read()
+            headers = {key: value for key, value in response.getheaders()}
+        except OSError as exc:
+            raise FetchSandboxError(f"Could not reach Fetch Sandbox: {exc}") from exc
+        finally:
+            connection.close()
+
+        if response is None:
+            raise FetchSandboxError("Fetch Sandbox request failed before a response was received.")
+        if response.status == 401:
+            raise FetchSandboxError(
+                "Fetch Sandbox rejected the request (401). Check the API key or sandbox auth mode."
+            )
+        if response.status >= 400:
+            raise FetchSandboxError(
+                f"Fetch Sandbox request failed with HTTP {response.status}: {response.reason}"
+            )
+        return data, headers, response.reason
+
+    @staticmethod
+    def _content_type(header: str) -> str:
+        return header.split(";", 1)[0].strip().lower()
