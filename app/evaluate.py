@@ -156,7 +156,13 @@ said...").
 - Add any missing formal elements: witness identity/relationship, opportunity to observe, \
 certification of truthfulness, signature/date block, and a note that the statement is submitted \
 on VA Form 21-10210.
-- Prefer concrete dates, frequencies, and specific incidents over vague language."""
+- Prefer concrete dates, frequencies, and specific incidents over vague language.
+- TOPIC COVERAGE: where the topic analysis says an applicable topic is absent or partial, the \
+rewrite may insert a bracketed prompt such as [Add if applicable: describe ...] so the witness \
+can supply it if true. NEVER invent the content of a topic the witness never described.
+- Translate symptoms into observable, dangerous consequences where grounded (e.g., memory loss \
+-> double-dosing risk), and where applicable make explicit that the caregiver's help is \
+necessary for safety, not merely convenient."""
 
 REVISE_USER = """Rewrite this lay/witness statement so it corrects every problem identified by \
 the review while keeping all legitimate lay observations.
@@ -200,6 +206,68 @@ RECORD FACTS THE STATEMENT COULD ADD:
 MEDICAL RECORD SUMMARY:
 <<<
 {digest_summary}
+>>>
+
+TOPIC COVERAGE ANALYSIS:
+<<<
+{topic_analysis}
+>>>"""
+
+
+TOPIC_SYSTEM_TEMPLATE = """You are a senior veterans-claims advocate auditing a lay/witness \
+statement for TOPIC COVERAGE against this checklist:
+
+{checklist}
+
+LEGAL FRAMEWORK REFERENCE:
+{legal}
+
+Rules:
+- First identify the statement's claim focus, then decide which checklist topics are APPLICABLE \
+to it. Physical-condition claims rarely need medication-mismanagement or self-harm topics; \
+mental-health / caregiver-necessity / aid-and-attendance claims usually need most of them. \
+Never force inapplicable topics onto a claim.
+- For each applicable topic, judge coverage from the STATEMENT TEXT itself: "covered" (concrete \
+examples present), "partial" (mentioned vaguely or without specifics), "absent" (not addressed).
+- Quote short evidence from the statement where present.
+- Each gap_note must be a concrete, implementable suggestion for what the witness should \
+describe or add if it is true.
+- critical_gaps: the missing/weak applicable topics whose absence most weakens THIS claim (max 5).
+- NEVER propose adding facts the witness may not know; gap notes prompt recollection or flag \
+the topic for the witness to address if true."""
+
+TOPIC_USER = """Analyze topic coverage for this statement.
+
+Return JSON:
+{{
+  "claim_focus": "one-line description of what this statement supports (condition + claim angle)",
+  "topics": [
+    {{
+      "topic": "checklist topic label (A-L)",
+      "applicable": true | false,
+      "coverage": "covered | partial | absent | not applicable",
+      "evidence": "short quote/paraphrase from the statement, or empty string",
+      "gap_note": "how to cover or strengthen it, or empty string"
+    }}
+  ],
+  "critical_gaps": ["up to 5 highest-impact missing or weak applicable topics and why they matter"],
+  "notes": "1-2 sentence overall coverage assessment"
+}}
+Return one topics entry per checklist topic (A through L), in checklist order.
+
+STATEMENT UNDER REVIEW:
+<<<
+{statement}
+>>>
+
+CLAIM-VERIFICATION RESULTS:
+<<<
+{verifications}
+>>>
+
+MEDICAL RECORD SUMMARY:
+<<<
+{digest_summary}
 >>>"""
 
 
@@ -214,6 +282,10 @@ class EvaluationResult:
     improvements: list[dict] = field(default_factory=list)
     omitted_record_facts: list[dict] = field(default_factory=list)
     executive_summary: str = ""
+    topic_focus: str = ""
+    topic_rows: list[dict] = field(default_factory=list)
+    topic_critical_gaps: list[str] = field(default_factory=list)
+    topic_notes: str = ""
     revision_notes: str = ""
     revision_changes: list[dict] = field(default_factory=list)
     revised_statement: str = ""
@@ -268,12 +340,12 @@ def run_evaluation(
         if progress:
             progress(frac, msg)
 
-    report(0.02, "Step 1/6 — Exhaustive review of medical records…")
+    report(0.02, "Step 1/7 — Exhaustive review of medical records…")
     result.digest = review_medical_records(
         llm, records, progress=lambda f, m: progress((0.02 + f * 0.48), m) if progress else None
     )
 
-    report(0.52, "Step 2/6 — Extracting factual claims from the statement…")
+    report(0.52, "Step 2/7 — Extracting factual claims from the statement…")
     claims_data = llm.chat_json(
         CLAIMS_SYSTEM,
         CLAIMS_USER.format(statement=statement_text[:40000]),
@@ -282,10 +354,10 @@ def run_evaluation(
     result.writer_role = claims_data.get("writer_role", "")
     result.claims = claims_data.get("claims", [])
 
-    report(0.60, "Step 3/6 — Verifying each claim against the records…")
+    report(0.60, "Step 3/7 — Verifying each claim against the records…")
     result.verifications = _verify_claims(llm, result.claims, result.digest, records, report)
 
-    report(0.78, "Step 4/6 — Scoring against the lay-evidence rubric…")
+    report(0.78, "Step 4/7 — Scoring against the lay-evidence rubric…")
     rubric_data = llm.chat_json(
         RUBRIC_SYSTEM_TEMPLATE.format(
             rubric=load_knowledge("evaluation_rubric.md"),
@@ -303,13 +375,49 @@ def run_evaluation(
     result.omitted_record_facts = rubric_data.get("omitted_record_facts", [])
     result.executive_summary = rubric_data.get("executive_summary", "")
 
-    report(0.86, "Step 5/6 — Drafting improvement suggestions and a revised statement…")
+    report(0.79, "Step 5/7 — Auditing topic coverage (hazards, care, family, progression)…")
+    _analyze_topics(llm, result, statement_text, report)
+
+    report(0.86, "Step 6/7 — Drafting improvement suggestions and a revised statement…")
     _draft_revision(llm, result, statement_text, report)
 
-    report(0.96, "Step 6/6 — Building the report…")
+    report(0.96, "Step 7/7 — Building the report…")
     result.report_markdown = build_report(result, statement_text)
     report(1.0, "Evaluation complete.")
     return result
+
+
+def _analyze_topics(
+    llm: LLMClient,
+    result: EvaluationResult,
+    statement_text: str,
+    report: ProgressCallback,
+) -> None:
+    """Audit the statement against the topic checklist (A–L).
+
+    Like the revision step, a failure here must not discard the completed
+    evaluation, so errors are swallowed and the fields stay empty.
+    """
+    try:
+        topic_data = llm.chat_json(
+            TOPIC_SYSTEM_TEMPLATE.format(
+                checklist=load_knowledge("topic_checklist.md"),
+                legal=load_knowledge("legal_framework.md"),
+            ),
+            TOPIC_USER.format(
+                statement=statement_text[:30000],
+                verifications=_verifications_text(result),
+                digest_summary=(result.digest.summary or "(no summary)")[:12000],
+            ),
+        )
+    except LLMError:
+        result.topic_notes = "Topic coverage analysis unavailable — the model call failed."
+        return
+    result.topic_focus = topic_data.get("claim_focus", "")
+    result.topic_rows = topic_data.get("topics", [])
+    result.topic_critical_gaps = [str(g) for g in topic_data.get("critical_gaps", []) if str(g).strip()]
+    result.topic_notes = topic_data.get("notes", "")
+    report(0.85, "Topic coverage audited.")
 
 
 def _draft_revision(
@@ -325,6 +433,18 @@ def _draft_revision(
     """
     import json as _json
 
+    if result.topic_rows:
+        topic_analysis = _json.dumps(
+            {
+                "claim_focus": result.topic_focus,
+                "topics": result.topic_rows,
+                "critical_gaps": result.topic_critical_gaps,
+            },
+            indent=1,
+        )[:20000]
+    else:
+        topic_analysis = "(no topic coverage analysis available)"
+
     try:
         revise_data = llm.chat_json(
             REVISE_SYSTEM,
@@ -335,6 +455,7 @@ def _draft_revision(
                 omitted_facts=_json.dumps(result.omitted_record_facts, indent=1)[:4000]
                 or "(none)",
                 digest_summary=(result.digest.summary or "(no summary)")[:12000],
+                topic_analysis=topic_analysis,
             ),
             max_tokens=6000,
         )
@@ -482,6 +603,29 @@ def build_report(result: EvaluationResult, statement_text: str) -> str:
             lines.append(f"   - Fix: {imp.get('suggestion', '')}")
             if imp.get("example_rewrite"):
                 lines.append(f"   - Example: “{imp.get('example_rewrite')}”")
+            lines.append("")
+
+    if result.topic_rows:
+        lines.append("## Topic Coverage — What the Statement Does and Does Not Address")
+        lines.append("")
+        if result.topic_focus:
+            lines.append(f"**Claim focus:** {result.topic_focus}")
+            lines.append("")
+        lines.append("| Topic | Applicable | Coverage | Evidence in statement | How to strengthen |")
+        lines.append("| --- | --- | --- | --- | --- |")
+        for t in result.topic_rows:
+            lines.append(
+                f"| {t.get('topic', '')} | {'Yes' if t.get('applicable') else 'No'} "
+                f"| {t.get('coverage', '')} | {t.get('evidence', '')} | {t.get('gap_note', '')} |"
+            )
+        lines.append("")
+        if result.topic_critical_gaps:
+            lines.append("**Critical gaps — the highest-impact topics to address:**")
+            for gap in result.topic_critical_gaps:
+                lines.append(f"- {gap}")
+            lines.append("")
+        if result.topic_notes:
+            lines.append(f"_{result.topic_notes}_")
             lines.append("")
 
     if result.omitted_record_facts:

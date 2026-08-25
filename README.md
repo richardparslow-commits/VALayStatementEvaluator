@@ -4,10 +4,16 @@ A Streamlit application that performs **exhaustive medical-record review** to:
 
 1. **Evaluate** an existing lay/witness statement (VA Form 21-10210 style) — extracting every
    factual claim, verifying each claim against the medical records, scoring the statement on an
-   8-dimension rubric drawn from VA lay-evidence law, and then suggesting how to improve it:
-   a prioritized improvement plan plus a proposed rewrite with record-grounded corrections; and
-2. **Draft** a new, factually grounded statement from a witness's own observations — flagging
-   anything that conflicts with or cannot be verified in the records.
+   8-dimension rubric drawn from VA lay-evidence law, auditing it against the **topic
+   checklist** (hazards and dangers, caregiver necessity, personal care, medication and
+   financial management, household safety, errands and driving, before/after progression,
+   observable behaviors, family impact, medication side effects), and then suggesting how to
+   improve it: a prioritized improvement plan plus a proposed rewrite with record-grounded
+   corrections; and
+2. **Draft** a new, factually grounded statement from a witness's own observations — checking
+   the observations against the topic checklist, asking follow-up questions for applicable
+   topics not yet covered, and flagging anything that conflicts with or cannot be verified in
+   the records.
 
 > ⚠️ **Disclaimer.** This tool is an educational and drafting aid. It is **not** legal, medical,
 > or claims advice. No output should be submitted to the VA without the witness personally
@@ -35,10 +41,11 @@ app/
   llm.py                  OpenAI-compatible client (retry, JSON parsing)
   documents.py            TXT/MD/DOCX/PDF extraction, page-aware chunking
   medical_review.py       Exhaustive chunked record review -> fact digest
-  evaluate.py             Claim extraction -> verification -> rubric scoring -> improvement
-                          suggestions & proposed rewrite -> report
-  draft.py                Grounding -> draft -> self-review pipeline
-  knowledge/              legal_framework.md, evaluation_rubric.md, drafting_guide.md
+  evaluate.py             Claim extraction -> verification -> rubric scoring -> topic coverage
+                          audit -> improvement suggestions & proposed rewrite -> report
+  draft.py                Grounding + topic coverage -> draft -> self-review pipeline
+  knowledge/              legal_framework.md, evaluation_rubric.md, drafting_guide.md,
+                          topic_checklist.md
 scripts/
   extract_pdfs.py         Build reference_docs/extracted/*.txt from source PDFs
   smoke_test.py           End-to-end pipeline test against the live LLM endpoint

@@ -5,7 +5,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from app.config import load_knowledge  # noqa: E402
 from app.documents import extract_document  # noqa: E402
+from app.draft import DraftResult, grounding_markdown  # noqa: E402
 from app.evaluate import EvaluationResult, build_report  # noqa: E402
 from app.medical_review import find_relevant_excerpts  # noqa: E402
 
@@ -55,6 +57,25 @@ class TestEvaluationResult(unittest.TestCase):
             ],
             revised_statement="I was treated in 2010. [Confirm: exact date]",
             added_facts_to_verify=["2010 cortisone injection"],
+            topic_focus="PTSD with need for regular assistance (spouse statement)",
+            topic_rows=[
+                {
+                    "topic": "A. Hazards and Dangers",
+                    "applicable": True,
+                    "coverage": "partial",
+                    "evidence": "He sometimes forgets the stove.",
+                    "gap_note": "Describe a specific near-miss incident.",
+                },
+                {
+                    "topic": "J. Physical Side Effects",
+                    "applicable": False,
+                    "coverage": "not applicable",
+                    "evidence": "",
+                    "gap_note": "",
+                },
+            ],
+            topic_critical_gaps=["B. Caregiver Burden — not addressed"],
+            topic_notes="Good base, but hazards need concrete incidents.",
         )
 
     def test_contradiction_count(self):
@@ -69,8 +90,25 @@ class TestEvaluationResult(unittest.TestCase):
         report = build_report(self._sample(), "statement body")
         for section in ["Evaluation Report", "Claim-by-Claim Verification", "Rubric Scores",
                         "Top Improvements", "CONTRADICTED", "not legal",
-                        "Suggested Improvements", "Proposed Rewrite"]:
+                        "Suggested Improvements", "Proposed Rewrite", "Topic Coverage"]:
             self.assertIn(section, report, msg=f"missing: {section}")
+
+    def test_report_renders_topic_coverage_rows(self):
+        report = build_report(self._sample(), "statement body")
+        self.assertIn("A. Hazards and Dangers", report)
+        self.assertIn("partial", report)
+        self.assertIn("He sometimes forgets the stove.", report)
+        self.assertIn("Describe a specific near-miss incident.", report)
+        self.assertIn("Critical gaps", report)
+        self.assertIn("B. Caregiver Burden — not addressed", report)
+        self.assertIn("PTSD with need for regular assistance", report)
+
+    def test_report_topic_coverage_optional(self):
+        result = self._sample()
+        result.topic_rows = []
+        result.topic_focus = ""
+        report = build_report(result, "statement body")
+        self.assertNotIn("Topic Coverage", report)
 
     def test_report_includes_revised_statement_and_confirm_flags(self):
         report = build_report(self._sample(), "statement body")
@@ -78,6 +116,50 @@ class TestEvaluationResult(unittest.TestCase):
         self.assertIn("[Confirm: exact date]", report)
         self.assertIn("contradiction_fix", report)
         self.assertIn("2010 cortisone injection", report)
+
+
+class TestGroundingMarkdown(unittest.TestCase):
+    def test_topic_coverage_rendered(self):
+        result = DraftResult(
+            grounding={
+                "supported_observations": [],
+                "unverified_observations": [],
+                "conflicts": [],
+                "strengthening_questions": [],
+                "topic_coverage": [
+                    {"topic": "A. Hazards and Dangers", "applicable": True, "covered": True,
+                     "prompt_for_witness": ""},
+                    {"topic": "B. Caregiver Burden", "applicable": True, "covered": False,
+                     "prompt_for_witness": "What happens if you are away for a day?"},
+                    {"topic": "J. Physical Side Effects", "applicable": False, "covered": False,
+                     "prompt_for_witness": ""},
+                ],
+            }
+        )
+        md = grounding_markdown(result)
+        self.assertIn("Topic coverage", md)
+        self.assertIn("A. Hazards and Dangers", md)
+        self.assertIn("B. Caregiver Burden", md)
+        self.assertIn("What happens if you are away for a day?", md)
+        self.assertNotIn("J. Physical Side Effects", md)
+
+
+class TestKnowledgeBase(unittest.TestCase):
+    def test_all_knowledge_files_load(self):
+        for name in ["legal_framework.md", "evaluation_rubric.md", "drafting_guide.md",
+                     "topic_checklist.md"]:
+            text = load_knowledge(name)
+            self.assertGreater(len(text), 500, msg=f"{name} unexpectedly small")
+
+    def test_topic_checklist_covers_required_topics(self):
+        checklist = load_knowledge("topic_checklist.md")
+        for topic in ["Hazards and Dangers", "Caregiver Burden", "Personal Care and Hygiene",
+                      "Medication and Financial Management", "Household Safety",
+                      "Routine Errands", "Symptom Progression", "Observable Behaviors",
+                      "Family Dynamics", "Physical Side Effects",
+                      "Functional Impairments from Medication", "Formatting and Certification",
+                      "double-dosing", "stove", "before", "after"]:
+            self.assertIn(topic, checklist, msg=f"checklist missing: {topic}")
 
 
 if __name__ == "__main__":

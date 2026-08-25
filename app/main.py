@@ -194,10 +194,13 @@ def evaluate_tab() -> None:
     st.divider()
     st.subheader("📋 Evaluation Results")
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     col1.metric("Overall rating", result.overall_rating)
     col2.metric("Claims verified", len(result.verifications))
     col3.metric("Contradictions", result.contradiction_count)
+    _applicable = [t for t in result.topic_rows if t.get("applicable")]
+    _covered = [t for t in _applicable if t.get("coverage") == "covered"]
+    col4.metric("Topics covered", f"{len(_covered)}/{len(_applicable)}" if _applicable else "—")
 
     with st.expander("Executive summary", expanded=True):
         st.write(result.executive_summary)
@@ -230,6 +233,32 @@ def evaluate_tab() -> None:
             {DIMENSION_LABELS[k]: result.scores.get(k, 0) for k in DIMENSION_LABELS},
             horizontal=True,
         )
+
+    if result.topic_rows:
+        with st.expander(
+            "🧭 Topic coverage — what the statement does and does not address", expanded=True
+        ):
+            if result.topic_focus:
+                st.write(f"**Claim focus:** {result.topic_focus}")
+            topic_table = [
+                {
+                    "Topic": t.get("topic", ""),
+                    "Applicable": "Yes" if t.get("applicable") else "No",
+                    "Coverage": t.get("coverage", ""),
+                    "Evidence in statement": t.get("evidence", ""),
+                    "How to strengthen": t.get("gap_note", ""),
+                }
+                for t in result.topic_rows
+            ]
+            st.dataframe(topic_table, use_container_width=True, hide_index=True)
+            if result.topic_critical_gaps:
+                st.warning(
+                    "**Critical gaps — the highest-impact topics this statement still misses:**"
+                )
+                for gap in result.topic_critical_gaps:
+                    st.write(f"- {gap}")
+            if result.topic_notes:
+                st.caption(result.topic_notes)
 
     with st.expander("Improvements & record facts to add", expanded=True):
         for imp in result.improvements:
@@ -431,12 +460,16 @@ def about_tab() -> None:
 medical records. The app conducts an exhaustive review of the records, extracts every factual
 claim in the statement, verifies each claim against the records (supported / contradicted /
 partially supported / not found), scores the statement on an 8-dimension rubric drawn from VA
-lay-evidence law, and then suggests how to improve it: a prioritized improvement plan plus a
-proposed rewrite with corrections grounded in the records and confirmation placeholders.
+lay-evidence law, and audits it against the topic checklist (hazards and dangers, caregiver
+necessity, personal care, medication and financial management, household safety, errands and
+driving, before/after progression, observable behaviors, family impact, medication side
+effects). It then suggests how to improve it: a prioritized improvement plan plus a proposed
+rewrite with corrections grounded in the records and confirmation placeholders.
 
 **Pathway 2 — Draft:** Upload the veteran's medical records and answer questions about what the
-witness has personally observed. The app grounds the statement in the records, flags anything
-that conflicts or cannot be verified, suggests strengthening questions, and drafts a
+witness has personally observed. The app grounds the statement in the records, checks the
+observations against the topic checklist and asks follow-up questions for applicable topics the
+witness has not yet covered, flags anything that conflicts or cannot be verified, and drafts a
 first-person statement in VA Form 21-10210 style that stays strictly within lay-competence
 boundaries.
 
@@ -451,6 +484,8 @@ so very long files are handled exhaustively.
         st.markdown(load_knowledge("evaluation_rubric.md"))
     with st.expander("Drafting guide"):
         st.markdown(load_knowledge("drafting_guide.md"))
+    with st.expander("Topic checklist"):
+        st.markdown(load_knowledge("topic_checklist.md"))
     st.info(
         "This tool is an educational and drafting aid. It is not legal, medical, or claims "
         "advice, and no output should be submitted without the witness personally verifying "

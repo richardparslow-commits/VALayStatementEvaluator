@@ -53,6 +53,12 @@ def smoke_evaluate(llm: LLMClient) -> None:
     print(f"  scores: {result.scores}")
     print(f"  overall: {result.overall_rating}")
     print(f"  summary: {result.executive_summary[:300]}")
+    _applicable = [t for t in result.topic_rows if t.get("applicable")]
+    _covered = [t for t in _applicable if t.get("coverage") == "covered"]
+    print(f"  topic focus: {result.topic_focus[:160]}")
+    print(f"  topics covered: {len(_covered)}/{len(_applicable)} applicable")
+    for gap in result.topic_critical_gaps:
+        print(f"    critical gap: {str(gap)[:160]}")
     print(f"  revision notes: {result.revision_notes[:200]}")
     print(f"  proposed changes: {len(result.revision_changes)}")
     print(f"  revised statement: {len(result.revised_statement)} chars")
@@ -100,6 +106,13 @@ def smoke_draft(llm: LLMClient) -> None:
     print(f"  unverified observations: {len(grounding.get('unverified_observations', []))}")
     print(f"  conflicts: {len(grounding.get('conflicts', []))}")
     print(f"  strengthening questions: {len(grounding.get('strengthening_questions', []))}")
+    _topics = grounding.get("topic_coverage", [])
+    _covered = [t for t in _topics if t.get("applicable") and t.get("covered")]
+    _missing = [t for t in _topics if t.get("applicable") and not t.get("covered")]
+    print(f"  topic coverage: {len(_covered)} covered, {len(_missing)} missing of "
+          f"{len([t for t in _topics if t.get('applicable')])} applicable topics")
+    for t in _missing[:5]:
+        print(f"    witness prompt: {t.get('topic', '')}: {str(t.get('prompt_for_witness', ''))[:140]}")
     print(f"  review issues fixed: {len(result.review_issues)}")
     print(f"  statement length: {len(result.output_statement)} chars")
     print("\n----- DRAFT PREVIEW (first 1200 chars) -----")
