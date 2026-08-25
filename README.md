@@ -75,7 +75,7 @@ cp .env.example .env     # then put your API key in .env (never commit .env)
 | `LLM_MODEL_MAIN` | Heavy model (analysis/scoring/drafting) | `qwen3.7-max` |
 | `LLM_MODEL_FAST` | Light model (fact extraction/merging) | `qwen3.7-flash` |
 | `FETCH_SANDBOX_API_KEY` | Optional Fetch Sandbox API key | empty |
-| `FETCH_SANDBOX_BASE_URL` | Fetch Sandbox base URL | `https://fetchsandbox.com` |
+| `FETCH_SANDBOX_BASE_URL` | Fetch Sandbox base URL (`fetchsandbox.com` or subdomain) | `https://fetchsandbox.com` |
 | `FETCH_SANDBOX_RECORDS_PATH` | GET path for the records endpoint | `/medical_records/{patient_id}` |
 
 All settings can also be overridden live in the app sidebar. Model availability depends on your
@@ -144,7 +144,8 @@ Optional metadata fields:
 When an API key is provided, the app sends both a bearer-token auth header and an `X-API-Key`
 header to maximize compatibility with different sandbox auth setups.
 
-For safety, imported document URLs must resolve to the same host as `FETCH_SANDBOX_BASE_URL`.
+For safety, the Fetch base URL must point to `fetchsandbox.com` (or one of its subdomains),
+and imported document URLs must resolve to that same host.
 
 ## Security notes
 

@@ -15,7 +15,7 @@ class TestFetchClient(unittest.TestCase):
     def _settings(
         self,
         *,
-        fetch_base_url: str = "https://sandbox.example",
+        fetch_base_url: str = "https://demo.fetchsandbox.com",
         fetch_records_path: str = "/medical_records/{patient_id}",
     ) -> Settings:
         return Settings(
@@ -36,20 +36,25 @@ class TestFetchClient(unittest.TestCase):
         client = FetchClient(self._settings())
         self.assertEqual(
             client._build_records_url("patient 123"),
-            "https://sandbox.example/medical_records/patient%20123",
+            "https://demo.fetchsandbox.com/medical_records/patient%20123",
         )
 
     def test_appends_query_param_when_path_has_no_placeholder(self):
         client = FetchClient(self._settings(fetch_records_path="/medical_records"))
         self.assertEqual(
             client._build_records_url("abc123"),
-            "https://sandbox.example/medical_records?patient_id=abc123",
+            "https://demo.fetchsandbox.com/medical_records?patient_id=abc123",
         )
 
     def test_rejects_blank_patient_id(self):
         client = FetchClient(self._settings())
         with self.assertRaises(FetchSandboxError):
             client.fetch_documents("   ")
+
+    def test_rejects_non_fetchsandbox_base_url(self):
+        client = FetchClient(self._settings(fetch_base_url="https://sandbox.example"))
+        with self.assertRaises(FetchSandboxError):
+            client._validated_url("/medical_records/test")
 
     def test_rejects_cross_host_download_urls(self):
         client = FetchClient(self._settings())

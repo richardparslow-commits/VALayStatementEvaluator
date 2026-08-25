@@ -25,6 +25,7 @@ BASE64_KEYS = ("base64", "data_base64", "file_base64", "content_base64")
 NAME_KEYS = ("filename", "name", "title", "id")
 TYPE_KEYS = ("content_type", "mime_type", "media_type", "type")
 REQUEST_TIMEOUT_SECONDS = 60.0
+ALLOWED_FETCH_HOSTS = ("fetchsandbox.com",)
 
 
 class FetchSandboxError(RuntimeError):
@@ -73,7 +74,7 @@ class FetchClient:
         return headers
 
     def _request_json(self, url: str) -> Any:
-        request = Request(url, headers=self._headers(), method="GET")
+        request = Request(self._validated_url(url), headers=self._headers(), method="GET")
         try:
             with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
                 body = response.read().decode("utf-8", errors="replace")
@@ -298,5 +299,13 @@ class FetchClient:
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise FetchSandboxError(
                 "Fetch Sandbox base URL must be an absolute HTTP(S) URL."
+            )
+        hostname = (parsed.hostname or "").lower()
+        if not any(
+            hostname == allowed or hostname.endswith(f".{allowed}")
+            for allowed in ALLOWED_FETCH_HOSTS
+        ):
+            raise FetchSandboxError(
+                "Fetch Sandbox base URL must point to fetchsandbox.com or one of its subdomains."
             )
         return parsed

@@ -36,7 +36,7 @@ class TestRelevanceSearch(unittest.TestCase):
             model_main="main-model",
             model_fast="fast-model",
             fetch_api_key="sandbox-token",
-            fetch_base_url="https://sandbox.example",
+            fetch_base_url="https://demo.fetchsandbox.com",
             fetch_records_path="/medical_records/{patient_id}",
         )
         client = FetchClient(settings)
