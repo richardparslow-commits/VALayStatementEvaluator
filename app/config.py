@@ -23,6 +23,8 @@ DEFAULT_BASE_URL = (
 )
 DEFAULT_MODEL_MAIN = "qwen3.7-max"
 DEFAULT_MODEL_FAST = "qwen3.7-flash"
+DEFAULT_FETCH_SANDBOX_BASE_URL = "https://fetchsandbox.com"
+DEFAULT_FETCH_SANDBOX_RECORDS_PATH = "/medical_records/{patient_id}"
 
 
 @dataclass
@@ -33,10 +35,17 @@ class Settings:
     base_url: str
     model_main: str
     model_fast: str
+    fetch_api_key: str
+    fetch_base_url: str
+    fetch_records_path: str
 
     @property
     def configured(self) -> bool:
         return bool(self.api_key.strip())
+
+    @property
+    def fetch_configured(self) -> bool:
+        return bool(self.fetch_base_url.strip() and self.fetch_records_path.strip())
 
 
 def load_settings() -> Settings:
@@ -49,6 +58,15 @@ def load_settings() -> Settings:
         or DEFAULT_MODEL_MAIN,
         model_fast=os.getenv("LLM_MODEL_FAST", DEFAULT_MODEL_FAST).strip()
         or DEFAULT_MODEL_FAST,
+        fetch_api_key=os.getenv("FETCH_SANDBOX_API_KEY", "").strip(),
+        fetch_base_url=os.getenv(
+            "FETCH_SANDBOX_BASE_URL", DEFAULT_FETCH_SANDBOX_BASE_URL
+        ).strip()
+        or DEFAULT_FETCH_SANDBOX_BASE_URL,
+        fetch_records_path=os.getenv(
+            "FETCH_SANDBOX_RECORDS_PATH", DEFAULT_FETCH_SANDBOX_RECORDS_PATH
+        ).strip()
+        or DEFAULT_FETCH_SANDBOX_RECORDS_PATH,
     )
 
 

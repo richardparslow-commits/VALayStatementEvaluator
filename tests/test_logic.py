@@ -5,10 +5,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from app.config import Settings  # noqa: E402
 from app.config import load_knowledge  # noqa: E402
 from app.documents import extract_document  # noqa: E402
 from app.draft import DraftResult, grounding_markdown  # noqa: E402
 from app.evaluate import EvaluationResult, build_report  # noqa: E402
+from app.fetch_client import FetchClient  # noqa: E402
 from app.medical_review import find_relevant_excerpts  # noqa: E402
 
 
@@ -26,6 +28,31 @@ class TestRelevanceSearch(unittest.TestCase):
     def test_empty_query_returns_empty(self):
         doc = extract_document("records.txt", b"Some medical text about back pain.")
         self.assertEqual(find_relevant_excerpts([doc], ""), "")
+
+    def test_fetch_documents_work_with_existing_record_search(self):
+        settings = Settings(
+            api_key="",
+            base_url="https://llm.example",
+            model_main="main-model",
+            model_fast="fast-model",
+            fetch_api_key="sandbox-token",
+            fetch_base_url="https://sandbox.example",
+            fetch_records_path="/medical_records/{patient_id}",
+        )
+        client = FetchClient(settings)
+        documents = client._normalize_payload(
+            {
+                "documents": [
+                    {
+                        "name": "records",
+                        "text": "Veteran reports insomnia and panic attacks after deployment.",
+                    }
+                ]
+            },
+            "pt-6",
+        )
+        excerpts = find_relevant_excerpts(documents, "panic attacks insomnia")
+        self.assertIn("panic attacks", excerpts)
 
 
 class TestEvaluationResult(unittest.TestCase):
