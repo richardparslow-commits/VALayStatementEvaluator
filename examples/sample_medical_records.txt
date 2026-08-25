@@ -1,0 +1,25 @@
+FICTIONAL SAMPLE MEDICAL RECORDS — FOR TESTING ONLY. NOT REAL PATIENT DATA.
+
+RIVERSIDE FAMILY CLINIC — PATIENT: SAMPLE, JOHN Q. DOB: 04/12/1980
+
+09/22/2014 — Acute visit. Patient presents with low back pain after lifting heavy pallet at work approximately one week ago. Pain rated 7/10, radiates to left buttock, no numbness. Lumbar strain diagnosed. Prescribed naproxen 500mg twice daily and referred to physical therapy. Patient declined imaging at this time. Provider: Dr. Alan Reyes, MD.
+
+10/06/2014 — Physical therapy initial evaluation. Patient reports pain with bending and lifting. Range of motion limited in flexion. Plan: 6 visits, core stabilization program.
+
+11/10/2014 — Physical therapy discharge. Patient improved, pain 3/10 with activity. Advised home exercise program.
+
+03/02/2016 — Follow-up visit. Patient reports recurring low back pain, worse after long shifts at warehouse. Pain 5/10. No radicular symptoms below the knee. X-ray lumbar spine: mild disc space narrowing L4-L5, otherwise unremarkable. Discussed ergonomics. Resumed naproxen as needed. Provider: Dr. Alan Reyes, MD.
+
+07/18/2017 — Visit for low back pain flare. Patient states pain radiates down left leg occasionally. Ordered MRI lumbar spine.
+
+08/01/2017 — MRI lumbar spine report: Small posterolateral disc protrusion at L4-L5 contacting the traversing left L5 nerve root. Mild facet arthropathy. Impression: findings correlate with left-sided radicular symptoms. Radiologist: Dr. Priya Nair, MD.
+
+08/22/2017 — Pain management consultation. Reviewed MRI. Administered left L5 transforaminal epidural steroid injection. Approximately 60% relief reported at two-week follow-up call. Provider: Dr. Kevin Osei, MD, Pain Medicine.
+
+01/15/2019 — Annual physical. Patient reports chronic daily low back pain, average 4/10, flares weekly. States he stopped working at warehouse in December 2018 because lifting aggravated symptoms. Currently employed part-time as delivery dispatcher. Sleep disturbance two to three nights per week due to pain. Continued home exercises intermittently. Provider: Dr. Alan Reyes, MD.
+
+05/09/2022 — Visit. Patient reports worsening pain, now 6/10 most days, difficulty standing more than 15-20 minutes. Notes difficulty bending to put on socks and shoes. Discussed repeat injection options; patient to consider. Prescribed topical diclofenac. Provider: Dr. Susan Park, DO.
+
+11/03/2023 — Pain management follow-up. Second L5 transforaminal epidural steroid injection performed. Relief partial and shorter duration than first. Discussed surgical consultation if symptoms progress; patient declines for now. Provider: Dr. Kevin Osei, MD.
+
+04/16/2025 — Visit for disability paperwork consultation. Patient reports persistent daily pain, cannot stand for full work shift, stopped fishing and yard work. Pain 6/10 average. Physical exam: limited lumbar flexion, positive straight leg raise on left at 60 degrees. Provider: Dr. Susan Park, DO.

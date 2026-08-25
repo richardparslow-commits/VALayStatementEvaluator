@@ -1,0 +1,66 @@
+
+
+----- Page 1 -----
+Back
+Vercel AI Gateway
+vck…4cX0Pk
+Requests
+0
+Total spend
+$0.00
+Success rate
+—
+Last used
+Never
+Active
+Spend Budget
+Cap how much this key can spend. Requests fail once the budget is used up.
+Limit ($)
+Set a spend limit, e.g. $1000
+Bring Your Own Key (BYOK) spend doesn’t count toward this budget.
+Budget Refresh
+Enable Budget
+Set a refresh cadence, e.g. weekly
+Edit
+Details
+Identity and lifecycle metadata for this key.
+Key vck…4cX0Pk
+ID D6wF3Ost…
+Vercel AI GatewayAI Gateway API Keys
+All Projects
+
+----- Page 2 -----
+Usage
+Models
+Created richardparslow-commits on Aug 14, 2026
+Last 12 hours
+Spend by Model
+$0
+No data in this time range
+P50 TTFT by Model
+0.00s
+No data in this time range
+Requests by Model
+0
+No data in this time range
+All Tokens
+0
+No data in this time range
+AI Model Requests Avg Tokens/s P50 Duration P50 TTFT
+No data found
+No results found for the selected time period
+
+
+----- Page 3 -----
+1 of 1
+Requests
+Search
+1 of 1
+Show 10
+Export CSV
+Time Status Model Provider
+Show 10
+Delete API Key
+Requests with this key will return401 Unauthorized. This can’t be undone.
+Vercel AI Gateway vck…4cX0Pk
+Delete API Key
