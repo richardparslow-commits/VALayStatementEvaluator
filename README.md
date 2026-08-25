@@ -4,8 +4,8 @@ A Streamlit application that performs **exhaustive medical-record review** to:
 
 1. **Evaluate** an existing lay/witness statement (VA Form 21-10210 style) — extracting every
    factual claim, verifying each claim against the medical records, scoring the statement on an
-   8-dimension rubric drawn from VA lay-evidence law, and producing a prioritized improvement
-   plan; and
+   8-dimension rubric drawn from VA lay-evidence law, and then suggesting how to improve it:
+   a prioritized improvement plan plus a proposed rewrite with record-grounded corrections; and
 2. **Draft** a new, factually grounded statement from a witness's own observations — flagging
    anything that conflicts with or cannot be verified in the records.
 
@@ -35,7 +35,8 @@ app/
   llm.py                  OpenAI-compatible client (retry, JSON parsing)
   documents.py            TXT/MD/DOCX/PDF extraction, page-aware chunking
   medical_review.py       Exhaustive chunked record review -> fact digest
-  evaluate.py             Claim extraction -> verification -> rubric scoring -> report
+  evaluate.py             Claim extraction -> verification -> rubric scoring -> improvement
+                          suggestions & proposed rewrite -> report
   draft.py                Grounding -> draft -> self-review pipeline
   knowledge/              legal_framework.md, evaluation_rubric.md, drafting_guide.md
 scripts/
@@ -80,9 +81,12 @@ streamlit run run_app.py
 1. Upload or paste the lay statement.
 2. Upload the veteran's medical records (PDF/TXT/MD/DOCX, multiple files OK).
 3. Click **Run exhaustive evaluation** — watch chunked record review, claim verification,
-   rubric scoring, and report generation progress.
+   rubric scoring, improvement drafting, and report generation progress.
 4. Review the verdict table (✅ supported / 🟡 partial / ❌ contradicted / ⚪ not found),
-   scores, and improvements; download the markdown report.
+   scores, and the prioritized improvement plan.
+5. Review the **proposed rewrite**: a change-by-change table (original → suggested → why),
+   the revised statement with `[Confirm: ...]` placeholders, and downloads for both the
+   report and the revised statement.
 
 ### Draft a statement
 

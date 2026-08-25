@@ -53,11 +53,17 @@ def smoke_evaluate(llm: LLMClient) -> None:
     print(f"  scores: {result.scores}")
     print(f"  overall: {result.overall_rating}")
     print(f"  summary: {result.executive_summary[:300]}")
+    print(f"  revision notes: {result.revision_notes[:200]}")
+    print(f"  proposed changes: {len(result.revision_changes)}")
+    print(f"  revised statement: {len(result.revised_statement)} chars")
+    print(f"  record-sourced additions to confirm: {len(result.added_facts_to_verify)}")
     print(f"  report length: {len(result.report_markdown)} chars")
     out = PROJECT_ROOT / "outputs"
     out.mkdir(exist_ok=True)
     (out / "smoke_evaluation_report.md").write_text(result.report_markdown, encoding="utf-8")
     print(f"  report written to outputs/smoke_evaluation_report.md")
+    (out / "smoke_revised_statement.txt").write_text(result.revised_statement, encoding="utf-8")
+    print(f"  revised statement written to outputs/smoke_revised_statement.txt")
 
 
 def smoke_draft(llm: LLMClient) -> None:

@@ -242,6 +242,52 @@ def evaluate_tab() -> None:
             for fact in result.omitted_record_facts:
                 st.write(f"- {fact.get('fact', '')} _(source: {fact.get('source', '')})_")
 
+    if result.revised_statement or result.revision_changes:
+        with st.expander("📝 Suggested improvements — proposed rewrite", expanded=True):
+            if result.revision_notes:
+                st.info(result.revision_notes)
+            if result.revision_changes:
+                change_rows = [
+                    {
+                        "Category": c.get("category", ""),
+                        "Original": c.get("original", "") or "(addition)",
+                        "Suggested": c.get("revised", ""),
+                        "Why": c.get("reason", ""),
+                    }
+                    for c in result.revision_changes
+                ]
+                st.dataframe(change_rows, use_container_width=True, hide_index=True)
+            if result.added_facts_to_verify:
+                st.markdown(
+                    "**Record-sourced facts added — the witness must confirm each before signing:**"
+                )
+                for fact in result.added_facts_to_verify:
+                    st.write(f"- {fact}")
+            st.markdown("#### Revised statement")
+            st.caption(
+                "Contradictions have been corrected to match the medical records. Resolve every "
+                "[Confirm: ...] placeholder with the witness before signing."
+            )
+            revised = st.text_area(
+                "Revised statement (editable)",
+                value=result.revised_statement,
+                height=420,
+                key="eval_revised_statement",
+            )
+            col_a, col_b = st.columns(2)
+            col_a.download_button(
+                "⬇️ Download revised statement (.txt)",
+                data=revised.encode("utf-8"),
+                file_name="lay_statement_revised.txt",
+                mime="text/plain",
+            )
+            col_b.download_button(
+                "⬇️ Download revised statement (.md)",
+                data=revised.encode("utf-8"),
+                file_name="lay_statement_revised.md",
+                mime="text/markdown",
+            )
+
     with st.expander("Full markdown report"):
         st.markdown(result.report_markdown)
     st.download_button(
@@ -385,7 +431,8 @@ def about_tab() -> None:
 medical records. The app conducts an exhaustive review of the records, extracts every factual
 claim in the statement, verifies each claim against the records (supported / contradicted /
 partially supported / not found), scores the statement on an 8-dimension rubric drawn from VA
-lay-evidence law, and produces a prioritized improvement plan.
+lay-evidence law, and then suggests how to improve it: a prioritized improvement plan plus a
+proposed rewrite with corrections grounded in the records and confirmation placeholders.
 
 **Pathway 2 — Draft:** Upload the veteran's medical records and answer questions about what the
 witness has personally observed. The app grounds the statement in the records, flags anything

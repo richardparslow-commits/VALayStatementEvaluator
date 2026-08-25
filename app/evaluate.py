@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 
 from .config import load_knowledge
 from .documents import ExtractedDocument
-from .llm import LLMClient
+from .llm import LLMClient, LLMError
 from .medical_review import (
     MedicalDigest,
     ProgressCallback,
@@ -135,6 +135,74 @@ MEDICAL RECORD SUMMARY:
 >>>"""
 
 
+REVISE_SYSTEM = """You are a senior veterans-claims advocate rewriting a lay/witness statement \
+to make it as strong and factually safe as possible, guided by a completed evidence review. \
+Hard rules:
+- NEVER invent facts. Every new factual detail must come from the provided record digest or the \
+original statement. Facts taken from the records that the witness should personally confirm \
+before signing MUST be wrapped in [Confirm: ...] placeholders.
+- Claims verified CONTRADICTED must be corrected to match the medical records (use the record \
+fact noted for them). If the witness might genuinely remember it differently, correct to the \
+record and append a [Confirm: ...] note.
+- Claims PARTIALLY SUPPORTED: align the disputed detail (date, place, name) with the records.
+- Claims NOT FOUND: KEEP them — absence from records is not negative evidence (Buchanan v. \
+Nicholson; Barr v. Nicholson). You may sharpen their wording but must not delete firsthand \
+observations merely because the records are silent.
+- Keep the writer's voice, grammatical person, and relationship (a coworker writes as a coworker).
+- Stay inside lay competence: observations, symptoms, events, and functional impact only. Reword \
+medical or legal conclusions as observations or attributed statements ("he told me his doctor \
+said...").
+- Do not pad with filler; preserve supported facts essentially as written.
+- Add any missing formal elements: witness identity/relationship, opportunity to observe, \
+certification of truthfulness, signature/date block, and a note that the statement is submitted \
+on VA Form 21-10210.
+- Prefer concrete dates, frequencies, and specific incidents over vague language."""
+
+REVISE_USER = """Rewrite this lay/witness statement so it corrects every problem identified by \
+the review while keeping all legitimate lay observations.
+
+Return JSON:
+{{
+  "revision_notes": "2-3 sentences explaining your revision strategy",
+  "changes": [
+    {{
+      "category": "contradiction_fix | alignment | specificity | lay_competence | structure | record_addition",
+      "original": "quoted or summarized original passage (empty string if pure addition)",
+      "revised": "the replacement or added text",
+      "reason": "why, tied to the verification result or rubric finding"
+    }}
+  ],
+  "revised_statement": "the COMPLETE revised statement, ready for the witness to review, with [Confirm: ...] placeholders wherever they must check something before signing",
+  "added_facts_to_verify": ["each record-sourced fact you added that the witness must confirm"]
+}}
+Include one changes entry per meaningful change, in statement order (typically 5-15 entries).
+
+ORIGINAL STATEMENT:
+<<<
+{statement}
+>>>
+
+CLAIM-VERIFICATION RESULTS:
+<<<
+{verifications}
+>>>
+
+RUBRIC IMPROVEMENTS IDENTIFIED:
+<<<
+{improvements}
+>>>
+
+RECORD FACTS THE STATEMENT COULD ADD:
+<<<
+{omitted_facts}
+>>>
+
+MEDICAL RECORD SUMMARY:
+<<<
+{digest_summary}
+>>>"""
+
+
 @dataclass
 class EvaluationResult:
     claimed_condition: str = ""
@@ -146,6 +214,10 @@ class EvaluationResult:
     improvements: list[dict] = field(default_factory=list)
     omitted_record_facts: list[dict] = field(default_factory=list)
     executive_summary: str = ""
+    revision_notes: str = ""
+    revision_changes: list[dict] = field(default_factory=list)
+    revised_statement: str = ""
+    added_facts_to_verify: list[str] = field(default_factory=list)
     digest: MedicalDigest | None = None
     report_markdown: str = ""
 
@@ -196,12 +268,12 @@ def run_evaluation(
         if progress:
             progress(frac, msg)
 
-    report(0.02, "Step 1/5 — Exhaustive review of medical records…")
+    report(0.02, "Step 1/6 — Exhaustive review of medical records…")
     result.digest = review_medical_records(
-        llm, records, progress=lambda f, m: progress((0.02 + f * 0.5), m) if progress else None
+        llm, records, progress=lambda f, m: progress((0.02 + f * 0.48), m) if progress else None
     )
 
-    report(0.55, "Step 2/5 — Extracting factual claims from the statement…")
+    report(0.52, "Step 2/6 — Extracting factual claims from the statement…")
     claims_data = llm.chat_json(
         CLAIMS_SYSTEM,
         CLAIMS_USER.format(statement=statement_text[:40000]),
@@ -210,10 +282,10 @@ def run_evaluation(
     result.writer_role = claims_data.get("writer_role", "")
     result.claims = claims_data.get("claims", [])
 
-    report(0.65, "Step 3/5 — Verifying each claim against the records…")
+    report(0.60, "Step 3/6 — Verifying each claim against the records…")
     result.verifications = _verify_claims(llm, result.claims, result.digest, records, report)
 
-    report(0.82, "Step 4/5 — Scoring against the lay-evidence rubric…")
+    report(0.78, "Step 4/6 — Scoring against the lay-evidence rubric…")
     rubric_data = llm.chat_json(
         RUBRIC_SYSTEM_TEMPLATE.format(
             rubric=load_knowledge("evaluation_rubric.md"),
@@ -231,10 +303,51 @@ def run_evaluation(
     result.omitted_record_facts = rubric_data.get("omitted_record_facts", [])
     result.executive_summary = rubric_data.get("executive_summary", "")
 
-    report(0.95, "Step 5/5 — Building the report…")
+    report(0.86, "Step 5/6 — Drafting improvement suggestions and a revised statement…")
+    _draft_revision(llm, result, statement_text, report)
+
+    report(0.96, "Step 6/6 — Building the report…")
     result.report_markdown = build_report(result, statement_text)
     report(1.0, "Evaluation complete.")
     return result
+
+
+def _draft_revision(
+    llm: LLMClient,
+    result: EvaluationResult,
+    statement_text: str,
+    report: ProgressCallback,
+) -> None:
+    """Generate the itemized improvement plan and a suggested rewrite.
+
+    A failure here should not lose the completed evaluation, so errors are
+    swallowed and the revision fields simply stay empty.
+    """
+    import json as _json
+
+    try:
+        revise_data = llm.chat_json(
+            REVISE_SYSTEM,
+            REVISE_USER.format(
+                statement=statement_text[:30000],
+                verifications=_verifications_text(result),
+                improvements=_json.dumps(result.improvements, indent=1)[:6000] or "(none)",
+                omitted_facts=_json.dumps(result.omitted_record_facts, indent=1)[:4000]
+                or "(none)",
+                digest_summary=(result.digest.summary or "(no summary)")[:12000],
+            ),
+            max_tokens=6000,
+        )
+    except LLMError:
+        result.revision_notes = "Revision draft unavailable — the model call failed."
+        return
+    result.revision_notes = revise_data.get("revision_notes", "")
+    result.revision_changes = revise_data.get("changes", [])
+    result.revised_statement = revise_data.get("revised_statement", "")
+    result.added_facts_to_verify = [
+        str(f) for f in revise_data.get("added_facts_to_verify", []) if str(f).strip()
+    ]
+    report(0.94, "Improvement suggestions drafted.")
 
 
 def _verify_claims(
@@ -250,7 +363,7 @@ def _verify_claims(
     batches = [claims[i : i + batch_size] for i in range(0, len(claims), batch_size)]
     for index, batch in enumerate(batches, start=1):
         report(
-            0.65 + 0.15 * index / max(len(batches), 1),
+            0.60 + 0.16 * index / max(len(batches), 1),
             f"Verifying claims — batch {index}/{len(batches)}…",
         )
         batch_query = " ".join(str(c.get("text", "")) for c in batch)
@@ -377,6 +490,36 @@ def build_report(result: EvaluationResult, statement_text: str) -> str:
         for fact in result.omitted_record_facts:
             lines.append(f"- {fact.get('fact', '')} _(source: {fact.get('source', 'records')})_")
         lines.append("")
+
+    if result.revised_statement or result.revision_changes:
+        lines.append("## Suggested Improvements — Proposed Rewrite")
+        lines.append("")
+        if result.revision_notes:
+            lines.append(f"**Revision strategy:** {result.revision_notes}")
+            lines.append("")
+        if result.revision_changes:
+            lines.append("| # | Category | Original | Suggested | Why |")
+            lines.append("|---|----------|----------|-----------|-----|")
+            for index, change in enumerate(result.revision_changes, start=1):
+                original = str(change.get("original", "") or "(addition)").replace("|", "/")[:200]
+                revised = str(change.get("revised", "")).replace("|", "/")[:300]
+                reason = str(change.get("reason", "")).replace("|", "/")[:200]
+                category = str(change.get("category", ""))[:24]
+                lines.append(f"| {index} | {category} | {original} | {revised} | {reason} |")
+            lines.append("")
+        if result.added_facts_to_verify:
+            lines.append("**Record-sourced facts added — the witness must confirm each before signing:**")
+            lines.append("")
+            for fact in result.added_facts_to_verify:
+                lines.append(f"- {fact}")
+            lines.append("")
+        if result.revised_statement:
+            lines.append("### Revised statement (resolve every `[Confirm: …]` before signing)")
+            lines.append("")
+            lines.append("```text")
+            lines.append(result.revised_statement)
+            lines.append("```")
+            lines.append("")
 
     if result.digest and result.digest.summary:
         lines.append("## Medical Record Digest (what the review saw)")

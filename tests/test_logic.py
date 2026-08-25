@@ -44,6 +44,17 @@ class TestEvaluationResult(unittest.TestCase):
                            "suggestion": "Add frequency", "example_rewrite": "daily pain"}],
             omitted_record_facts=[{"fact": "MRI findings", "source": "chunk 1/1"}],
             executive_summary="Solid statement.",
+            revision_notes="Corrected the date to match the STRs.",
+            revision_changes=[
+                {
+                    "category": "contradiction_fix",
+                    "original": "treated in 2009",
+                    "revised": "treated in 2010 [Confirm: STRs show 2010]",
+                    "reason": "Records show 2010 treatment.",
+                }
+            ],
+            revised_statement="I was treated in 2010. [Confirm: exact date]",
+            added_facts_to_verify=["2010 cortisone injection"],
         )
 
     def test_contradiction_count(self):
@@ -57,8 +68,16 @@ class TestEvaluationResult(unittest.TestCase):
     def test_report_contains_key_sections(self):
         report = build_report(self._sample(), "statement body")
         for section in ["Evaluation Report", "Claim-by-Claim Verification", "Rubric Scores",
-                        "Top Improvements", "CONTRADICTED", "not legal"]:
+                        "Top Improvements", "CONTRADICTED", "not legal",
+                        "Suggested Improvements", "Proposed Rewrite"]:
             self.assertIn(section, report, msg=f"missing: {section}")
+
+    def test_report_includes_revised_statement_and_confirm_flags(self):
+        report = build_report(self._sample(), "statement body")
+        self.assertIn("treated in 2010", report)
+        self.assertIn("[Confirm: exact date]", report)
+        self.assertIn("contradiction_fix", report)
+        self.assertIn("2010 cortisone injection", report)
 
 
 if __name__ == "__main__":
