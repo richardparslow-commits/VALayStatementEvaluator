@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import streamlit as st
 
+from . import config
 from .config import DEFAULT_BASE_URL, load_settings
 from .documents import ExtractionError, extract_document, MAX_STATEMENT_CHARS
 from .draft import grounding_markdown, run_draft
@@ -118,7 +119,16 @@ def _records_uploader(slot: str) -> list:
         accept_multiple_files=True,
         key=f"files_{slot}",
     )
-    return _extract_uploads(files, slot)
+    documents = _extract_uploads(files, slot)
+    total_pages = sum(len(d.pages) for d in documents)
+    if documents and total_pages > config.MAX_RECORD_PAGES:
+        st.error(
+            f"Record set is {total_pages:,} pages, which exceeds the configured limit of "
+            f"{config.MAX_RECORD_PAGES:,} pages. Remove some files or raise "
+            "VA_LSE_MAX_RECORD_PAGES."
+        )
+        return []
+    return documents
 
 
 def _progress_widgets():
@@ -158,9 +168,14 @@ def evaluate_tab() -> None:
     if records:
         total_pages = sum(len(d.pages) for d in records)
         st.success(
-            f"Loaded {len(records)} record file(s), {total_pages} page(s): "
+            f"Loaded {len(records)} record file(s), {total_pages:,} page(s): "
             + ", ".join(d.filename for d in records)
         )
+        if total_pages > 200:
+            st.info(
+                "Large record set: chunks are digested in parallel with duplicate pages "
+                "skipped, but expect a longer run for a meticulous review."
+            )
 
     run = st.button("🔍 Run exhaustive evaluation", type="primary", key="eval_run")
     if run:
@@ -334,9 +349,14 @@ def draft_tab() -> None:
     if records:
         total_pages = sum(len(d.pages) for d in records)
         st.success(
-            f"Loaded {len(records)} record file(s), {total_pages} page(s): "
+            f"Loaded {len(records)} record file(s), {total_pages:,} page(s): "
             + ", ".join(d.filename for d in records)
         )
+        if total_pages > 200:
+            st.info(
+                "Large record set: chunks are digested in parallel with duplicate pages "
+                "skipped, but expect a longer run for a meticulous review."
+            )
 
     st.subheader("Step 2 — Claim details")
     col1, col2 = st.columns(2)
@@ -445,8 +465,14 @@ def draft_tab() -> None:
 
     if result.digest:
         with st.expander("Medical record digest used for grounding"):
+            st.caption(
+                f"{len(result.digest.facts):,} facts extracted from "
+                f"{result.digest.pages_reviewed:,} pages "
+                f"({result.digest.chunks_reviewed} chunks, "
+                f"{result.digest.duplicates_skipped} duplicate page(s) skipped)"
+            )
             st.write(result.digest.summary)
-            st.code(result.digest.timeline_text()[:12000], language=None)
+            st.code(result.digest.timeline_text()[:20000], language=None)
 
 
 # ----------------------------------------------------------------- about tab
@@ -474,7 +500,10 @@ first-person statement in VA Form 21-10210 style that stays strictly within lay-
 boundaries.
 
 Both pathways review every page of every uploaded document — records are processed in chunks
-so very long files are handled exhaustively.
+so very long files are handled exhaustively. Large record sets (hundreds to thousands of pages,
+up to a configurable cap of ~5,000 pages) are supported: chunks are digested in parallel,
+duplicate pages are skipped automatically, and verification always searches the full digest for
+evidence relevant to each claim rather than reading only the first pages.
 """
     )
     st.subheader("Legal foundation")

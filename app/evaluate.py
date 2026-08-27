@@ -488,14 +488,14 @@ def _verify_claims(
             f"Verifying claims — batch {index}/{len(batches)}…",
         )
         batch_query = " ".join(str(c.get("text", "")) for c in batch)
-        excerpts = find_relevant_excerpts(records, batch_query, top_k=6)
+        excerpts = find_relevant_excerpts(records, batch_query, top_k=8)
         import json as _json
 
         data = llm.chat_json(
             VERIFY_SYSTEM,
             VERIFY_USER.format(
-                digest=digest.as_json_text()[:24000],
-                excerpts=excerpts[:8000] or "(no matching raw excerpts found)",
+                digest=digest.relevant_facts_text(batch_query, max_facts=150),
+                excerpts=excerpts[:16000] or "(no matching raw excerpts found)",
                 claims=_json.dumps(batch, indent=1),
             ),
         )
@@ -539,8 +539,10 @@ def build_report(result: EvaluationResult, statement_text: str) -> str:
         lines.append(f"**Writer role:** {result.writer_role}")
     if result.digest:
         lines.append(
-            f"**Records reviewed:** {result.digest.pages_reviewed} pages, "
-            f"{len(result.digest.facts)} facts extracted"
+            f"**Records reviewed:** {result.digest.pages_reviewed:,} pages in "
+            f"{result.digest.chunks_reviewed} chunks "
+            f"({result.digest.duplicates_skipped} duplicate page(s) skipped), "
+            f"{len(result.digest.facts):,} facts extracted"
         )
     lines.append("")
 

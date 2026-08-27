@@ -58,3 +58,29 @@ def load_knowledge(name: str) -> str:
     if not path.exists():
         raise FileNotFoundError(f"Knowledge file missing: {path}")
     return path.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Large-record-set handling. All overridable via environment variables so the
+# app can be tuned per machine/API rate limits without code changes.
+# ---------------------------------------------------------------------------
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, "").strip() or default)
+    except ValueError:
+        return default
+
+
+# Hard cap on total pages across all uploaded record files.
+MAX_RECORD_PAGES = _int_env("VA_LSE_MAX_RECORD_PAGES", 5000)
+
+# Number of record chunks digested in parallel. Keep modest to respect API
+# rate limits; 6 is a good balance for ~2,000-page sets.
+RECORDS_CONCURRENCY = max(1, _int_env("VA_LSE_RECORDS_CONCURRENCY", 6))
+
+# Maximum facts kept in the digest after consolidation.
+MAX_DIGEST_FACTS = _int_env("VA_LSE_MAX_DIGEST_FACTS", 1500)
+
+# Characters per record chunk. Smaller chunks => more LLM calls but better
+# recall on dense pages (nothing gets truncated mid-extraction).
+DIGEST_CHUNK_CHARS = _int_env("VA_LSE_DIGEST_CHUNK_CHARS", 8000)

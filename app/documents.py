@@ -9,11 +9,14 @@ from dataclasses import dataclass, field
 
 from pypdf import PdfReader
 
+from . import config
+
 SUPPORTED_EXTENSIONS = (".pdf", ".txt", ".md", ".docx")
 
 # Chunk size chosen so a digest prompt (system + knowledge + chunk) stays well under
-# typical 32k-token context windows of fast models.
-DEFAULT_CHUNK_CHARS = 12_000
+# typical context windows while small enough that dense pages are never truncated
+# mid-extraction. Overridable via VA_LSE_DIGEST_CHUNK_CHARS.
+DEFAULT_CHUNK_CHARS = config.DIGEST_CHUNK_CHARS
 CHUNK_OVERLAP_CHARS = 400
 MAX_STATEMENT_CHARS = 60_000
 
@@ -171,3 +174,37 @@ def chunk_page_labelled_text(text: str, max_chars: int = DEFAULT_CHUNK_CHARS) ->
 
     total = len(chunks)
     return [Chunk(i, total, c) for i, c in enumerate(chunks, start=1)]
+
+
+# ------------------------------------------------------- paragraph retrieval
+@dataclass
+class Paragraph:
+    """One paragraph of record text with its page label, ready for scoring."""
+
+    label: str
+    text: str
+
+
+_PARAGRAPH_CACHE: dict[tuple, list[Paragraph]] = {}
+
+
+def paragraph_index(doc: ExtractedDocument, min_chars: int = 40) -> list[Paragraph]:
+    """Split a document into scannable paragraphs, cached per document.
+
+    Large record sets (1,000+ pages) are searched once per claim batch, so the
+    split/tokenize work is memoized instead of repeated for every query.
+    """
+    key = (doc.filename, len(doc.pages), doc.char_count)
+    cached = _PARAGRAPH_CACHE.get(key)
+    if cached is not None:
+        return cached
+    paragraphs: list[Paragraph] = []
+    for page in doc.pages:
+        for block in re.split(r"\n{2,}", page.text):
+            block = block.strip()
+            if len(block) >= min_chars:
+                paragraphs.append(Paragraph(page.label, block))
+    if len(_PARAGRAPH_CACHE) > 64:  # keep the cache bounded
+        _PARAGRAPH_CACHE.clear()
+    _PARAGRAPH_CACHE[key] = paragraphs
+    return paragraphs

@@ -49,12 +49,13 @@ app/
 scripts/
   extract_pdfs.py         Build reference_docs/extracted/*.txt from source PDFs
   smoke_test.py           End-to-end pipeline test against the live LLM endpoint
+  scale_sim.py            Offline 2,000-page pipeline simulation (no API calls)
 tests/                    Offline unit tests (no API key required)
 examples/                 Fictional sample statement + sample medical records
 ```
 
 Long documents are processed in overlapping, page-labelled chunks so reviews are exhaustive
-regardless of record length.
+regardless of record length. See **Large record sets** below for how very large files scale.
 
 ## Setup
 
@@ -73,6 +74,10 @@ cp .env.example .env     # then put your API key in .env (never commit .env)
 | `OPENAI_BASE_URL` | OpenAI-compatible base URL | Alibaba MaaS gateway |
 | `LLM_MODEL_MAIN` | Heavy model (analysis/scoring/drafting) | `qwen3.7-max` |
 | `LLM_MODEL_FAST` | Light model (fact extraction/merging) | `qwen3.7-flash` |
+| `VA_LSE_MAX_RECORD_PAGES` | Max total pages across uploaded record files | `5000` |
+| `VA_LSE_RECORDS_CONCURRENCY` | Parallel chunk-digest workers | `6` |
+| `VA_LSE_MAX_DIGEST_FACTS` | Max facts kept in the consolidated digest | `1500` |
+| `VA_LSE_DIGEST_CHUNK_CHARS` | Characters per record chunk | `8000` |
 
 All four can also be overridden live in the app sidebar. Model availability depends on your
 gateway workspace; check `GET {base_url}/models`.
@@ -103,6 +108,32 @@ streamlit run run_app.py
    conflicts, suggests strengthening questions, drafts the statement, and self-reviews it.
 4. Resolve every bracketed `[Confirm: ...]` placeholder with the witness before signing.
    Submit on VA Form 21-10210 (one form per witness).
+
+## Large record sets (1 to ~5,000 pages)
+
+The reviewer is built for full VA claim files, including bundles of 1,000–2,000+ pages:
+
+- **Parallel digestion** — record chunks are extracted by `VA_LSE_RECORDS_CONCURRENCY`
+  workers at once instead of serially, so a ~1,900-page file that would take hours
+  sequentially completes in tens of minutes. Progress is reported per chunk.
+- **Duplicate-page skipping** — pages repeated within or across files (very common in
+  VA bundles) are hash-detected and skipped, with the count shown in the results.
+- **Transient-failure tolerance** — a chunk that fails (e.g. rate limit) is retried
+  once; the run only aborts if it still fails, and the failing chunks are named.
+- **Hierarchical fact merging** — thousands of extracted facts are consolidated in
+  parallel batches (never one oversized call), deduplicated, and capped at
+  `VA_LSE_MAX_DIGEST_FACTS`.
+- **No evidence lost to truncation** — claim verification and draft grounding do not
+  read only the head of the digest. Each claim batch retrieves the digest facts most
+  relevant to it (IDF-weighted term matching) plus matching raw-record excerpts, so
+  evidence buried on page 1,700 is found just like evidence on page 2.
+- **Full-timeline summaries** — the narrative record summary samples facts evenly across
+  the whole timeline instead of only the earliest documents.
+
+Tuning: raise `VA_LSE_RECORDS_CONCURRENCY` if your endpoint allows more parallel
+requests; lower `VA_LSE_DIGEST_CHUNK_CHARS` for extra recall on very dense pages (at the
+cost of more LLM calls). `scripts/scale_sim.py` runs an offline 2,000-page simulation of
+the pipeline (no API calls) to verify orchestration at scale.
 
 ## Tests
 

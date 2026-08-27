@@ -177,6 +177,7 @@ def run_draft(
     )
 
     report(0.5, "Step 2/4 — Grounding witness observations against the records and topic checklist…")
+    grounding_query = f"{condition} {observations}"
     result.grounding = llm.chat_json(
         GROUNDING_SYSTEM,
         GROUNDING_USER.format(
@@ -184,7 +185,7 @@ def run_draft(
             claim_type=claim_type,
             relationship=witness.get("relationship", "not specified"),
             observations=observations[:20000],
-            digest=result.digest.as_json_text()[:24000],
+            digest=result.digest.relevant_facts_text(grounding_query, max_facts=150),
             checklist=load_knowledge("topic_checklist.md"),
         ),
     )
