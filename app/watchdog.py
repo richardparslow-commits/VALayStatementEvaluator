@@ -175,7 +175,10 @@ def fit_effective_rate(history: UsageHistory) -> FitResult:
             - (tokens_prev["prompt"] + tokens_prev["completion"])
         )
         dcredits = curr.credits - prev.credits
-        if dtokens <= 0 or dcredits < 0:
+        # A credit delta of exactly 0 while tokens were consumed usually means
+        # the user re-entered the same console number (or the console didn't
+        # refresh); treat it as a no-op interval instead of a bogus 0 rate.
+        if dtokens <= 0 or dcredits <= 0:
             continue
         intervals.append((dtokens, dcredits))
         result.observed_tokens += dtokens

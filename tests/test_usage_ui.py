@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 from app.usage import UsageTracker  # noqa: E402
+from app import watchdog  # noqa: E402
 
 
 class _FakeSettings:
@@ -131,6 +132,34 @@ class TestUsageUi(unittest.TestCase):
         self.assertIn("records:summary", phases)
         self.assertIn("claims", phases)
         self.assertGreater(fake.usage.totals().calls, 0)
+
+
+    def test_explicit_env_rate_not_overwritten_by_watchdog(self):
+        """A .env rate set for ONE model must not be clobbered by the watchdog
+        blended rate; the watchdog only fills the missing model's slot."""
+        import app.config as config
+        import unittest.mock as mock
+
+        # Seed watchdog history with a learned blended rate (e.g. 100 credits/1M).
+        history = watchdog.UsageHistory()
+        watchdog.record_run(history, prompt_tokens=1000, completion_tokens=0, calls=1)
+        watchdog.record_calibration(history, credits=0.0, ts=1.0)
+        watchdog.record_run(history, prompt_tokens=1000, completion_tokens=0, calls=1)
+        watchdog.record_calibration(history, credits=0.1, ts=2.0)  # 100 credits/1M
+        watchdog.save_history(history, str(Path(self._tmp_hist) / "hist.json"))
+
+        # User explicitly set only the MAIN rate in .env; watchdog knows a rate.
+        with mock.patch.object(config, "CREDITS_PER_1M_MAIN", 800.0), mock.patch.object(
+            config, "CREDITS_PER_1M_FAST", None
+        ):
+            import app.main as main
+
+            rates, label = main._effective_credit_rates()
+
+        # MAIN keeps its explicit 800; only FAST borrows from the watchdog (100).
+        self.assertEqual(rates[config.DEFAULT_MODEL_MAIN], 800.0)
+        self.assertAlmostEqual(rates[config.DEFAULT_MODEL_FAST], 100.0, delta=1e-6)
+        self.assertIn("watchdog", label)
 
 
 if __name__ == "__main__":

@@ -327,9 +327,11 @@ def _effective_credit_rates() -> tuple[dict[str, float | None], str]:
     fit = watchdog.fit_effective_rate(_load_usage_history())
     if fit.any_rate():  # pragma: no branch - guarded
         label = "estimated by the usage watchdog"
-        if fit.main_rate is not None:
+        # Fill only the rates missing from .env; never overwrite an explicit
+        # value the user configured for one model.
+        if rates[config.DEFAULT_MODEL_MAIN] is None and fit.main_rate is not None:
             rates[config.DEFAULT_MODEL_MAIN] = fit.main_rate
-        if fit.fast_rate is not None:
+        if rates[config.DEFAULT_MODEL_FAST] is None and fit.fast_rate is not None:
             rates[config.DEFAULT_MODEL_FAST] = fit.fast_rate
         return rates, label
     return rates, "entry"
