@@ -14,6 +14,7 @@ from app.documents import (  # noqa: E402
     ExtractionError,
     chunk_page_labelled_text,
     extract_document,
+    extract_uploaded_documents,
     paragraph_index,
     records_from_local_path,
 )
@@ -181,6 +182,44 @@ class TestLocalPathLoading(unittest.TestCase):
             else:
                 os.environ["HOME"] = old_home
         self.assertEqual(len(docs), 1)
+
+
+class TestUploadedExtraction(unittest.TestCase):
+    class _FakeUploaded:
+        """Minimal stand-in for a Streamlit UploadedFile."""
+
+        def __init__(self, name: str, data: bytes):
+            self.name = name
+            self.size = len(data)
+            self._data = data
+
+        def getvalue(self) -> bytes:
+            return self._data
+
+    def test_good_and_bad_files_split_into_docs_and_skipped(self):
+        files = [
+            self._FakeUploaded("good.txt", b"Knee pain noted."),
+            self._FakeUploaded("bad.pdf", b"%PDF-1.4 broken scan data"),
+            self._FakeUploaded("other.txt", b"Tinnitus reported."),
+        ]
+        docs, skipped = extract_uploaded_documents(files)
+        self.assertEqual([d.filename for d in docs], ["good.txt", "other.txt"])
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("bad.pdf", skipped[0])
+
+    def test_all_bad_returns_no_docs_and_all_skipped(self):
+        files = [
+            self._FakeUploaded("a.pdf", b"%PDF broken"),
+            self._FakeUploaded("b.pdf", b"%PDF broken"),
+        ]
+        docs, skipped = extract_uploaded_documents(files)
+        self.assertEqual(docs, [])
+        self.assertEqual(len(skipped), 2)
+
+    def test_empty_input(self):
+        docs, skipped = extract_uploaded_documents([])
+        self.assertEqual(docs, [])
+        self.assertEqual(skipped, [])
 
 
 class TestChunking(unittest.TestCase):

@@ -13,6 +13,7 @@ from .documents import (
     ExtractionError,
     MAX_STATEMENT_CHARS,
     extract_document,
+    extract_uploaded_documents,
     records_from_local_path,
 )
 from .draft import grounding_markdown, run_draft
@@ -120,21 +121,41 @@ def _get_llm() -> LLMClient | None:
 
 # ------------------------------------------------------------- shared uploads
 def _extract_uploads(files, slot: str) -> list:
-    """Extract text from uploaded files; cache results per file identity."""
+    """Extract text from uploaded files; cache results per file identity.
+
+    Files that fail extraction (e.g. image-only PDFs) are reported as
+    per-file warnings that persist in session state, so unreadable uploads
+    never silently disappear.
+    """
     documents = []
+    to_extract = []
     for uploaded in files:
         cache_key = f"{slot}:{uploaded.name}:{uploaded.size}"
         if cache_key in st.session_state:
             documents.append(st.session_state[cache_key])
-            continue
-        try:
-            doc = extract_document(uploaded.name, uploaded.getvalue())
-        except ExtractionError as exc:
-            st.warning(str(exc))
-            continue
-        st.session_state[cache_key] = doc
+        else:
+            to_extract.append(uploaded)
+
+    new_docs, skipped = extract_uploaded_documents(to_extract)
+    for doc in new_docs:
+        # Cache each successful extraction by its (slot, name, size) identity.
+        for uploaded in to_extract:
+            if uploaded.name == doc.filename:
+                st.session_state[f"{slot}:{uploaded.name}:{uploaded.size}"] = doc
+                break
         documents.append(doc)
+    _record_skipped(slot, skipped)
     return documents
+
+
+def _record_skipped(slot: str, skipped: list[str]) -> None:
+    """Persist per-file skip warnings and render them for this run."""
+    key = f"{slot}:skipped"
+    existing = st.session_state.get(key, [])
+    merged = existing + [s for s in skipped if s not in existing]
+    st.session_state[key] = merged
+    for message in merged:
+        st.warning(message)
 
 
 def _is_local_run() -> bool:

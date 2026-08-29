@@ -130,6 +130,25 @@ def _extract_docx(filename: str, data: bytes) -> ExtractedDocument:
     return ExtractedDocument(filename=filename, pages=[DocumentPage(filename, 1, text)])
 
 
+def extract_uploaded_documents(
+    files,  # iterable of Streamlit UploadedFile-like objects (name + getvalue)
+) -> tuple[list[ExtractedDocument], list[str]]:
+    """Extract uploaded files; returns ``(documents, skipped)``.
+
+    ``skipped`` holds one message per file that could not be extracted (e.g.
+    an image-only PDF), so callers can surface them as warnings instead of
+    letting unreadable uploads silently vanish.
+    """
+    documents: list[ExtractedDocument] = []
+    skipped: list[str] = []
+    for uploaded in files:
+        try:
+            documents.append(extract_document(uploaded.name, uploaded.getvalue()))
+        except ExtractionError as exc:
+            skipped.append(str(exc))
+    return documents, skipped
+
+
 def records_from_local_path(path: str) -> tuple[list[ExtractedDocument], list[str]]:
     """Read supported record files directly from a local file or folder path.
 
