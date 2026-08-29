@@ -38,6 +38,7 @@ run_app.py                Streamlit launcher
 app/
   main.py                 UI: Evaluate / Draft / About tabs
   config.py               Settings (.env), knowledge-file loader
+  fetch_client.py         Fetch Sandbox GET client -> normalized record documents
   llm.py                  OpenAI-compatible client (retry, JSON parsing)
   documents.py            TXT/MD/DOCX/PDF extraction, page-aware chunking
   medical_review.py       Exhaustive chunked record review -> fact digest
@@ -78,9 +79,16 @@ cp .env.example .env     # then put your API key in .env (never commit .env)
 | `VA_LSE_RECORDS_CONCURRENCY` | Parallel chunk-digest workers | `6` |
 | `VA_LSE_MAX_DIGEST_FACTS` | Max facts kept in the consolidated digest | `1500` |
 | `VA_LSE_DIGEST_CHUNK_CHARS` | Characters per record chunk | `8000` |
+| `FETCH_SANDBOX_API_KEY` | Optional Fetch Sandbox API key | empty |
+| `FETCH_SANDBOX_BASE_URL` | Fetch Sandbox base URL (`fetchsandbox.com` or subdomain) | `https://fetchsandbox.com` |
+| `FETCH_SANDBOX_RECORDS_PATH` | GET path for the records endpoint | `/medical_records/{patient_id}` |
 
-All four can also be overridden live in the app sidebar. Model availability depends on your
+All settings can also be overridden live in the app sidebar. Model availability depends on your
 gateway workspace; check `GET {base_url}/models`.
+
+Fetch Sandbox settings can also be overridden in the sidebar. Because Fetch Sandbox mirrors
+your own OpenAPI spec, you must point `FETCH_SANDBOX_RECORDS_PATH` at the GET endpoint your
+sandbox exposes for record retrieval.
 
 ## Run
 
@@ -91,7 +99,9 @@ streamlit run run_app.py
 ### Evaluate a statement
 
 1. Upload or paste the lay statement.
-2. Upload the veteran's medical records (PDF/TXT/MD/DOCX, multiple files OK).
+2. Choose a medical-record source:
+   - **Upload files** (PDF/TXT/MD/DOCX, multiple files OK), or
+   - **Fetch Sandbox** (enter a patient or record ID and import from your sandbox endpoint).
 3. Click **Run exhaustive evaluation** — watch chunked record review, claim verification,
    rubric scoring, improvement drafting, and report generation progress.
 4. Review the verdict table (✅ supported / 🟡 partial / ❌ contradicted / ⚪ not found),
@@ -102,7 +112,7 @@ streamlit run run_app.py
 
 ### Draft a statement
 
-1. Upload the veteran's medical records.
+1. Choose the veteran's medical-record source: upload files or import from Fetch Sandbox.
 2. Enter witness details and bulleted firsthand observations.
 3. Click **Draft the statement** — the app grounds every observation in the records, flags
    conflicts, suggests strengthening questions, drafts the statement, and self-reviews it.
@@ -141,6 +151,32 @@ the pipeline (no API calls) to verify orchestration at scale.
 python -m unittest discover -s tests -v        # offline unit tests
 python scripts/smoke_test.py all               # live end-to-end (needs valid .env)
 ```
+
+## Fetch Sandbox contract
+
+This integration assumes the sandbox exposes a **GET** endpoint that returns JSON. The app
+supports these response shapes:
+
+- `{ "documents": [...] }`, `{ "records": [...] }`, `{ "files": [...] }`, or `{ "items": [...] }`
+- a top-level JSON array of document items
+- a single structured JSON object, which the app will import as one JSON-backed document
+
+Each document item may provide one of:
+
+- `text` / `content` / `body` / `markdown`
+- `base64` / `data_base64` / `file_base64` / `content_base64`
+- `download_url` / `url` / `file_url` / `href`
+
+Optional metadata fields:
+
+- `filename` / `name` / `title`
+- `content_type` / `mime_type` / `media_type`
+
+When an API key is provided, the app sends both a bearer-token auth header and an `X-API-Key`
+header to maximize compatibility with different sandbox auth setups.
+
+For safety, the Fetch base URL must point to `fetchsandbox.com` (or one of its subdomains),
+and imported document URLs must resolve to that same host.
 
 ## Security notes
 

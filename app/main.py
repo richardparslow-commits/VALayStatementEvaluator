@@ -12,6 +12,7 @@ from .config import DEFAULT_BASE_URL, load_settings
 from .documents import ExtractionError, extract_document, MAX_STATEMENT_CHARS
 from .draft import grounding_markdown, run_draft
 from .evaluate import DIMENSION_LABELS, run_evaluation
+from .fetch_client import FetchClient, FetchSandboxError
 from .llm import LLMClient, LLMError
 
 st.set_page_config(
@@ -62,11 +63,30 @@ def _sidebar_settings() -> None:
         st.session_state.model_fast_input = col2.text_input(
             "Fast model", value=settings.model_fast, help="Bulk record digests"
         )
+        st.divider()
+        st.subheader("Fetch Sandbox")
+        st.session_state.fetch_api_key_input = st.text_input(
+            "Fetch API key",
+            value=settings.fetch_api_key,
+            type="password",
+            help="Optional if the sandbox runs in relaxed auth mode.",
+        )
+        st.session_state.fetch_base_url_input = st.text_input(
+            "Fetch base URL", value=settings.fetch_base_url
+        )
+        st.session_state.fetch_records_path_input = st.text_input(
+            "Fetch records path",
+            value=settings.fetch_records_path,
+            help="GET path for records. Use {patient_id} where the selected ID belongs.",
+        )
         if st.button("Apply settings"):
             settings.api_key = st.session_state.api_key_input.strip()
             settings.base_url = st.session_state.base_url_input.strip() or DEFAULT_BASE_URL
             settings.model_main = st.session_state.model_main_input.strip()
             settings.model_fast = st.session_state.model_fast_input.strip()
+            settings.fetch_api_key = st.session_state.fetch_api_key_input.strip()
+            settings.fetch_base_url = st.session_state.fetch_base_url_input.strip()
+            settings.fetch_records_path = st.session_state.fetch_records_path_input.strip()
             st.rerun()
 
         st.divider()
@@ -113,6 +133,15 @@ def _extract_uploads(files, slot: str) -> list:
 
 
 def _records_uploader(slot: str) -> list:
+    source = st.radio(
+        "Medical record source",
+        ["Upload files", "Fetch Sandbox"],
+        horizontal=True,
+        key=f"records_source_{slot}",
+    )
+    if source == "Fetch Sandbox":
+        return _fetch_records(slot)
+
     files = st.file_uploader(
         "Upload medical records (PDF, TXT, MD, DOCX — multiple allowed)",
         type=["pdf", "txt", "md", "docx"],
@@ -129,6 +158,28 @@ def _records_uploader(slot: str) -> list:
         )
         return []
     return documents
+
+
+def _fetch_records(slot: str) -> list:
+    settings = st.session_state.settings
+    patient_id = st.text_input(
+        "Patient or record ID",
+        key=f"fetch_patient_id_{slot}",
+        help="Used for the {patient_id} placeholder in the Fetch records path.",
+    )
+    st.caption(
+        f"GET {settings.fetch_base_url.rstrip('/')}{settings.fetch_records_path}"
+    )
+    import_key = f"fetch_records_{slot}"
+    if st.button("Import medical records from Fetch Sandbox", key=f"fetch_import_{slot}"):
+        st.session_state.pop(import_key, None)
+        try:
+            records = FetchClient(settings).fetch_documents(patient_id)
+        except FetchSandboxError as exc:
+            st.warning(str(exc))
+        else:
+            st.session_state[import_key] = records
+    return st.session_state.get(import_key, [])
 
 
 def _progress_widgets():

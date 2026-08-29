@@ -68,17 +68,20 @@ def extract_document(filename: str, data: bytes) -> ExtractedDocument:
     if lower.endswith(".pdf"):
         return _extract_pdf(filename, data)
     if lower.endswith((".txt", ".md")):
-        text = data.decode("utf-8", errors="replace").strip()
-        if not text:
-            raise ExtractionError(f"{filename}: file is empty.")
-        return ExtractedDocument(
-            filename=filename, pages=[DocumentPage(filename, 1, text)]
-        )
+        return document_from_text(filename, data.decode("utf-8", errors="replace"))
     if lower.endswith(".docx"):
         return _extract_docx(filename, data)
     raise ExtractionError(
         f"{filename}: unsupported file type. Use PDF, TXT, MD, or DOCX."
     )
+
+
+def document_from_text(filename: str, text: str) -> ExtractedDocument:
+    """Create a single-page extracted document from plain text."""
+    text = clean_text(text)
+    if not text:
+        raise ExtractionError(f"{filename}: file is empty.")
+    return ExtractedDocument(filename=filename, pages=[DocumentPage(filename, 1, text)])
 
 
 def _extract_pdf(filename: str, data: bytes) -> ExtractedDocument:
