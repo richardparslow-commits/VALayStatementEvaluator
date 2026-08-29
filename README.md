@@ -231,6 +231,23 @@ header to maximize compatibility with different sandbox auth setups.
 For safety, the Fetch base URL must point to `fetchsandbox.com` (or one of its subdomains),
 and imported document URLs must resolve to that same host.
 
+### Testing locally with the mock sandbox
+
+A stdlib-only mock server is included at `scripts/mock_fetch_sandbox.py` for local testing. Because
+the app only accepts `*.fetchsandbox.com` hosts, map a subdomain to localhost in `/etc/hosts`, then
+run the mock and point the app at it:
+
+```sh
+# 1. /etc/hosts: 127.0.0.1  local.fetchsandbox.com
+# 2. run the mock:
+.venv/bin/python scripts/mock_fetch_sandbox.py
+# 3. app sidebar: base URL http://local.fetchsandbox.com:8001, records path /medical_records/{patient_id}
+```
+
+The mock responds to both URL styles the app emits (`/medical_records/{patient_id}` and
+`/medical_records?patient_id=...`) with a two-document JSON payload — see the script's docstring
+for full instructions.
+
 ## Security notes
 
 - `.env`, `.venv/`, and `outputs/` are git-ignored.
