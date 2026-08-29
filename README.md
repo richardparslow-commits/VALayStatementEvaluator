@@ -104,11 +104,12 @@ it two ways:
 1. **Set explicit rates** — `VA_LSE_CREDITS_PER_1M_MAIN` and `VA_LSE_CREDITS_PER_1M_FAST` to
    your plan's effective rates (explicit values always win), plus `VA_LSE_CREDIT_QUOTA` if your
    quota differs from the 2,500-credit Lite default.
-2. **Let the watchdog learn it** (default). Every finished run persists its token totals to a
-   git-ignored `usage_history.json`. In the sidebar's **Usage watchdog** panel, enter the plan's
-   cumulative "credits used" reading from the QwenCloud console each time after a run. After two
-   readings separated by new runs, the app fits your effective credits-per-1M rate by matching
-   observed credit burn to token counts and uses it as a fallback for the credit-burn estimate.
+2. **Let the watchdog learn it** (default). Every finished run persists its per-role token totals
+   (main vs fast model) to a git-ignored `usage_history.json`. In the sidebar's **Usage watchdog**
+   panel, enter the plan's cumulative "credits used" reading from the QwenCloud console each time
+   after a run. With readings separated by new runs, the app fits a **separate credits-per-1M rate
+   per model** by least squares over the calibration intervals (falling back to one blended rate
+   when the data can't separate them), and uses those rates for the credit-burn estimate.
 
 The estimator is purely informational — it never limits or throttles a run.
 

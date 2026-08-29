@@ -13,6 +13,10 @@ from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
 
+# Phases that always run on the cheap (fast) model: the bulk record digest and
+# the mechanical fact dedup/merge. Every other phase runs on the main model.
+FAST_MODEL_PHASES = frozenset({"records:digest", "records:merge"})
+
 
 def estimate_tokens(text: str) -> int:
     """Rough token estimate: ~4 chars/token, never zero for non-empty input."""
@@ -86,6 +90,19 @@ class UsageTracker:
             s.completion_tokens += entry.completion_tokens
             s.models[entry.model] += 1
         return stats
+
+    def per_role_tokens(self) -> dict[str, int]:
+        """Total tokens consumed split into 'main' vs 'fast' model roles.
+
+        Roles are inferred from each entry's phase (the digest/merge passes
+        always run the fast model), because the model *name* is configurable in
+        the sidebar while the phase role is fixed by the pipeline.
+        """
+        roles: dict[str, int] = {"main": 0, "fast": 0}
+        for entry in self.entries:
+            role = "fast" if entry.phase in FAST_MODEL_PHASES else "main"
+            roles[role] += entry.prompt_tokens + entry.completion_tokens
+        return roles
 
     def totals(self) -> PhaseStats:
         total = PhaseStats()

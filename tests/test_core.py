@@ -321,6 +321,82 @@ class TestUsageWatchdog(unittest.TestCase):
         watchdog.record_calibration(history, credits=0.5, ts=1.0)
         self.assertFalse(watchdog.fit_effective_rate(history).any_rate())
 
+    def test_persistence_round_trip_with_by_role(self):
+        import tempfile
+
+        tmp = tempfile.mkdtemp()
+        path = str(Path(tmp) / "hist.json")
+        history = watchdog.UsageHistory()
+        watchdog.record_run(
+            history,
+            prompt_tokens=1000,
+            completion_tokens=2000,
+            calls=5,
+            by_role={"main": 1200, "fast": 1800},
+        )
+        watchdog.save_history(history, path)
+        loaded = watchdog.load_history(path)
+        self.assertEqual(loaded.runs[0].by_role, {"main": 1200, "fast": 1800})
+        # Legacy records without by_role still load.
+        watchdog.record_run(history, prompt_tokens=10, completion_tokens=5, calls=1)
+        watchdog.save_history(history, path)
+        loaded2 = watchdog.load_history(path)
+        self.assertEqual(loaded2.runs[1].by_role, {})
+
+    def test_per_model_least_squares_separates_rates(self):
+        history = watchdog.UsageHistory()
+        # Baseline run + reading at rate 0.
+        watchdog.record_run(history, prompt_tokens=100, completion_tokens=0, calls=1)
+        watchdog.record_calibration(history, credits=0.0, ts=1.0)
+        # Interval 1: only the fast model runs (2M tokens -> 100 credits).
+        watchdog.record_run(
+            history, prompt_tokens=2_000_000, completion_tokens=0, calls=1,
+            by_role={"fast": 2_000_000},
+        )
+        watchdog.record_calibration(history, credits=100.0, ts=2.0)
+        # Interval 2: only the main model runs (2M tokens -> 1600 credits).
+        watchdog.record_run(
+            history, prompt_tokens=2_000_000, completion_tokens=0, calls=1,
+            by_role={"main": 2_000_000},
+        )
+        watchdog.record_calibration(history, credits=1700.0, ts=3.0)
+
+        fit = watchdog.fit_effective_rate(history)
+        self.assertIsNotNone(fit.main_rate)
+        self.assertIsNotNone(fit.fast_rate)
+        # fast = 100 credits / 2M tokens * 1e6 = 50; main = 1600/2M*1e6 = 800.
+        self.assertAlmostEqual(fit.fast_rate, 50.0, delta=1e-6)
+        self.assertAlmostEqual(fit.main_rate, 800.0, delta=1e-6)
+        self.assertNotEqual(fit.main_rate, fit.fast_rate)
+        # Blended is still reported as an overall figure.
+        self.assertAlmostEqual(fit.blended_rate, 1700.0 / 4_000_000 * 1e6, delta=1e-6)
+
+    def test_per_model_falls_back_to_blended_when_single_model(self):
+        """All-main data cannot separate rates; both slots use the blended rate."""
+        history = watchdog.UsageHistory()
+        watchdog.record_run(history, prompt_tokens=1000, completion_tokens=0, calls=1)
+        watchdog.record_calibration(history, credits=0.0, ts=1.0)
+        watchdog.record_run(
+            history, prompt_tokens=1_000_000, completion_tokens=0, calls=1,
+            by_role={"main": 1_000_000},
+        )
+        watchdog.record_calibration(history, credits=500.0, ts=2.0)
+        fit = watchdog.fit_effective_rate(history)
+        self.assertEqual(fit.main_rate, fit.fast_rate)
+        self.assertAlmostEqual(fit.main_rate, 500.0, delta=1e-6)
+
+    def test_per_role_tokens_classifies_by_phase(self):
+        from app.usage import UsageTracker
+
+        tracker = UsageTracker()
+        tracker.record(model="m", phase="records:digest", system="s", user="u",
+                       content="o", prompt_tokens=100, completion_tokens=50)
+        tracker.record(model="m", phase="claims", system="s", user="u",
+                       content="o", prompt_tokens=10, completion_tokens=20)
+        roles = tracker.per_role_tokens()
+        self.assertEqual(roles["fast"], 150)
+        self.assertEqual(roles["main"], 30)
+
     def test_negative_credit_delta_skipped(self):
         history = watchdog.UsageHistory()
         watchdog.record_run(history, prompt_tokens=1000, completion_tokens=0, calls=1)

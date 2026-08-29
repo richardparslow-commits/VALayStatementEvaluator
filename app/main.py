@@ -297,7 +297,11 @@ def _save_usage_history(history: watchdog.UsageHistory) -> None:
 
 
 def _record_watchdog_run(usage) -> None:
-    """Append a finished run's token totals to the persisted history."""
+    """Append a finished run's token totals to the persisted history.
+
+    Per-role token totals (main vs fast) are carried along so the watchdog can
+    fit separate credit rates for the two models.
+    """
     total = usage.totals()
     if not total.calls:
         return
@@ -307,6 +311,7 @@ def _record_watchdog_run(usage) -> None:
         prompt_tokens=total.prompt_tokens,
         completion_tokens=total.completion_tokens,
         calls=total.calls,
+        by_role=usage.per_role_tokens(),
     )
     _save_usage_history(history)
 
@@ -372,18 +377,30 @@ def _credit_calibration_widget() -> None:
             f"Runs tracked: {n_runs} · calibrations: {len(history.calibrations)}"
         )
         if fit.any_rate():
-            st.markdown(
-                f"**Learned effective rate:** ≈{fit.blended_rate:,.0f} credits / 1M "
-                f"tokens {fit.multiline_note}"
-            )
+            separate = fit.main_rate != fit.fast_rate
+            if separate:
+                st.markdown(
+                    f"**Learned rates:** main ≈{fit.main_rate:,.0f} · fast "
+                    f"≈{fit.fast_rate:,.0f} credits/1M tokens. {fit.multiline_note}"
+                )
+            else:
+                st.markdown(
+                    f"**Learned effective rate:** ≈{fit.blended_rate:,.0f} credits / 1M "
+                    f"tokens {fit.multiline_note}"
+                )
             enabled = all(
                 config.CREDITS_PER_1M_MAIN is None
                 and config.CREDITS_PER_1M_FAST is None
             )
             if enabled:
+                rate_desc = (
+                    f"main **{fit.main_rate:,.0f}** / fast **{fit.fast_rate:,.0f} credits/1M**"
+                    if separate
+                    else f"**{fit.blended_rate:,.0f} credits/1M**"
+                )
                 st.markdown(
-                    f"The estimator will now use **{fit.blended_rate:,.0f} credits/1M** "
-                    "as a fallback until you set explicit rates in `.env`."
+                    f"The estimator will now use {rate_desc} as a fallback for the "
+                    "credit estimate until you set explicit rates in `.env`."
                 )
         else:
             st.markdown(

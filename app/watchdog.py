@@ -28,6 +28,7 @@ class RunRecord:
     prompt_tokens: int
     completion_tokens: int
     calls: int
+    by_role: dict[str, int] = field(default_factory=dict)  # "main"/"fast" -> tokens
 
     @property
     def total_tokens(self) -> int:
@@ -92,10 +93,27 @@ def load_history(path: Path | str | None = None) -> UsageHistory:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return UsageHistory()
+    def _run_from_dict(raw: dict) -> RunRecord:
+        return RunRecord(
+            ts=float(raw.get("ts", 0.0)),
+            prompt_tokens=int(raw.get("prompt_tokens", 0)),
+            completion_tokens=int(raw.get("completion_tokens", 0)),
+            calls=int(raw.get("calls", 0)),
+            by_role={
+                str(k): int(v)
+                for k, v in (raw.get("by_role") or {}).items()
+                if isinstance(k, str) and isinstance(v, (int, float))
+            },
+        )
+
     return UsageHistory(
-        runs=[RunRecord(**r) for r in data.get("runs", []) if isinstance(r, dict)],
+        runs=[_run_from_dict(r) for r in data.get("runs", []) if isinstance(r, dict)],
         calibrations=[
-            CalibrationPoint(**c)
+            CalibrationPoint(
+                ts=float(c.get("ts", 0.0)),
+                credits=float(c.get("credits", 0.0)),
+                run_index=int(c.get("run_index", -1)),
+            )
             for c in data.get("calibrations", [])
             if isinstance(c, dict)
         ],
@@ -117,6 +135,7 @@ def record_run(
     prompt_tokens: int,
     completion_tokens: int,
     calls: int,
+    by_role: dict[str, int] | None = None,
     ts: float | None = None,
 ) -> RunRecord:
     """Append a finished run; returns the new record."""
@@ -125,6 +144,7 @@ def record_run(
         prompt_tokens=int(prompt_tokens),
         completion_tokens=int(completion_tokens),
         calls=int(calls),
+        by_role={str(k): int(v) for k, v in (by_role or {}).items()},
     )
     history.runs.append(record)
     return record
@@ -147,19 +167,31 @@ def record_calibration(
 
 
 # --------------------------------------------------------------------- fitting
-def fit_effective_rate(history: UsageHistory) -> FitResult:
-    """Fit an effective credits-per-1M rate from calibration intervals.
+def _role_delta(runs: list[RunRecord]) -> dict[str, int]:
+    """Sum per-role tokens across a run slice."""
+    out: dict[str, int] = {}
+    for run in runs:
+        for role, tokens in run.by_role.items():
+            out[role] = out.get(role, 0) + tokens
+    return out
 
-    Each interval between two console readings maps a known token increase to a
-    known credit increase; the effective rate is their ratio. When intervals
-    disagree (rate drift), the answer is the token-weighted average, which
-    emphasizes the longest/ most recent usage.
+
+def fit_effective_rate(history: UsageHistory) -> FitResult:
+    """Fit credits-per-1M rates for the main and fast models separately.
+
+    Each interval between console readings maps a known credit increase to known
+    token increases per model role. With at least two intervals whose main/fast
+    mix differs, we solve the two rates via ordinary least squares. When the
+    data can't separate the models (only one model used, or every interval has
+    the same main/fast ratio), we fall back to a single blended rate.
+
+    Regression model per interval i:
+        credits_i ~= main_tokens_i/1e6 * r_main + fast_tokens_i/1e6 * r_fast
     """
     result = FitResult()
     cals = sorted(history.calibrations, key=lambda c: c.ts)
 
-    # Build intervals: reading[i] covers runs strictly after reading[i-1].
-    intervals: list[tuple[int, int, float]] = []  # (run_from, run_to, credits_delta)
+    intervals: list[tuple[dict[str, int], float]] = []  # (role tokens, credits delta)
     for i in range(1, len(cals)):
         prev = cals[i - 1]
         curr = cals[i]
@@ -167,20 +199,18 @@ def fit_effective_rate(history: UsageHistory) -> FitResult:
         run_to = curr.run_index
         if run_to < run_from:
             continue  # no new runs between readings
-        tokens = history.cumulative_tokens(run_to)
+        covered = history.runs[run_from : run_to + 1]
         tokens_prev = history.cumulative_tokens(prev.run_index)
+        tokens = history.cumulative_tokens(run_to)
         dtokens = (
             tokens["prompt"]
             + tokens["completion"]
             - (tokens_prev["prompt"] + tokens_prev["completion"])
         )
         dcredits = curr.credits - prev.credits
-        # A credit delta of exactly 0 while tokens were consumed usually means
-        # the user re-entered the same console number (or the console didn't
-        # refresh); treat it as a no-op interval instead of a bogus 0 rate.
         if dtokens <= 0 or dcredits <= 0:
             continue
-        intervals.append((dtokens, dcredits))
+        intervals.append((_role_delta(covered), dcredits))
         result.observed_tokens += dtokens
         result.observed_credits += dcredits
         result.intervals += 1
@@ -192,31 +222,58 @@ def fit_effective_rate(history: UsageHistory) -> FitResult:
         )
         return result
 
-    # Token-weighted average rate (credits per 1M tokens).
-    total_tokens = sum(t for t, _ in intervals)
-    weighted = (
-        sum((t / total_tokens) * (c / t) for t, c in intervals) * 1_000_000
-        if total_tokens
-        else None
-    )
-    if weighted is None:
-        return result
+    blended = result.observed_credits / result.observed_tokens * 1_000_000
+    result.blended_rate = blended
 
-    result.blended_rate = weighted
-    result.main_rate = weighted
-    result.fast_rate = weighted
+    # --- least squares for (r_main, r_fast): X^T X r = X^T y ---
+    x1: list[tuple[float, float, float]] = []  # (main_tokens/1e6, fast_tokens/1e6, credits)
+    for role_tokens, dcredits in intervals:
+        dm = role_tokens.get("main", 0)
+        df = role_tokens.get("fast", 0)
+        if dm + df <= 0:
+            continue  # no per-role breakdown for this interval
+        x1.append((dm / 1_000_000.0, df / 1_000_000.0, dcredits))
+
+    if len(x1) >= 2:
+        # Normal equations.
+        s_aa = sum(a * a for a, _, _ in x1)
+        s_ab = sum(a * b for a, b, _ in x1)
+        s_bb = sum(b * b for _, b, _ in x1)
+        s_ay = sum(a * y for a, _, y in x1)
+        s_by = sum(b * y for _, b, y in x1)
+        det = s_aa * s_bb - s_ab * s_ab
+        if abs(det) > 1e-12:
+            r_main = (s_ay * s_bb - s_ab * s_by) / det
+            r_fast = (s_aa * s_by - s_ab * s_ay) / det
+            if r_main >= 0 and r_fast >= 0:  # reject negative (nonphysical) fits
+                result.main_rate = r_main
+                result.fast_rate = r_fast
+
+    if result.main_rate is None:
+        # Couldn't separate models: apply the blended rate to both.
+        result.main_rate = blended
+        result.fast_rate = blended
 
     if result.intervals == 1:
         result.multiline_note = (
             f"Fitted from {result.observed_tokens:,} tokens and "
-            f"{result.observed_credits:,.0f} credits across 1 interval. Add more "
-            "readings to refine."
+            f"{result.observed_credits:,.0f} credits across 1 interval. Add "
+            "readings after both models run to separate their rates."
+        )
+    elif result.main_rate == result.fast_rate:
+        result.multiline_note = (
+            f"Fitted from {result.observed_tokens:,} tokens and "
+            f"{result.observed_credits:,.0f} credits across {
+                result.intervals
+            } intervals, but the data couldn't separate the two models "
+            "(same rate applied to both). Add runs where main and fast mix "
+            "differs to split them."
         )
     else:
         result.multiline_note = (
             f"Fitted from {result.observed_tokens:,} tokens and "
             f"{result.observed_credits:,.0f} credits across {
                 result.intervals
-            } intervals (token-weighted)."
+            } intervals for two separate model rates."
         )
     return result
