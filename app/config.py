@@ -18,10 +18,17 @@ KNOWLEDGE_DIR = Path(__file__).resolve().parent / "knowledge"
 # the project's .env wins over any pre-existing environment values.
 load_dotenv(PROJECT_ROOT / ".env", override=True)
 
+# Default endpoint tuned for the QwenCloud Individual Plan Lite subscription.
+# Token Plan uses a dedicated sk-sp- API key that MUST be paired with this
+# base URL (Token Plan keys do not work against the general MaaS gateway).
 DEFAULT_BASE_URL = (
-    "https://ws-tc9lxz8v26y5ywu1.us-east-1.maas.aliyuncs.com/compatible-mode/v1"
+    "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
 )
+# Low-volume, high-value calls (claim extraction, verification, rubric scoring,
+# topic audit, rewrite) use the strong reasoning model.
 DEFAULT_MODEL_MAIN = "qwen3.7-max"
+# The bulk digest/merge passes (one call per record chunk — by far the most
+# calls) use the cheap model to preserve the Lite plan's limited credit quota.
 DEFAULT_MODEL_FAST = "qwen3.7-flash"
 DEFAULT_FETCH_SANDBOX_BASE_URL = "https://fetchsandbox.com"
 DEFAULT_FETCH_SANDBOX_RECORDS_PATH = "/medical_records/{patient_id}"
@@ -92,9 +99,11 @@ def _int_env(name: str, default: int) -> int:
 # Hard cap on total pages across all uploaded record files.
 MAX_RECORD_PAGES = _int_env("VA_LSE_MAX_RECORD_PAGES", 5000)
 
-# Number of record chunks digested in parallel. Keep modest to respect API
-# rate limits; 6 is a good balance for ~2,000-page sets.
-RECORDS_CONCURRENCY = max(1, _int_env("VA_LSE_RECORDS_CONCURRENCY", 6))
+# Number of record chunks digested in parallel. Tuned down for the QwenCloud
+# Individual Plan Lite, which allows ~1-2 concurrent agents; higher values just
+# trigger rate limiting and burn the small credit quota faster. Raise via
+# VA_LSE_RECORDS_CONCURRENCY if you move to a higher QwenCloud tier.
+RECORDS_CONCURRENCY = max(1, _int_env("VA_LSE_RECORDS_CONCURRENCY", 2))
 
 # Maximum facts kept in the digest after consolidation.
 MAX_DIGEST_FACTS = _int_env("VA_LSE_MAX_DIGEST_FACTS", 1500)

@@ -71,12 +71,12 @@ cp .env.example .env     # then put your API key in .env (never commit .env)
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `OPENAI_API_KEY` | API key for the gateway | (required) |
-| `OPENAI_BASE_URL` | OpenAI-compatible base URL | Alibaba MaaS gateway |
-| `LLM_MODEL_MAIN` | Heavy model (analysis/scoring/drafting) | `qwen3.7-max` |
-| `LLM_MODEL_FAST` | Light model (fact extraction/merging) | `qwen3.7-flash` |
+| `OPENAI_API_KEY` | QwenCloud Token Plan API key (starts `sk-sp-`) | (required) |
+| `OPENAI_BASE_URL` | OpenAI-compatible base URL (Token Plan) | `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1` |
+| `LLM_MODEL_MAIN` | Low-volume heavy model (analysis/scoring/drafting) | `qwen3.7-max` |
+| `LLM_MODEL_FAST` | Cheap model for the bulk digest/merge passes | `qwen3.7-flash` |
 | `VA_LSE_MAX_RECORD_PAGES` | Max total pages across uploaded record files | `5000` |
-| `VA_LSE_RECORDS_CONCURRENCY` | Parallel chunk-digest workers | `6` |
+| `VA_LSE_RECORDS_CONCURRENCY` | Parallel chunk-digest workers | `2` (Lite plan fits 1–2 concurrent agents) |
 | `VA_LSE_MAX_DIGEST_FACTS` | Max facts kept in the consolidated digest | `1500` |
 | `VA_LSE_DIGEST_CHUNK_CHARS` | Characters per record chunk | `8000` |
 | `FETCH_SANDBOX_API_KEY` | Optional Fetch Sandbox API key | empty |
@@ -161,6 +161,23 @@ python scripts/smoke_test.py all               # live end-to-end (needs valid .e
 > Actions tab and only runs when an `OPENAI_API_KEY` secret is configured; the optional
 > `OPENAI_BASE_URL`, `LLM_MODEL_MAIN`, and `LLM_MODEL_FAST` secrets override the endpoint and
 > models in that job if set (see `.env.example`).
+
+## QwenCloud Individual Plan Lite tuning
+
+These defaults are tuned for a single user on the QwenCloud Individual Plan Lite subscription
+($8/month, **2,500 Credits per rolling 7-day window**, 1–2 concurrent agents):
+
+- **Base URL / key are paired** — the `sk-sp-` Token Plan key only works with the Token Plan
+  base URL; they never work against the general MaaS gateway.
+- **Model split is the biggest credit saver.** The bulk record-digest and merge passes (one
+  call per chunk — by far the most calls, especially on large files) run on the cheap
+  `qwen3.7-flash`. Only the low-volume, high-value steps — claim extraction, verification,
+  rubric scoring, topic audit, and the rewrite — use the strong `qwen3.7-max`.
+- **Concurrency is capped at 2** to match the plan's 1–2 agent limit; higher parallelism just
+  triggers rate limiting.
+- **Watch the window quota.** A single exhaustive run over a very large record set (hundreds
+  to thousands of pages) can consume much of the 2,500-credit quota. Run the `examples/`
+  sample first to gauge burn, and consider the Credit Pack add-on for heavy use.
 
 ## Fetch Sandbox contract
 

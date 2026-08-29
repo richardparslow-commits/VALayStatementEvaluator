@@ -67,7 +67,10 @@ def _sidebar_settings() -> None:
             "Main model", value=settings.model_main, help="Analysis, scoring, drafting"
         )
         st.session_state.model_fast_input = col2.text_input(
-            "Fast model", value=settings.model_fast, help="Bulk record digests"
+            "Fast model",
+            value=settings.model_fast,
+            help="Bulk record digests — use a cheap model here to preserve "
+            "QwenCloud Lite quota.",
         )
         st.divider()
         st.subheader("Fetch Sandbox")
