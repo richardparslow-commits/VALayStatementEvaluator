@@ -152,6 +152,12 @@ python -m unittest discover -s tests -v        # offline unit tests
 python scripts/smoke_test.py all               # live end-to-end (needs valid .env)
 ```
 
+> GitHub Actions runs the offline tests and scale simulation automatically on every push to
+> `main` (and on pull requests). The live smoke test is triggered **manually** from the
+> Actions tab and only runs when an `OPENAI_API_KEY` secret is configured; the optional
+> `OPENAI_BASE_URL`, `LLM_MODEL_MAIN`, and `LLM_MODEL_FAST` secrets override the endpoint and
+> models in that job if set (see `.env.example`).
+
 ## Fetch Sandbox contract
 
 This integration assumes the sandbox exposes a **GET** endpoint that returns JSON. The app
