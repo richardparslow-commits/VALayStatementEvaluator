@@ -144,18 +144,12 @@ def _extract_uploads(files, slot: str) -> list:
                 st.session_state[f"{slot}:{uploaded.name}:{uploaded.size}"] = doc
                 break
         documents.append(doc)
-    _record_skipped(slot, skipped)
-    return documents
-
-
-def _record_skipped(slot: str, skipped: list[str]) -> None:
-    """Persist per-file skip warnings and render them for this run."""
-    key = f"{slot}:skipped"
-    existing = st.session_state.get(key, [])
-    merged = existing + [s for s in skipped if s not in existing]
-    st.session_state[key] = merged
-    for message in merged:
+    # The uploader re-delivers files on every rerun, so warnings are recomputed
+    # fresh each run: they persist while a bad file is still uploaded and clear
+    # as soon as it is removed or replaced.
+    for message in skipped:
         st.warning(message)
+    return documents
 
 
 def _is_local_run() -> bool:

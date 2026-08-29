@@ -59,6 +59,47 @@ class TestUploadWarnings(unittest.TestCase):
         messages = [w.value for w in at.warning]
         self.assertTrue(any("bad.pdf" in m for m in messages), msg=messages)
 
+    def test_warning_clears_when_bad_file_replaced(self):
+        """Warnings are recomputed per run, so removing the bad file clears them."""
+        at = self._app()
+        at.run()
+        at.file_uploader(key="files_eval").set_value(
+            [("bad.pdf", b"%PDF-1.4 broken scan data", "application/pdf")]
+        )
+        at.run()
+        self.assertTrue(any("bad.pdf" in w.value for w in at.warning))
+        at.file_uploader(key="files_eval").set_value(
+            [("good.txt", b"Knee pain noted during visit.", "text/plain")]
+        )
+        at.run()
+        self.assertFalse(
+            any("bad.pdf" in w.value for w in at.warning),
+            msg=f"stale warning after replacing file: {[w.value for w in at.warning]}",
+        )
+
+    def test_bad_statement_upload_warns_in_step_1(self):
+        """Unreadable statement files warn in the Step 1 uploader too."""
+        at = self._app()
+        at.run()
+        at.file_uploader(key="eval_statement_file").set_value(
+            ("bad_stmt.pdf", b"%PDF-1.4 broken scan data", "application/pdf")
+        )
+        at.run()
+        messages = [w.value for w in at.warning]
+        self.assertTrue(
+            any("bad_stmt.pdf" in m and "could not read PDF" in m for m in messages),
+            msg=f"expected a bad_stmt.pdf warning, got: {messages}",
+        )
+        # Replacing it with a readable statement clears the warning.
+        at.file_uploader(key="eval_statement_file").set_value(
+            ("good_stmt.txt", b"I observed the veteran limping.", "text/plain")
+        )
+        at.run()
+        self.assertFalse(
+            any("bad_stmt.pdf" in w.value for w in at.warning),
+            msg=f"stale statement warning: {[w.value for w in at.warning]}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
