@@ -9,7 +9,12 @@ import streamlit as st
 
 from . import config
 from .config import DEFAULT_BASE_URL, load_settings
-from .documents import ExtractionError, extract_document, MAX_STATEMENT_CHARS
+from .documents import (
+    ExtractionError,
+    MAX_STATEMENT_CHARS,
+    extract_document,
+    records_from_local_path,
+)
 from .draft import grounding_markdown, run_draft
 from .evaluate import DIMENSION_LABELS, run_evaluation
 from .fetch_client import FetchClient, FetchSandboxError
@@ -132,15 +137,44 @@ def _extract_uploads(files, slot: str) -> list:
     return documents
 
 
+def _is_local_run() -> bool:
+    """True when the app is served on the same machine as the browser.
+
+    Used to gate reading records directly from the local filesystem: that is
+    only safe for a local Streamlit run, never for a public deployment (where
+    it would let anyone read server files). Fall back to an explicit opt-in
+    env var for unusual local setups.
+    """
+    import os
+    from urllib.parse import urlparse
+
+    if os.getenv("VA_LSE_ALLOW_LOCAL_PATHS", "").strip() == "1":
+        return True
+    try:
+        context = st.context
+        host = (context.headers.get("Host") or "").split(":")[0].lower()
+        if host in ("localhost", "127.0.0.1", "::1"):
+            return True
+        url_host = urlparse(context.url or "").hostname or ""
+        return url_host in ("localhost", "127.0.0.1", "::1")
+    except Exception:  # noqa: BLE001 - context may be unavailable in tests
+        return False
+
+
 def _records_uploader(slot: str) -> list:
+    sources = ["Upload files", "Fetch Sandbox"]
+    if _is_local_run():
+        sources.append("Local folder / file")
     source = st.radio(
         "Medical record source",
-        ["Upload files", "Fetch Sandbox"],
+        sources,
         horizontal=True,
         key=f"records_source_{slot}",
     )
     if source == "Fetch Sandbox":
         return _fetch_records(slot)
+    if source == "Local folder / file":
+        return _local_records(slot)
 
     files = st.file_uploader(
         "Upload medical records (PDF, TXT, MD, DOCX — multiple allowed)",
@@ -158,6 +192,29 @@ def _records_uploader(slot: str) -> list:
         )
         return []
     return documents
+
+
+def _local_records(slot: str) -> list:
+    """Load record files straight from a path on the local machine."""
+    st.caption(
+        "Reads supported record files (.pdf/.txt/.md/.docx) directly from this "
+        "machine's filesystem. Only available when the app runs locally."
+    )
+    path = st.text_input(
+        "Folder or file path",
+        key=f"local_path_{slot}",
+        placeholder="e.g. ~/Desktop/ClaimRecords or ~/Desktop/records.pdf",
+    )
+    import_key = f"local_records_{slot}"
+    if st.button("Load records from path", key=f"local_load_{slot}"):
+        st.session_state.pop(import_key, None)
+        try:
+            records = records_from_local_path(path)
+        except ExtractionError as exc:
+            st.warning(str(exc))
+        else:
+            st.session_state[import_key] = records
+    return st.session_state.get(import_key, [])
 
 
 def _fetch_records(slot: str) -> list:

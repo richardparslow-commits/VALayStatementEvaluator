@@ -82,6 +82,7 @@ cp .env.example .env     # then put your API key in .env (never commit .env)
 | `FETCH_SANDBOX_API_KEY` | Optional Fetch Sandbox API key | empty |
 | `FETCH_SANDBOX_BASE_URL` | Fetch Sandbox base URL (`fetchsandbox.com` or subdomain) | `https://fetchsandbox.com` |
 | `FETCH_SANDBOX_RECORDS_PATH` | GET path for the records endpoint | `/medical_records/{patient_id}` |
+| `VA_LSE_ALLOW_LOCAL_PATHS` | Force-enable the local folder/file record source (`1`) even when the local-run check can't detect localhost | (auto) |
 
 All settings can also be overridden live in the app sidebar. Model availability depends on your
 gateway workspace; check `GET {base_url}/models`.
@@ -100,8 +101,10 @@ streamlit run run_app.py
 
 1. Upload or paste the lay statement.
 2. Choose a medical-record source:
-   - **Upload files** (PDF/TXT/MD/DOCX, multiple files OK), or
-   - **Fetch Sandbox** (enter a patient or record ID and import from your sandbox endpoint).
+   - **Upload files** (PDF/TXT/MD/DOCX, multiple files OK),
+   - **Fetch Sandbox** (enter a patient or record ID and import from your sandbox endpoint), or
+   - **Local folder / file** (local runs only — read records straight from a path on this
+     machine, e.g. `~/Desktop/ClaimRecords`; hidden when the app is served remotely).
 3. Click **Run exhaustive evaluation** — watch chunked record review, claim verification,
    rubric scoring, improvement drafting, and report generation progress.
 4. Review the verdict table (✅ supported / 🟡 partial / ❌ contradicted / ⚪ not found),
@@ -112,7 +115,8 @@ streamlit run run_app.py
 
 ### Draft a statement
 
-1. Choose the veteran's medical-record source: upload files or import from Fetch Sandbox.
+1. Choose the veteran's medical-record source: upload files, import from Fetch Sandbox, or
+   read from a local folder/file path (local runs only).
 2. Enter witness details and bulleted firsthand observations.
 3. Click **Draft the statement** — the app grounds every observation in the records, flags
    conflicts, suggests strengthening questions, drafts the statement, and self-reviews it.

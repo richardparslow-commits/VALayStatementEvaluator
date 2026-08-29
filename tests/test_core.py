@@ -15,6 +15,7 @@ from app.documents import (  # noqa: E402
     chunk_page_labelled_text,
     extract_document,
     paragraph_index,
+    records_from_local_path,
 )
 from app.llm import _parse_json  # noqa: E402
 from app import config  # noqa: E402
@@ -58,6 +59,68 @@ class TestExtraction(unittest.TestCase):
     def test_page_labelled_text(self):
         doc = extract_document("note.txt", b"Body text here.")
         self.assertIn("page 1", doc.page_labelled_text())
+
+
+class TestLocalPathLoading(unittest.TestCase):
+    def _make_tmp(self, files: dict[str, bytes]):
+        import tempfile
+
+        tmp = tempfile.mkdtemp()
+        for name, data in files.items():
+            p = Path(tmp) / name
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(data)
+        return tmp
+
+    def test_loads_single_file(self):
+        tmp = self._make_tmp({"note.txt": b"Knee pain noted during visit."})
+        docs = records_from_local_path(str(Path(tmp) / "note.txt"))
+        self.assertEqual(len(docs), 1)
+        self.assertEqual(docs[0].filename, "note.txt")
+        self.assertIn("Knee pain", docs[0].full_text)
+
+    def test_loads_folder_recursively_and_sorts(self):
+        tmp = self._make_tmp(
+            {
+                "b/note.txt": b"Second record.",
+                "a/note.md": b"First record.",
+                "ignore.csv": b"not supported",
+                "nested/deep/note.txt": b"Third record.",
+            }
+        )
+        docs = records_from_local_path(tmp)
+        self.assertEqual([d.filename for d in docs], ["note.md", "note.txt", "note.txt"])
+        self.assertIn("Third record", docs[-1].full_text)
+        self.assertTrue(all("not supported" not in d.full_text for d in docs))
+
+    def test_missing_path_raises(self):
+        with self.assertRaises(ExtractionError):
+            records_from_local_path("/nonexistent/records/folder")
+
+    def test_empty_folder_raises(self):
+        tmp = self._make_tmp({})
+        with self.assertRaises(ExtractionError):
+            records_from_local_path(tmp)
+
+    def test_no_supported_files_raises(self):
+        tmp = self._make_tmp({"data.csv": b"a,b\n1,2\n"})
+        with self.assertRaises(ExtractionError):
+            records_from_local_path(tmp)
+
+    def test_expands_user_home(self):
+        import os
+
+        tmp = self._make_tmp({"note.txt": b"Home record."})
+        old_home = os.environ.get("HOME")
+        try:
+            os.environ["HOME"] = tmp
+            docs = records_from_local_path("~/note.txt")
+        finally:
+            if old_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = old_home
+        self.assertEqual(len(docs), 1)
 
 
 class TestChunking(unittest.TestCase):

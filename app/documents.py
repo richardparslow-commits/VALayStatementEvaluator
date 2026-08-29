@@ -6,6 +6,7 @@ import re
 import zipfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from pypdf import PdfReader
 
@@ -127,6 +128,45 @@ def _extract_docx(filename: str, data: bytes) -> ExtractedDocument:
     if not text:
         raise ExtractionError(f"{filename}: DOCX contains no readable text.")
     return ExtractedDocument(filename=filename, pages=[DocumentPage(filename, 1, text)])
+
+
+def records_from_local_path(path: str) -> list[ExtractedDocument]:
+    """Read supported record files directly from a local file or folder path.
+
+    Only meaningful when the app runs on the same machine as the records
+    (local Streamlit run) — the UI gates this behind a local-run check.
+
+    Raises ExtractionError if the path does not exist, contains no supported
+    files, or none of the files could be extracted.
+    """
+    root = Path(path).expanduser()
+    if not root.exists():
+        raise ExtractionError(f"Local path not found: {root}")
+
+    if root.is_file():
+        files = [root]
+    else:
+        files = sorted(
+            p
+            for p in root.rglob("*")
+            if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
+        )
+    if not files:
+        raise ExtractionError(
+            f"No supported record files (.pdf/.txt/.md/.docx) found in: {root}"
+        )
+
+    documents: list[ExtractedDocument] = []
+    errors: list[str] = []
+    for file in files:
+        try:
+            documents.append(extract_document(file.name, file.read_bytes()))
+        except ExtractionError as exc:
+            errors.append(str(exc))
+    if not documents:
+        detail = f" ({'; '.join(errors)}) " if errors else " "
+        raise ExtractionError(f"Could not load any records from {root}{detail}")
+    return documents
 
 
 def clean_text(text: str) -> str:
