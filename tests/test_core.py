@@ -18,8 +18,10 @@ from app.documents import (  # noqa: E402
     paragraph_index,
     records_from_local_path,
 )
-from app.llm import _parse_json  # noqa: E402
+from app.llm import LLMClient, _parse_json  # noqa: E402
 from app import config  # noqa: E402
+from app.usage import UsageTracker, estimate_tokens  # noqa: E402
+from app.llm import _usage_tokens  # noqa: E402
 from app.medical_review import (  # noqa: E402
     MedicalDigest,
     MedicalFact,
@@ -243,6 +245,102 @@ class TestChunking(unittest.TestCase):
         union = "".join(c.text for c in chunks)
         for token in text.split()[:100]:
             self.assertIn(token, union)
+
+
+class TestUsageTracker(unittest.TestCase):
+    def test_estimate_tokens_never_zero_for_nonempty(self):
+        self.assertGreater(estimate_tokens("x"), 0)
+        self.assertEqual(estimate_tokens(""), 0)
+
+    def test_aggregates_by_phase(self):
+        tracker = UsageTracker()
+        tracker.record(model="m", phase="digest", system="s", user="u",
+                       content="o", prompt_tokens=10, completion_tokens=20)
+        tracker.record(model="m", phase="digest", system="s", user="u",
+                       content="o", prompt_tokens=15, completion_tokens=25)
+        tracker.record(model="m", phase="verify", system="s", user="u",
+                       content="o", prompt_tokens=8, completion_tokens=2)
+        per = tracker.per_phase()
+        self.assertEqual(per["digest"].calls, 2)
+        self.assertEqual(per["digest"].prompt_tokens, 25)
+        self.assertEqual(per["digest"].completion_tokens, 45)
+        self.assertEqual(per["verify"].calls, 1)
+        self.assertEqual(tracker.totals().calls, 3)
+        self.assertEqual(tracker.totals().total_tokens, 80)
+
+    def test_falls_back_to_character_estimate_without_usage(self):
+        tracker = UsageTracker()
+        tracker.record(model="m", phase="p", system="a" * 40, user="b" * 40,
+                       content="c" * 40, prompt_tokens=None, completion_tokens=None)
+        # 80 prompt chars /4 = 20; 40 completion chars /4 = 10.
+        self.assertEqual(tracker.totals().prompt_tokens, 20)
+        self.assertEqual(tracker.totals().completion_tokens, 10)
+
+    def test_phase_counts_models(self):
+        tracker = UsageTracker()
+        tracker.record(model="fast", phase="digest", system="s", user="u",
+                       content="o", prompt_tokens=1, completion_tokens=1)
+        tracker.record(model="main", phase="digest", system="s", user="u",
+                       content="o", prompt_tokens=1, completion_tokens=1)
+        stats = tracker.per_phase()["digest"]
+        self.assertEqual(stats.models["fast"], 1)
+        self.assertEqual(stats.models["main"], 1)
+
+    def test_credit_estimate_none_without_rates(self):
+        tracker = UsageTracker()
+        tracker.record(model="qwen3.7-max", phase="p", system="s", user="u",
+                       content="o", prompt_tokens=1_000_000)
+        self.assertIsNone(tracker.credit_estimate({}))
+        # Unrated model still has no known rate => None.
+        self.assertIsNone(
+            tracker.credit_estimate({"qwen3.7-flash": 200.0})
+        )
+
+    def test_credit_estimate_converts_when_rate_known(self):
+        tracker = UsageTracker()
+        # 2M total tokens on the main model at 800 credits/1M => 1600 credits.
+        tracker.record(model="qwen3.7-max", phase="p", system="s", user="u",
+                       content="o", prompt_tokens=1_500_000, completion_tokens=500_000)
+        credits = tracker.credit_estimate({"qwen3.7-max": 800.0, "qwen3.7-flash": 200.0})
+        self.assertAlmostEqual(credits, 1600.0)
+
+    def test_live_line_empty_when_no_calls(self):
+        self.assertEqual(UsageTracker().live_line(), "")
+
+    def test_live_line_counts_calls(self):
+        tracker = UsageTracker()
+        tracker.record(model="m", phase="p", system="s", user="u", content="o",
+                       prompt_tokens=1000, completion_tokens=500)
+        line = tracker.live_line()
+        self.assertIn("1 call", line)
+        self.assertIn("1,000 in", line)
+        self.assertIn("500 out", line)
+
+    def test_usage_tokens_parses_provider_metadata(self):
+        class _Usage:
+            prompt_tokens = 11
+            completion_tokens = 22
+
+        class _Resp:
+            usage = _Usage()
+
+        self.assertEqual(_usage_tokens(_Resp()), (11, 22))
+
+    def test_usage_tokens_none_without_metadata(self):
+        class _Resp:
+            usage = None
+
+        self.assertEqual(_usage_tokens(_Resp()), (None, None))
+
+    def test_llm_client_constructs_usage_tracker(self):
+        class _S:
+            configured = True
+            api_key = "k"
+            base_url = "http://example.invalid"
+            model_main = "m"
+
+        client = LLMClient(_S())
+        self.assertIsInstance(client.usage, UsageTracker)
 
 
 class TestJsonParsing(unittest.TestCase):

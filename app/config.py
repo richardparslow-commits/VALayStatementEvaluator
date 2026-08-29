@@ -89,6 +89,17 @@ def load_knowledge(name: str) -> str:
 # Large-record-set handling. All overridable via environment variables so the
 # app can be tuned per machine/API rate limits without code changes.
 # ---------------------------------------------------------------------------
+def _float_env(name: str, default: float | None) -> float | None:
+    """Read an optional float env var; returns default when unset/invalid."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 def _int_env(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, "").strip() or default)
@@ -111,3 +122,18 @@ MAX_DIGEST_FACTS = _int_env("VA_LSE_MAX_DIGEST_FACTS", 1500)
 # Characters per record chunk. Smaller chunks => more LLM calls but better
 # recall on dense pages (nothing gets truncated mid-extraction).
 DIGEST_CHUNK_CHARS = _int_env("VA_LSE_DIGEST_CHUNK_CHARS", 8000)
+
+# ---------------------------------------------------------------------------
+# Optional credit-burn gauge for the usage estimator. QwenCloud Token Plan does
+# not publish a fixed credits-per-1M-token rate (and it changes), so we default
+# to "unbounded": the estimator reports calls + estimated tokens per phase but
+# only shows a credit figure once you set these to your plan's effective rates.
+# Example: if the fast model burns ~800 credits per 1M tokens on your plan, set
+# VA_LSE_CREDITS_PER_1M_FAST=800. The contributions are summed and compared to
+# the quota shown in the UI.
+CREDITS_PER_1M_MAIN = _float_env("VA_LSE_CREDITS_PER_1M_MAIN", None)
+CREDITS_PER_1M_FAST = _float_env("VA_LSE_CREDITS_PER_1M_FAST", None)
+
+# Weekly credit quota on the QwenCloud Individual Plan Lite (informational; used
+# only for the usage gauge, never limits the run).
+CREDIT_QUOTA = _float_env("VA_LSE_CREDIT_QUOTA", 2500.0)

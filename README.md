@@ -83,9 +83,26 @@ cp .env.example .env     # then put your API key in .env (never commit .env)
 | `FETCH_SANDBOX_BASE_URL` | Fetch Sandbox base URL (`fetchsandbox.com` or subdomain) | `https://fetchsandbox.com` |
 | `FETCH_SANDBOX_RECORDS_PATH` | GET path for the records endpoint | `/medical_records/{patient_id}` |
 | `VA_LSE_ALLOW_LOCAL_PATHS` | Force-enable the local folder/file record source (`1`) even when the local-run check can't detect localhost | (auto) |
+| `VA_LSE_CREDITS_PER_1M_MAIN` | Approx credits per 1M tokens for the main model (enables the credit-burn gauge) | (unset — gauge shows tokens/calls only) |
+| `VA_LSE_CREDITS_PER_1M_FAST` | Approx credits per 1M tokens for the fast model (enables the credit-burn gauge) | (unset — gauge shows tokens/calls only) |
+| `VA_LSE_CREDIT_QUOTA` | Your plan's weekly credit quota, used to render %-of-quota burn | `2500` |
 
 All settings can also be overridden live in the app sidebar. Model availability depends on your
 gateway workspace; check `GET {base_url}/models`.
+
+### Estimating API usage & credit burn
+
+Every run shows a live usage line in the progress caption and, after completion, an expandable
+"Estimated API usage" table in the results with **calls, input, and output tokens per phase**
+(record digest/merge/summary, claims, verification, rubric, topic audit, revision — or grounding/
+draft/review on the Draft tab). Token counts are estimates based on prompt length and model
+output, using the provider's reported usage when the endpoint supplies it.
+
+Because QwenCloud Token Plan doesn't publish a fixed credits-per-1M-token rate, the gauge only
+shows a **credit burn vs. your weekly quota** after you set `VA_LSE_CREDITS_PER_1M_MAIN` and
+`VA_LSE_CREDITS_PER_1M_FAST` to your plan's effective rates (and `VA_LSE_CREDIT_QUOTA` if your
+quota differs from the 2,500-credit Lite default). Users on higher tiers can override the same
+knobs; the estimator never limits a run, it only reports.
 
 Fetch Sandbox settings can also be overridden in the sidebar. Because Fetch Sandbox mirrors
 your own OpenAPI spec, you must point `FETCH_SANDBOX_RECORDS_PATH` at the GET endpoint your

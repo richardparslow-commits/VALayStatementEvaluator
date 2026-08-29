@@ -8,9 +8,28 @@ from typing import Any
 from openai import OpenAI
 
 from .config import Settings
+from .usage import UsageTracker
 
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 2.0
+
+
+def _usage_tokens(response: Any) -> tuple[int | None, int | None]:
+    """Pull prompt/completion tokens from a response if the provider reports them.
+
+    Some OpenAI-compatible gateways omit usage entirely; we fall back to a
+    character-based estimate in that case.
+    """
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return None, None
+    prompt = getattr(usage, "prompt_tokens", None)
+    completion = getattr(usage, "completion_tokens", None)
+    if not isinstance(prompt, int) or prompt < 0:
+        prompt = None
+    if not isinstance(completion, int) or completion < 0:
+        completion = None
+    return prompt, completion
 
 
 class LLMError(RuntimeError):
@@ -18,7 +37,11 @@ class LLMError(RuntimeError):
 
 
 class LLMClient:
-    """Thin wrapper around any OpenAI-compatible endpoint."""
+    """Thin wrapper around any OpenAI-compatible endpoint.
+
+    Tracks an estimated-usage ``UsageTracker`` so callers can report per-phase
+    token/call counts and (optionally) credit burn after a run.
+    """
 
     def __init__(self, settings: Settings) -> None:
         if not settings.configured:
@@ -29,6 +52,7 @@ class LLMClient:
         self._client = OpenAI(
             api_key=settings.api_key, base_url=settings.base_url, timeout=300.0
         )
+        self.usage = UsageTracker()
 
     # ------------------------------------------------------------------ core
     def chat(
@@ -39,6 +63,7 @@ class LLMClient:
         model: str | None = None,
         temperature: float = 0.2,
         max_tokens: int = 8000,
+        phase: str = "general",
     ) -> str:
         """Single-turn chat completion with basic retry. Returns text."""
         model = model or self._settings.model_main
@@ -57,7 +82,18 @@ class LLMClient:
                 content = response.choices[0].message.content
                 if not content or not content.strip():
                     raise LLMError("Model returned an empty response.")
-                return content.strip()
+                content = content.strip()
+                prompt_tokens, completion_tokens = _usage_tokens(response)
+                self.usage.record(
+                    model=model,
+                    phase=phase,
+                    system=system,
+                    user=user,
+                    content=content,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                )
+                return content
             except Exception as exc:  # noqa: BLE001 - retry on any provider error
                 last_error = exc
                 if attempt < MAX_RETRIES - 1:
@@ -73,6 +109,7 @@ class LLMClient:
         model: str | None = None,
         temperature: float = 0.1,
         max_tokens: int = 8000,
+        phase: str = "general",
     ) -> Any:
         """Chat completion that must return a JSON document; parses it."""
         text = self.chat(
@@ -81,6 +118,7 @@ class LLMClient:
             model=model,
             temperature=temperature,
             max_tokens=max_tokens,
+            phase=phase,
         )
         return _parse_json(text)
 

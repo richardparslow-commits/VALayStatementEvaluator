@@ -188,6 +188,7 @@ def run_draft(
             digest=result.digest.relevant_facts_text(grounding_query, max_facts=150),
             checklist=load_knowledge("topic_checklist.md"),
         ),
+        phase="grounding",
     )
 
     report(0.68, "Step 3/4 — Drafting the statement…")
@@ -210,6 +211,7 @@ def run_draft(
             digest_summary=result.digest.summary or "(no summary)",
         ),
         max_tokens=6000,
+        phase="draft",
     )
 
     report(0.85, "Step 4/4 — Self-review and improvement pass…")
@@ -220,6 +222,7 @@ def run_draft(
             guide=load_knowledge("drafting_guide.md")[:6000],
             checklist=load_knowledge("topic_checklist.md")[:6000],
         ),
+        phase="review",
     )
     result.review_issues = review.get("issues_found", [])
     improved = review.get("improved_statement", "")

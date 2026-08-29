@@ -277,13 +277,66 @@ def _fetch_records(slot: str) -> list:
     return st.session_state.get(import_key, [])
 
 
-def _progress_widgets():
+def _progress_widgets(llm: LLMClient | None = None):
+    """Progress bar whose caption appends a live estimated-usage line."""
     bar = st.progress(0.0, text="Starting…")
 
     def update(frac: float, msg: str) -> None:
-        bar.progress(min(max(frac, 0.0), 1.0), text=msg)
+        text = msg
+        if llm is not None:
+            text += llm.usage.live_line()
+        bar.progress(min(max(frac, 0.0), 1.0), text=text)
 
     return bar, update
+
+
+def _render_usage_summary(usage) -> None:
+    """Render an estimated per-phase usage breakdown after a successful run."""
+    if usage is None:
+        return
+    total = usage.totals()
+    if not total.calls:
+        return
+
+    with st.expander("⚙️ Estimated API usage (tokens / calls)", expanded=False):
+        rows = []
+        for phase, stats in usage.per_phase().items():
+            models = ", ".join(f"{m}×{c}" for m, c in stats.models.items())
+            rows.append(
+                {
+                    "Phase": phase,
+                    "Calls": stats.calls,
+                    "Est. input tokens": stats.prompt_tokens,
+                    "Est. output tokens": stats.completion_tokens,
+                    "Models (calls)": models,
+                }
+            )
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.caption(
+            f"**Total:** {total.calls} call(s) · "
+            f"{total.prompt_tokens:,} input / {total.completion_tokens:,} output tokens "
+            f"({total.total_tokens:,} total). Token counts are estimates based on prompt "
+            "length and model output; they use the provider's reported usage when available."
+        )
+
+        credits = usage.credit_estimate(
+            {
+                config.DEFAULT_MODEL_MAIN: config.CREDITS_PER_1M_MAIN,
+                config.DEFAULT_MODEL_FAST: config.CREDITS_PER_1M_FAST,
+            }
+        )
+        if credits is not None:
+            pct = credits / config.CREDIT_QUOTA * 100 if config.CREDIT_QUOTA else 0.0
+            st.caption(
+                f"**Estimated credit burn:** {credits:,.0f} / {config.CREDIT_QUOTA:,.0f} "
+                f"({pct:.1f}% of the weekly quota)"
+            )
+        else:
+            st.caption(
+                "Set `VA_LSE_CREDITS_PER_1M_MAIN` / `VA_LSE_CREDITS_PER_1M_FAST` in your "
+                ".env to convert these figures into an estimated credit burn against "
+                "your plan's weekly quota."
+            )
 
 
 
@@ -338,7 +391,7 @@ def evaluate_tab() -> None:
         if llm is None:
             return
 
-        bar, update = _progress_widgets()
+        bar, update = _progress_widgets(llm)
         try:
             result = run_evaluation(llm, statement_text.strip(), records, progress=update)
         except Exception as exc:  # noqa: BLE001
@@ -347,10 +400,13 @@ def evaluate_tab() -> None:
             return
         bar.empty()
         st.session_state.eval_result = result
+        st.session_state.eval_usage = llm.usage
 
     result = st.session_state.get("eval_result")
     if result is None:
         return
+
+    _render_usage_summary(st.session_state.get("eval_usage"))
 
     st.divider()
     st.subheader("📋 Evaluation Results")
@@ -559,7 +615,7 @@ def draft_tab() -> None:
             "veteran_name": veteran_name.strip(),
             "witnessed_event": witnessed_event,
         }
-        bar, update = _progress_widgets()
+        bar, update = _progress_widgets(llm)
         try:
             result = run_draft(
                 llm, records, witness, observations.strip(), condition.strip(),
@@ -571,10 +627,13 @@ def draft_tab() -> None:
             return
         bar.empty()
         st.session_state.draft_result = result
+        st.session_state.draft_usage = llm.usage
 
     result = st.session_state.get("draft_result")
     if result is None:
         return
+
+    _render_usage_summary(st.session_state.get("draft_usage"))
 
     st.divider()
     st.subheader("📋 Draft Results")

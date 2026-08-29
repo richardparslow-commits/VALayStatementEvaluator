@@ -349,6 +349,7 @@ def run_evaluation(
     claims_data = llm.chat_json(
         CLAIMS_SYSTEM,
         CLAIMS_USER.format(statement=statement_text[:40000]),
+        phase="claims",
     )
     result.claimed_condition = claims_data.get("claimed_condition", "")
     result.writer_role = claims_data.get("writer_role", "")
@@ -368,6 +369,7 @@ def run_evaluation(
             verifications=_verifications_text(result),
             digest_summary=result.digest.summary or "(no summary)",
         ),
+        phase="rubric",
     )
     result.scores = {k: float(v) for k, v in rubric_data.get("scores", {}).items()}
     result.rationales = rubric_data.get("rationales", {})
@@ -409,6 +411,7 @@ def _analyze_topics(
                 verifications=_verifications_text(result),
                 digest_summary=(result.digest.summary or "(no summary)")[:12000],
             ),
+            phase="topic",
         )
     except LLMError:
         result.topic_notes = "Topic coverage analysis unavailable — the model call failed."
@@ -458,6 +461,7 @@ def _draft_revision(
                 topic_analysis=topic_analysis,
             ),
             max_tokens=6000,
+            phase="revision",
         )
     except LLMError:
         result.revision_notes = "Revision draft unavailable — the model call failed."
@@ -498,6 +502,7 @@ def _verify_claims(
                 excerpts=excerpts[:16000] or "(no matching raw excerpts found)",
                 claims=_json.dumps(batch, indent=1),
             ),
+            phase="verify",
         )
         for item in data.get("verifications", []):
             try:

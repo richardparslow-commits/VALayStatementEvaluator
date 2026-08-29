@@ -296,6 +296,7 @@ def review_medical_records(
             ),
             model=llm._settings.model_fast,
             max_tokens=8000,
+            phase="records:digest",
         )
 
     # -------------------------------------------- parallel chunk extraction
@@ -452,6 +453,7 @@ def _merge_once(llm: LLMClient, facts: list[MedicalFact]) -> list[MedicalFact]:
         + json.dumps([vars(f) for f in facts]),
         model=llm._settings.model_fast,
         max_tokens=8000,
+        phase="records:merge",
     )
     merged: list[MedicalFact] = []
     for raw in data.get("facts", []) or []:
@@ -469,6 +471,7 @@ def _summarize(llm: LLMClient, digest: MedicalDigest) -> str:
         "status. Plain text only.",
         "Extracted facts (sampled evenly across the full timeline):\n"
         + digest.condensed_timeline(max_entries=400)[:16000],
+        phase="records:summary",
     )
 
 
