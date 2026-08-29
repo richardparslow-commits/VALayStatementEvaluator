@@ -5,12 +5,20 @@ import json
 import time
 from typing import Any
 
-from openai import OpenAI
+from openai import BadRequestError, OpenAI
+from openai import PermissionDeniedError
 
 from .config import Settings
 
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 2.0
+# When set on a chat call, the client will raise LLMError on the first failure
+# instead of retrying. Useful in batch jobs that want to fail fast and surface
+# errors instead of burning through retry budget.
+FAIL_FAST_NON_RETRYABLE: tuple[type[BaseException], ...] = (
+    BadRequestError,
+    PermissionDeniedError,
+)
 
 
 class LLMError(RuntimeError):
@@ -18,7 +26,12 @@ class LLMError(RuntimeError):
 
 
 class LLMClient:
-    """Thin wrapper around any OpenAI-compatible endpoint."""
+    """Thin wrapper around any OpenAI-compatible endpoint.
+
+    When `raise_for_status=True` is passed to `chat`, the client raises
+    `LLMError` on the first failure instead of retrying — useful for batch
+    callers that want to fail fast.
+    """
 
     def __init__(self, settings: Settings) -> None:
         if not settings.configured:
@@ -39,11 +52,18 @@ class LLMClient:
         model: str | None = None,
         temperature: float = 0.2,
         max_tokens: int = 8000,
+        raise_for_status: bool = False,
     ) -> str:
-        """Single-turn chat completion with basic retry. Returns text."""
+        """Single-turn chat completion with basic retry. Returns text.
+
+        `raise_for_status=True` short-circuits retries and propagates the first
+        provider error as `LLMError`. Non-retryable client errors (400/401/403)
+        are never retried in either mode.
+        """
         model = model or self._settings.model_main
+        attempts = 1 if raise_for_status else MAX_RETRIES
         last_error: Exception | None = None
-        for attempt in range(MAX_RETRIES):
+        for attempt in range(attempts):
             try:
                 response = self._client.chat.completions.create(
                     model=model,
@@ -58,11 +78,16 @@ class LLMClient:
                 if not content or not content.strip():
                     raise LLMError("Model returned an empty response.")
                 return content.strip()
+            except LLMError:
+                # Empty-response errors are deterministic; never retry them.
+                raise
+            except FAIL_FAST_NON_RETRYABLE as exc:
+                raise LLMError(f"LLM call failed after 1 attempt(s) (non-retryable): {exc}") from exc
             except Exception as exc:  # noqa: BLE001 - retry on any provider error
                 last_error = exc
-                if attempt < MAX_RETRIES - 1:
+                if attempt < attempts - 1:
                     time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
-        raise LLMError(f"LLM call failed after {MAX_RETRIES} attempts: {last_error}")
+        raise LLMError(f"LLM call failed after {attempts} attempt(s): {last_error}")
 
     # ------------------------------------------------------------------ json
     def chat_json(
@@ -73,6 +98,7 @@ class LLMClient:
         model: str | None = None,
         temperature: float = 0.1,
         max_tokens: int = 8000,
+        raise_for_status: bool = False,
     ) -> Any:
         """Chat completion that must return a JSON document; parses it."""
         text = self.chat(
@@ -81,6 +107,7 @@ class LLMClient:
             model=model,
             temperature=temperature,
             max_tokens=max_tokens,
+            raise_for_status=raise_for_status,
         )
         return _parse_json(text)
 

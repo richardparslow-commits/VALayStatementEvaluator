@@ -3,10 +3,16 @@
 Runs BOTH pathways over the fictional sample data in examples/ and prints a
 condensed summary of every pipeline stage. Requires a valid .env.
 
-Run: .venv/bin/python scripts/smoke_test.py [evaluate|draft|all]
+Examples:
+    .venv/bin/python scripts/smoke_test.py                 # run both pathways
+    .venv/bin/python scripts/smoke_test.py evaluate        # just evaluate
+    .venv/bin/python scripts/smoke_test.py draft           # just draft
+    .venv/bin/python scripts/smoke_test.py all --max-pages 2000
+    .venv/bin/python scripts/smoke_test.py evaluate --fail-fast
 """
 from __future__ import annotations
 
+import argparse
 import sys
 import time
 from pathlib import Path
