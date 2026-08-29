@@ -100,6 +100,51 @@ class TestUploadWarnings(unittest.TestCase):
             msg=f"stale statement warning: {[w.value for w in at.warning]}",
         )
 
+    def _summary_lines(self, at):
+        return [c.value for c in at.caption if "skipped" in c.value]
+
+    def test_loaded_vs_skipped_summary_for_records(self):
+        """Records uploader shows a loaded-vs-skipped summary line."""
+        at = self._app()
+        at.run()
+        at.file_uploader(key="files_eval").set_value(
+            [
+                ("good.txt", b"Knee pain noted during visit.", "text/plain"),
+                ("bad.pdf", b"%PDF-1.4 broken scan data", "application/pdf"),
+                ("other.txt", b"Tinnitus reported.", "text/plain"),
+            ]
+        )
+        at.run()
+        summaries = self._summary_lines(at)
+        self.assertTrue(
+            any("Loaded 2 of 3" in s for s in summaries),
+            msg=f"expected 'Loaded 2 of 3' summary, got: {summaries}",
+        )
+
+    def test_loaded_vs_skipped_summary_for_statement(self):
+        """Step 1 statement uploader shows a loaded-vs-skipped summary line."""
+        at = self._app()
+        at.run()
+        at.file_uploader(key="eval_statement_file").set_value(
+            ("bad_stmt.pdf", b"%PDF-1.4 broken scan data", "application/pdf")
+        )
+        at.run()
+        summaries = self._summary_lines(at)
+        self.assertTrue(
+            any("Loaded 0 of 1" in s for s in summaries),
+            msg=f"expected 'Loaded 0 of 1' summary, got: {summaries}",
+        )
+
+    def test_no_summary_when_all_files_load(self):
+        """No loaded-vs-skipped line when everything extracts cleanly."""
+        at = self._app()
+        at.run()
+        at.file_uploader(key="files_eval").set_value(
+            [("good.txt", b"Knee pain noted during visit.", "text/plain")]
+        )
+        at.run()
+        self.assertEqual(self._summary_lines(at), [])
+
 
 if __name__ == "__main__":
     unittest.main()

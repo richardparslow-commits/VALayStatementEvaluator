@@ -124,8 +124,9 @@ def _extract_uploads(files, slot: str) -> list:
     """Extract text from uploaded files; cache results per file identity.
 
     Files that fail extraction (e.g. image-only PDFs) are reported as
-    per-file warnings that persist in session state, so unreadable uploads
-    never silently disappear.
+    per-file warnings plus a loaded-vs-skipped summary, recomputed fresh each
+    run so unreadable uploads never silently disappear and never linger once
+    the bad file is removed or replaced.
     """
     documents = []
     to_extract = []
@@ -147,9 +148,22 @@ def _extract_uploads(files, slot: str) -> list:
     # The uploader re-delivers files on every rerun, so warnings are recomputed
     # fresh each run: they persist while a bad file is still uploaded and clear
     # as soon as it is removed or replaced.
+    _render_skip_summary(files, documents, skipped)
     for message in skipped:
         st.warning(message)
     return documents
+
+
+def _render_skip_summary(files, documents: list, skipped: list[str]) -> None:
+    """Show a loaded-vs-skipped summary under an uploader when any file failed."""
+    if not files or not skipped:
+        return
+    total = len(files)
+    loaded = len(documents)
+    st.caption(
+        f"Loaded {loaded} of {total} file(s) — {len(skipped)} skipped "
+        "(listed below)."
+    )
 
 
 def _is_local_run() -> bool:
