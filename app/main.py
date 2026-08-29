@@ -20,6 +20,7 @@ from .draft import grounding_markdown, run_draft
 from .evaluate import DIMENSION_LABELS, run_evaluation
 from .fetch_client import FetchClient, FetchSandboxError
 from .llm import LLMClient, LLMError
+from . import watchdog
 
 st.set_page_config(
     page_title="VA Lay Statement Evaluator",
@@ -98,6 +99,8 @@ def _sidebar_settings() -> None:
             settings.fetch_records_path = st.session_state.fetch_records_path_input.strip()
             st.rerun()
 
+        st.divider()
+        _credit_calibration_widget()
         st.divider()
         st.caption(
             "⚠️ Uploaded documents are sent to the configured LLM endpoint for analysis. "
@@ -277,6 +280,121 @@ def _fetch_records(slot: str) -> list:
     return st.session_state.get(import_key, [])
 
 
+def _load_usage_history() -> watchdog.UsageHistory:
+    """Load cached usage history; never fails (empty on first run)."""
+    try:
+        return watchdog.load_history()
+    except Exception:  # noqa: BLE001 - keep the app usable on any I/O error
+        return watchdog.UsageHistory()
+
+
+def _save_usage_history(history: watchdog.UsageHistory) -> None:
+    """Persist usage history; swallow I/O errors so the app never breaks on them."""
+    try:
+        watchdog.save_history(history)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _record_watchdog_run(usage) -> None:
+    """Append a finished run's token totals to the persisted history."""
+    total = usage.totals()
+    if not total.calls:
+        return
+    history = _load_usage_history()
+    watchdog.record_run(
+        history,
+        prompt_tokens=total.prompt_tokens,
+        completion_tokens=total.completion_tokens,
+        calls=total.calls,
+    )
+    _save_usage_history(history)
+
+
+def _effective_credit_rates() -> tuple[dict[str, float | None], str]:
+    """Resolve credits-per-1M rates for the estimator.
+
+    Prefers explicitly-configured env/per-model rates; otherwise falls back to the
+    effective blended rate learned by the watchdog (if it has enough data).
+    Returns (rates_by_model, source_label).
+    """
+    rates = {
+        config.DEFAULT_MODEL_MAIN: config.CREDITS_PER_1M_MAIN,
+        config.DEFAULT_MODEL_FAST: config.CREDITS_PER_1M_FAST,
+    }
+    if all(value is not None for value in rates.values()):
+        return rates, "configured in .env"
+    fit = watchdog.fit_effective_rate(_load_usage_history())
+    if fit.any_rate():  # pragma: no branch - guarded
+        label = "estimated by the usage watchdog"
+        if fit.main_rate is not None:
+            rates[config.DEFAULT_MODEL_MAIN] = fit.main_rate
+        if fit.fast_rate is not None:
+            rates[config.DEFAULT_MODEL_FAST] = fit.fast_rate
+        return rates, label
+    return rates, "entry"
+
+
+def _credit_calibration_widget() -> None:
+    """Sidebar: record console readings and surface the learned rate."""
+    with st.expander("🎚️ Usage watchdog (credit rate)"):
+        history = _load_usage_history()
+        fit = watchdog.fit_effective_rate(history)
+
+        last_credits = st.session_state.get("watchdog_last_credits", "")
+        credits = st.text_input(
+            "Total credits used (from QwenCloud console)",
+            value=last_credits,
+            key="watchdog_credits_input",
+        )
+        captured = False
+        if st.button("Record this reading"):
+            try:
+                parsed = float(credits)
+                if parsed < 0:
+                    raise ValueError
+                watchdog.record_calibration(history, credits=parsed)
+                _save_usage_history(history)
+                st.session_state["watchdog_last_credits"] = credits
+                captured = True
+            except (TypeError, ValueError):
+                st.warning("Enter a non-negative number for credits used.")
+
+        n_runs = len(history.runs)
+        if captured:
+            st.success(
+                f"Reading saved ({n_runs} run(s) recorded). Repeat after more runs to refine."
+            )
+
+        st.caption(
+            f"Runs tracked: {n_runs} · calibrations: {len(history.calibrations)}"
+        )
+        if fit.any_rate():
+            st.markdown(
+                f"**Learned effective rate:** ≈{fit.blended_rate:,.0f} credits / 1M "
+                f"tokens {fit.multiline_note}"
+            )
+            enabled = all(
+                config.CREDITS_PER_1M_MAIN is None
+                and config.CREDITS_PER_1M_FAST is None
+            )
+            if enabled:
+                st.markdown(
+                    f"The estimator will now use **{fit.blended_rate:,.0f} credits/1M** "
+                    "as a fallback until you set explicit rates in `.env`."
+                )
+        else:
+            st.markdown(
+                "Add the total credits your plan reports each time after a run. Once you've "
+                "recorded at least two readings separated by new runs, the app fits your "
+                "effective credits-per-1M rate and starts estimating credit burn."
+            )
+            st.caption(
+                "Tip: post each eval/draft run's totals (shown here) and your console's "
+                "cumulative credits to converge in a few runs."
+            )
+
+
 def _progress_widgets(llm: LLMClient | None = None):
     """Progress bar whose caption appends a live estimated-usage line."""
     bar = st.progress(0.0, text="Starting…")
@@ -319,23 +437,19 @@ def _render_usage_summary(usage) -> None:
             "length and model output; they use the provider's reported usage when available."
         )
 
-        credits = usage.credit_estimate(
-            {
-                config.DEFAULT_MODEL_MAIN: config.CREDITS_PER_1M_MAIN,
-                config.DEFAULT_MODEL_FAST: config.CREDITS_PER_1M_FAST,
-            }
-        )
+        rates, rate_source = _effective_credit_rates()
+        credits = usage.credit_estimate(rates)
         if credits is not None:
             pct = credits / config.CREDIT_QUOTA * 100 if config.CREDIT_QUOTA else 0.0
             st.caption(
                 f"**Estimated credit burn:** {credits:,.0f} / {config.CREDIT_QUOTA:,.0f} "
-                f"({pct:.1f}% of the weekly quota)"
+                f"({pct:.1f}% of the weekly quota, {rate_source})"
             )
         else:
             st.caption(
                 "Set `VA_LSE_CREDITS_PER_1M_MAIN` / `VA_LSE_CREDITS_PER_1M_FAST` in your "
-                ".env to convert these figures into an estimated credit burn against "
-                "your plan's weekly quota."
+                ".env — or add console readings in the sidebar's **Usage watchdog** "
+                "panel so the app can estimate your rate — to see credit burn here."
             )
 
 
@@ -401,6 +515,7 @@ def evaluate_tab() -> None:
         bar.empty()
         st.session_state.eval_result = result
         st.session_state.eval_usage = llm.usage
+        _record_watchdog_run(llm.usage)
 
     result = st.session_state.get("eval_result")
     if result is None:
@@ -628,6 +743,7 @@ def draft_tab() -> None:
         bar.empty()
         st.session_state.draft_result = result
         st.session_state.draft_usage = llm.usage
+        _record_watchdog_run(llm.usage)
 
     result = st.session_state.get("draft_result")
     if result is None:

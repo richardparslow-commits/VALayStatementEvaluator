@@ -98,11 +98,19 @@ Every run shows a live usage line in the progress caption and, after completion,
 draft/review on the Draft tab). Token counts are estimates based on prompt length and model
 output, using the provider's reported usage when the endpoint supplies it.
 
-Because QwenCloud Token Plan doesn't publish a fixed credits-per-1M-token rate, the gauge only
-shows a **credit burn vs. your weekly quota** after you set `VA_LSE_CREDITS_PER_1M_MAIN` and
-`VA_LSE_CREDITS_PER_1M_FAST` to your plan's effective rates (and `VA_LSE_CREDIT_QUOTA` if your
-quota differs from the 2,500-credit Lite default). Users on higher tiers can override the same
-knobs; the estimator never limits a run, it only reports.
+Because QwenCloud Token Plan doesn't publish a fixed credits-per-1M-token rate, you can provide
+it two ways:
+
+1. **Set explicit rates** — `VA_LSE_CREDITS_PER_1M_MAIN` and `VA_LSE_CREDITS_PER_1M_FAST` to
+   your plan's effective rates (explicit values always win), plus `VA_LSE_CREDIT_QUOTA` if your
+   quota differs from the 2,500-credit Lite default.
+2. **Let the watchdog learn it** (default). Every finished run persists its token totals to a
+   git-ignored `usage_history.json`. In the sidebar's **Usage watchdog** panel, enter the plan's
+   cumulative "credits used" reading from the QwenCloud console each time after a run. After two
+   readings separated by new runs, the app fits your effective credits-per-1M rate by matching
+   observed credit burn to token counts and uses it as a fallback for the credit-burn estimate.
+
+The estimator is purely informational — it never limits or throttles a run.
 
 Fetch Sandbox settings can also be overridden in the sidebar. Because Fetch Sandbox mirrors
 your own OpenAPI spec, you must point `FETCH_SANDBOX_RECORDS_PATH` at the GET endpoint your

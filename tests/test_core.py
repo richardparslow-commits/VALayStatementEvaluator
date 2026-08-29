@@ -20,6 +20,7 @@ from app.documents import (  # noqa: E402
 )
 from app.llm import LLMClient, _parse_json  # noqa: E402
 from app import config  # noqa: E402
+from app import watchdog  # noqa: E402
 from app.usage import UsageTracker, estimate_tokens  # noqa: E402
 from app.llm import _usage_tokens  # noqa: E402
 from app.medical_review import (  # noqa: E402
@@ -245,6 +246,98 @@ class TestChunking(unittest.TestCase):
         union = "".join(c.text for c in chunks)
         for token in text.split()[:100]:
             self.assertIn(token, union)
+
+
+class TestUsageWatchdog(unittest.TestCase):
+    def test_persistence_round_trip(self):
+        import tempfile
+
+        tmp = tempfile.mkdtemp()
+        path = str(Path(tmp) / "hist.json")
+        history = watchdog.UsageHistory()
+        watchdog.record_run(history, prompt_tokens=100, completion_tokens=50, calls=3)
+        watchdog.record_calibration(history, credits=120.5)
+        watchdog.save_history(history, path)
+
+        loaded = watchdog.load_history(path)
+        self.assertEqual(len(loaded.runs), 1)
+        self.assertEqual(loaded.runs[0].prompt_tokens, 100)
+        self.assertEqual(loaded.runs[0].completion_tokens, 50)
+        self.assertEqual(len(loaded.calibrations), 1)
+        self.assertAlmostEqual(loaded.calibrations[0].credits, 120.5)
+
+    def test_cumulative_tokens(self):
+        history = watchdog.UsageHistory()
+        watchdog.record_run(history, prompt_tokens=100, completion_tokens=50, calls=1)
+        watchdog.record_run(history, prompt_tokens=200, completion_tokens=100, calls=1)
+        totals = history.cumulative_tokens()
+        self.assertEqual(totals["prompt"], 300)
+        self.assertEqual(totals["completion"], 150)
+        # up to run 0 only
+        totals0 = history.cumulative_tokens(0)
+        self.assertEqual(totals0["prompt"], 100)
+
+    def test_fit_single_interval_blended_rate(self):
+        history = watchdog.UsageHistory()
+        # run1: 150 tokens total, baseline reading taken right after it.
+        watchdog.record_run(history, prompt_tokens=100, completion_tokens=50, calls=2)
+        watchdog.record_calibration(history, credits=0.0, ts=1.0)
+        # run2: another 350 tokens (500 total now)
+        watchdog.record_run(history, prompt_tokens=200, completion_tokens=150, calls=3)
+        watchdog.record_calibration(history, credits=0.6, ts=2.0)
+        fit = watchdog.fit_effective_rate(history)
+        self.assertTrue(fit.any_rate())
+        # Interval spans run 1 only = 350 new tokens => 0.6 credits.
+        self.assertAlmostEqual(fit.blended_rate, 0.6 / 350 * 1e6, delta=1e-6)
+        self.assertEqual(fit.intervals, 1)
+
+    def test_fit_token_weighted_across_intervals(self):
+        history = watchdog.UsageHistory()
+        # run0 baseline.
+        watchdog.record_run(history, prompt_tokens=1000, completion_tokens=0, calls=1)
+        watchdog.record_calibration(history, credits=0.0, ts=1.0)
+        # run1: 1000 more tokens -> +1 credit (1000/1M)
+        watchdog.record_run(history, prompt_tokens=1000, completion_tokens=0, calls=1)
+        watchdog.record_calibration(history, credits=1.0, ts=2.0)
+        # run2: 3000 more tokens -> +6 credits (2000/1M)
+        watchdog.record_run(history, prompt_tokens=3000, completion_tokens=0, calls=1)
+        watchdog.record_calibration(history, credits=7.0, ts=3.0)
+        fit = watchdog.fit_effective_rate(history)
+        expected = (1000 / 4000) * 1000 + (3000 / 4000) * 2000  # = 1750
+        self.assertAlmostEqual(fit.blended_rate, expected, delta=1e-6)
+        self.assertEqual(fit.intervals, 2)
+        self.assertEqual(fit.observed_credits, 7.0)
+
+    def test_no_fit_without_calibrations(self):
+        history = watchdog.UsageHistory()
+        watchdog.record_run(history, prompt_tokens=100, completion_tokens=50, calls=1)
+        fit = watchdog.fit_effective_rate(history)
+        self.assertFalse(fit.any_rate())
+        self.assertEqual(fit.intervals, 0)
+
+    def test_no_fit_with_single_calibration(self):
+        history = watchdog.UsageHistory()
+        watchdog.record_run(history, prompt_tokens=100, completion_tokens=0, calls=1)
+        watchdog.record_calibration(history, credits=0.5, ts=1.0)
+        self.assertFalse(watchdog.fit_effective_rate(history).any_rate())
+
+    def test_negative_credit_delta_skipped(self):
+        history = watchdog.UsageHistory()
+        watchdog.record_run(history, prompt_tokens=1000, completion_tokens=0, calls=1)
+        watchdog.record_calibration(history, credits=10.0, ts=1.0)
+        watchdog.record_run(history, prompt_tokens=1000, completion_tokens=0, calls=1)
+        # console shows fewer credits later (reset) => invalid interval, skipped
+        watchdog.record_calibration(history, credits=5.0, ts=2.0)
+        fit = watchdog.fit_effective_rate(history)
+        self.assertFalse(fit.any_rate())
+
+    def test_duplicate_readings_same_run_ignored(self):
+        history = watchdog.UsageHistory()
+        watchdog.record_run(history, prompt_tokens=1000, completion_tokens=0, calls=1)
+        watchdog.record_calibration(history, credits=1.0, ts=1.0)
+        # second reading with no new runs between -> no interval
+        watchdog.record_calibration(history, credits=2.0, ts=1.5)
+        self.assertFalse(watchdog.fit_effective_rate(history).any_rate())
 
 
 class TestUsageTracker(unittest.TestCase):

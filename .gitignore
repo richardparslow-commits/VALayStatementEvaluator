@@ -18,3 +18,4 @@ __pycache__/
 # App runtime artifacts
 outputs/
 *.log
+usage_history.json

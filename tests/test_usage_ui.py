@@ -4,6 +4,7 @@ Drives the real app with Streamlit's AppTest, stubbing the LLM so no network or
 key is needed, and asserts that a run surfaces (a) a live caption line and
 (b) the per-phase "Estimated API usage" expander.
 """
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -68,6 +69,21 @@ class _FakeLLM:
 
 @unittest.skipUnless((PROJECT_ROOT / ".venv").exists(), "requires the project venv")
 class TestUsageUi(unittest.TestCase):
+    def setUp(self) -> None:
+        # Route the watchdog's persisted history to a temp file so test runs
+        # don't pollute (or depend on) the real usage_history.json.
+        import tempfile
+
+        self._tmp_hist = tempfile.mkdtemp()
+        self._old_env = os.environ.get("VA_LSE_WATCHDOG_PATH")
+        os.environ["VA_LSE_WATCHDOG_PATH"] = str(Path(self._tmp_hist) / "hist.json")
+
+    def tearDown(self) -> None:
+        if self._old_env is None:
+            os.environ.pop("VA_LSE_WATCHDOG_PATH", None)
+        else:
+            os.environ["VA_LSE_WATCHDOG_PATH"] = self._old_env
+
     def _app(self):
         from streamlit.testing.v1 import AppTest
 
