@@ -206,14 +206,20 @@ def _local_records(slot: str) -> list:
         placeholder="e.g. ~/Desktop/ClaimRecords or ~/Desktop/records.pdf",
     )
     import_key = f"local_records_{slot}"
+    skipped_key = f"local_records_skipped_{slot}"
     if st.button("Load records from path", key=f"local_load_{slot}"):
         st.session_state.pop(import_key, None)
+        st.session_state.pop(skipped_key, None)
         try:
-            records = records_from_local_path(path)
+            records, skipped = records_from_local_path(path)
         except ExtractionError as exc:
             st.warning(str(exc))
         else:
             st.session_state[import_key] = records
+            if skipped:
+                st.session_state[skipped_key] = skipped
+    for message in st.session_state.get(skipped_key, []):
+        st.warning(message)
     return st.session_state.get(import_key, [])
 
 

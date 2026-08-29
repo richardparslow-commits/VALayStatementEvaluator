@@ -130,11 +130,14 @@ def _extract_docx(filename: str, data: bytes) -> ExtractedDocument:
     return ExtractedDocument(filename=filename, pages=[DocumentPage(filename, 1, text)])
 
 
-def records_from_local_path(path: str) -> list[ExtractedDocument]:
+def records_from_local_path(path: str) -> tuple[list[ExtractedDocument], list[str]]:
     """Read supported record files directly from a local file or folder path.
 
-    Only meaningful when the app runs on the same machine as the records
-    (local Streamlit run) — the UI gates this behind a local-run check.
+    Returns ``(documents, skipped)`` where ``skipped`` lists one message per
+    file that could not be extracted (e.g. image-only PDF) so the caller can
+    surface them as warnings instead of failing the whole load. Filenames are
+    preserved; files inside nested subfolders keep their relative path so
+    same-named files in different folders do not collide.
 
     Raises ExtractionError if the path does not exist, contains no supported
     files, or none of the files could be extracted.
@@ -145,28 +148,30 @@ def records_from_local_path(path: str) -> list[ExtractedDocument]:
 
     if root.is_file():
         files = [root]
+        label_for = lambda file: file.name  # noqa: E731 - single file keeps bare name
     else:
         files = sorted(
             p
             for p in root.rglob("*")
             if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
         )
+        label_for = lambda file: str(file.relative_to(root))  # noqa: E731
     if not files:
         raise ExtractionError(
             f"No supported record files (.pdf/.txt/.md/.docx) found in: {root}"
         )
 
     documents: list[ExtractedDocument] = []
-    errors: list[str] = []
+    skipped: list[str] = []
     for file in files:
         try:
-            documents.append(extract_document(file.name, file.read_bytes()))
+            documents.append(extract_document(label_for(file), file.read_bytes()))
         except ExtractionError as exc:
-            errors.append(str(exc))
+            skipped.append(str(exc))
     if not documents:
-        detail = f" ({'; '.join(errors)}) " if errors else " "
+        detail = f" ({'; '.join(skipped)}) " if skipped else " "
         raise ExtractionError(f"Could not load any records from {root}{detail}")
-    return documents
+    return documents, skipped
 
 
 def clean_text(text: str) -> str:

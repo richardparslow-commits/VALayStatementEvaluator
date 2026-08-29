@@ -72,12 +72,34 @@ class TestLocalPathLoading(unittest.TestCase):
             p.write_bytes(data)
         return tmp
 
+    def _make_docx_bytes(self, text: str) -> bytes:
+        xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+            f"<w:body><w:p><w:r><w:t>{text}</w:t></w:r></w:p>"
+            "</w:body></w:document>"
+        )
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("word/document.xml", xml)
+        return buffer.getvalue()
+
     def test_loads_single_file(self):
         tmp = self._make_tmp({"note.txt": b"Knee pain noted during visit."})
-        docs = records_from_local_path(str(Path(tmp) / "note.txt"))
+        docs, skipped = records_from_local_path(str(Path(tmp) / "note.txt"))
         self.assertEqual(len(docs), 1)
         self.assertEqual(docs[0].filename, "note.txt")
         self.assertIn("Knee pain", docs[0].full_text)
+        self.assertEqual(skipped, [])
+
+    def test_loads_docx_with_filename_preserved(self):
+        docx = self._make_docx_bytes("Treated with sertraline.")
+        tmp = self._make_tmp({"records/medication.docx": docx})
+        docs, skipped = records_from_local_path(tmp)
+        self.assertEqual(len(docs), 1)
+        self.assertEqual(docs[0].filename, "records/medication.docx")
+        self.assertIn("sertraline", docs[0].full_text)
+        self.assertEqual(skipped, [])
 
     def test_loads_folder_recursively_and_sorts(self):
         tmp = self._make_tmp(
@@ -88,10 +110,48 @@ class TestLocalPathLoading(unittest.TestCase):
                 "nested/deep/note.txt": b"Third record.",
             }
         )
-        docs = records_from_local_path(tmp)
-        self.assertEqual([d.filename for d in docs], ["note.md", "note.txt", "note.txt"])
+        docs, _ = records_from_local_path(tmp)
+        self.assertEqual(
+            [d.filename for d in docs], ["a/note.md", "b/note.txt", "nested/deep/note.txt"]
+        )
         self.assertIn("Third record", docs[-1].full_text)
         self.assertTrue(all("not supported" not in d.full_text for d in docs))
+
+    def test_same_named_files_in_different_folders_do_not_collide(self):
+        tmp = self._make_tmp(
+            {
+                "2023/note.txt": b"First year.",
+                "2024/note.txt": b"Second year.",
+            }
+        )
+        docs, _ = records_from_local_path(tmp)
+        self.assertEqual(
+            [d.filename for d in docs], ["2023/note.txt", "2024/note.txt"]
+        )
+        self.assertEqual(
+            {d.full_text for d in docs}, {"First year.", "Second year."}
+        )
+
+    def test_unreadable_files_are_reported_not_fatal(self):
+        # A scanned/image-only PDF fails extraction but must not sink the load.
+        tmp = self._make_tmp(
+            {
+                "good.txt": b"Knee pain noted.",
+                "scanned.pdf": b"%PDF-1.4 completely unreadable scanned image data",
+            }
+        )
+        docs, skipped = records_from_local_path(tmp)
+        self.assertEqual(len(docs), 1)
+        self.assertEqual(docs[0].filename, "good.txt")
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("scanned.pdf", skipped[0])
+
+    def test_all_files_unreadable_raises(self):
+        tmp = self._make_tmp(
+            {"scanned.pdf": b"%PDF-1.4 unreadable scanned image data"}
+        )
+        with self.assertRaises(ExtractionError):
+            records_from_local_path(tmp)
 
     def test_missing_path_raises(self):
         with self.assertRaises(ExtractionError):
@@ -114,7 +174,7 @@ class TestLocalPathLoading(unittest.TestCase):
         old_home = os.environ.get("HOME")
         try:
             os.environ["HOME"] = tmp
-            docs = records_from_local_path("~/note.txt")
+            docs, _ = records_from_local_path("~/note.txt")
         finally:
             if old_home is None:
                 os.environ.pop("HOME", None)
