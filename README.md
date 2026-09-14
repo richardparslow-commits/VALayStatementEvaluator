@@ -82,6 +82,7 @@ cp .env.example .env     # then put your API key in .env (never commit .env)
 | `FETCH_SANDBOX_API_KEY` | Optional Fetch Sandbox API key | empty |
 | `FETCH_SANDBOX_BASE_URL` | Fetch Sandbox base URL (`fetchsandbox.com` or subdomain) | `https://fetchsandbox.com` |
 | `FETCH_SANDBOX_RECORDS_PATH` | GET path for the records endpoint | `/medical_records/{patient_id}` |
+| `FETCH_SANDBOX_MAX_RESPONSE_BYTES` | Max bytes accepted from a Fetch Sandbox HTTP response | `104857600` |
 | `VA_LSE_ALLOW_LOCAL_PATHS` | Force-enable the local folder/file record source (`1`) even when the local-run check can't detect localhost | (auto) |
 | `VA_LSE_CREDITS_PER_1M_MAIN` | Approx credits per 1M tokens for the main model (enables the credit-burn gauge) | (unset — gauge shows tokens/calls only) |
 | `VA_LSE_CREDITS_PER_1M_FAST` | Approx credits per 1M tokens for the fast model (enables the credit-burn gauge) | (unset — gauge shows tokens/calls only) |
@@ -116,6 +117,10 @@ The estimator is purely informational — it never limits or throttles a run.
 Fetch Sandbox settings can also be overridden in the sidebar. Because Fetch Sandbox mirrors
 your own OpenAPI spec, you must point `FETCH_SANDBOX_RECORDS_PATH` at the GET endpoint your
 sandbox exposes for record retrieval.
+
+Fetch Sandbox HTTP responses are read in chunks and capped by
+`FETCH_SANDBOX_MAX_RESPONSE_BYTES` (default 100 MB). If a response exceeds this
+limit, the import fails with `FetchSandboxError`.
 
 ## Run
 

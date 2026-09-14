@@ -24,6 +24,8 @@ NAME_KEYS = ("filename", "name", "title", "id")
 TYPE_KEYS = ("content_type", "mime_type", "media_type", "type")
 REQUEST_TIMEOUT_SECONDS = 60.0
 ALLOWED_FETCH_HOSTS = ("fetchsandbox.com",)
+DEFAULT_MAX_RESPONSE_BYTES = 100 * 1024 * 1024
+READ_CHUNK_BYTES = 64 * 1024
 
 
 class FetchSandboxError(RuntimeError):
@@ -301,7 +303,10 @@ class FetchClient:
         try:
             connection.request("GET", path, headers=self._headers())
             response = connection.getresponse()
-            data = response.read()
+            data = self._read_limited_response(
+                response,
+                self._settings.fetch_max_response_bytes,
+            )
             headers = {key: value for key, value in response.getheaders()}
         except OSError as exc:
             raise FetchSandboxError(f"Could not reach Fetch Sandbox: {exc}") from exc
@@ -319,6 +324,34 @@ class FetchClient:
                 f"Fetch Sandbox request failed with HTTP {response.status}: {response.reason}"
             )
         return data, headers, response.reason
+
+    @staticmethod
+    def _read_limited_response(response: Any, max_bytes: int) -> bytes:
+        content_length = response.getheader("Content-Length")
+        if content_length is not None:
+            try:
+                if int(content_length) > max_bytes:
+                    raise FetchSandboxError(
+                        "Fetch Sandbox response too large "
+                        f"(Content-Length {content_length} bytes, limit {max_bytes} bytes)."
+                    )
+            except ValueError:
+                pass
+
+        total = 0
+        chunks: list[bytes] = []
+        while True:
+            chunk = response.read(READ_CHUNK_BYTES)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise FetchSandboxError(
+                    "Fetch Sandbox response exceeded maximum size "
+                    f"({total} bytes, limit {max_bytes} bytes)."
+                )
+            chunks.append(chunk)
+        return b"".join(chunks)
 
     @staticmethod
     def _content_type(header: str) -> str:
