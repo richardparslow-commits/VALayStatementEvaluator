@@ -115,20 +115,20 @@ def _extract_docx(filename: str, data: bytes) -> ExtractedDocument:
     max_total_bytes = config.DOCX_MAX_TOTAL_UNCOMPRESSED_BYTES
     max_member_count = config.DOCX_MAX_INTERNAL_FILE_COUNT
     try:
-        archive = zipfile.ZipFile(io.BytesIO(data))
-        _validate_docx_uncompressed_sizes(
-            filename,
-            archive=archive,
-            max_member_bytes=max_member_bytes,
-            max_total_bytes=max_total_bytes,
-            max_member_count=max_member_count,
-        )
-        xml_bytes = _read_docx_member_limited(
-            filename,
-            archive=archive,
-            member_name="word/document.xml",
-            max_member_bytes=max_member_bytes,
-        )
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            _validate_docx_uncompressed_sizes(
+                filename,
+                archive=archive,
+                max_member_bytes=max_member_bytes,
+                max_total_bytes=max_total_bytes,
+                max_member_count=max_member_count,
+            )
+            xml_bytes = _read_docx_member_limited(
+                filename,
+                archive=archive,
+                member_name="word/document.xml",
+                max_member_bytes=max_member_bytes,
+            )
     except ExtractionError:
         raise
     except Exception as exc:  # noqa: BLE001
