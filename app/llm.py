@@ -2,13 +2,17 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from typing import Any
 
 from openai import OpenAI
 
 from .config import Settings
+from .logging_config import get_request_id
 from .usage import UsageTracker
+
+logger = logging.getLogger("app.llm")
 
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 2.0
@@ -66,9 +70,15 @@ class LLMClient:
         phase: str = "general",
     ) -> str:
         """Single-turn chat completion with basic retry. Returns text."""
-        model = model or self._settings.model_main
+        model = model or self._settings.model_main  # noqa: A001 - reassign param
+        rid = get_request_id() or "-"
         last_error: Exception | None = None
+        t0 = time.perf_counter()
+        # Never log prompt/response bodies (may contain PII / medical text).
+        sys_len = len(system or "")
+        user_len = len(user or "")
         for attempt in range(MAX_RETRIES):
+            attempt_t0 = time.perf_counter()
             try:
                 response = self._client.chat.completions.create(
                     model=model,
@@ -93,10 +103,63 @@ class LLMClient:
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                 )
+                duration_ms = int((time.perf_counter() - attempt_t0) * 1000)
+                total_ms = int((time.perf_counter() - t0) * 1000)
+                logger.info(
+                    "llm call ok phase=%s model=%s attempt=%d/%d duration_ms=%d total_ms=%d tokens_in=%s tokens_out=%s sys_chars=%d user_chars=%d out_chars=%d",
+                    phase,
+                    model,
+                    attempt + 1,
+                    MAX_RETRIES,
+                    duration_ms,
+                    total_ms,
+                    str(prompt_tokens) if prompt_tokens is not None else "est",
+                    str(completion_tokens) if completion_tokens is not None else "est",
+                    sys_len,
+                    user_len,
+                    len(content),
+                    extra={
+                        "request_id": rid,
+                        "phase": phase,
+                        "status": "ok",
+                        "model": model,
+                        "attempt": attempt + 1,
+                        "retries": MAX_RETRIES,
+                        "duration_ms": duration_ms,
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                    },
+                )
                 return content
             except Exception as exc:  # noqa: BLE001 - retry on any provider error
                 last_error = exc
-                if attempt < MAX_RETRIES - 1:
+                # LLMError with "empty response" is non-retriable in spirit, but we
+                # keep the same retry behavior; structured logging must distinguish it.
+                duration_ms = int((time.perf_counter() - attempt_t0) * 1000)
+                is_last = attempt >= MAX_RETRIES - 1
+                logger.log(
+                    logging.ERROR if is_last else logging.WARNING,
+                    "llm call %s phase=%s model=%s attempt=%d/%d duration_ms=%d error=%s",
+                    "failed" if is_last else "retry",
+                    phase,
+                    model,
+                    attempt + 1,
+                    MAX_RETRIES,
+                    duration_ms,
+                    f"{type(exc).__name__}: {exc}",
+                    exc_info=exc if is_last else None,
+                    extra={
+                        "request_id": rid,
+                        "phase": phase,
+                        "status": "error" if is_last else "retry",
+                        "model": model,
+                        "attempt": attempt + 1,
+                        "retries": MAX_RETRIES,
+                        "duration_ms": duration_ms,
+                        "error_class": type(exc).__name__,
+                    },
+                )
+                if not is_last:
                     time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
         raise LLMError(f"LLM call failed after {MAX_RETRIES} attempts: {last_error}")
 

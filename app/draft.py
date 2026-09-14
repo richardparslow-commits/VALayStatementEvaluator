@@ -5,6 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+import logging
+import time
+
 from .agiloop_telemetry import track_feature_error
 from .config import load_knowledge
 from .documents import (
@@ -13,6 +16,9 @@ from .documents import (
     MAX_OBSERVATIONS_CHARS,
 )
 from .llm import LLMClient
+from .logging_config import PhaseTimer, get_request_id
+
+logger = logging.getLogger("app.draft")
 from .medical_review import MedicalDigest, ProgressCallback, review_medical_records
 
 # Feature: Condition-Specific Templates
@@ -177,9 +183,35 @@ def run_draft(
     progress: ProgressCallback | None = None,
 ) -> DraftResult:
     """Execute the full drafting pipeline."""
+    rid = get_request_id() or "-"
+    t0 = time.perf_counter()
+    logger.info(
+        "draft start pages=%d observations_chars=%d condition=%s",
+        sum(len(d.pages) for d in records),
+        len(observations),
+        condition[:60] if condition else "-",
+        extra={"request_id": rid, "phase": "draft_pipeline", "status": "start"},
+    )
     try:
-        return _run_draft(llm, records, witness, observations, condition, claim_type, progress)
+        result = _run_draft(llm, records, witness, observations, condition, claim_type, progress)
+        duration_ms = int((time.perf_counter() - t0) * 1000)
+        logger.info(
+            "draft done duration_ms=%d draft_chars=%d grounding_items=%d",
+            duration_ms,
+            len(result.output_statement),
+            len(result.grounding) if isinstance(result.grounding, dict) else 0,
+            extra={"request_id": rid, "phase": "draft_pipeline", "status": "ok", "duration_ms": duration_ms},
+        )
+        return result
     except Exception as exc:  # noqa: BLE001 - feature-error boundary
+        duration_ms = int((time.perf_counter() - t0) * 1000)
+        logger.error(
+            "draft error duration_ms=%d error=%s",
+            duration_ms,
+            f"{type(exc).__name__}: {exc}",
+            exc_info=exc,
+            extra={"request_id": rid, "phase": "draft_pipeline", "status": "error", "duration_ms": duration_ms, "error_class": type(exc).__name__},
+        )
         track_feature_error(FEATURE_ID, exc)
         raise
 
@@ -222,59 +254,64 @@ def _run_draft(
         if progress:
             progress(frac, msg)
 
-    report(0.02, "Step 1/4 — Exhaustive review of medical records…")
-    result.digest = review_medical_records(
-        llm, records, progress=lambda f, m: progress((0.02 + f * 0.45), m) if progress else None
-    )
+    rid = get_request_id() or "-"
+    with PhaseTimer(logger, "records:review", request_id=rid, chunks=len(records)):
+        report(0.02, "Step 1/4 — Exhaustive review of medical records…")
+        result.digest = review_medical_records(
+            llm, records, progress=lambda f, m: progress((0.02 + f * 0.45), m) if progress else None
+        )
 
-    report(0.5, "Step 2/4 — Grounding witness observations against the records and topic checklist…")
-    grounding_query = f"{condition} {obs_for_prompt}"
-    result.grounding = llm.chat_json(
-        GROUNDING_SYSTEM,
-        GROUNDING_USER.format(
-            condition=condition,
-            claim_type=claim_type,
-            relationship=witness.get("relationship", "not specified"),
-            observations=obs_for_prompt,
-            digest=result.digest.relevant_facts_text(grounding_query, max_facts=150),
-            checklist=load_knowledge("topic_checklist.md"),
-        ),
-        phase="grounding",
-    )
+    with PhaseTimer(logger, "grounding", request_id=rid):
+        report(0.5, "Step 2/4 — Grounding witness observations against the records and topic checklist…")
+        grounding_query = f"{condition} {obs_for_prompt}"
+        result.grounding = llm.chat_json(
+            GROUNDING_SYSTEM,
+            GROUNDING_USER.format(
+                condition=condition,
+                claim_type=claim_type,
+                relationship=witness.get("relationship", "not specified"),
+                observations=obs_for_prompt,
+                digest=result.digest.relevant_facts_text(grounding_query, max_facts=150),
+                checklist=load_knowledge("topic_checklist.md"),
+            ),
+            phase="grounding",
+        )
 
-    report(0.68, "Step 3/4 — Drafting the statement…")
-    result.draft = llm.chat(
-        DRAFT_SYSTEM_TEMPLATE.format(
-            guide=load_knowledge("drafting_guide.md"),
-            checklist=load_knowledge("topic_checklist.md"),
-        ),
-        DRAFT_USER.format(
-            witness_name=witness.get("name", "[Witness Name]"),
-            relationship=witness.get("relationship", "[relationship]"),
-            known_since=witness.get("known_since", "[how long known]"),
-            contact_frequency=witness.get("contact_frequency", "[frequency of contact]"),
-            veteran_name=witness.get("veteran_name", "[Veteran Name]"),
-            condition=condition,
-            claim_type=claim_type,
-            witnessed_event=witness.get("witnessed_event", "unknown"),
-            observations=obs_for_prompt,
-            grounding=_json_dumps(result.grounding),
-            digest_summary=result.digest.summary or "(no summary)",
-        ),
-        max_tokens=6000,
-        phase="draft",
-    )
+    with PhaseTimer(logger, "draft", request_id=rid):
+        report(0.68, "Step 3/4 — Drafting the statement…")
+        result.draft = llm.chat(
+            DRAFT_SYSTEM_TEMPLATE.format(
+                guide=load_knowledge("drafting_guide.md"),
+                checklist=load_knowledge("topic_checklist.md"),
+            ),
+            DRAFT_USER.format(
+                witness_name=witness.get("name", "[Witness Name]"),
+                relationship=witness.get("relationship", "[relationship]"),
+                known_since=witness.get("known_since", "[how long known]"),
+                contact_frequency=witness.get("contact_frequency", "[frequency of contact]"),
+                veteran_name=witness.get("veteran_name", "[Veteran Name]"),
+                condition=condition,
+                claim_type=claim_type,
+                witnessed_event=witness.get("witnessed_event", "unknown"),
+                observations=obs_for_prompt,
+                grounding=_json_dumps(result.grounding),
+                digest_summary=result.digest.summary or "(no summary)",
+            ),
+            max_tokens=6000,
+            phase="draft",
+        )
 
-    report(0.85, "Step 4/4 — Self-review and improvement pass…")
-    review = llm.chat_json(
-        REVIEW_SYSTEM,
-        REVIEW_USER.format(
-            draft=result.draft[:16000],
-            guide=load_knowledge("drafting_guide.md")[:6000],
-            checklist=load_knowledge("topic_checklist.md")[:6000],
-        ),
-        phase="review",
-    )
+    with PhaseTimer(logger, "review", request_id=rid):
+        report(0.85, "Step 4/4 — Self-review and improvement pass…")
+        review = llm.chat_json(
+            REVIEW_SYSTEM,
+            REVIEW_USER.format(
+                draft=result.draft[:16000],
+                guide=load_knowledge("drafting_guide.md")[:6000],
+                checklist=load_knowledge("topic_checklist.md")[:6000],
+            ),
+            phase="review",
+        )
     result.review_issues = review.get("issues_found", [])
     improved = review.get("improved_statement", "")
     if improved and len(improved) > max(200, int(len(result.draft) * 0.4)):

@@ -130,6 +130,12 @@ installs on macOS and Linux CI.
 | `AGILOOP_INSPECT_API_KEY` | Server-side Agiloop Inspect telemetry API key. Leave unset (with `AGILOOP_PROJECT_ID`) to run telemetry in mock/no-op mode. | empty (mock mode) |
 | `AGILOOP_INSPECT_URL` | Agiloop Inspect telemetry endpoint base URL | `https://inspect.api.agiloop.app` |
 | `AGILOOP_PROJECT_ID` | Agiloop project id for telemetry event routing | empty (mock mode) |
+| `VA_LSE_LOG_LEVEL` | Structured log level (`DEBUG`/`INFO`/`WARNING`…) | `INFO` |
+| `VA_LSE_LOG_JSON` | `1` → JSON lines for ELK/CloudWatch/Datadog; `0` → plain text | `0` |
+| `VA_LSE_LOG_DIR` | Directory for rotating `app.log` (also always logs to stdout) | empty (stdout only) |
+| `VA_LSE_LOG_FILE` | Filename inside `VA_LSE_LOG_DIR` | `app.log` |
+| `VA_LSE_LOG_MAX_BYTES` | Rotate size per log file (bytes) | `10485760` (10 MiB) |
+| `VA_LSE_LOG_BACKUPS` | Rotated files kept | `5` |
 
 Leave the `VA_GOV_API_BASE_URL` group or the `AGILOOP_INSPECT_*` group fully unset to run
 those integrations in mock mode. Partially configuring an integration (e.g. setting
@@ -373,6 +379,37 @@ Inspect API key never leaves the Python process.
 - `app/telemetry.py` is feature-id-neutral shared infrastructure: it never hardcodes a feature
   id. Each feature's call sites (e.g. `app/va_gov_client.py`, `app/main.py`) supply their own
   `featureId` explicitly.
+
+## Structured logging (diagnostics & performance traces)
+
+Every Evaluate/Draft run mints a correlation id (`req_…`) stored in `st.session_state` and a
+`ContextVar` so parallel record-digest/merge workers carry it. The id is attached to every log
+record (`request_id`), appended to user-facing errors as `reference: req_…` for post-mortem
+correlation, and never carries PII — logs emit only phases, timings, counts, and classifications
+(prompt/response bodies, statements, observations, and record text are excluded).
+
+- **`app/logging_config.py`** — `configure_logging()` (idempotent), `JsonFormatter` (one JSON line
+  per record for ELK/CloudWatch/Datadog) and `PlainFormatter` fallback, `PhaseTimer` context
+  manager, and the `ContextVar` helpers. The `app` parent logger fans out to all `app.*`
+  children, so existing modules need no individual setup.
+- **`app/llm.py`** — every LLM call logs `phase`, `model`, `attempt`/`retries`, `duration_ms`,
+  `prompt_tokens`/`completion_tokens` (or `"est"`), and `sys_chars`/`user_chars`/`out_chars`
+  once; retries log at WARNING, final failures at ERROR with stack trace.
+- **`app/medical_review.py`** — `records:review` start/done with `pages`/`chunks`/`facts`, per-
+  worker `records:digest` with chunk label + duration, plus `records:merge`/`records:summary`
+  via `PhaseTimer` so slow paths are traceable.
+- **`app/evaluate.py` / `app/draft.py`** — full pipeline spans: each phase (`claims`, `verify`,
+  `rubric`, `topic`, `revision`, `report` / `grounding`, `draft`, `review`) wrapped in
+  `PhaseTimer`; the outer `run_evaluation`/`run_draft` wrapper logs pipeline start/done with
+  `duration_ms` and routes the error via the feature-id-neutral error boundary.
+- **`app/main.py`** — baseline `request_id` per session, per-run `req_…` minted on the action
+  button, `evaluate`/`draft` start/done, `llm_config` validation, st.error/warning paths
+  enriched with `reference: req_…`, and a root `app` error boundary.
+
+Configure via env (see `.env.example`): `VA_LSE_LOG_LEVEL`, `VA_LSE_LOG_JSON` (JSON vs plain),
+`VA_LSE_LOG_DIR`/`VA_LSE_LOG_FILE` (rotating file + stdout), `VA_LSE_LOG_MAX_BYTES` and
+`VA_LSE_LOG_BACKUPS`. With `VA_LSE_LOG_DIR` unset the app still logs to stdout so platform drains
+(`docker logs`, Agiloop build harness) stay useful; setting it adds a `RotatingFileHandler`.
 
 ## Security notes
 

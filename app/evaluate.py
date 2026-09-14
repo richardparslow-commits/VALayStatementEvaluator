@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import logging
+import time
+
 from .agiloop_telemetry import track_feature_error
 from .config import load_knowledge
 from .documents import (
@@ -12,6 +15,9 @@ from .documents import (
     MAX_STATEMENT_CHARS,
 )
 from .llm import LLMClient, LLMError
+from .logging_config import PhaseTimer, get_request_id
+
+logger = logging.getLogger("app.evaluate")
 from .medical_review import (
     MedicalDigest,
     ProgressCallback,
@@ -346,9 +352,46 @@ def run_evaluation(
     progress: ProgressCallback | None = None,
 ) -> EvaluationResult:
     """Execute the full evaluation pipeline."""
+    rid = get_request_id() or "-"
+    t0 = time.perf_counter()
+    logger.info(
+        "evaluate start pages=%d statement_chars=%d",
+        sum(len(d.pages) for d in records),
+        len(statement_text),
+        extra={"request_id": rid, "phase": "evaluate", "status": "start"},
+    )
     try:
-        return _run_evaluation(llm, statement_text, records, progress)
+        result = _run_evaluation(llm, statement_text, records, progress)
+        duration_ms = int((time.perf_counter() - t0) * 1000)
+        logger.info(
+            "evaluate done duration_ms=%d claims=%d verifications=%d contradictions=%d",
+            duration_ms,
+            len(result.claims),
+            len(result.verifications),
+            result.contradiction_count,
+            extra={
+                "request_id": rid,
+                "phase": "evaluate",
+                "status": "ok",
+                "duration_ms": duration_ms,
+            },
+        )
+        return result
     except Exception as exc:  # noqa: BLE001 - feature-error boundary
+        duration_ms = int((time.perf_counter() - t0) * 1000)
+        logger.error(
+            "evaluate error duration_ms=%d error=%s",
+            duration_ms,
+            f"{type(exc).__name__}: {exc}",
+            exc_info=exc,
+            extra={
+                "request_id": rid,
+                "phase": "evaluate",
+                "status": "error",
+                "duration_ms": duration_ms,
+                "error_class": type(exc).__name__,
+            },
+        )
         track_feature_error(FEATURE_ID, exc)
         raise
 
@@ -394,51 +437,66 @@ def _run_evaluation(
         if progress:
             progress(frac, msg)
 
-    report(0.02, "Step 1/7 — Exhaustive review of medical records…")
-    result.digest = review_medical_records(
-        llm, records, progress=lambda f, m: progress((0.02 + f * 0.48), m) if progress else None
-    )
+    rid = get_request_id() or "-"
+    with PhaseTimer(logger, "records:review", request_id=rid, chunks=len(records)):
+        report(0.02, "Step 1/7 — Exhaustive review of medical records…")
+        result.digest = review_medical_records(
+            llm, records, progress=lambda f, m: progress((0.02 + f * 0.48), m) if progress else None
+        )
 
-    report(0.52, "Step 2/7 — Extracting factual claims from the statement…")
-    claims_data = llm.chat_json(
-        CLAIMS_SYSTEM,
-        CLAIMS_USER.format(statement=prompt_statement),
-        phase="claims",
-    )
-    result.claimed_condition = claims_data.get("claimed_condition", "")
-    result.writer_role = claims_data.get("writer_role", "")
-    result.claims = claims_data.get("claims", [])
+    with PhaseTimer(logger, "claims", request_id=rid):
+        report(0.52, "Step 2/7 — Extracting factual claims from the statement…")
+        claims_data = llm.chat_json(
+            CLAIMS_SYSTEM,
+            CLAIMS_USER.format(statement=prompt_statement),
+            phase="claims",
+        )
+        result.claimed_condition = claims_data.get("claimed_condition", "")
+        result.writer_role = claims_data.get("writer_role", "")
+        result.claims = claims_data.get("claims", [])
+        logger.info(
+            "claims extracted count=%d condition=%s role=%s",
+            len(result.claims),
+            result.claimed_condition[:80] if result.claimed_condition else "-",
+            result.writer_role or "-",
+            extra={"request_id": rid, "phase": "claims", "status": "ok"},
+        )
 
-    report(0.60, "Step 3/7 — Verifying each claim against the records…")
-    result.verifications = _verify_claims(llm, result.claims, result.digest, records, report)
+    with PhaseTimer(logger, "verify", request_id=rid, claims=len(result.claims)):
+        report(0.60, "Step 3/7 — Verifying each claim against the records…")
+        result.verifications = _verify_claims(llm, result.claims, result.digest, records, report)
 
-    report(0.78, "Step 4/7 — Scoring against the lay-evidence rubric…")
-    rubric_data = llm.chat_json(
-        RUBRIC_SYSTEM_TEMPLATE.format(
-            rubric=load_knowledge("evaluation_rubric.md"),
-            legal=load_knowledge("legal_framework.md"),
-        ),
-        RUBRIC_USER.format(
-            statement=prompt_statement,
-            verifications=_verifications_text(result),
-            digest_summary=result.digest.summary or "(no summary)",
-        ),
-        phase="rubric",
-    )
-    result.scores = {k: float(v) for k, v in rubric_data.get("scores", {}).items()}
-    result.rationales = rubric_data.get("rationales", {})
-    result.improvements = rubric_data.get("improvements", [])
-    result.omitted_record_facts = rubric_data.get("omitted_record_facts", [])
-    result.executive_summary = rubric_data.get("executive_summary", "")
+    with PhaseTimer(logger, "rubric", request_id=rid):
+        report(0.78, "Step 4/7 — Scoring against the lay-evidence rubric…")
+        rubric_data = llm.chat_json(
+            RUBRIC_SYSTEM_TEMPLATE.format(
+                rubric=load_knowledge("evaluation_rubric.md"),
+                legal=load_knowledge("legal_framework.md"),
+            ),
+            RUBRIC_USER.format(
+                statement=prompt_statement,
+                verifications=_verifications_text(result),
+                digest_summary=result.digest.summary or "(no summary)",
+            ),
+            phase="rubric",
+        )
+        result.scores = {k: float(v) for k, v in rubric_data.get("scores", {}).items()}
+        result.rationales = rubric_data.get("rationales", {})
+        result.improvements = rubric_data.get("improvements", [])
+        result.omitted_record_facts = rubric_data.get("omitted_record_facts", [])
+        result.executive_summary = rubric_data.get("executive_summary", "")
 
-    report(0.79, "Step 5/7 — Auditing topic coverage (hazards, care, family, progression)…")
-    _analyze_topics(llm, result, statement_text, report)
+    with PhaseTimer(logger, "topic", request_id=rid):
+        report(0.79, "Step 5/7 — Auditing topic coverage (hazards, care, family, progression)…")
+        _analyze_topics(llm, result, statement_text, report)
 
-    report(0.86, "Step 6/7 — Drafting improvement suggestions and a revised statement…")
-    _draft_revision(llm, result, statement_text, report)
+    with PhaseTimer(logger, "revision", request_id=rid):
+        report(0.86, "Step 6/7 — Drafting improvement suggestions and a revised statement…")
+        _draft_revision(llm, result, statement_text, report)
 
-    report(0.96, "Step 7/7 — Building the report…")
-    result.report_markdown = build_report(result, statement_text)
+    with PhaseTimer(logger, "report", request_id=rid):
+        report(0.96, "Step 7/7 — Building the report…")
+        result.report_markdown = build_report(result, statement_text)
     report(1.0, "Evaluation complete.")
     return result
 
@@ -468,7 +526,12 @@ def _analyze_topics(
             ),
             phase="topic",
         )
-    except LLMError:
+    except LLMError as exc:
+        logger.warning(
+            "topic coverage unavailable error=%s",
+            f"{type(exc).__name__}: {exc}",
+            extra={"request_id": get_request_id() or "-", "phase": "topic", "status": "error", "error_class": type(exc).__name__},
+        )
         result.topic_notes = "Topic coverage analysis unavailable — the model call failed."
         return
     result.topic_focus = topic_data.get("claim_focus", "")
@@ -519,7 +582,12 @@ def _draft_revision(
             max_tokens=6000,
             phase="revision",
         )
-    except LLMError:
+    except LLMError as exc:
+        logger.warning(
+            "revision draft unavailable error=%s",
+            f"{type(exc).__name__}: {exc}",
+            extra={"request_id": get_request_id() or "-", "phase": "revision", "status": "error", "error_class": type(exc).__name__},
+        )
         result.revision_notes = "Revision draft unavailable — the model call failed."
         return
     result.revision_notes = revise_data.get("revision_notes", "")

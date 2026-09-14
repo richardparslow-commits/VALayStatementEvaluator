@@ -20,9 +20,16 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Callable
 
+import contextvars
+import logging
+import time
+
 from . import config
 from .documents import ExtractedDocument, chunk_page_labelled_text, paragraph_index
 from .llm import LLMClient, LLMError
+from .logging_config import PhaseTimer, get_request_id
+
+logger = logging.getLogger("app.medical_review")
 
 ProgressCallback = Callable[[float, str], None]
 
@@ -287,23 +294,83 @@ def review_medical_records(
             f"{config.RECORDS_CONCURRENCY} parallel worker(s)…",
         )
 
-    def digest_chunk(chunk) -> dict:
-        return llm.chat_json(
-            DIGEST_SYSTEM,
-            DIGEST_USER_TEMPLATE.format(
-                label=chunk.label,
-                source_hint=chunk.label,
-                chunk_text=chunk.text,
-            ),
-            model=llm._settings.model_fast,
-            max_tokens=8000,
-            phase="records:digest",
-        )
+    _ctx_request_id = get_request_id()  # capture for worker threads
+
+    def digest_chunk(chunk) -> dict:  # type: ignore[no-untyped-def]
+        # Propagate the run's correlation id into the worker thread.
+        from .logging_config import _request_id_var  # local import to avoid cycle at import time
+
+        token = _request_id_var.set(_ctx_request_id)
+        t0 = time.perf_counter()
+        try:
+            data = llm.chat_json(
+                DIGEST_SYSTEM,
+                DIGEST_USER_TEMPLATE.format(
+                    label=chunk.label,
+                    source_hint=chunk.label,
+                    chunk_text=chunk.text,
+                ),
+                model=llm._settings.model_fast,
+                max_tokens=8000,
+                phase="records:digest",
+            )
+            duration_ms = int((time.perf_counter() - t0) * 1000)
+            logger.debug(
+                "chunk digest ok label=%s facts=%d duration_ms=%d",
+                chunk.label,
+                len(data.get("facts", []) or []),
+                duration_ms,
+                extra={
+                    "request_id": _ctx_request_id or "-",
+                    "phase": "records:digest",
+                    "status": "ok",
+                    "duration_ms": duration_ms,
+                    "chunks": chunk.label,
+                },
+            )
+            return data
+        except Exception as exc:  # noqa: BLE001
+            duration_ms = int((time.perf_counter() - t0) * 1000)
+            logger.warning(
+                "chunk digest error label=%s duration_ms=%d error=%s",
+                chunk.label,
+                duration_ms,
+                f"{type(exc).__name__}: {exc}",
+                extra={
+                    "request_id": _ctx_request_id or "-",
+                    "phase": "records:digest",
+                    "status": "error",
+                    "duration_ms": duration_ms,
+                    "error_class": type(exc).__name__,
+                },
+            )
+            raise
+        finally:
+            try:
+                _request_id_var.reset(token)
+            except ValueError:
+                pass
 
     # -------------------------------------------- parallel chunk extraction
     results: dict[int, dict] = {}
     failed: dict[int, str] = {}
     completed = 0
+    _review_t0 = time.perf_counter()
+    rid = get_request_id() or "-"
+    logger.info(
+        "records review start pages=%d chunks=%d concurrency=%d duplicates_skipped=%d",
+        pages,
+        total_units,
+        config.RECORDS_CONCURRENCY,
+        duplicates_skipped,
+        extra={
+            "request_id": rid,
+            "phase": "records:review",
+            "status": "start",
+            "pages": pages,
+            "chunks": total_units,
+        },
+    )
 
     def run_round(pending: list) -> None:
         nonlocal completed
@@ -327,6 +394,17 @@ def review_medical_records(
     # Retry failed chunks once; parallel bursts can hit transient rate limits.
     if failed:
         retry_targets = [c for c in chunks if c.index in failed]
+        logger.warning(
+            "records digest retry pending=%d failed=%s",
+            len(retry_targets),
+            sorted(failed.keys()),
+            extra={
+                "request_id": rid,
+                "phase": "records:digest",
+                "status": "retry",
+                "chunks": len(retry_targets),
+            },
+        )
         failed.clear()
         if progress:
             progress(0.62, f"Retrying {len(retry_targets)} failed chunk(s)…")
@@ -335,6 +413,18 @@ def review_medical_records(
     if failed:
         labels = ", ".join(f"chunk {i}" for i in sorted(failed))
         first_error = failed[sorted(failed)[0]][:200]
+        logger.error(
+            "records review failed chunks=%s error=%s",
+            sorted(failed.keys()),
+            first_error,
+            extra={
+                "request_id": rid,
+                "phase": "records:review",
+                "status": "error",
+                "chunks": len(failed),
+                "error_class": "LLMError",
+            },
+        )
         raise LLMError(
             f"Record review failed: could not digest {labels} after a retry "
             f"({first_error}). Re-run the review; if it persists, split the record "
@@ -373,8 +463,28 @@ def review_medical_records(
         duplicates_skipped=duplicates_skipped,
     )
 
-    digest.facts = _merge_facts(llm, digest, progress)
-    digest.summary = _summarize(llm, digest)
+    with PhaseTimer(logger, "records:merge", request_id=rid, facts=len(all_facts)):
+        digest.facts = _merge_facts(llm, digest, progress)
+    with PhaseTimer(logger, "records:summary", request_id=rid):
+        digest.summary = _summarize(llm, digest)
+    duration_ms = int((time.perf_counter() - _review_t0) * 1000)
+    logger.info(
+        "records review done pages=%d chunks=%d facts=%d duplicates_skipped=%d duration_ms=%d",
+        pages,
+        len(chunks),
+        len(digest.facts),
+        duplicates_skipped,
+        duration_ms,
+        extra={
+            "request_id": rid,
+            "phase": "records:review",
+            "status": "ok",
+            "duration_ms": duration_ms,
+            "pages": pages,
+            "chunks": len(chunks),
+            "facts": len(digest.facts),
+        },
+    )
     if progress:
         progress(
             0.8,
@@ -408,11 +518,25 @@ def _merge_facts(
             return facts
 
     current = facts
+    _merge_rid = get_request_id() or "-"
     for round_no in range(1, 4):
         batches = [
             current[i : i + MERGE_BATCH_SIZE]
             for i in range(0, len(current), MERGE_BATCH_SIZE)
         ]
+        logger.info(
+            "merge round start round=%d facts=%d batches=%d",
+            round_no,
+            len(current),
+            len(batches),
+            extra={
+                "request_id": _merge_rid,
+                "phase": "records:merge",
+                "status": "start",
+                "facts": len(current),
+                "chunks": len(batches),
+            },
+        )
         if progress:
             progress(
                 0.66,
@@ -420,16 +544,42 @@ def _merge_facts(
                 f"{len(current):,} facts in {len(batches)} batch(es)…",
             )
         merged_by_batch: dict[int, list[MedicalFact]] = {}
+        # Capture correlation id for merge workers as well.
+        _merge_ctx = _merge_rid
+        def _merge_with_ctx(batch):  # type: ignore[no-untyped-def]
+            from .logging_config import _request_id_var as _rid_var
+
+            tok = _rid_var.set(_merge_ctx)
+            try:
+                return _merge_once(llm, batch)
+            finally:
+                try:
+                    _rid_var.reset(tok)
+                except ValueError:
+                    pass
+
         with ThreadPoolExecutor(max_workers=config.RECORDS_CONCURRENCY) as pool:
             future_map = {
-                pool.submit(_merge_once, llm, batch): batch_index
+                pool.submit(_merge_with_ctx, batch): batch_index
                 for batch_index, batch in enumerate(batches)
             }
             for future in as_completed(future_map):
                 batch_index = future_map[future]
                 try:
                     merged_by_batch[batch_index] = future.result() or batches[batch_index]
-                except LLMError:
+                except LLMError as exc:
+                    logger.warning(
+                        "merge batch failed round=%d batch=%d error=%s",
+                        round_no,
+                        batch_index,
+                        f"{type(exc).__name__}: {exc}",
+                        extra={
+                            "request_id": _merge_rid,
+                            "phase": "records:merge",
+                            "status": "error",
+                            "error_class": type(exc).__name__,
+                        },
+                    )
                     merged_by_batch[batch_index] = batches[batch_index]  # keep raw facts
 
         merged: list[MedicalFact] = []

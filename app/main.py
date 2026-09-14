@@ -5,6 +5,9 @@ Run with:
 """
 from __future__ import annotations
 
+import logging
+import time
+
 import streamlit as st
 
 from . import config
@@ -24,9 +27,19 @@ from .draft import grounding_markdown, run_draft
 from .evaluate import DIMENSION_LABELS, run_evaluation
 from .fetch_client import FetchClient, FetchSandboxError
 from .llm import LLMClient, LLMError
+from .logging_config import (
+    configure_logging,
+    get_request_id,
+    get_logger,
+    new_request_id,
+    set_request_id,
+)
 from . import telemetry
 from . import va_gov_client
 from . import watchdog
+
+logger = get_logger("app.main")
+_REQUEST_ID_KEY = "va_lse_request_id"
 
 # Feature: Condition-Specific Templates
 FEATURE_ID = "02f0935a-ee5e-4083-88a2-10e11753ccc9"  # condition-specific-templates
@@ -121,20 +134,53 @@ def _sidebar_settings() -> None:
         )
 
 
+def _get_or_create_request_id() -> str:
+    """Return the active run's correlation id, minting one if needed."""
+    rid = st.session_state.get(_REQUEST_ID_KEY, "")
+    if rid:
+        # Ensure ContextVar mirrors session state (Streamlit reruns may reset context).
+        set_request_id(rid)
+        return rid
+    rid = new_request_id()
+    st.session_state[_REQUEST_ID_KEY] = rid
+    set_request_id(rid)
+    return rid
+
+
+def _new_run_request_id() -> str:
+    """Mint a fresh correlation id for a new Evaluate/Draft run."""
+    rid = new_request_id()
+    st.session_state[_REQUEST_ID_KEY] = rid
+    set_request_id(rid)
+    return rid
+
+
 def _get_llm() -> LLMClient | None:
+    rid = st.session_state.get(_REQUEST_ID_KEY, "") or get_request_id() or "-"
     settings = st.session_state.settings
     settings.api_key = st.session_state.get("api_key_input", settings.api_key).strip()
     if not settings.configured:
+        logger.warning("LLM not configured — missing API key", extra={"request_id": rid, "phase": "llm_config", "status": "error"})
         st.error("Enter your LLM API key in the sidebar before running.")
         return None
     try:
         return LLMClient(settings)
     except LLMError as exc:
+        logger.error(
+            "LLM client init failed: %s", exc, exc_info=exc,
+            extra={"request_id": rid, "phase": "llm_config", "status": "error", "error_class": type(exc).__name__},
+        )
         st.error(str(exc))
         return None
 
 
 # ------------------------------------------------------------- shared uploads
+def _format_error_for_user(exc: Exception, request_id: str) -> str:
+    """User-facing error string that carries the correlation id without PII."""
+    rid_suffix = f" (reference: {request_id})" if request_id and request_id != "-" else ""
+    return f"{exc}{rid_suffix}"
+
+
 def _extract_uploads(files, slot: str) -> list:
     """Extract text from uploaded files; cache results per file identity.
 
@@ -569,11 +615,13 @@ def _credit_calibration_widget() -> None:
             )
 
 
-def _progress_widgets(llm: LLMClient | None = None):
+def _progress_widgets(llm: LLMClient | None = None, *, request_id: str | None = None):
     """Progress bar whose caption appends a live estimated-usage line."""
     bar = st.progress(0.0, text="Starting…")
+    rid = request_id or get_request_id() or "-"
 
     def update(frac: float, msg: str) -> None:
+        logger.debug("progress %.0f%% — %s", frac * 100, msg, extra={"request_id": rid, "phase": "progress", "status": "ok"})
         text = msg
         if llm is not None:
             text += llm.usage.live_line()
@@ -724,20 +772,42 @@ def evaluate_tab() -> None:
         if not records:
             st.error("Upload at least one medical record file.")
             return
+        rid = _new_run_request_id()
         llm = _get_llm()
         if llm is None:
             return
 
-        bar, update = _progress_widgets(llm)
+        logger.info(
+            "evaluate run start statement_chars=%d pages=%d",
+            len(statement_text.strip()), sum(len(d.pages) for d in records),
+            extra={"request_id": rid, "phase": "evaluate", "status": "start"},
+        )
+        bar, update = _progress_widgets(llm, request_id=rid)
+        t0 = time.perf_counter()
         try:
             result = run_evaluation(llm, statement_text.strip(), records, progress=update)
         except Exception as exc:  # noqa: BLE001
             bar.empty()
-            st.error(f"Evaluation failed: {exc}")
+            duration_ms = int((time.perf_counter() - t0) * 1000)
+            logger.error(
+                "evaluate run error duration_ms=%d error=%s",
+                duration_ms, f"{type(exc).__name__}: {exc}",
+                exc_info=exc,
+                extra={"request_id": rid, "phase": "evaluate", "status": "error", "duration_ms": duration_ms, "error_class": type(exc).__name__},
+            )
+            st.error(f"Evaluation failed: {_format_error_for_user(exc, rid)}")
             return
+        duration_ms = int((time.perf_counter() - t0) * 1000)
+        total = llm.usage.totals()
+        logger.info(
+            "evaluate run done duration_ms=%d calls=%d tokens_in=%d tokens_out=%d",
+            duration_ms, total.calls, total.prompt_tokens, total.completion_tokens,
+            extra={"request_id": rid, "phase": "evaluate", "status": "ok", "duration_ms": duration_ms, "calls": total.calls, "prompt_tokens": total.prompt_tokens, "completion_tokens": total.completion_tokens},
+        )
         bar.empty()
         st.session_state.eval_result = result
         st.session_state.eval_usage = llm.usage
+        st.session_state.eval_request_id = rid
         _record_watchdog_run(llm.usage)
 
     result = st.session_state.get("eval_result")
@@ -997,10 +1067,17 @@ def draft_tab() -> None:
                 msg += f" {will_truncate:,} characters would be truncated and not grounded."
             st.error(msg)
             return
+        rid = _new_run_request_id()
         llm = _get_llm()
         if llm is None:
             return
 
+        logger.info(
+            "draft run start observations_chars=%d pages=%d condition=%s",
+            len(observations.strip()), sum(len(d.pages) for d in records),
+            condition.strip()[:60] if condition.strip() else "-",
+            extra={"request_id": rid, "phase": "draft", "status": "start"},
+        )
         witness = {
             "name": witness_name.strip(),
             "relationship": relationship,
@@ -1009,7 +1086,8 @@ def draft_tab() -> None:
             "veteran_name": veteran_name.strip(),
             "witnessed_event": witnessed_event,
         }
-        bar, update = _progress_widgets(llm)
+        bar, update = _progress_widgets(llm, request_id=rid)
+        t0 = time.perf_counter()
         try:
             result = run_draft(
                 llm, records, witness, observations.strip(), condition.strip(),
@@ -1017,11 +1095,26 @@ def draft_tab() -> None:
             )
         except Exception as exc:  # noqa: BLE001
             bar.empty()
-            st.error(f"Drafting failed: {exc}")
+            duration_ms = int((time.perf_counter() - t0) * 1000)
+            logger.error(
+                "draft run error duration_ms=%d error=%s",
+                duration_ms, f"{type(exc).__name__}: {exc}",
+                exc_info=exc,
+                extra={"request_id": rid, "phase": "draft", "status": "error", "duration_ms": duration_ms, "error_class": type(exc).__name__},
+            )
+            st.error(f"Drafting failed: {_format_error_for_user(exc, rid)}")
             return
+        duration_ms = int((time.perf_counter() - t0) * 1000)
+        total = llm.usage.totals()
+        logger.info(
+            "draft run done duration_ms=%d calls=%d tokens_in=%d tokens_out=%d",
+            duration_ms, total.calls, total.prompt_tokens, total.completion_tokens,
+            extra={"request_id": rid, "phase": "draft", "status": "ok", "duration_ms": duration_ms, "calls": total.calls, "prompt_tokens": total.prompt_tokens, "completion_tokens": total.completion_tokens},
+        )
         bar.empty()
         st.session_state.draft_result = result
         st.session_state.draft_usage = llm.usage
+        st.session_state.draft_request_id = rid
         _record_watchdog_run(llm.usage)
 
     result = st.session_state.get("draft_result")
@@ -1130,6 +1223,14 @@ evidence relevant to each claim rather than reading only the first pages.
 
 # --------------------------------------------------------------------- layout
 def main() -> None:
+    configure_logging()
+    # Ensure every browser session has a baseline correlation id (also used
+    # for pre-run validation / upload errors so those logs are correlatable).
+    try:
+        _get_or_create_request_id()
+    except Exception:  # noqa: BLE001
+        pass
+    logger.info("app start", extra={"request_id": get_request_id() or "-", "phase": "app", "status": "start"})
     telemetry.init_telemetry()
     _sidebar_settings()
     st.title("🎖️ VA Lay Statement Evaluator")
@@ -1150,8 +1251,14 @@ def main() -> None:
         with tab_about:
             about_tab()
     except Exception as exc:  # noqa: BLE001 - root error boundary
+        rid = get_request_id() or st.session_state.get(_REQUEST_ID_KEY, "-") or "-"
+        logger.error(
+            "unhandled app error: %s", f"{type(exc).__name__}: {exc}",
+            exc_info=exc,
+            extra={"request_id": rid, "phase": "app", "status": "error", "error_class": type(exc).__name__},
+        )
         telemetry.track_app_error(exc)
-        st.error(f"Something went wrong while rendering the app: {exc}")
+        st.error(f"Something went wrong while rendering the app: {_format_error_for_user(exc, rid)}")
 
 
 if __name__ == "__main__":
