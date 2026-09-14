@@ -217,11 +217,6 @@ def _read_docx_member_limited(
                     f"{filename}: DOCX member '{member_name}' exceeded max uncompressed "
                     f"size while reading ({len(output)} bytes > {max_member_bytes} bytes)."
                 )
-            if len(output) > max_total_bytes:
-                raise ExtractionError(
-                    f"{filename}: DOCX total uncompressed size exceeded while reading "
-                    f"({len(output)} bytes > {max_total_bytes} bytes)."
-                )
             if existing_total_bytes + len(output) > max_total_bytes:
                 raise ExtractionError(
                     f"{filename}: DOCX total uncompressed size exceeded while reading "
