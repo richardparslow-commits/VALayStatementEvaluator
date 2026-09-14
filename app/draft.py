@@ -5,10 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from .agiloop_telemetry import track_feature_error
 from .config import load_knowledge
 from .documents import ExtractedDocument
 from .llm import LLMClient
 from .medical_review import MedicalDigest, ProgressCallback, review_medical_records
+
+# Feature: Condition-Specific Templates
+FEATURE_ID = "02f0935a-ee5e-4083-88a2-10e11753ccc9"  # condition-specific-templates
 
 GROUNDING_SYSTEM = """You are a veterans-claims evidence specialist preparing to draft a \
 lay/witness statement (VA Form 21-10210 style). You must ground every available fact in the \
@@ -165,6 +169,22 @@ def run_draft(
     progress: ProgressCallback | None = None,
 ) -> DraftResult:
     """Execute the full drafting pipeline."""
+    try:
+        return _run_draft(llm, records, witness, observations, condition, claim_type, progress)
+    except Exception as exc:  # noqa: BLE001 - feature-error boundary
+        track_feature_error(FEATURE_ID, exc)
+        raise
+
+
+def _run_draft(
+    llm: LLMClient,
+    records: list[ExtractedDocument],
+    witness: dict[str, str],
+    observations: str,
+    condition: str,
+    claim_type: str,
+    progress: ProgressCallback | None,
+) -> DraftResult:
     result = DraftResult()
 
     def report(frac: float, msg: str) -> None:
