@@ -4,7 +4,7 @@
       "name": "streamlit-web",
       "type": "repo",
       "primary": true,
-      "buildCommand": "pip install -r requirements.txt",
+      "buildCommand": "pip install --require-hashes -r requirements.lock",
       "startCommand": "streamlit run run_app.py --server.port $PORT --server.address 0.0.0.0",
       "variables": {
         "AGILOOP_INSPECT_API_KEY": "",

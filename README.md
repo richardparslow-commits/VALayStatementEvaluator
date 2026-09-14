@@ -70,9 +70,37 @@ regardless of record length. See **Large record sets** below for how very large 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install --require-hashes -r requirements.lock   # exact, hash-verified versions
 cp .env.example .env     # then put your API key in .env (never commit .env)
 ```
+
+Install from **`requirements.lock`** for development, CI, and production so every environment
+runs the identical tested dependency set. `requirements.txt` stays the human-edited input
+(minimum versions); see **Dependency locking** below.
+
+### Dependency locking
+
+`requirements.txt` lists direct dependencies with minimum versions; `requirements.lock` is the
+`pip-compile`-generated lockfile pinning **every** direct and transitive package to an exact
+version with SHA-256 hashes, so local dev, CI, and deploys resolve identically. Every install
+path uses it (`pip install --require-hashes -r requirements.lock` in `.github/workflows/test.yml`
+and `.agiloop/deploy.json`).
+
+To upgrade dependencies:
+
+```bash
+pip install pip-tools                 # provides pip-compile
+# 1. edit requirements.txt (add a package or raise a minimum version)
+# 2. re-resolve the full graph and rewrite the lockfile
+pip-compile --generate-hashes requirements.txt -o requirements.lock
+# 3. review the diff, run the offline tests, then commit BOTH files together
+python -m unittest discover -s tests -v
+git add requirements.txt requirements.lock && git diff --cached
+```
+
+Use `pip-compile --upgrade` (optionally with `-P <package>`) for a deliberate bulk or
+single-package bump; pip-compile pins hashes for every platform wheel, so the same lockfile
+installs on macOS and Linux CI.
 
 ### Environment variables (`.env`)
 
@@ -164,7 +192,7 @@ Matches `.agiloop/deploy.json` (single `streamlit-web` service):
 
 ```bash
 # Build
-pip install -r requirements.txt
+pip install --require-hashes -r requirements.lock
 
 # Start (binds to the platform-provided $PORT)
 streamlit run run_app.py --server.port $PORT --server.address 0.0.0.0
@@ -241,8 +269,9 @@ python -m unittest discover -s tests -v        # offline unit tests
 python scripts/smoke_test.py all               # live end-to-end (needs valid .env)
 ```
 
-> GitHub Actions runs the offline tests and scale simulation automatically on every push to
-> `main` (and on pull requests). The live smoke test is triggered **manually** from the
+> GitHub Actions installs from the hash-pinned `requirements.lock` (see **Dependency locking**),
+> then runs the offline tests and scale simulation automatically on every push to `main` (and on
+> pull requests). The live smoke test is triggered **manually** from the
 > Actions tab and only runs when an `OPENAI_API_KEY` secret is configured; the optional
 > `OPENAI_BASE_URL`, `LLM_MODEL_MAIN`, and `LLM_MODEL_FAST` secrets override the endpoint and
 > models in that job if set (see `.env.example`).
