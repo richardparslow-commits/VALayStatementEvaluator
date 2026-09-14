@@ -192,6 +192,19 @@ class TestFetchClient(unittest.TestCase):
         self.assertEqual(response.read_calls, 0)
         self.assertTrue(connection.closed)
 
+    def test_http_get_rejects_non_integer_content_length_before_read(self):
+        client = FetchClient(self._settings(fetch_max_response_bytes=10))
+        response = self._FakeResponse(
+            headers={"Content-Length": "abc"},
+            chunks=[b"should-not-be-read"],
+        )
+        connection = self._FakeConnection(response)
+        with patch("app.fetch_client.HTTPSConnection", return_value=connection):
+            with self.assertRaises(FetchSandboxError):
+                client._http_get("https://demo.fetchsandbox.com/records")
+        self.assertEqual(response.read_calls, 0)
+        self.assertTrue(connection.closed)
+
     def test_http_get_rejects_oversized_body_during_chunked_read(self):
         client = FetchClient(self._settings(fetch_max_response_bytes=10))
         response = self._FakeResponse(
