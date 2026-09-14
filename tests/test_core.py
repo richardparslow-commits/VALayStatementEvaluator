@@ -201,6 +201,38 @@ class TestExtraction(unittest.TestCase):
             )
         self.assertIn("total uncompressed size exceeded while reading", str(exc.exception))
 
+    def test_docx_member_runtime_guard_wins_with_existing_total(self):
+        class _FakeStream:
+            def __init__(self):
+                self._chunks = [b"abc", b"def", b""]
+
+            def read(self, _size: int) -> bytes:
+                return self._chunks.pop(0)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class _FakeArchive:
+            def getinfo(self, _name: str):
+                return type("Info", (), {"file_size": 4})()
+
+            def open(self, _info, _mode: str):
+                return _FakeStream()
+
+        with self.assertRaises(ExtractionError) as exc:
+            _read_docx_member_limited(
+                "runtime-member-existing-total.docx",
+                archive=_FakeArchive(),
+                member_name="word/document.xml",
+                max_member_bytes=5,
+                max_total_bytes=100,
+                existing_total_bytes=40,
+            )
+        self.assertIn("member 'word/document.xml' exceeded max uncompressed size", str(exc.exception))
+
     def test_page_labelled_text(self):
         doc = extract_document("note.txt", b"Body text here.")
         self.assertIn("page 1", doc.page_labelled_text())
