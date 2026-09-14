@@ -7,7 +7,11 @@ from typing import Any
 
 from .agiloop_telemetry import track_feature_error
 from .config import load_knowledge
-from .documents import ExtractedDocument
+from .documents import (
+    DRAFT_INTERNAL_MAX_CHARS,
+    ExtractedDocument,
+    MAX_OBSERVATIONS_CHARS,
+)
 from .llm import LLMClient
 from .medical_review import MedicalDigest, ProgressCallback, review_medical_records
 
@@ -153,6 +157,10 @@ class DraftResult:
     final_statement: str = ""
     review_issues: list[str] = field(default_factory=list)
     digest: MedicalDigest | None = None
+    # Truncation audit for observations
+    input_chars: int = 0
+    truncated_chars: int = 0
+    truncation_warning: str = ""
 
     @property
     def output_statement(self) -> str:
@@ -176,6 +184,12 @@ def run_draft(
         raise
 
 
+def _truncate_for_prompt(text: str, limit: int = DRAFT_INTERNAL_MAX_CHARS) -> tuple[str, int]:
+    if len(text) <= limit:
+        return text, 0
+    return text[:limit], len(text) - limit
+
+
 def _run_draft(
     llm: LLMClient,
     records: list[ExtractedDocument],
@@ -186,6 +200,23 @@ def _run_draft(
     progress: ProgressCallback | None,
 ) -> DraftResult:
     result = DraftResult()
+    result.input_chars = len(observations)
+    obs_for_prompt, removed = _truncate_for_prompt(observations, DRAFT_INTERNAL_MAX_CHARS)
+    result.truncated_chars = removed
+    if removed:
+        result.truncation_warning = (
+            f"Observations were {result.input_chars:,} characters — "
+            f"{removed:,} characters beyond the {DRAFT_INTERNAL_MAX_CHARS:,} internal prompt limit "
+            f"were truncated and not grounded. Details at the end may have been missed. "
+            f"Shorten or split the observations and re-run."
+        )
+        if result.input_chars > MAX_OBSERVATIONS_CHARS:
+            result.truncation_warning = (
+                f"Observations were {result.input_chars:,} characters — "
+                f"{result.input_chars - MAX_OBSERVATIONS_CHARS:,} over the {MAX_OBSERVATIONS_CHARS:,} "
+                f"recommended limit. {removed:,} characters were truncated for the model prompts; "
+                f"details at the end may have been missed. Shorten or split and re-run."
+            )
 
     def report(frac: float, msg: str) -> None:
         if progress:
@@ -197,14 +228,14 @@ def _run_draft(
     )
 
     report(0.5, "Step 2/4 — Grounding witness observations against the records and topic checklist…")
-    grounding_query = f"{condition} {observations}"
+    grounding_query = f"{condition} {obs_for_prompt}"
     result.grounding = llm.chat_json(
         GROUNDING_SYSTEM,
         GROUNDING_USER.format(
             condition=condition,
             claim_type=claim_type,
             relationship=witness.get("relationship", "not specified"),
-            observations=observations[:20000],
+            observations=obs_for_prompt,
             digest=result.digest.relevant_facts_text(grounding_query, max_facts=150),
             checklist=load_knowledge("topic_checklist.md"),
         ),
@@ -226,7 +257,7 @@ def _run_draft(
             condition=condition,
             claim_type=claim_type,
             witnessed_event=witness.get("witnessed_event", "unknown"),
-            observations=observations[:20000],
+            observations=obs_for_prompt,
             grounding=_json_dumps(result.grounding),
             digest_summary=result.digest.summary or "(no summary)",
         ),
@@ -265,6 +296,9 @@ def _json_dumps(data: Any) -> str:
 def grounding_markdown(result: DraftResult) -> str:
     """Render the grounding analysis as readable markdown for the UI."""
     lines: list[str] = []
+    if result.truncation_warning:
+        lines.append(f"> ⚠️ **Truncated observations:** {result.truncation_warning}")
+        lines.append("")
     supported = result.grounding.get("supported_observations", [])
     if supported:
         lines.append("### ✅ Observations corroborated by the records")

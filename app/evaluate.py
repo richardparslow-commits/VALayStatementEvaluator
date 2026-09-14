@@ -6,7 +6,11 @@ from dataclasses import dataclass, field
 
 from .agiloop_telemetry import track_feature_error
 from .config import load_knowledge
-from .documents import ExtractedDocument
+from .documents import (
+    EVALUATE_INTERNAL_MAX_CHARS,
+    ExtractedDocument,
+    MAX_STATEMENT_CHARS,
+)
 from .llm import LLMClient, LLMError
 from .medical_review import (
     MedicalDigest,
@@ -296,6 +300,10 @@ class EvaluationResult:
     added_facts_to_verify: list[str] = field(default_factory=list)
     digest: MedicalDigest | None = None
     report_markdown: str = ""
+    # Truncation audit — set when the input exceeds EVALUATE_INTERNAL_MAX_CHARS
+    input_chars: int = 0
+    truncated_chars: int = 0
+    truncation_warning: str = ""
 
     @property
     def contradiction_count(self) -> int:
@@ -345,6 +353,13 @@ def run_evaluation(
         raise
 
 
+def _truncate_for_prompt(text: str, limit: int = EVALUATE_INTERNAL_MAX_CHARS) -> tuple[str, int]:
+    """Return (possibly truncated text, chars_removed) bounded at *limit*."""
+    if len(text) <= limit:
+        return text, 0
+    return text[:limit], len(text) - limit
+
+
 def _run_evaluation(
     llm: LLMClient,
     statement_text: str,
@@ -352,6 +367,28 @@ def _run_evaluation(
     progress: ProgressCallback | None,
 ) -> EvaluationResult:
     result = EvaluationResult()
+    result.input_chars = len(statement_text)
+    # Hard bound for LLM prompts (80k) — the 60k soft limit is enforced in the UI
+    # with a warning + confirmation. Direct callers bypassing the UI still get
+    # bounded prompts and an auditable warning in the report.
+    prompt_statement, removed = _truncate_for_prompt(statement_text, EVALUATE_INTERNAL_MAX_CHARS)
+    result.truncated_chars = removed
+    if removed:
+        result.truncation_warning = (
+            f"Statement was {result.input_chars:,} characters — "
+            f"{removed:,} characters beyond the {EVALUATE_INTERNAL_MAX_CHARS:,} internal prompt limit "
+            f"were truncated and not analyzed. Claims at the end of the statement may have been missed. "
+            f"Split the statement or shorten it and re-run for complete coverage."
+        )
+        # Layer a soft-limit note when the input also exceeded the 60k UI gate
+        if result.input_chars > MAX_STATEMENT_CHARS:
+            result.truncation_warning = (
+                f"Statement was {result.input_chars:,} characters — "
+                f"{result.input_chars - MAX_STATEMENT_CHARS:,} characters over the {MAX_STATEMENT_CHARS:,} "
+                f"recommended limit. {removed:,} characters were truncated for the model prompts; "
+                f"claims at the end (e.g., family impact, caregiver necessity) may have been missed. "
+                f"Split the statement into smaller parts or shorten it and re-run."
+            )
 
     def report(frac: float, msg: str) -> None:
         if progress:
@@ -365,7 +402,7 @@ def _run_evaluation(
     report(0.52, "Step 2/7 — Extracting factual claims from the statement…")
     claims_data = llm.chat_json(
         CLAIMS_SYSTEM,
-        CLAIMS_USER.format(statement=statement_text[:40000]),
+        CLAIMS_USER.format(statement=prompt_statement),
         phase="claims",
     )
     result.claimed_condition = claims_data.get("claimed_condition", "")
@@ -382,7 +419,7 @@ def _run_evaluation(
             legal=load_knowledge("legal_framework.md"),
         ),
         RUBRIC_USER.format(
-            statement=statement_text[:30000],
+            statement=prompt_statement,
             verifications=_verifications_text(result),
             digest_summary=result.digest.summary or "(no summary)",
         ),
@@ -417,6 +454,7 @@ def _analyze_topics(
     Like the revision step, a failure here must not discard the completed
     evaluation, so errors are swallowed and the fields stay empty.
     """
+    truncated_statement, _ = _truncate_for_prompt(statement_text, EVALUATE_INTERNAL_MAX_CHARS)
     try:
         topic_data = llm.chat_json(
             TOPIC_SYSTEM_TEMPLATE.format(
@@ -424,7 +462,7 @@ def _analyze_topics(
                 legal=load_knowledge("legal_framework.md"),
             ),
             TOPIC_USER.format(
-                statement=statement_text[:30000],
+                statement=truncated_statement,
                 verifications=_verifications_text(result),
                 digest_summary=(result.digest.summary or "(no summary)")[:12000],
             ),
@@ -465,11 +503,12 @@ def _draft_revision(
     else:
         topic_analysis = "(no topic coverage analysis available)"
 
+    truncated_statement, _ = _truncate_for_prompt(statement_text, EVALUATE_INTERNAL_MAX_CHARS)
     try:
         revise_data = llm.chat_json(
             REVISE_SYSTEM,
             REVISE_USER.format(
-                statement=statement_text[:30000],
+                statement=truncated_statement,
                 verifications=_verifications_text(result),
                 improvements=_json.dumps(result.improvements, indent=1)[:6000] or "(none)",
                 omitted_facts=_json.dumps(result.omitted_record_facts, indent=1)[:4000]
@@ -554,6 +593,9 @@ def build_report(result: EvaluationResult, statement_text: str) -> str:
     lines: list[str] = []
     lines.append("# Lay Statement Evaluation Report")
     lines.append("")
+    if result.truncation_warning:
+        lines.append(f"> ⚠️ **Truncated input:** {result.truncation_warning}")
+        lines.append("")
     lines.append(f"**Overall rating: {result.overall_rating}**")
     if result.claimed_condition:
         lines.append(f"**Appears to support claim for:** {result.claimed_condition}")

@@ -11,7 +11,10 @@ from . import config
 from .condition_selector import render_condition_selector
 from .config import DEFAULT_BASE_URL, load_settings
 from .documents import (
+    DRAFT_INTERNAL_MAX_CHARS,
+    EVALUATE_INTERNAL_MAX_CHARS,
     ExtractionError,
+    MAX_OBSERVATIONS_CHARS,
     MAX_STATEMENT_CHARS,
     extract_document,
     extract_uploaded_documents,
@@ -647,6 +650,42 @@ def evaluate_tab() -> None:
             if docs:
                 statement_text = docs[0].full_text
 
+    if statement_text:
+        n = len(statement_text)
+        st.caption(
+            f"Statement length: {n:,} / {MAX_STATEMENT_CHARS:,} characters "
+            f"(recommended limit; hard prompt limit {EVALUATE_INTERNAL_MAX_CHARS:,})."
+        )
+        if n > MAX_STATEMENT_CHARS:
+            over = n - MAX_STATEMENT_CHARS
+            will_truncate = max(0, n - EVALUATE_INTERNAL_MAX_CHARS)
+            if will_truncate:
+                st.warning(
+                    f"⚠️ Statement is {n:,} characters — {over:,} over the {MAX_STATEMENT_CHARS:,} "
+                    f"recommended limit. {will_truncate:,} characters beyond the "
+                    f"{EVALUATE_INTERNAL_MAX_CHARS:,} internal prompt limit will be "
+                    f"truncated and not analyzed. Claims at the end (e.g., family impact, "
+                    f"caregiver necessity) may be missed. Consider splitting the statement "
+                    f"into smaller parts or shortening it."
+                )
+            else:
+                st.warning(
+                    f"⚠️ Statement is {n:,} characters — {over:,} over the {MAX_STATEMENT_CHARS:,} "
+                    f"recommended limit. It will still be analyzed in full (internal limit "
+                    f"{EVALUATE_INTERNAL_MAX_CHARS:,}), but very long statements may reduce "
+                    f"model accuracy. Consider shortening for best results."
+                )
+            st.checkbox(
+                f"I understand the statement is {over:,} characters over the limit and "
+                "want to proceed anyway (any truncated portion will be noted in the report).",
+                key="eval_confirm_oversize",
+            )
+        elif n > int(MAX_STATEMENT_CHARS * 0.85):
+            st.caption(
+                f"ℹ️ Approaching the {MAX_STATEMENT_CHARS:,} character recommended limit "
+                f"({MAX_STATEMENT_CHARS - n:,} remaining before a confirmation is required)."
+            )
+
     st.subheader("Step 2 — Provide the medical records")
     records = _records_uploader("eval")
     if records:
@@ -668,8 +707,19 @@ def evaluate_tab() -> None:
         if not statement_text.strip():
             st.error("Provide the lay statement first (upload or paste).")
             return
-        if len(statement_text) > MAX_STATEMENT_CHARS:
-            st.error(f"Statement is too long (max {MAX_STATEMENT_CHARS} characters).")
+        if len(statement_text) > MAX_STATEMENT_CHARS and not st.session_state.get(
+            "eval_confirm_oversize"
+        ):
+            over = len(statement_text) - MAX_STATEMENT_CHARS
+            will_truncate = max(0, len(statement_text) - EVALUATE_INTERNAL_MAX_CHARS)
+            msg = (
+                f"Statement is {len(statement_text):,} characters — {over:,} over the "
+                f"{MAX_STATEMENT_CHARS:,} limit. Check the confirmation box above to proceed, "
+                "or split/shorten the statement."
+            )
+            if will_truncate:
+                msg += f" {will_truncate:,} characters would be truncated and not analyzed."
+            st.error(msg)
             return
         if not records:
             st.error("Upload at least one medical record file.")
@@ -695,6 +745,12 @@ def evaluate_tab() -> None:
         return
 
     _render_usage_summary(st.session_state.get("eval_usage"))
+
+    if getattr(result, "truncation_warning", ""):
+        st.warning(
+            f"⚠️ {result.truncation_warning} (input was {result.input_chars:,} chars; "
+            f"{result.truncated_chars:,} truncated). Review the report header for details."
+        )
 
     st.divider()
     st.subheader("📋 Evaluation Results")
@@ -884,6 +940,40 @@ def draft_tab() -> None:
         height=220,
         key="draft_observations",
     )
+    if observations:
+        n = len(observations)
+        st.caption(
+            f"Observations length: {n:,} / {MAX_OBSERVATIONS_CHARS:,} characters "
+            f"(recommended limit; hard prompt limit {DRAFT_INTERNAL_MAX_CHARS:,})."
+        )
+        if n > MAX_OBSERVATIONS_CHARS:
+            over = n - MAX_OBSERVATIONS_CHARS
+            will_truncate = max(0, n - DRAFT_INTERNAL_MAX_CHARS)
+            if will_truncate:
+                st.warning(
+                    f"⚠️ Observations are {n:,} characters — {over:,} over the "
+                    f"{MAX_OBSERVATIONS_CHARS:,} recommended limit. {will_truncate:,} "
+                    f"characters beyond the {DRAFT_INTERNAL_MAX_CHARS:,} internal limit "
+                    f"will be truncated and not grounded. Details at the end may be missed. "
+                    f"Consider shortening or splitting."
+                )
+            else:
+                st.warning(
+                    f"⚠️ Observations are {n:,} characters — {over:,} over the "
+                    f"{MAX_OBSERVATIONS_CHARS:,} recommended limit. They will still be "
+                    f"grounded in full (internal limit {DRAFT_INTERNAL_MAX_CHARS:,}), but "
+                    f"very long inputs may reduce accuracy."
+                )
+            st.checkbox(
+                f"I understand the observations are {over:,} characters over the limit and "
+                "want to proceed anyway (any truncated portion will be noted in the results).",
+                key="draft_confirm_oversize",
+            )
+        elif n > int(MAX_OBSERVATIONS_CHARS * 0.85):
+            st.caption(
+                f"ℹ️ Approaching the {MAX_OBSERVATIONS_CHARS:,} recommended limit "
+                f"({MAX_OBSERVATIONS_CHARS - n:,} remaining before confirmation is required)."
+            )
 
     run = st.button("✍️ Draft the statement", type="primary", key="draft_run")
     if run:
@@ -892,6 +982,20 @@ def draft_tab() -> None:
             return
         if not observations.strip() or not condition.strip():
             st.error("Enter the condition and the witness's observations.")
+            return
+        if len(observations) > MAX_OBSERVATIONS_CHARS and not st.session_state.get(
+            "draft_confirm_oversize"
+        ):
+            over = len(observations) - MAX_OBSERVATIONS_CHARS
+            will_truncate = max(0, len(observations) - DRAFT_INTERNAL_MAX_CHARS)
+            msg = (
+                f"Observations are {len(observations):,} characters — {over:,} over the "
+                f"{MAX_OBSERVATIONS_CHARS:,} limit. Check the confirmation box above to proceed, "
+                "or shorten/split the observations."
+            )
+            if will_truncate:
+                msg += f" {will_truncate:,} characters would be truncated and not grounded."
+            st.error(msg)
             return
         llm = _get_llm()
         if llm is None:
@@ -925,6 +1029,12 @@ def draft_tab() -> None:
         return
 
     _render_usage_summary(st.session_state.get("draft_usage"))
+
+    if getattr(result, "truncation_warning", ""):
+        st.warning(
+            f"⚠️ {result.truncation_warning} (input was {result.input_chars:,} chars; "
+            f"{result.truncated_chars:,} truncated). Review the grounding section for details."
+        )
 
     st.divider()
     st.subheader("📋 Draft Results")

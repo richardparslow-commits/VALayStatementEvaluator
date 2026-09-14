@@ -20,6 +20,13 @@ SUPPORTED_EXTENSIONS = (".pdf", ".txt", ".md", ".docx")
 DEFAULT_CHUNK_CHARS = config.DIGEST_CHUNK_CHARS
 CHUNK_OVERLAP_CHARS = 400
 MAX_STATEMENT_CHARS = 60_000
+# Max observations chars for the draft pathway (witness observations)
+MAX_OBSERVATIONS_CHARS = 60_000
+# Internal pipeline limits — raised to 80k so the upfront MAX_* checks are the
+# first line of defense; no silent 30k/40k truncation for statements that
+# passed the 60k UI gate. Bypass callers still get bounded prompts.
+EVALUATE_INTERNAL_MAX_CHARS = 80_000
+DRAFT_INTERNAL_MAX_CHARS = 80_000
 DOCX_READ_CHUNK_BYTES = 64 * 1024
 
 
