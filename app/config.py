@@ -195,3 +195,14 @@ LLM_CB_RECOVERY_SECONDS = _positive_int_env("VA_LSE_CB_RECOVERY_SECONDS", 60)
 LLM_MAX_CONCURRENT = _positive_int_env("VA_LSE_MAX_CONCURRENT_LLM_CALLS", 20)
 LLM_QUEUE_MAX_DEPTH = _positive_int_env("VA_LSE_LLM_QUEUE_MAX_DEPTH", 50)
 LLM_QUEUE_TIMEOUT_SECONDS = _positive_int_env("VA_LSE_LLM_QUEUE_TIMEOUT_SECONDS", 30)
+
+# ---------------------------------------------------------------------------
+# Audit logging — dedicated JSON stream for compliance/forensics (see app/audit.py).
+# Separate from diagnostic app.log so it can be queried and retained under a
+# different policy. Disabled only by setting dir to empty; otherwise writes to
+# {AUDIT_LOG_DIR}/{AUDIT_LOG_FILE} with rotation.
+# ---------------------------------------------------------------------------
+AUDIT_LOG_DIR = os.getenv("VA_LSE_AUDIT_LOG_DIR", "").strip() or os.getenv("VA_LSE_LOG_DIR", "").strip() or "logs"
+AUDIT_LOG_FILE = os.getenv("VA_LSE_AUDIT_LOG_FILE", "audit.log").strip() or "audit.log"
+AUDIT_LOG_MAX_BYTES = _positive_int_env("VA_LSE_AUDIT_LOG_MAX_BYTES", 10 * 1024 * 1024)
+AUDIT_LOG_BACKUPS = _positive_int_env("VA_LSE_AUDIT_LOG_BACKUPS", 10)

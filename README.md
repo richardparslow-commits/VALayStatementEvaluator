@@ -161,6 +161,10 @@ installs on macOS and Linux CI.
 | `VA_LSE_LLM_QUEUE_MAX_DEPTH` | Max queued callers waiting for a concurrency slot | `50` |
 | `VA_LSE_LLM_QUEUE_TIMEOUT_SECONDS` | Seconds a queued caller waits before `QueueFullError` | `30` |
 | `VA_LSE_HEALTH_PORT` | Sidecar health server port (`0` disables `GET /health` & `GET /ready`) | `8001` |
+| `VA_LSE_AUDIT_LOG_DIR` | Directory for the separate `audit.log` JSON stream (audit trail, distinct from `VA_LSE_LOG_DIR`) | `logs` (or `VA_LSE_LOG_DIR` when set) |
+| `VA_LSE_AUDIT_LOG_FILE` | Filename inside `VA_LSE_AUDIT_LOG_DIR` | `audit.log` |
+| `VA_LSE_AUDIT_LOG_MAX_BYTES` | Rotate size per audit log file (bytes) | `10485760` (10 MiB) |
+| `VA_LSE_AUDIT_LOG_BACKUPS` | Rotated audit files kept | `10` |
 
 Leave the `VA_GOV_API_BASE_URL` group or the `AGILOOP_INSPECT_*` group fully unset to run
 those integrations in mock mode. Partially configuring an integration (e.g. setting
@@ -442,6 +446,40 @@ VA_LSE_HEALTH_PORT=0 streamlit run run_app.py      # disable sidecar entirely
 | **Concurrency limiter** | Global semaphore (`VA_LSE_MAX_CONCURRENT_LLM_CALLS`, default `20`) caps simultaneous LLM calls across all threads/users. Extras queue; up to `VA_LSE_LLM_QUEUE_MAX_DEPTH=50` are queued and block up to `VA_LSE_LLM_QUEUE_TIMEOUT_SECONDS=30s`. Beyond either limit the call is rejected with `QueueFullError` (no retry). | `concurrent=20`, `queue=50`, `timeout=30s` | Raise `MAX_CONCURRENT` on higher-tier endpoints; raise `MAX_DEPTH` on bursty multi-user hosts |
 
 * Queue + breaker interact correctly: the breaker is checked **before** queuing (immediate fail-fast when open) and **again** after queuing (in case it opened while waiting). Queue-full or breaker rejections are **not** counted as endpoint failures. All breaker state changes (`CLOSED → OPEN`, `OPEN → HALF_OPEN`, `HALF_OPEN → CLOSED/OPEN`) log at `WARNING` with `phase=circuit_breaker`; queue-full/timeout log at `WARNING` with `phase=concurrency` — wire these to your alerting. `CircuitBreakerOpenError`/`QueueFullError` are re-exported from `app/llm.py` so callers can distinguish them from `LLMError`. Tests in `tests/test_circuit_breaker.py` cover the full state machine, the fail-fast <50 ms SLO, and the limiter queue off offline (no network).
+
+## Audit logging (Evaluate & Draft)
+
+Every Evaluate and Draft run emits **two** audit entries to a separate JSON
+stream (`{VA_LSE_AUDIT_LOG_DIR}/audit.log`, default `logs/audit.log`) so
+forensics and retention tooling can query it without scraping the diagnostic
+`app.log`. The stream is independent: it has its own rotating file logger
+(`audit.log`, 10 MiB, 10 backups by default) and a distinct `audit` logger
+name, so you can route or retain it differently.
+
+**Entry fields (no PII):** `timestamp`, `action` (`evaluate`|`draft`),
+`status` (`start`|`ok`|`error`), `request_id` (`req_…` for correlation with
+diagnostic logs), `user_session_id` (`sess_…`, stable per browser session),
+`condition` (claimed-condition label only, truncated), `record_sources` (source
+labels e.g. `Upload`/`Fetch Sandbox`/`VA.gov`/`Local folder / file`), `record_files`,
+`record_pages`, `duration_ms`, and a small `outcome` classification (`claims`/`contradictions`/`overall_rating`
+for Evaluate; `draft_chars`/`grounding_items` for Draft). Error entries add `error_class` +
+user-facing `error_message`. **Never logged:** statement / observations / record
+text, veteran/witness names, or file content.
+
+```bash
+# Tail the audit log (JSON lines, jq-friendly)
+cat logs/audit.log | python -m json.tool   # or: tail -f logs/audit.log
+# Filter by action
+cat logs/audit.log | python -c "import json,sys; [print(l) for l in sys.stdin if json.loads(l).get('action')=='evaluate']"
+# Env overrides (see .env.example)
+VA_LSE_AUDIT_LOG_DIR=/var/log/va-lse VA_LSE_AUDIT_LOG_FILE=audit.log \
+VA_LSE_AUDIT_LOG_MAX_BYTES=10485760 VA_LSE_AUDIT_LOG_BACKUPS=10 \
+streamlit run run_app.py
+```
+
+The audit logger is best-effort and never blocks a run; a failure to open the
+audit file falls back to stdout (the `audit` logger on `sys.stdout`) so
+deployments without a writable log directory still emit the stream.
 
 ## Telemetry (Agiloop Inspect)
 

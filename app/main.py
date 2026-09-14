@@ -35,6 +35,7 @@ from .logging_config import (
     new_request_id,
     set_request_id,
 )
+from . import audit as audit_log
 from . import telemetry
 from . import va_gov_client
 from . import watchdog
@@ -259,6 +260,46 @@ def _new_run_request_id() -> str:
     st.session_state[_REQUEST_ID_KEY] = rid
     set_request_id(rid)
     return rid
+
+
+def _audit_record_meta(slot: str, records: list[Any]) -> tuple[list[str], int, int]:
+    """Return (record_sources, file_count, page_count) for audit events."""
+    try:
+        store_any: Any = st.session_state.get(f"source_records_{slot}", {})
+        if isinstance(store_any, dict) and store_any:
+            sources = [str(k) for k in store_any.keys() if str(k).strip()]
+        else:
+            sources = []
+    except Exception:  # noqa: BLE001
+        sources = []
+    # Fallback label when store is empty but records exist (e.g. direct upload in tests).
+    if not sources and records:
+        sources = ["Upload"]
+    files = len(records)
+    try:
+        pages = sum(len(getattr(d, "pages", [])) for d in records)
+    except Exception:  # noqa: BLE001
+        pages = 0
+    return sources, files, pages
+
+
+def _audit_condition_for_slot(slot: str) -> str:
+    """Best-effort claimed-condition label for the audit (no PII)."""
+    try:
+        selected_any: Any = st.session_state.get(f"selected_conditions_{slot}", [])
+        if isinstance(selected_any, list) and selected_any:
+            names: list[str] = []
+            for item in selected_any:
+                if isinstance(item, (list, tuple)) and len(item) == 2:
+                    names.append(str(item[1]).strip())
+                elif isinstance(item, str):
+                    names.append(item.strip())
+            names = [n for n in names if n]
+            if names:
+                return ", ".join(names)[:120]
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
 
 
 def _get_llm() -> LLMClient | None:
@@ -927,6 +968,17 @@ def evaluate_tab() -> None:
         if llm is None:
             return
 
+        # Audit: start — metadata only, never statement/record text.
+        _audit_sources, _audit_files, _audit_pages = _audit_record_meta("eval", records)
+        _audit_condition = _audit_condition_for_slot("eval")
+        audit_log.audit_evaluate_start(
+            request_id=rid,
+            condition=_audit_condition or None,
+            record_sources=_audit_sources or None,
+            record_files=_audit_files,
+            record_pages=_audit_pages,
+        )
+
         logger.info(
             "evaluate run start statement_chars=%d pages=%d",
             len(statement_text.strip()), sum(len(d.pages) for d in records),
@@ -945,6 +997,15 @@ def evaluate_tab() -> None:
                 exc_info=exc,
                 extra={"request_id": rid, "phase": "evaluate", "status": "error", "duration_ms": duration_ms, "error_class": type(exc).__name__},
             )
+            audit_log.audit_evaluate_error(
+                request_id=rid,
+                duration_ms=duration_ms,
+                error=exc,
+                condition=_audit_condition or None,
+                record_sources=_audit_sources or None,
+                record_files=_audit_files,
+                record_pages=_audit_pages,
+            )
             st.error(f"Evaluation failed: {_format_error_for_user(exc, rid)}")
             return
         duration_ms = int((time.perf_counter() - t0) * 1000)
@@ -953,6 +1014,24 @@ def evaluate_tab() -> None:
             "evaluate run done duration_ms=%d calls=%d tokens_in=%d tokens_out=%d",
             duration_ms, total.calls, total.prompt_tokens, total.completion_tokens,
             extra={"request_id": rid, "phase": "evaluate", "status": "ok", "duration_ms": duration_ms, "calls": total.calls, "prompt_tokens": total.prompt_tokens, "completion_tokens": total.completion_tokens},
+        )
+        # Audit: ok — only classifications/counters, never statement text.
+        try:
+            _outcome: dict[str, Any] = {
+                "claims": len(getattr(result, "claims", []) or []),
+                "contradictions": int(getattr(result, "contradiction_count", 0) or 0),
+                "overall_rating": str(getattr(result, "overall_rating", "") or ""),
+            }
+        except Exception:  # noqa: BLE001
+            _outcome = {}
+        audit_log.audit_evaluate_ok(
+            request_id=rid,
+            duration_ms=duration_ms,
+            condition=_audit_condition or None,
+            record_sources=_audit_sources or None,
+            record_files=_audit_files,
+            record_pages=_audit_pages,
+            outcome=_outcome or None,
         )
         bar.empty()
         st.session_state.eval_result = result
@@ -1223,6 +1302,17 @@ def draft_tab() -> None:
         if llm is None:
             return
 
+        # Audit: start — metadata only, never observations/record text.
+        _audit_sources_d, _audit_files_d, _audit_pages_d = _audit_record_meta("draft", records)
+        _audit_condition_d = (condition.strip()[:120] if condition and condition.strip() else _audit_condition_for_slot("draft"))
+        audit_log.audit_draft_start(
+            request_id=rid,
+            condition=_audit_condition_d or None,
+            record_sources=_audit_sources_d or None,
+            record_files=_audit_files_d,
+            record_pages=_audit_pages_d,
+        )
+
         logger.info(
             "draft run start observations_chars=%d pages=%d condition=%s",
             len(observations.strip()), sum(len(d.pages) for d in records),
@@ -1253,6 +1343,15 @@ def draft_tab() -> None:
                 exc_info=exc,
                 extra={"request_id": rid, "phase": "draft", "status": "error", "duration_ms": duration_ms, "error_class": type(exc).__name__},
             )
+            audit_log.audit_draft_error(
+                request_id=rid,
+                duration_ms=duration_ms,
+                error=exc,
+                condition=_audit_condition_d or None,
+                record_sources=_audit_sources_d or None,
+                record_files=_audit_files_d,
+                record_pages=_audit_pages_d,
+            )
             st.error(f"Drafting failed: {_format_error_for_user(exc, rid)}")
             return
         duration_ms = int((time.perf_counter() - t0) * 1000)
@@ -1261,6 +1360,23 @@ def draft_tab() -> None:
             "draft run done duration_ms=%d calls=%d tokens_in=%d tokens_out=%d",
             duration_ms, total.calls, total.prompt_tokens, total.completion_tokens,
             extra={"request_id": rid, "phase": "draft", "status": "ok", "duration_ms": duration_ms, "calls": total.calls, "prompt_tokens": total.prompt_tokens, "completion_tokens": total.completion_tokens},
+        )
+        # Audit: ok — only small outcome classification, never draft text.
+        try:
+            _outcome_d: dict[str, Any] = {
+                "draft_chars": len(getattr(result, "output_statement", "") or getattr(result, "draft", "") or ""),
+                "grounding_items": len(getattr(result, "grounding", {}) or {}),
+            }
+        except Exception:  # noqa: BLE001
+            _outcome_d = {}
+        audit_log.audit_draft_ok(
+            request_id=rid,
+            duration_ms=duration_ms,
+            condition=_audit_condition_d or None,
+            record_sources=_audit_sources_d or None,
+            record_files=_audit_files_d,
+            record_pages=_audit_pages_d,
+            outcome=_outcome_d or None,
         )
         bar.empty()
         st.session_state.draft_result = result
@@ -1376,6 +1492,10 @@ evidence relevant to each claim rather than reading only the first pages.
 # --------------------------------------------------------------------- layout
 def main() -> None:
     configure_logging()
+    try:
+        audit_log.configure_audit_logging()
+    except Exception:  # noqa: BLE001 - audit is best-effort
+        pass
     _check_streamlit_config_hardening()
     # Ensure every browser session has a baseline correlation id (also used
     # for pre-run validation / upload errors so those logs are correlatable).
