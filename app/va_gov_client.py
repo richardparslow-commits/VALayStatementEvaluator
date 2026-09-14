@@ -35,6 +35,8 @@ logger = logging.getLogger("app.va_gov_client")
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 1.5
 REQUEST_TIMEOUT_SECONDS = 30.0
+DEFAULT_VA_GOV_MAX_RESPONSE_BYTES = 100 * 1024 * 1024
+VA_GOV_READ_CHUNK_BYTES = 64 * 1024
 
 
 class VaGovError(RuntimeError):
@@ -356,12 +358,63 @@ def _https_request(
     try:
         connection.request(method, full_path, body=body, headers=headers)
         response = connection.getresponse()
-        data = response.read()
+        data = _read_limited_response(response, _va_gov_max_response_bytes())
         return data, response.status
+    except VaGovError:
+        raise
     except OSError as exc:
         raise VaGovError(f"Could not reach VA.gov: {exc}", error_class="connection_error", partial=True) from exc
     finally:
         connection.close()
+
+
+def _va_gov_max_response_bytes() -> int:
+    raw = os.getenv("VA_GOV_MAX_RESPONSE_BYTES", "").strip()
+    if raw:
+        try:
+            value = int(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    return DEFAULT_VA_GOV_MAX_RESPONSE_BYTES
+
+
+def _read_limited_response(response: Any, max_bytes: int) -> bytes:
+    content_length = response.getheader("Content-Length")
+    if content_length is not None:
+        invalid_length_message = (
+            "VA.gov response has invalid Content-Length " f"({content_length})."
+        )
+        try:
+            declared_size = int(content_length)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            raise VaGovError(invalid_length_message, error_class="fetch_failed")
+        if declared_size < 0:
+            raise VaGovError(invalid_length_message, error_class="fetch_failed")
+        if declared_size > max_bytes:
+            raise VaGovError(
+                "VA.gov response too large "
+                f"(Content-Length {content_length} bytes, limit {max_bytes} bytes).",
+                error_class="fetch_failed",
+                partial=True,
+            )
+    total = 0
+    data = bytearray()
+    while True:
+        chunk = response.read(VA_GOV_READ_CHUNK_BYTES)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise VaGovError(
+                "VA.gov response exceeded maximum size "
+                f"({total} bytes, limit {max_bytes} bytes).",
+                error_class="fetch_failed",
+                partial=True,
+            )
+        data.extend(chunk)
+    return bytes(data)
 
 
 def _normalize_records_payload(payload: Any) -> VaGovFetchResult:
