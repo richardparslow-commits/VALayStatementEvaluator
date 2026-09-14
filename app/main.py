@@ -8,6 +8,8 @@ from __future__ import annotations
 import streamlit as st
 
 from . import config
+from .agiloop_telemetry import init_telemetry, track_app_error
+from .condition_selector import render_condition_selector
 from .config import DEFAULT_BASE_URL, load_settings
 from .documents import (
     ExtractionError,
@@ -21,6 +23,9 @@ from .evaluate import DIMENSION_LABELS, run_evaluation
 from .fetch_client import FetchClient, FetchSandboxError
 from .llm import LLMClient, LLMError
 from . import watchdog
+
+# Feature: Condition-Specific Templates
+FEATURE_ID = "02f0935a-ee5e-4083-88a2-10e11753ccc9"  # condition-specific-templates
 
 st.set_page_config(
     page_title="VA Lay Statement Evaluator",
@@ -509,6 +514,8 @@ def evaluate_tab() -> None:
                 "skipped, but expect a longer run for a meticulous review."
             )
 
+    render_condition_selector("eval", FEATURE_ID)
+
     run = st.button("🔍 Run exhaustive evaluation", type="primary", key="eval_run")
     if run:
         if not statement_text.strip():
@@ -694,6 +701,8 @@ def draft_tab() -> None:
                 "skipped, but expect a longer run for a meticulous review."
             )
 
+    render_condition_selector("draft", FEATURE_ID)
+
     st.subheader("Step 2 — Claim details")
     col1, col2 = st.columns(2)
     veteran_name = col1.text_input("Veteran's name", key="draft_vet_name")
@@ -864,6 +873,7 @@ evidence relevant to each claim rather than reading only the first pages.
 
 # --------------------------------------------------------------------- layout
 def main() -> None:
+    init_telemetry()
     _sidebar_settings()
     st.title("🎖️ VA Lay Statement Evaluator")
     st.caption(
@@ -875,12 +885,16 @@ def main() -> None:
     tab_eval, tab_draft, tab_about = st.tabs(
         ["🔍 Evaluate a statement", "✍️ Draft a statement", "📖 About / Guide"]
     )
-    with tab_eval:
-        evaluate_tab()
-    with tab_draft:
-        draft_tab()
-    with tab_about:
-        about_tab()
+    try:
+        with tab_eval:
+            evaluate_tab()
+        with tab_draft:
+            draft_tab()
+        with tab_about:
+            about_tab()
+    except Exception as exc:  # noqa: BLE001 - root error boundary
+        track_app_error(exc)
+        raise
 
 
 if __name__ == "__main__":

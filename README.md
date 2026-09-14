@@ -45,6 +45,11 @@ app/
   evaluate.py             Claim extraction -> verification -> rubric scoring -> topic coverage
                           audit -> improvement suggestions & proposed rewrite -> report
   draft.py                Grounding + topic coverage -> draft -> self-review pipeline
+  condition_selector.py   Claimed-condition selector: body-system radio buttons + searchable
+                          condition dropdown -> auto pre-selects relevant topics from the
+                          12-topic checklist; A&A/SMC-L toggle forces topics B, C, E, J
+  condition_topics.json   Body-system -> condition -> topic-checklist mapping (34 conditions)
+  agiloop_telemetry.py    Agiloop Inspect telemetry client (impression/interaction/error/goal)
   knowledge/              legal_framework.md, evaluation_rubric.md, drafting_guide.md,
                           topic_checklist.md
 scripts/
@@ -86,9 +91,21 @@ cp .env.example .env     # then put your API key in .env (never commit .env)
 | `VA_LSE_CREDITS_PER_1M_MAIN` | Approx credits per 1M tokens for the main model (enables the credit-burn gauge) | (unset — gauge shows tokens/calls only) |
 | `VA_LSE_CREDITS_PER_1M_FAST` | Approx credits per 1M tokens for the fast model (enables the credit-burn gauge) | (unset — gauge shows tokens/calls only) |
 | `VA_LSE_CREDIT_QUOTA` | Your plan's weekly credit quota, used to render %-of-quota burn | `2500` |
+| `AGILOOP_INSPECT_API_KEY` | Agiloop Inspect telemetry API key (server-side only). Leave unset to run telemetry in mock/no-op mode. | empty |
+| `AGILOOP_INSPECT_URL` | Agiloop Inspect base URL | `https://inspect.api.agiloop.app` |
+| `AGILOOP_PROJECT_ID` | Agiloop project id that routes telemetry events. Leave unset to run telemetry in mock/no-op mode. | empty |
 
 All settings can also be overridden live in the app sidebar. Model availability depends on your
 gateway workspace; check `GET {base_url}/models`.
+
+### Telemetry (Agiloop Inspect)
+
+The app ships with usage telemetry (impressions, interactions, errors, goals) for the
+claimed-condition selector, sent via `app/agiloop_telemetry.py`. Because Streamlit runs
+entirely server-side, this module sending events directly to Inspect *is* the same-origin
+proxy pattern — the rendered page never holds or transmits the API key. Telemetry is fully
+optional: leave `AGILOOP_INSPECT_API_KEY` and `AGILOOP_PROJECT_ID` unset to run in mock mode
+(events are logged at debug level and dropped; the app works identically either way).
 
 ### Estimating API usage & credit burn
 
@@ -123,6 +140,18 @@ sandbox exposes for record retrieval.
 streamlit run run_app.py
 ```
 
+### Production build & start
+
+Matches `.agiloop/deploy.json` (single `streamlit-web` service):
+
+```bash
+# Build
+pip install -r requirements.txt
+
+# Start (binds to the platform-provided $PORT)
+streamlit run run_app.py --server.port $PORT --server.address 0.0.0.0
+```
+
 ### Evaluate a statement
 
 1. Upload or paste the lay statement.
@@ -131,7 +160,12 @@ streamlit run run_app.py
    - **Fetch Sandbox** (enter a patient or record ID and import from your sandbox endpoint), or
    - **Local folder / file** (local runs only — read records straight from a path on this
      machine, e.g. `~/Desktop/ClaimRecords`; hidden when the app is served remotely).
-3. Click **Run exhaustive evaluation** — watch chunked record review, claim verification,
+3. Pick the **claimed condition**: choose a body system (radio buttons), then search and
+   select one or more conditions from the filtered dropdown. The app automatically
+   pre-selects the relevant 12-topic-checklist topics (union across all selected
+   conditions); toggle **Aid & Attendance / SMC-L** to force topics B, C, E, and J as
+   mandatory. Adjust the pre-selection freely, then click **Proceed**.
+4. Click **Run exhaustive evaluation** — watch chunked record review, claim verification,
    rubric scoring, improvement drafting, and report generation progress.
 4. Review the verdict table (✅ supported / 🟡 partial / ❌ contradicted / ⚪ not found),
    scores, and the prioritized improvement plan.
@@ -143,8 +177,11 @@ streamlit run run_app.py
 
 1. Choose the veteran's medical-record source: upload files, import from Fetch Sandbox, or
    read from a local folder/file path (local runs only).
-2. Enter witness details and bulleted firsthand observations.
-3. Click **Draft the statement** — the app grounds every observation in the records, flags
+2. Pick the **claimed condition** (body system + searchable dropdown) the same way as in
+   Evaluate mode; adjust the pre-selected topics or toggle **Aid & Attendance / SMC-L**, then
+   click **Proceed**.
+3. Enter witness details and bulleted firsthand observations.
+4. Click **Draft the statement** — the app grounds every observation in the records, flags
    conflicts, suggests strengthening questions, drafts the statement, and self-reviews it.
 4. Resolve every bracketed `[Confirm: ...]` placeholder with the witness before signing.
    Submit on VA Form 21-10210 (one form per witness).

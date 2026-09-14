@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from .agiloop_telemetry import track_feature_error
 from .config import load_knowledge
 from .documents import ExtractedDocument
 from .llm import LLMClient, LLMError
@@ -13,6 +14,9 @@ from .medical_review import (
     find_relevant_excerpts,
     review_medical_records,
 )
+
+# Feature: Condition-Specific Templates
+FEATURE_ID = "02f0935a-ee5e-4083-88a2-10e11753ccc9"  # condition-specific-templates
 
 CLAIMS_SYSTEM = """You are a VA claims evidence analyst. Decompose a lay/witness statement \
 into atomic factual assertions so each can be checked against medical records. Distinguish \
@@ -334,6 +338,19 @@ def run_evaluation(
     progress: ProgressCallback | None = None,
 ) -> EvaluationResult:
     """Execute the full evaluation pipeline."""
+    try:
+        return _run_evaluation(llm, statement_text, records, progress)
+    except Exception as exc:  # noqa: BLE001 - feature-error boundary
+        track_feature_error(FEATURE_ID, exc)
+        raise
+
+
+def _run_evaluation(
+    llm: LLMClient,
+    statement_text: str,
+    records: list[ExtractedDocument],
+    progress: ProgressCallback | None,
+) -> EvaluationResult:
     result = EvaluationResult()
 
     def report(frac: float, msg: str) -> None:

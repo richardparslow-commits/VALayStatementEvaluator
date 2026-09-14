@@ -23,3 +23,10 @@ usage_history.json
 # macOS “Save As… “ duplicates (foo.py -> “foo 2.py”) and similar stray copies
 * 2.*
 * 3.*
+
+# Agiloop build harness — generated per-build, not part of the app source
+CLAUDE.md
+.claude.md
+.claude/
+.claudeignore
+.implement/

@@ -1,0 +1,63 @@
+{
+  "_comment": "Maps body systems to claimed conditions, each with the union of topic-checklist letters (A-L, see app/knowledge/topic_checklist.md) that are typically relevant. Conditions mapped to null fall back to the DEFAULT_FALLBACK_TOPICS in app/condition_selector.py. This file introduces no external dependency and is loaded once at startup with json.load.",
+  "body_systems": {
+    "Musculoskeletal": {
+      "conditions": {
+        "Lumbar strain / degenerative disc disease": ["F", "G", "H", "K"],
+        "Cervical strain / degenerative disc disease": ["F", "G", "H", "K"],
+        "Knee condition (patellofemoral syndrome / meniscus tear)": ["F", "G", "H"],
+        "Shoulder impingement / rotator cuff condition": ["F", "G", "H"],
+        "Plantar fasciitis / foot condition": ["F", "G", "H"],
+        "Fibromyalgia": ["F", "G", "H", "I", "K"],
+        "Rheumatoid arthritis": ["A", "F", "G", "H", "I", "K"],
+        "Hip osteoarthritis": ["F", "G", "H", "K"],
+        "Carpal tunnel syndrome": ["F", "H", "K"],
+        "Other / not listed": null
+      }
+    },
+    "Mental Health": {
+      "conditions": {
+        "PTSD (post-traumatic stress disorder)": ["A", "G", "H", "I"],
+        "Major depressive disorder": ["A", "C", "G", "H", "I"],
+        "Generalized anxiety disorder": ["F", "G", "H", "I"],
+        "Bipolar disorder": ["A", "C", "D", "G", "H", "I"],
+        "Panic disorder": ["F", "G", "H", "I"],
+        "Substance use disorder (secondary to service-connected condition)": ["A", "D", "G", "H", "I"],
+        "Other / not listed": null
+      }
+    },
+    "Neurological": {
+      "conditions": {
+        "Traumatic brain injury (TBI)": ["A", "B", "C", "D", "E", "G", "H", "K"],
+        "Migraine / chronic headache disorder": ["F", "G", "H"],
+        "Peripheral neuropathy": ["A", "F", "G", "H", "K"],
+        "Seizure disorder": ["A", "E", "F", "G", "H"],
+        "Parkinsonism / tremor disorder": ["A", "B", "C", "E", "G", "H", "K"],
+        "Other / not listed": null
+      }
+    },
+    "Cardiovascular / Respiratory": {
+      "conditions": {
+        "Ischemic heart disease": ["F", "G", "H", "K"],
+        "COPD / asthma": ["F", "G", "H", "K"],
+        "Sleep apnea": ["G", "H", "J", "K"],
+        "Other / not listed": null
+      }
+    },
+    "Sensory (Hearing & Vision)": {
+      "conditions": {
+        "Tinnitus": ["G", "H"],
+        "Hearing loss": ["F", "G", "H", "I"],
+        "Vision loss / impairment": ["A", "F", "G", "H"],
+        "Other / not listed": null
+      }
+    },
+    "Aid & Attendance / SMC": {
+      "conditions": {
+        "Need for regular aid and attendance (general)": ["A", "B", "C", "D", "E", "G", "H"],
+        "Housebound status": ["A", "B", "C", "E", "F", "G", "H"],
+        "Other / not listed": null
+      }
+    }
+  }
+}
