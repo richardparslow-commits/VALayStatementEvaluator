@@ -14,6 +14,13 @@ from .config import Settings
 from .logging_config import get_request_id
 from .usage import UsageTracker
 
+try:
+    import httpx as _httpx  # noqa: F401  # optional; only for TimeoutException isinstance check
+
+    _HttpxTimeoutError: tuple[type[BaseException], ...] = (_httpx.TimeoutException,)
+except ImportError:  # pragma: no cover - httpx not always installed in tests
+    _HttpxTimeoutError = ()
+
 logger = logging.getLogger("app.llm")
 
 # Re-export for callers that want to catch these specifically.
@@ -92,8 +99,16 @@ class LLMClient:
                 "No API key configured. Add your key in the sidebar or in a .env file."
             )
         self._settings = settings
+        # Per-call timeout so a hung LLM call cannot block graceful shutdown
+        # forever. Tuned via VA_LSE_LLM_CALL_TIMEOUT_SECONDS (default 300 s / 5 min).
+        try:
+            from . import config as _cfg  # local import to avoid cycle
+
+            _timeout_s = float(getattr(_cfg, "LLM_CALL_TIMEOUT_SECONDS", 300))
+        except Exception:  # noqa: BLE001
+            _timeout_s = 300.0
         self._client = OpenAI(
-            api_key=settings.api_key, base_url=settings.base_url, timeout=300.0
+            api_key=settings.api_key, base_url=settings.base_url, timeout=max(1.0, _timeout_s)
         )
         self.usage = UsageTracker()
 
@@ -194,6 +209,31 @@ class LLMClient:
                     # Never count limiter/breaker rejections as endpoint failures.
                     raise
                 except Exception as exc:  # noqa: BLE001 - retry on any provider error
+                    # Detect per-call timeout (httpx/APITimeoutError or stdlib TimeoutError)
+                    # and surface a clear, user-visible message. Timeout is not
+                    # special-cased for breaker counting — it is a logical call
+                    # failure like any other provider error, but the message names
+                    # the configured timeout so the user can tune it.
+                    is_timeout = isinstance(exc, _HttpxTimeoutError) or isinstance(
+                        exc, TimeoutError
+                    )
+                    # OpenAI SDK wraps httpx timeouts in APITimeoutError which
+                    # ends with "TimeoutError" in its class name even when httpx
+                    # is not importable directly.
+                    if not is_timeout and type(exc).__name__.endswith("TimeoutError"):
+                        is_timeout = True
+                    if is_timeout:
+                        try:
+                            from . import config as _cfg2
+
+                            _ts = int(getattr(_cfg2, "LLM_CALL_TIMEOUT_SECONDS", 300))
+                        except Exception:  # noqa: BLE001
+                            _ts = 300
+                        # Rewrite to a concise, actionable message for the UI.
+                        exc = LLMError(
+                            f"LLM call timed out after {_ts}s — the endpoint did not respond in time. "
+                            f"Try again or raise VA_LSE_LLM_CALL_TIMEOUT_SECONDS. ({type(exc).__name__}: {exc})"
+                        )
                     last_error = exc
                     duration_ms = int((time.perf_counter() - attempt_t0) * 1000)
                     is_last = attempt >= MAX_RETRIES - 1

@@ -43,6 +43,7 @@ app/
   telemetry.py            Agiloop Inspect telemetry helper (feature-id-neutral)
   llm.py                  OpenAI-compatible client (retry, JSON parsing, circuit breaker & concurrency limiter)
   circuit_breaker.py      Stdlib circuit breaker (fail-fast after N failures) + in-memory concurrency limiter & bounded queue
+  shutdown.py             Graceful SIGTERM/SIGINT shutdown: inflight drain, /ready 503, per-call timeout
   documents.py            TXT/MD/DOCX/PDF extraction, page-aware chunking
   medical_review.py       Exhaustive chunked record review -> fact digest
   evaluate.py             Claim extraction -> verification -> rubric scoring -> topic coverage
@@ -165,6 +166,8 @@ installs on macOS and Linux CI.
 | `VA_LSE_AUDIT_LOG_FILE` | Filename inside `VA_LSE_AUDIT_LOG_DIR` | `audit.log` |
 | `VA_LSE_AUDIT_LOG_MAX_BYTES` | Rotate size per audit log file (bytes) | `10485760` (10 MiB) |
 | `VA_LSE_AUDIT_LOG_BACKUPS` | Rotated audit files kept | `10` |
+| `VA_LSE_SHUTDOWN_GRACE_SECONDS` | Max seconds to wait for inflight runs on SIGTERM before orchestrator SIGKILL | `30` |
+| `VA_LSE_LLM_CALL_TIMEOUT_SECONDS` | Per-LLM-call timeout (prevents hung calls from blocking graceful shutdown) | `300` (5 min) |
 
 Leave the `VA_GOV_API_BASE_URL` group or the `AGILOOP_INSPECT_*` group fully unset to run
 those integrations in mock mode. Partially configuring an integration (e.g. setting
@@ -495,6 +498,40 @@ changes; telemetry is always best-effort and never blocks the UI.
 - `app/telemetry.py` is feature-id-neutral shared infrastructure: it never hardcodes a feature
 id. Each feature's call sites (e.g. `app/va_gov_client.py`, `app/main.py`) supply their own
 `featureId` explicitly.
+
+## Graceful shutdown (SIGTERM/SIGINT)
+
+Kubernetes (and similar orchestrators) send SIGTERM to a pod before SIGKILL.
+Without a handler the process dies mid-request, aborting in-flight LLM calls
+and losing the user's work.  This app handles SIGTERM and SIGINT to drain
+in-flight runs cleanly:
+
+1. **Signal handlers** are installed in `run_app.py` on the main thread before
+   Streamlit starts (`app/shutdown.py`).  On SIGTERM/SIGINT a daemon thread
+   sets a process-wide flag and waits up to `VA_LSE_SHUTDOWN_GRACE_SECONDS`
+   (default 30 s) for inflight Evaluate/Draft runs to finish.
+2. **`/ready` flips to 503** immediately so the orchestrator stops routing
+   new traffic to this instance (`app/health.py` checks `is_shutting_down()`
+   before the LLM probe).  Liveness (`/health`) stays 200 — the process is
+   still alive and draining.
+3. **New runs are rejected** with a user-visible warning in both the Evaluate
+   and Draft tabs once shutdown begins (`app/main.py` checks `enter_run()`).
+4. **Per-LLM-call timeout** (`VA_LSE_LLM_CALL_TIMEOUT_SECONDS`, default 300 s
+   / 5 min) prevents a single hung call from blocking the drain forever.  A
+   timeout surfaces as `LLMError` with a clear, actionable message.
+5. If the grace window expires with runs still in flight, a WARNING is logged
+   and the orchestrator's SIGKILL forces exit.
+
+```bash
+# Tune the drain window (default 30 s — increase for very large record sets)
+VA_LSE_SHUTDOWN_GRACE_SECONDS=60 streamlit run run_app.py
+# Tune the per-call timeout (default 300 s / 5 min)
+VA_LSE_LLM_CALL_TIMEOUT_SECONDS=300 streamlit run run_app.py
+```
+
+Test locally with `kill -TERM <pid>` or Ctrl+C; inspect `logs/app.log` for
+`phase=shutdown` WARNING lines showing `draining` → `drained` or `force_exit`.
+See `ARCHITECTURE.md → Cross-cutting → Graceful shutdown` for the full design.
 
 ## Structured logging (diagnostics & performance traces)
 

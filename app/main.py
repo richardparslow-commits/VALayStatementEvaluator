@@ -39,6 +39,7 @@ from . import audit as audit_log
 from . import telemetry
 from . import va_gov_client
 from . import watchdog
+from .shutdown import enter_run, exit_run, is_shutting_down
 from .prompt_sanitize import validate_api_key, validate_model_name
 
 logger = get_logger("app.main")
@@ -967,6 +968,19 @@ def evaluate_tab() -> None:
         llm = _get_llm()
         if llm is None:
             return
+        # Graceful shutdown gate — reject new work when draining (SIGTERM/SIGINT).
+        if is_shutting_down():
+            st.error(
+                "The app is shutting down to finish a deployment or restart. "
+                "No new evaluation runs can start right now — please try again in a moment."
+            )
+            return
+        if not enter_run():
+            st.error(
+                "The app is shutting down — no new evaluation runs can start right now. "
+                "Please try again in a moment."
+            )
+            return
 
         # Audit: start — metadata only, never statement/record text.
         _audit_sources, _audit_files, _audit_pages = _audit_record_meta("eval", records)
@@ -1008,6 +1022,8 @@ def evaluate_tab() -> None:
             )
             st.error(f"Evaluation failed: {_format_error_for_user(exc, rid)}")
             return
+        finally:
+            exit_run()
         duration_ms = int((time.perf_counter() - t0) * 1000)
         total = llm.usage.totals()
         logger.info(
@@ -1301,6 +1317,19 @@ def draft_tab() -> None:
         llm = _get_llm()
         if llm is None:
             return
+        # Graceful shutdown gate — reject new work when draining (SIGTERM/SIGINT).
+        if is_shutting_down():
+            st.error(
+                "The app is shutting down to finish a deployment or restart. "
+                "No new draft runs can start right now — please try again in a moment."
+            )
+            return
+        if not enter_run():
+            st.error(
+                "The app is shutting down — no new draft runs can start right now. "
+                "Please try again in a moment."
+            )
+            return
 
         # Audit: start — metadata only, never observations/record text.
         _audit_sources_d, _audit_files_d, _audit_pages_d = _audit_record_meta("draft", records)
@@ -1354,6 +1383,8 @@ def draft_tab() -> None:
             )
             st.error(f"Drafting failed: {_format_error_for_user(exc, rid)}")
             return
+        finally:
+            exit_run()
         duration_ms = int((time.perf_counter() - t0) * 1000)
         total = llm.usage.totals()
         logger.info(

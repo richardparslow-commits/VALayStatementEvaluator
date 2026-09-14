@@ -206,3 +206,15 @@ AUDIT_LOG_DIR = os.getenv("VA_LSE_AUDIT_LOG_DIR", "").strip() or os.getenv("VA_L
 AUDIT_LOG_FILE = os.getenv("VA_LSE_AUDIT_LOG_FILE", "audit.log").strip() or "audit.log"
 AUDIT_LOG_MAX_BYTES = _positive_int_env("VA_LSE_AUDIT_LOG_MAX_BYTES", 10 * 1024 * 1024)
 AUDIT_LOG_BACKUPS = _positive_int_env("VA_LSE_AUDIT_LOG_BACKUPS", 10)
+
+# ---------------------------------------------------------------------------
+# Graceful shutdown + per-LLM-call timeout (see app/shutdown.py + app/llm.py).
+# On SIGTERM the app stops accepting new Evaluate/Draft runs, keeps
+# /health 200 but flips /ready to 503 so the orchestrator drains traffic,
+# and waits up to SHUTDOWN_GRACE_SECONDS for inflight runs to finish before
+# the orchestrator's SIGKILL arrives. Each LLM call is bounded by
+# LLM_CALL_TIMEOUT_SECONDS (5 min default) so a single hung call cannot block
+# the drain forever; a timeout surfaces as a user-visible LLMError.
+# ---------------------------------------------------------------------------
+SHUTDOWN_GRACE_SECONDS = _positive_int_env("VA_LSE_SHUTDOWN_GRACE_SECONDS", 30)
+LLM_CALL_TIMEOUT_SECONDS = _positive_int_env("VA_LSE_LLM_CALL_TIMEOUT_SECONDS", 300)

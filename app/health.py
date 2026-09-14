@@ -180,6 +180,27 @@ class _HealthHandler(BaseHTTPRequestHandler):
                 logger.debug("health probe path=%s status=200", path)
                 return
             if path == READY_PATH:
+                # During graceful shutdown the instance must fall out of the
+                # load-balancer pool so no new work is routed to it.  Liveness
+                # (/health) stays 200 — the process is still alive and draining.
+                draining = False
+                try:
+                    from .shutdown import is_shutting_down, inflight_count
+
+                    draining = is_shutting_down()
+                except Exception:  # noqa: BLE001
+                    pass
+                if draining:
+                    detail = f"draining — {inflight_count()} inflight run(s) finishing before SIGKILL"
+                    payload = _ready_payload(False, detail)
+                    body = json.dumps(payload).encode("utf-8")
+                    self._send_json(503, body, get_body=get_body)
+                    logger.warning(
+                        "readiness probe draining inflight=%s status=503",
+                        inflight_count(),
+                        extra={"phase": "health", "status": "draining", "duration_ms": int((time.monotonic() - started) * 1000)},
+                    )
+                    return
                 # Serve cached readiness but refresh on background if stale?
                 # For correctness we refresh synchronously — still <2s because
                 # the probe itself is bounded to 1.4s.
