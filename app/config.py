@@ -32,6 +32,7 @@ DEFAULT_MODEL_MAIN = "qwen3.7-max"
 DEFAULT_MODEL_FAST = "qwen3.7-flash"
 DEFAULT_FETCH_SANDBOX_BASE_URL = "https://fetchsandbox.com"
 DEFAULT_FETCH_SANDBOX_RECORDS_PATH = "/medical_records/{patient_id}"
+DEFAULT_FETCH_SANDBOX_MAX_RESPONSE_BYTES = 100 * 1024 * 1024
 
 
 @dataclass
@@ -45,6 +46,7 @@ class Settings:
     fetch_api_key: str
     fetch_base_url: str
     fetch_records_path: str
+    fetch_max_response_bytes: int = DEFAULT_FETCH_SANDBOX_MAX_RESPONSE_BYTES
 
     @property
     def configured(self) -> bool:
@@ -74,6 +76,10 @@ def load_settings() -> Settings:
             "FETCH_SANDBOX_RECORDS_PATH", DEFAULT_FETCH_SANDBOX_RECORDS_PATH
         ).strip()
         or DEFAULT_FETCH_SANDBOX_RECORDS_PATH,
+        fetch_max_response_bytes=_positive_int_env(
+            "FETCH_SANDBOX_MAX_RESPONSE_BYTES",
+            DEFAULT_FETCH_SANDBOX_MAX_RESPONSE_BYTES,
+        ),
     )
 
 
@@ -107,6 +113,11 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def _positive_int_env(name: str, default: int) -> int:
+    value = _int_env(name, default)
+    return value if value > 0 else default
+
+
 # Hard cap on total pages across all uploaded record files.
 MAX_RECORD_PAGES = _int_env("VA_LSE_MAX_RECORD_PAGES", 5000)
 
@@ -122,6 +133,20 @@ MAX_DIGEST_FACTS = _int_env("VA_LSE_MAX_DIGEST_FACTS", 1500)
 # Characters per record chunk. Smaller chunks => more LLM calls but better
 # recall on dense pages (nothing gets truncated mid-extraction).
 DIGEST_CHUNK_CHARS = _int_env("VA_LSE_DIGEST_CHUNK_CHARS", 8000)
+
+# DOCX unzip hardening: reject oversized internal members before decompression.
+DOCX_MAX_INTERNAL_FILE_BYTES = _positive_int_env(
+    "VA_LSE_DOCX_MAX_INTERNAL_FILE_BYTES",
+    50 * 1024 * 1024,
+)
+DOCX_MAX_TOTAL_UNCOMPRESSED_BYTES = _positive_int_env(
+    "VA_LSE_DOCX_MAX_TOTAL_UNCOMPRESSED_BYTES",
+    200 * 1024 * 1024,
+)
+DOCX_MAX_INTERNAL_FILE_COUNT = _positive_int_env(
+    "VA_LSE_DOCX_MAX_INTERNAL_FILE_COUNT",
+    10_000,
+)
 
 # ---------------------------------------------------------------------------
 # Optional credit-burn gauge for the usage estimator. QwenCloud Token Plan does

@@ -24,7 +24,7 @@ usage_history.json
 * 2.*
 * 3.*
 
-# Agiloop build harness — generated per-build, not part of the app source
+# Agiloop build harness — generated/managed per build, not part of the app
 CLAUDE.md
 .claude.md
 .claude/

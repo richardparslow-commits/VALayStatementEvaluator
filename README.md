@@ -39,6 +39,8 @@ app/
   main.py                 UI: Evaluate / Draft / About tabs
   config.py               Settings (.env), knowledge-file loader
   fetch_client.py         Fetch Sandbox GET client -> normalized record documents
+  va_gov_client.py        VA.gov auth/fetch/merge client (real HTTPS or in-memory mock)
+  telemetry.py            Agiloop Inspect telemetry helper (feature-id-neutral)
   llm.py                  OpenAI-compatible client (retry, JSON parsing)
   documents.py            TXT/MD/DOCX/PDF extraction, page-aware chunking
   medical_review.py       Exhaustive chunked record review -> fact digest
@@ -84,16 +86,28 @@ cp .env.example .env     # then put your API key in .env (never commit .env)
 | `VA_LSE_RECORDS_CONCURRENCY` | Parallel chunk-digest workers | `2` (Lite plan fits 1–2 concurrent agents) |
 | `VA_LSE_MAX_DIGEST_FACTS` | Max facts kept in the consolidated digest | `1500` |
 | `VA_LSE_DIGEST_CHUNK_CHARS` | Characters per record chunk | `8000` |
+| `VA_LSE_DOCX_MAX_INTERNAL_FILE_BYTES` | Max uncompressed bytes allowed for a single DOCX internal file | `52428800` |
+| `VA_LSE_DOCX_MAX_TOTAL_UNCOMPRESSED_BYTES` | Max total uncompressed bytes allowed across all DOCX internal files | `209715200` |
+| `VA_LSE_DOCX_MAX_INTERNAL_FILE_COUNT` | Max number of internal files allowed in a DOCX archive | `10000` |
 | `FETCH_SANDBOX_API_KEY` | Optional Fetch Sandbox API key | empty |
 | `FETCH_SANDBOX_BASE_URL` | Fetch Sandbox base URL (`fetchsandbox.com` or subdomain) | `https://fetchsandbox.com` |
 | `FETCH_SANDBOX_RECORDS_PATH` | GET path for the records endpoint | `/medical_records/{patient_id}` |
+| `FETCH_SANDBOX_MAX_RESPONSE_BYTES` | Max bytes accepted from a Fetch Sandbox HTTP response | `104857600` |
 | `VA_LSE_ALLOW_LOCAL_PATHS` | Force-enable the local folder/file record source (`1`) even when the local-run check can't detect localhost | (auto) |
 | `VA_LSE_CREDITS_PER_1M_MAIN` | Approx credits per 1M tokens for the main model (enables the credit-burn gauge) | (unset — gauge shows tokens/calls only) |
 | `VA_LSE_CREDITS_PER_1M_FAST` | Approx credits per 1M tokens for the fast model (enables the credit-burn gauge) | (unset — gauge shows tokens/calls only) |
 | `VA_LSE_CREDIT_QUOTA` | Your plan's weekly credit quota, used to render %-of-quota burn | `2500` |
-| `AGILOOP_INSPECT_API_KEY` | Agiloop Inspect telemetry API key (server-side only). Leave unset to run telemetry in mock/no-op mode. | empty |
-| `AGILOOP_INSPECT_URL` | Agiloop Inspect base URL | `https://inspect.api.agiloop.app` |
-| `AGILOOP_PROJECT_ID` | Agiloop project id that routes telemetry events. Leave unset to run telemetry in mock/no-op mode. | empty |
+| `VA_GOV_API_BASE_URL` | HTTPS base URL for the VA.gov record-retrieval API. Leave unset to run VA.gov auth/fetch in mock mode. | empty (mock mode) |
+| `FRONTEND_URL` | App origin for CORS allowlisting. Unused today (single-origin Streamlit app); documented for deploy-harness forward compatibility. | empty |
+| `AGILOOP_INSPECT_API_KEY` | Server-side Agiloop Inspect telemetry API key. Leave unset (with `AGILOOP_PROJECT_ID`) to run telemetry in mock/no-op mode. | empty (mock mode) |
+| `AGILOOP_INSPECT_URL` | Agiloop Inspect telemetry endpoint base URL | `https://inspect.api.agiloop.app` |
+| `AGILOOP_PROJECT_ID` | Agiloop project id for telemetry event routing | empty (mock mode) |
+
+Leave the `VA_GOV_API_BASE_URL` group or the `AGILOOP_INSPECT_*` group fully unset to run
+those integrations in mock mode. Partially configuring an integration (e.g. setting
+`AGILOOP_INSPECT_API_KEY` without `AGILOOP_PROJECT_ID`) does not fail startup for this app —
+telemetry simply logs that combination as mock and drops events, since telemetry must never
+block the app.
 
 All settings can also be overridden live in the app sidebar. Model availability depends on your
 gateway workspace; check `GET {base_url}/models`.
@@ -134,6 +148,10 @@ Fetch Sandbox settings can also be overridden in the sidebar. Because Fetch Sand
 your own OpenAPI spec, you must point `FETCH_SANDBOX_RECORDS_PATH` at the GET endpoint your
 sandbox exposes for record retrieval.
 
+Fetch Sandbox HTTP responses are read in chunks and capped by
+`FETCH_SANDBOX_MAX_RESPONSE_BYTES` (default 100 MB). If a response exceeds this
+limit, the import fails with `FetchSandboxError`.
+
 ## Run
 
 ```bash
@@ -157,9 +175,13 @@ streamlit run run_app.py --server.port $PORT --server.address 0.0.0.0
 1. Upload or paste the lay statement.
 2. Choose a medical-record source:
    - **Upload files** (PDF/TXT/MD/DOCX, multiple files OK),
-   - **Fetch Sandbox** (enter a patient or record ID and import from your sandbox endpoint), or
+   - **Fetch Sandbox** (enter a patient or record ID and import from your sandbox endpoint),
+   - **VA.gov** (secure per-session login + explicit consent, then automatic fetch of all
+     available records — see **VA.gov record source** below), or
    - **Local folder / file** (local runs only — read records straight from a path on this
      machine, e.g. `~/Desktop/ClaimRecords`; hidden when the app is served remotely).
+   - Security hardening: DOCX uploads with oversized uncompressed internal ZIP contents are
+     rejected to prevent decompression-bomb memory exhaustion.
 3. Pick the **claimed condition**: choose a body system (radio buttons), then search and
    select one or more conditions from the filtered dropdown. The app automatically
    pre-selects the relevant 12-topic-checklist topics (union across all selected
@@ -167,9 +189,9 @@ streamlit run run_app.py --server.port $PORT --server.address 0.0.0.0
    mandatory. Adjust the pre-selection freely, then click **Proceed**.
 4. Click **Run exhaustive evaluation** — watch chunked record review, claim verification,
    rubric scoring, improvement drafting, and report generation progress.
-4. Review the verdict table (✅ supported / 🟡 partial / ❌ contradicted / ⚪ not found),
+5. Review the verdict table (✅ supported / 🟡 partial / ❌ contradicted / ⚪ not found),
    scores, and the prioritized improvement plan.
-5. Review the **proposed rewrite**: a change-by-change table (original → suggested → why),
+6. Review the **proposed rewrite**: a change-by-change table (original → suggested → why),
    the revised statement with `[Confirm: ...]` placeholders, and downloads for both the
    report and the revised statement.
 
@@ -183,7 +205,7 @@ streamlit run run_app.py --server.port $PORT --server.address 0.0.0.0
 3. Enter witness details and bulleted firsthand observations.
 4. Click **Draft the statement** — the app grounds every observation in the records, flags
    conflicts, suggests strengthening questions, drafts the statement, and self-reviews it.
-4. Resolve every bracketed `[Confirm: ...]` placeholder with the witness before signing.
+5. Resolve every bracketed `[Confirm: ...]` placeholder with the witness before signing.
    Submit on VA Form 21-10210 (one form per witness).
 
 ## Large record sets (1 to ~5,000 pages)
@@ -285,7 +307,46 @@ The mock responds to both URL styles the app emits (`/medical_records/{patient_i
 `/medical_records?patient_id=...`) with a two-document JSON payload — see the script's docstring
 for full instructions.
 
+## VA.gov record source
+
+Selecting **VA.gov** as the record source (Evaluate or Draft) opens a secure, per-session login
+form with an explicit consent checkbox. After consenting and signing in, the app automatically
+fetches all available VA.gov records for that session, merges them with any other sources
+already loaded in the same workflow this session, and shows a **merged records summary** (source
+label + file + page count per row) that requires explicit confirmation before the merged set is
+used for evaluation or drafting.
+
+- **Mock mode (default):** leave `VA_GOV_API_BASE_URL` unset — `authenticate_va_gov` and
+  `fetch_va_records` return a deterministic in-memory mock session and two mock records, so the
+  full login → fetch → merge → confirm flow works with zero VA.gov env vars configured.
+- **Real mode:** set `VA_GOV_API_BASE_URL` (must be `https://`) to call a real VA.gov-compatible
+  authenticated record-retrieval API. Requests retry up to 3 times with exponential backoff.
+- **Partial/connection-error handling:** if VA.gov returns fewer records than expected or the
+  connection drops, the app shows the retrieved-vs-expected counts, a **Retry** button, and a
+  **Continue with available records** option — VA.gov failures never block using the other
+  record sources.
+- **Privacy:** VA.gov records are treated identically to every other source for extraction,
+  chunking, duplicate detection, and page labeling. Fetched records and the VA.gov session token
+  live only in `st.session_state` for the current browser session; credentials are **never**
+  written to disk, `.env`, or logs.
+
+## Telemetry (Agiloop Inspect)
+
+The app reports usage telemetry (impressions, interactions, errors) to Agiloop Inspect via
+`app/telemetry.py`. Because this is a single-origin Streamlit app with no browser JS bundle, the
+Inspect API key never leaves the Python process.
+
+- **Mock mode (default):** leave `AGILOOP_INSPECT_API_KEY` and `AGILOOP_PROJECT_ID` unset —
+  events are logged at debug level and dropped instead of sent. Nothing about the app's behavior
+  changes; telemetry is always best-effort and never blocks the UI.
+- **Real mode:** set both `AGILOOP_INSPECT_API_KEY` and `AGILOOP_PROJECT_ID` (and optionally
+  `AGILOOP_INSPECT_URL` to point at a non-default Inspect deployment) to send real events.
+- `app/telemetry.py` is feature-id-neutral shared infrastructure: it never hardcodes a feature
+  id. Each feature's call sites (e.g. `app/va_gov_client.py`, `app/main.py`) supply their own
+  `featureId` explicitly.
+
 ## Security notes
 
 - `.env`, `.venv/`, and `outputs/` are git-ignored.
-- Medical records stay local: they are only sent to the configured LLM endpoint.
+- Medical records stay local: they are only sent to the configured LLM endpoint. VA.gov
+  credentials and session tokens are never written to disk, `.env`, or logs.
