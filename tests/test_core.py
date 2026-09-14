@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.documents import (  # noqa: E402
     ExtractionError,
+    _read_docx_member_limited,
     chunk_page_labelled_text,
     extract_document,
     extract_uploaded_documents,
@@ -95,6 +96,44 @@ class TestExtraction(unittest.TestCase):
         ):
             doc = extract_document("under-limit.docx", docx)
         self.assertIn("Observed pain", doc.full_text)
+
+    def test_docx_rejects_too_many_internal_files(self):
+        extra = {f"customXml/item{i}.xml": b"x" for i in range(5)}
+        docx = self._make_docx_bytes(extra_entries=extra)
+        with patch.object(config, "DOCX_MAX_INTERNAL_FILE_COUNT", 3):
+            with self.assertRaises(ExtractionError) as exc:
+                extract_document("too-many-members.docx", docx)
+        self.assertIn("too many internal files", str(exc.exception))
+
+    def test_docx_member_runtime_overflow_guard(self):
+        class _FakeStream:
+            def __init__(self):
+                self._chunks = [b"abc", b"def", b"ghi", b""]
+
+            def read(self, _size: int) -> bytes:
+                return self._chunks.pop(0)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class _FakeArchive:
+            def getinfo(self, _name: str):
+                return type("Info", (), {"file_size": 4})()
+
+            def open(self, _info, _mode: str):
+                return _FakeStream()
+
+        with self.assertRaises(ExtractionError) as exc:
+            _read_docx_member_limited(
+                "runtime-overflow.docx",
+                archive=_FakeArchive(),
+                member_name="word/document.xml",
+                max_member_bytes=5,
+            )
+        self.assertIn("exceeded max uncompressed size while reading", str(exc.exception))
 
     def test_page_labelled_text(self):
         doc = extract_document("note.txt", b"Body text here.")

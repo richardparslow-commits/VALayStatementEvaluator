@@ -137,6 +137,10 @@ DOCX_MAX_TOTAL_UNCOMPRESSED_BYTES = _positive_int_env(
     "VA_LSE_DOCX_MAX_TOTAL_UNCOMPRESSED_BYTES",
     200 * 1024 * 1024,
 )
+DOCX_MAX_INTERNAL_FILE_COUNT = _positive_int_env(
+    "VA_LSE_DOCX_MAX_INTERNAL_FILE_COUNT",
+    10_000,
+)
 
 # ---------------------------------------------------------------------------
 # Optional credit-burn gauge for the usage estimator. QwenCloud Token Plan does

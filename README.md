@@ -81,6 +81,7 @@ cp .env.example .env     # then put your API key in .env (never commit .env)
 | `VA_LSE_DIGEST_CHUNK_CHARS` | Characters per record chunk | `8000` |
 | `VA_LSE_DOCX_MAX_INTERNAL_FILE_BYTES` | Max uncompressed bytes allowed for a single DOCX internal file | `52428800` |
 | `VA_LSE_DOCX_MAX_TOTAL_UNCOMPRESSED_BYTES` | Max total uncompressed bytes allowed across all DOCX internal files | `209715200` |
+| `VA_LSE_DOCX_MAX_INTERNAL_FILE_COUNT` | Max number of internal files allowed in a DOCX archive | `10000` |
 | `FETCH_SANDBOX_API_KEY` | Optional Fetch Sandbox API key | empty |
 | `FETCH_SANDBOX_BASE_URL` | Fetch Sandbox base URL (`fetchsandbox.com` or subdomain) | `https://fetchsandbox.com` |
 | `FETCH_SANDBOX_RECORDS_PATH` | GET path for the records endpoint | `/medical_records/{patient_id}` |

@@ -113,6 +113,7 @@ def _extract_docx(filename: str, data: bytes) -> ExtractedDocument:
     """Minimal DOCX text extraction without external dependencies."""
     max_member_bytes = config.DOCX_MAX_INTERNAL_FILE_BYTES
     max_total_bytes = config.DOCX_MAX_TOTAL_UNCOMPRESSED_BYTES
+    max_member_count = config.DOCX_MAX_INTERNAL_FILE_COUNT
     try:
         archive = zipfile.ZipFile(io.BytesIO(data))
         _validate_docx_uncompressed_sizes(
@@ -120,6 +121,7 @@ def _extract_docx(filename: str, data: bytes) -> ExtractedDocument:
             archive=archive,
             max_member_bytes=max_member_bytes,
             max_total_bytes=max_total_bytes,
+            max_member_count=max_member_count,
         )
         xml_bytes = _read_docx_member_limited(
             filename,
@@ -151,11 +153,19 @@ def _validate_docx_uncompressed_sizes(
     archive: zipfile.ZipFile,
     max_member_bytes: int,
     max_total_bytes: int,
+    max_member_count: int,
 ) -> None:
     total_uncompressed = 0
+    member_count = 0
     for info in archive.infolist():
         if info.is_dir():
             continue
+        member_count += 1
+        if member_count > max_member_count:
+            raise ExtractionError(
+                f"{filename}: DOCX has too many internal files "
+                f"({member_count} > {max_member_count})."
+            )
         if info.file_size > max_member_bytes:
             raise ExtractionError(
                 f"{filename}: DOCX member '{info.filename}' exceeds max uncompressed "
