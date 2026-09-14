@@ -79,6 +79,8 @@ cp .env.example .env     # then put your API key in .env (never commit .env)
 | `VA_LSE_RECORDS_CONCURRENCY` | Parallel chunk-digest workers | `2` (Lite plan fits 1–2 concurrent agents) |
 | `VA_LSE_MAX_DIGEST_FACTS` | Max facts kept in the consolidated digest | `1500` |
 | `VA_LSE_DIGEST_CHUNK_CHARS` | Characters per record chunk | `8000` |
+| `VA_LSE_DOCX_MAX_INTERNAL_FILE_BYTES` | Max uncompressed bytes allowed for a single DOCX internal file | `52428800` |
+| `VA_LSE_DOCX_MAX_TOTAL_UNCOMPRESSED_BYTES` | Max total uncompressed bytes allowed across all DOCX internal files | `209715200` |
 | `FETCH_SANDBOX_API_KEY` | Optional Fetch Sandbox API key | empty |
 | `FETCH_SANDBOX_BASE_URL` | Fetch Sandbox base URL (`fetchsandbox.com` or subdomain) | `https://fetchsandbox.com` |
 | `FETCH_SANDBOX_RECORDS_PATH` | GET path for the records endpoint | `/medical_records/{patient_id}` |
@@ -131,6 +133,8 @@ streamlit run run_app.py
    - **Fetch Sandbox** (enter a patient or record ID and import from your sandbox endpoint), or
    - **Local folder / file** (local runs only — read records straight from a path on this
      machine, e.g. `~/Desktop/ClaimRecords`; hidden when the app is served remotely).
+   - Security hardening: DOCX uploads with oversized uncompressed internal ZIP contents are
+     rejected to prevent decompression-bomb memory exhaustion.
 3. Click **Run exhaustive evaluation** — watch chunked record review, claim verification,
    rubric scoring, improvement drafting, and report generation progress.
 4. Review the verdict table (✅ supported / 🟡 partial / ❌ contradicted / ⚪ not found),

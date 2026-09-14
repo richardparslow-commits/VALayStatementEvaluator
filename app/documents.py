@@ -20,6 +20,7 @@ SUPPORTED_EXTENSIONS = (".pdf", ".txt", ".md", ".docx")
 DEFAULT_CHUNK_CHARS = config.DIGEST_CHUNK_CHARS
 CHUNK_OVERLAP_CHARS = 400
 MAX_STATEMENT_CHARS = 60_000
+DOCX_READ_CHUNK_BYTES = 64 * 1024
 
 
 class ExtractionError(RuntimeError):
@@ -110,9 +111,24 @@ def _extract_pdf(filename: str, data: bytes) -> ExtractedDocument:
 
 def _extract_docx(filename: str, data: bytes) -> ExtractedDocument:
     """Minimal DOCX text extraction without external dependencies."""
+    max_member_bytes = config.DOCX_MAX_INTERNAL_FILE_BYTES
+    max_total_bytes = config.DOCX_MAX_TOTAL_UNCOMPRESSED_BYTES
     try:
         archive = zipfile.ZipFile(io.BytesIO(data))
-        xml_bytes = archive.read("word/document.xml")
+        _validate_docx_uncompressed_sizes(
+            filename,
+            archive=archive,
+            max_member_bytes=max_member_bytes,
+            max_total_bytes=max_total_bytes,
+        )
+        xml_bytes = _read_docx_member_limited(
+            filename,
+            archive=archive,
+            member_name="word/document.xml",
+            max_member_bytes=max_member_bytes,
+        )
+    except ExtractionError:
+        raise
     except Exception as exc:  # noqa: BLE001
         raise ExtractionError(f"{filename}: could not read DOCX ({exc})") from exc
 
@@ -128,6 +144,60 @@ def _extract_docx(filename: str, data: bytes) -> ExtractedDocument:
     if not text:
         raise ExtractionError(f"{filename}: DOCX contains no readable text.")
     return ExtractedDocument(filename=filename, pages=[DocumentPage(filename, 1, text)])
+
+
+def _validate_docx_uncompressed_sizes(
+    filename: str,
+    archive: zipfile.ZipFile,
+    max_member_bytes: int,
+    max_total_bytes: int,
+) -> None:
+    total_uncompressed = 0
+    for info in archive.infolist():
+        if info.is_dir():
+            continue
+        if info.file_size > max_member_bytes:
+            raise ExtractionError(
+                f"{filename}: DOCX member '{info.filename}' exceeds max uncompressed "
+                f"size ({info.file_size} bytes > {max_member_bytes} bytes)."
+            )
+        total_uncompressed += info.file_size
+        if total_uncompressed > max_total_bytes:
+            raise ExtractionError(
+                f"{filename}: DOCX total uncompressed size exceeds limit "
+                f"({total_uncompressed} bytes > {max_total_bytes} bytes)."
+            )
+
+
+def _read_docx_member_limited(
+    filename: str,
+    archive: zipfile.ZipFile,
+    member_name: str,
+    max_member_bytes: int,
+) -> bytes:
+    try:
+        info = archive.getinfo(member_name)
+    except KeyError as exc:
+        raise ExtractionError(f"{filename}: missing DOCX content ({member_name}).") from exc
+    if info.file_size > max_member_bytes:
+        raise ExtractionError(
+            f"{filename}: DOCX member '{member_name}' exceeds max uncompressed size "
+            f"({info.file_size} bytes > {max_member_bytes} bytes)."
+        )
+
+    output = bytearray()
+    with archive.open(info, "r") as stream:
+        while True:
+            chunk = stream.read(DOCX_READ_CHUNK_BYTES)
+            if not chunk:
+                break
+            output.extend(chunk)
+            if len(output) > max_member_bytes:
+                raise ExtractionError(
+                    f"{filename}: DOCX member '{member_name}' exceeded max uncompressed "
+                    f"size while reading ({len(output)} bytes > {max_member_bytes} bytes)."
+                )
+    return bytes(output)
 
 
 def extract_uploaded_documents(
