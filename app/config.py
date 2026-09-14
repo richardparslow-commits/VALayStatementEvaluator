@@ -153,6 +153,17 @@ DOCX_MAX_INTERNAL_FILE_COUNT = _positive_int_env(
 )
 
 # ---------------------------------------------------------------------------
+# Upload size hardening — enforced both at the Streamlit server layer
+# (.streamlit/config.toml maxUploadSize) and in Python (app/main.py) so the
+# limit is visible even without the server config.
+# ---------------------------------------------------------------------------
+MAX_UPLOAD_BYTES = _positive_int_env("VA_LSE_MAX_UPLOAD_BYTES", 50 * 1024 * 1024)
+MAX_TOTAL_UPLOAD_BYTES = _positive_int_env(
+    "VA_LSE_MAX_TOTAL_UPLOAD_BYTES",
+    200 * 1024 * 1024,
+)
+
+# ---------------------------------------------------------------------------
 # Optional credit-burn gauge for the usage estimator. QwenCloud Token Plan does
 # not publish a fixed credits-per-1M-token rate (and it changes), so we default
 # to "unbounded": the estimator reports calls + estimated tokens per phase but

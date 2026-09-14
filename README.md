@@ -424,6 +424,38 @@ Configure via env (see `.env.example`): `VA_LSE_LOG_LEVEL`, `VA_LSE_LOG_JSON` (J
 `VA_LSE_LOG_BACKUPS`. With `VA_LSE_LOG_DIR` unset the app still logs to stdout so platform drains
 (`docker logs`, Agiloop build harness) stay useful; setting it adds a `RotatingFileHandler`.
 
+## Production hardening (Streamlit)
+
+`.streamlit/config.toml` is committed so shared deployments cannot silently run with
+Streamlit's permissive defaults. It pins:
+
+- `server.enableXsrfProtection = true` (XSRF on form posts / uploads)
+- `client.toolbarMode = "minimal"` (no fork/deploy buttons in hosted mode)
+- `server.headless = true`
+- `logger.level = "info"`
+- `server.maxUploadSize = 50` (per-file cap; matched by `VA_LSE_MAX_UPLOAD_BYTES` in `app/config.py`)
+
+At startup `app/main.py` emits `⚠️ Streamlit security hardening is not fully active`
+if the file is missing or those keys are absent (non-blocking warning).
+
+Upload limits are also enforced in Python (`app/main.py:_check_upload_limits`) so the
+tight 50 MB per-file / 200 MB batch caps (`VA_LSE_MAX_UPLOAD_BYTES` /
+`VA_LSE_MAX_TOTAL_UPLOAD_BYTES`, overridable via env) produce a clear in-UI message
+even when `maxUploadSize` is not active; total size is capped across the batch
+(largest files dropped first until it fits).
+
+Streamlit cannot set arbitrary HTTP response headers from `config.toml`. For
+production, front the app with a reverse proxy (nginx / CloudFlare / Agiloop)
+that adds:
+
+- `Content-Security-Policy` (tight `default-src 'self'` with Streamlit-allowed inline styles/scripts)
+- `X-Frame-Options: SAMEORIGIN` (clickjacking guard)
+- `Strict-Transport-Security` (HSTS) and `X-Content-Type-Options: nosniff`
+- Rate limiting per IP and upload throttling
+
+`.streamlit/secrets.toml` is git-ignored — never store deploy keys there as a
+checked-in file.
+
 ## Compatibility & migration
 
 - **Tested endpoints & models:** QwenCloud Token Plan (`qwen3.7-max`/`flash`), OpenAI (`gpt-4-turbo`/`gpt-4o-mini`), and any OpenAI-compatible proxy (Ollama via shim) — see [`COMPATIBILITY.md`](COMPATIBILITY.md) for minimum versions, model tables, and breaking-change history.
@@ -432,6 +464,7 @@ Configure via env (see `.env.example`): `VA_LSE_LOG_LEVEL`, `VA_LSE_LOG_JSON` (J
 
 ## Security notes
 
+- **Streamlit hardening:** `.streamlit/config.toml` (committed) sets XSRF, toolbar, and `maxUploadSize`; missed config triggers a startup warning (see Production hardening above).
 - **Secrets are never committed.** `.env`, `.env.local`, `.env.*.local`, and `.streamlit/secrets.toml` are git-ignored (see `SECURITY.md`). Rotate keys after any leak.
 - **Pre-commit guard.** `scripts/hooks/pre-commit` rejects staged `.env` files, `*.pem`/`*.key`, and key assignments (`OPENAI_API_KEY=`, `sk-*`). Install with `cp scripts/hooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit`.
 - Medical records stay local: they are only sent to the configured LLM endpoint. VA.gov credentials and session tokens are never written to disk, `.env`, or logs.

@@ -69,6 +69,89 @@ RELATIONSHIPS = [
 ]
 
 
+def _check_streamlit_config_hardening() -> None:
+    """Warn once per session if .streamlit/config.toml hardening is not active.
+
+    Streamlit itself does not expose a clean API to confirm config source, so
+    this checks the filesystem so a deployment missing the config file surfaces
+    visibly instead of silently running with defaults.
+    """
+    if st.session_state.get("_streamlit_hardening_checked"):
+        return
+    st.session_state["_streamlit_hardening_checked"] = True
+    try:
+        from pathlib import Path as _P
+        cfg = (_P(__file__).resolve().parent.parent / ".streamlit" / "config.toml")
+        text = cfg.read_text(encoding="utf-8") if cfg.exists() else ""
+        missing: list[str] = []
+        if "enableXsrfProtection" not in text:
+            missing.append("server.enableXsrfProtection")
+        if 'toolbarMode' not in text:
+            missing.append("client.toolbarMode")
+        if "maxUploadSize" not in text:
+            missing.append("server.maxUploadSize")
+        if missing:
+            msg = (
+                "⚠️ Streamlit security hardening is not fully active (missing from .streamlit/config.toml: "
+                + ", ".join(missing)
+                + "). The app still works, but XSRF protection, toolbar hardening, and upload caps "
+                "depend on that file — see README → Production hardening."
+            )
+            logger.warning("streamlit hardening incomplete: %s", ", ".join(missing), extra={"request_id": get_request_id() or "-", "phase": "app", "status": "warning"})
+            st.warning(msg)
+    except Exception:  # noqa: BLE001 - hardening check must never break the app
+        pass
+
+
+def _check_upload_limits(files) -> tuple[list, list[str]]:
+    """Split uploaded files into accepted vs rejected by VA_LSE_MAX_UPLOAD_BYTES.
+
+    Returns (accepted_files, rejection_messages). Accepted files also pass a
+    total-batch cap (VA_LSE_MAX_TOTAL_UPLOAD_BYTES) — the largest files are
+    dropped first until the batch fits, with one message per dropped file.
+    """
+    if not files:
+        return [], []
+    # Each Streamlit UploadedFile exposes .name and .size (bytes). Fall back to
+    # len(getvalue()) for test fakes that only expose getvalue().
+    def _size(f) -> int:
+        try:
+            return int(getattr(f, "size", None) or len(f.getvalue()))
+        except Exception:  # noqa: BLE001
+            return 0
+    per_file_limit = config.MAX_UPLOAD_BYTES
+    total_limit = config.MAX_TOTAL_UPLOAD_BYTES
+    rejected_msgs: list[str] = []
+    # Per-file check
+    accepted: list = []
+    for f in files:
+        sz = _size(f)
+        if sz > per_file_limit:
+            rejected_msgs.append(
+                f"✖️ {f.name}: {sz // 1_048_576} MB exceeds the per-file limit "
+                f"({per_file_limit // 1_048_576} MB). Reduce or split this file."
+            )
+        else:
+            accepted.append(f)
+    # Batch total check — drop excess largest-first so the user's first files tend to survive.
+    total = sum(_size(f) for f in accepted)
+    if total > total_limit and accepted:
+        accepted.sort(key=_size)  # smallest first; we keep small ones
+        kept: list = []
+        running = 0
+        for f in accepted:
+            if running + _size(f) <= total_limit:
+                kept.append(f)
+                running += _size(f)
+            else:
+                rejected_msgs.append(
+                    f"✖️ {f.name}: batch total would exceed {total_limit // 1_048_576} MB — file skipped. "
+                    "Remove some files or raise VA_LSE_MAX_TOTAL_UPLOAD_BYTES."
+                )
+        accepted = kept
+    return accepted, rejected_msgs
+
+
 # ------------------------------------------------------------------- settings
 def _sidebar_settings() -> None:
     if "settings" not in st.session_state:
@@ -323,6 +406,13 @@ def _records_uploader(slot: str) -> list:
         accept_multiple_files=True,
         key=f"files_{slot}",
     )
+    # Enforce upload size caps before extraction so the tight 50 MB default
+    # surfaces as a clear message rather than a downstream failure.
+    if files:
+        accepted, rejections = _check_upload_limits(files)
+        for msg in rejections:
+            st.warning(msg)
+        files = accepted if rejections else files
     documents = _extract_uploads(files, slot)
     total_pages = sum(len(d.pages) for d in documents)
     if documents and total_pages > config.MAX_RECORD_PAGES:
@@ -747,7 +837,13 @@ def evaluate_tab() -> None:
             key="eval_statement_file",
         )
         if files is not None:
-            docs = _extract_uploads([files], "eval_statement")
+            accepted, rejections = _check_upload_limits([files])
+            for msg in rejections:
+                st.warning(msg)
+            if rejections:
+                docs = []
+            else:
+                docs = _extract_uploads([files], "eval_statement")
             if docs:
                 statement_text = docs[0].full_text
 
@@ -1277,6 +1373,7 @@ evidence relevant to each claim rather than reading only the first pages.
 # --------------------------------------------------------------------- layout
 def main() -> None:
     configure_logging()
+    _check_streamlit_config_hardening()
     # Ensure every browser session has a baseline correlation id (also used
     # for pre-run validation / upload errors so those logs are correlatable).
     try:

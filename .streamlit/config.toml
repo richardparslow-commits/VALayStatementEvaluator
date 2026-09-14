@@ -1,0 +1,40 @@
+# Streamlit configuration — security defaults (see README → Production hardening).
+#
+# Copy intentionally committed to source control so shared deployments cannot
+# silently run with unsafe Streamlit defaults.
+#
+# To override for local debugging only: set an env var per
+# https://docs.streamlit.io/develop/api-reference/configuration
+# or use `.streamlit/config.local.toml` (blocked from version control).
+
+[server]
+# Headless prevents the browser auto-launch and suits containerized deploys.
+headless = true
+# XSRF protection for form posts / file uploads — do not disable in shared
+# or hosted environments.
+enableXsrfProtection = true
+# Defense-in-depth against clickjacking (also enforced by reverse-proxy
+# headers; see SECURITY.md / README → Production hardening). No CORS
+# allowlist change here; single-origin by default.
+enableCORS = true
+enableWebsocketCompression = false
+# Upload cap — matches the in-code guard (app/config.py VA_LSE_MAX_UPLOAD_BYTES).
+# Streamlit >= 1.32 enforces this server-side before Python sees the file.
+maxUploadSize = 50
+
+[client]
+# Hide the fork/deploy buttons in shared/hosted deployments.
+toolbarMode = "minimal"
+
+[browser]
+# Require explicit navigation; no auto-rerun on focus loss.
+gatherUsageStats = false
+
+[logger]
+level = "info"
+
+[mapbox]
+# No map features in this app.
+
+[theme]
+

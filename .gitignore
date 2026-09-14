@@ -11,6 +11,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .streamlit/secrets.toml
+.streamlit/config.local.toml
 
 # OS / IDE
 .DS_Store
