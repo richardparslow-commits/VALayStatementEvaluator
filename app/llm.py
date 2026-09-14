@@ -16,6 +16,35 @@ logger = logging.getLogger("app.llm")
 
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 2.0
+MODELS_ENDPOINT_TIMEOUT_SECONDS = 6
+
+
+def check_model_availability(base_url: str, api_key: str) -> set[str] | None:
+    """GET {base_url}/models and return the set of model ids, or None on failure.
+
+    Best-effort only: any network, auth, or parse failure returns None so
+    callers can silently skip the availability warning. Without an API key
+    the check is not attempted. Uses only stdlib (urllib) so no extra deps.
+    """
+    if not api_key or not api_key.strip():
+        return None
+    url = base_url.rstrip("/") + "/models"
+    try:
+        import urllib.error
+        import urllib.request
+
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_key.strip()}"})
+        with urllib.request.urlopen(req, timeout=MODELS_ENDPOINT_TIMEOUT_SECONDS) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        rows = data.get("data", []) if isinstance(data, dict) else []
+        ids: set[str] = set()
+        for row in rows:
+            mid = row.get("id") if isinstance(row, dict) else None
+            if isinstance(mid, str) and mid.strip():
+                ids.add(mid.strip())
+        return ids
+    except Exception:  # noqa: BLE001 - availability check is advisory only
+        return None
 
 
 def _usage_tokens(response: Any) -> tuple[int | None, int | None]:

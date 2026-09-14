@@ -83,6 +83,13 @@ Install from **`requirements.lock`** for development, CI, and production so ever
 runs the identical tested dependency set. `requirements.txt` stays the human-edited input
 (minimum versions); see **Dependency locking** below.
 
+> This app is tested with QwenCloud Token Plan but works with **any
+> OpenAI-compatible API** (OpenAI, Azure OpenAI via proxy, local Ollama with an
+> OpenAI-compat shim). See [`COMPATIBILITY.md`](COMPATIBILITY.md) for supported
+> endpoints and models and [`MIGRATION.md`](MIGRATION.md) for switching providers.
+> At launch the sidebar warns if your configured models are not listed at
+> `GET {base_url}/models` (non-blocking; network failures are ignored).
+
 ### Dependency locking
 
 `requirements.txt` lists direct dependencies with minimum versions; `requirements.lock` is the
@@ -149,7 +156,8 @@ telemetry simply logs that combination as mock and drops events, since telemetry
 block the app.
 
 All settings can also be overridden live in the app sidebar. Model availability depends on your
-gateway workspace; check `GET {base_url}/models`.
+provider: the app checks `GET {base_url}/models` at startup and warns if `LLM_MODEL_MAIN` or
+`LLM_MODEL_FAST` is not listed (see [`COMPATIBILITY.md`](COMPATIBILITY.md)).
 
 ### Telemetry (Agiloop Inspect)
 
@@ -415,6 +423,12 @@ Configure via env (see `.env.example`): `VA_LSE_LOG_LEVEL`, `VA_LSE_LOG_JSON` (J
 `VA_LSE_LOG_DIR`/`VA_LSE_LOG_FILE` (rotating file + stdout), `VA_LSE_LOG_MAX_BYTES` and
 `VA_LSE_LOG_BACKUPS`. With `VA_LSE_LOG_DIR` unset the app still logs to stdout so platform drains
 (`docker logs`, Agiloop build harness) stay useful; setting it adds a `RotatingFileHandler`.
+
+## Compatibility & migration
+
+- **Tested endpoints & models:** QwenCloud Token Plan (`qwen3.7-max`/`flash`), OpenAI (`gpt-4-turbo`/`gpt-4o-mini`), and any OpenAI-compatible proxy (Ollama via shim) — see [`COMPATIBILITY.md`](COMPATIBILITY.md) for minimum versions, model tables, and breaking-change history.
+- **Switching providers:** see [`MIGRATION.md`](MIGRATION.md) (QwenCloud ↔ OpenAI ↔ local). No code change needed — update `.env`.
+- **Deployed app outdated?** Check the startup warning: `GET {base_url}/models` is queried; missing `LLM_MODEL_*` values produce a non-blocking sidebar warning linking to `COMPATIBILITY.md`.
 
 ## Security notes
 

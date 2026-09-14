@@ -18,17 +18,21 @@ KNOWLEDGE_DIR = Path(__file__).resolve().parent / "knowledge"
 # the project's .env wins over any pre-existing environment values.
 load_dotenv(PROJECT_ROOT / ".env", override=True)
 
-# Default endpoint tuned for the QwenCloud Individual Plan Lite subscription.
-# Token Plan uses a dedicated sk-sp- API key that MUST be paired with this
-# base URL (Token Plan keys do not work against the general MaaS gateway).
+# Default endpoint tuned for the QwenCloud Individual Plan Lite subscription
+# but the app speaks to ANY OpenAI-compatible POST {base_url}/chat/completions
+# endpoint (see COMPATIBILITY.md / MIGRATION.md). Token Plan uses a dedicated
+# sk-sp- API key that MUST be paired with this base URL (they do not work
+# against the general MaaS gateway).
 DEFAULT_BASE_URL = (
     "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
 )
 # Low-volume, high-value calls (claim extraction, verification, rubric scoring,
-# topic audit, rewrite) use the strong reasoning model.
+# topic audit, rewrite) use the strong reasoning model. Override via
+# LLM_MODEL_MAIN for another provider (e.g. gpt-4-turbo — see COMPATIBILITY.md).
 DEFAULT_MODEL_MAIN = "qwen3.7-max"
 # The bulk digest/merge passes (one call per record chunk — by far the most
 # calls) use the cheap model to preserve the Lite plan's limited credit quota.
+# Override via LLM_MODEL_FAST (e.g. gpt-4o-mini for OpenAI).
 DEFAULT_MODEL_FAST = "qwen3.7-flash"
 DEFAULT_FETCH_SANDBOX_BASE_URL = "https://fetchsandbox.com"
 DEFAULT_FETCH_SANDBOX_RECORDS_PATH = "/medical_records/{patient_id}"

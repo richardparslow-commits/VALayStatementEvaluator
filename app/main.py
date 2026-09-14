@@ -140,6 +140,8 @@ def _sidebar_settings() -> None:
                 settings.fetch_records_path = st.session_state.fetch_records_path_input.strip()
                 st.rerun()
 
+        _compat_model_warning(settings)
+
         st.divider()
         _credit_calibration_widget()
         st.divider()
@@ -632,6 +634,38 @@ def _credit_calibration_widget() -> None:
                 "Tip: post each eval/draft run's totals (shown here) and your console's "
                 "cumulative credits to converge in a few runs."
             )
+
+
+def _compat_model_warning(settings) -> None:
+    """Warn if the configured models are not listed at GET {base_url}/models.
+
+    Advisory only: network/permission failures are silently ignored and the
+    warning is cached per-session so the endpoint is not hit on every rerun.
+    """
+    sig = f"{settings.base_url}|{settings.model_main}|{settings.model_fast}"
+    if st.session_state.get("_compat_checked_sig") == sig:
+        for msg in st.session_state.get("_compat_warnings", []):
+            st.warning(msg)
+        return
+    try:
+        from .llm import check_model_availability
+
+        available = check_model_availability(settings.base_url, settings.api_key)
+    except Exception:  # noqa: BLE001 - never break the UI on a compat check
+        available = None
+    warnings: list[str] = []
+    if available is not None:
+        for label, model in (("Main model", settings.model_main), ("Fast model", settings.model_fast)):
+            if model and model not in available:
+                warnings.append(
+                    f"⚠️ {label} `{model}` not found at `{settings.base_url.rstrip('/')}/models`. "
+                    "The provider may have deprecated it — check `COMPATIBILITY.md` and `MIGRATION.md`."
+                )
+    st.session_state["_compat_checked_sig"] = sig
+    st.session_state["_compat_warnings"] = warnings
+    for msg in warnings:
+        logger.warning("model availability warning: %s", msg, extra={"request_id": get_request_id() or "-", "phase": "compat", "status": "warning"})
+        st.warning(msg)
 
 
 def _progress_widgets(llm: LLMClient | None = None, *, request_id: str | None = None):
