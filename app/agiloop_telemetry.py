@@ -107,18 +107,40 @@ def track_interaction(feature_id: str, **attributes: Any) -> None:
     _send_event("feature.interaction", feature_id=feature_id, metadata=attributes or None)
 
 
+_MAX_ERROR_MESSAGE_LEN = 200
+
+
+def _sanitize_error_message(error: BaseException) -> str:
+    """Bound the outbound error message to a short, non-content-bearing summary.
+
+    Some internal exceptions (e.g. LLM chunk-digest failures) can embed
+    fragments of the underlying medical-record text or other user-supplied
+    content in their `str()` representation. Telemetry must never carry PII
+    or record content off the server (see Telemetry Leakage Rules), so we
+    only forward the exception type plus a short, truncated message — enough
+    for triage, not enough to leak substantive record content.
+    """
+    message = str(error).replace("\n", " ").replace("\r", " ").strip()
+    truncated = message[:_MAX_ERROR_MESSAGE_LEN]
+    if len(message) > _MAX_ERROR_MESSAGE_LEN:
+        truncated += "…[truncated]"
+    return f"{type(error).__name__}: {truncated}" if truncated else type(error).__name__
+
+
 def track_feature_error(feature_id: str, error: BaseException) -> None:
     """Track a feature-level error caught at a feature boundary."""
     _send_event(
         "feature.error",
         feature_id=feature_id,
-        metadata={"errorMessage": str(error)},
+        metadata={"errorMessage": _sanitize_error_message(error)},
     )
 
 
 def track_app_error(error: BaseException) -> None:
     """Track an app-level (root error boundary) error. No feature id attached."""
-    _send_event("app.error", feature_id=None, metadata={"errorMessage": str(error)})
+    _send_event(
+        "app.error", feature_id=None, metadata={"errorMessage": _sanitize_error_message(error)}
+    )
 
 
 def track_goal(feature_id: str, goal_description: str, **attributes: Any) -> None:
