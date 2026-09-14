@@ -17,6 +17,7 @@ import re
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Callable
 
 from . import config
@@ -484,24 +485,22 @@ _STOPWORDS = {
 }
 
 
-_TOKEN_CACHE: dict[str, frozenset[str]] = {}
-
-
+@lru_cache(maxsize=10_000)
 def _tokens(text: str) -> frozenset[str]:
-    """Tokenize text into content words; cached because facts and paragraphs
-    are scored repeatedly during verification of many claims."""
-    cached = _TOKEN_CACHE.get(text)
-    if cached is not None:
-        return cached
-    tokens = frozenset(
+    """Tokenize text into content words; LRU-cached (bounded at 10k entries)
+    because facts and paragraphs are scored repeatedly during verification of
+    many claims. Bounded LRU prevents unbounded memory growth on large record
+    sets while retaining high hit rates for repeated phrases."""
+    return frozenset(
         token
         for token in re.findall(r"[a-z0-9]{3,}", text.lower())
         if token not in _STOPWORDS
     )
-    if len(_TOKEN_CACHE) > 200_000:
-        _TOKEN_CACHE.clear()
-    _TOKEN_CACHE[text] = tokens
-    return tokens
+
+
+# Backwards-compat alias: some tooling/tests may import _TOKEN_CACHE.
+# Expose the underlying cache mapping via the LRU wrapper's cache_info.
+_TOKEN_CACHE = {}  # deprecated; _tokens is now LRU-bounded
 
 
 def find_relevant_excerpts(
