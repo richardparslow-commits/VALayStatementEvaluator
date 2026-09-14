@@ -1,4 +1,5 @@
-"""OpenAI-compatible LLM client with retries and JSON-mode helpers."""
+"""OpenAI-compatible LLM client with retries, JSON-mode helpers, circuit breaker and concurrency limiting."""
+
 from __future__ import annotations
 
 import json
@@ -8,11 +9,15 @@ from typing import Any
 
 from openai import OpenAI
 
+from .circuit_breaker import CircuitBreakerOpenError, QueueFullError, get_llm_breaker, get_llm_limiter
 from .config import Settings
 from .logging_config import get_request_id
 from .usage import UsageTracker
 
 logger = logging.getLogger("app.llm")
+
+# Re-export for callers that want to catch these specifically.
+__all__ = ["LLMClient", "LLMError", "CircuitBreakerOpenError", "QueueFullError", "check_model_availability"]
 
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 2.0
@@ -34,7 +39,7 @@ def check_model_availability(base_url: str, api_key: str) -> set[str] | None:
         import urllib.request
 
         req = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_key.strip()}"})
-        with urllib.request.urlopen(req, timeout=MODELS_ENDPOINT_TIMEOUT_SECONDS) as resp:
+        with urllib.request.urlopen(req, timeout=MODELS_ENDPOINT_TIMEOUT_SECONDS) as resp:  # noqa: S310
             data = json.loads(resp.read().decode("utf-8"))
         rows = data.get("data", []) if isinstance(data, dict) else []
         ids: set[str] = set()
@@ -74,6 +79,11 @@ class LLMClient:
 
     Tracks an estimated-usage ``UsageTracker`` so callers can report per-phase
     token/call counts and (optionally) credit burn after a run.
+
+    Each ``chat`` call is gated by a process-wide **circuit breaker** (opens
+    after 3 consecutive logical failures, fail-fast in <2 s while open) and a
+    **concurrency limiter** with a bounded queue (see ``app/circuit_breaker.py``
+    and ``app/config.py``).
     """
 
     def __init__(self, settings: Settings) -> None:
@@ -98,99 +108,129 @@ class LLMClient:
         max_tokens: int = 8000,
         phase: str = "general",
     ) -> str:
-        """Single-turn chat completion with basic retry. Returns text."""
+        """Single-turn chat completion with retry, breaker, and concurrency guards.
+
+        Raises ``CircuitBreakerOpenError`` (fail-fast, <2 s, no network) when
+        the breaker is OPEN, ``QueueFullError`` when the concurrency queue is
+        full or times out, and ``LLMError`` when the provider call exhausts its
+        retries. The breaker counts only *logical* call failures (one per
+        ``chat`` that exhausts retries), not per-attempt retries.
+        """
         model = model or self._settings.model_main  # noqa: A001 - reassign param
         rid = get_request_id() or "-"
-        last_error: Exception | None = None
-        t0 = time.perf_counter()
-        # Never log prompt/response bodies (may contain PII / medical text).
-        sys_len = len(system or "")
-        user_len = len(user or "")
-        for attempt in range(MAX_RETRIES):
-            attempt_t0 = time.perf_counter()
-            try:
-                response = self._client.chat.completions.create(
-                    model=model,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    messages=[
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                )
-                content = response.choices[0].message.content
-                if not content or not content.strip():
-                    raise LLMError("Model returned an empty response.")
-                content = content.strip()
-                prompt_tokens, completion_tokens = _usage_tokens(response)
-                self.usage.record(
-                    model=model,
-                    phase=phase,
-                    system=system,
-                    user=user,
-                    content=content,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                )
-                duration_ms = int((time.perf_counter() - attempt_t0) * 1000)
-                total_ms = int((time.perf_counter() - t0) * 1000)
-                logger.info(
-                    "llm call ok phase=%s model=%s attempt=%d/%d duration_ms=%d total_ms=%d tokens_in=%s tokens_out=%s sys_chars=%d user_chars=%d out_chars=%d",
-                    phase,
-                    model,
-                    attempt + 1,
-                    MAX_RETRIES,
-                    duration_ms,
-                    total_ms,
-                    str(prompt_tokens) if prompt_tokens is not None else "est",
-                    str(completion_tokens) if completion_tokens is not None else "est",
-                    sys_len,
-                    user_len,
-                    len(content),
-                    extra={
-                        "request_id": rid,
-                        "phase": phase,
-                        "status": "ok",
-                        "model": model,
-                        "attempt": attempt + 1,
-                        "retries": MAX_RETRIES,
-                        "duration_ms": duration_ms,
-                        "prompt_tokens": prompt_tokens,
-                        "completion_tokens": completion_tokens,
-                    },
-                )
-                return content
-            except Exception as exc:  # noqa: BLE001 - retry on any provider error
-                last_error = exc
-                # LLMError with "empty response" is non-retriable in spirit, but we
-                # keep the same retry behavior; structured logging must distinguish it.
-                duration_ms = int((time.perf_counter() - attempt_t0) * 1000)
-                is_last = attempt >= MAX_RETRIES - 1
-                logger.log(
-                    logging.ERROR if is_last else logging.WARNING,
-                    "llm call %s phase=%s model=%s attempt=%d/%d duration_ms=%d error=%s",
-                    "failed" if is_last else "retry",
-                    phase,
-                    model,
-                    attempt + 1,
-                    MAX_RETRIES,
-                    duration_ms,
-                    f"{type(exc).__name__}: {exc}",
-                    exc_info=exc if is_last else None,
-                    extra={
-                        "request_id": rid,
-                        "phase": phase,
-                        "status": "error" if is_last else "retry",
-                        "model": model,
-                        "attempt": attempt + 1,
-                        "retries": MAX_RETRIES,
-                        "duration_ms": duration_ms,
-                        "error_class": type(exc).__name__,
-                    },
-                )
-                if not is_last:
-                    time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
-        raise LLMError(f"LLM call failed after {MAX_RETRIES} attempts: {last_error}")
+
+        # Fail fast before touching the limiter or the network.
+        breaker = get_llm_breaker()
+        breaker.check_or_raise()
+
+        limiter = get_llm_limiter()
+        # Acquire a concurrency slot (queues up to max_queue_depth, else QueueFullError).
+        limiter.acquire()
+        acquired = True
+        try:
+            # Re-check breaker after queuing — it may have opened while we waited.
+            breaker.check_or_raise()
+
+            sys_len = len(system or "")
+            user_len = len(user or "")
+            last_error: Exception | None = None
+            t0 = time.perf_counter()
+            for attempt in range(MAX_RETRIES):
+                attempt_t0 = time.perf_counter()
+                try:
+                    response = self._client.chat.completions.create(
+                        model=model,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        messages=[
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": user},
+                        ],
+                    )
+                    content = response.choices[0].message.content
+                    if not content or not content.strip():
+                        raise LLMError("Model returned an empty response.")
+                    content = content.strip()
+                    prompt_tokens, completion_tokens = _usage_tokens(response)
+                    self.usage.record(
+                        model=model,
+                        phase=phase,
+                        system=system,
+                        user=user,
+                        content=content,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                    )
+                    duration_ms = int((time.perf_counter() - attempt_t0) * 1000)
+                    total_ms = int((time.perf_counter() - t0) * 1000)
+                    logger.info(
+                        "llm call ok phase=%s model=%s attempt=%d/%d duration_ms=%d total_ms=%d tokens_in=%s tokens_out=%s sys_chars=%d user_chars=%d out_chars=%d",
+                        phase,
+                        model,
+                        attempt + 1,
+                        MAX_RETRIES,
+                        duration_ms,
+                        total_ms,
+                        str(prompt_tokens) if prompt_tokens is not None else "est",
+                        str(completion_tokens) if completion_tokens is not None else "est",
+                        sys_len,
+                        user_len,
+                        len(content),
+                        extra={
+                            "request_id": rid,
+                            "phase": phase,
+                            "status": "ok",
+                            "model": model,
+                            "attempt": attempt + 1,
+                            "retries": MAX_RETRIES,
+                            "duration_ms": duration_ms,
+                            "prompt_tokens": prompt_tokens,
+                            "completion_tokens": completion_tokens,
+                        },
+                    )
+                    breaker.record_success()
+                    return content
+                except (CircuitBreakerOpenError, QueueFullError):
+                    # Never count limiter/breaker rejections as endpoint failures.
+                    raise
+                except Exception as exc:  # noqa: BLE001 - retry on any provider error
+                    last_error = exc
+                    duration_ms = int((time.perf_counter() - attempt_t0) * 1000)
+                    is_last = attempt >= MAX_RETRIES - 1
+                    logger.log(
+                        logging.ERROR if is_last else logging.WARNING,
+                        "llm call %s phase=%s model=%s attempt=%d/%d duration_ms=%d error=%s",
+                        "failed" if is_last else "retry",
+                        phase,
+                        model,
+                        attempt + 1,
+                        MAX_RETRIES,
+                        duration_ms,
+                        f"{type(exc).__name__}: {exc}",
+                        exc_info=exc if is_last else None,
+                        extra={
+                            "request_id": rid,
+                            "phase": phase,
+                            "status": "error" if is_last else "retry",
+                            "model": model,
+                            "attempt": attempt + 1,
+                            "retries": MAX_RETRIES,
+                            "duration_ms": duration_ms,
+                            "error_class": type(exc).__name__,
+                        },
+                    )
+                    if not is_last:
+                        time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
+            # Exhausted retries — counts as one logical failure for the breaker.
+            breaker.record_failure()
+            raise LLMError(f"LLM call failed after {MAX_RETRIES} attempts: {last_error}")
+        except (CircuitBreakerOpenError, QueueFullError):
+            # Re-raise without counting as a breaker failure and without extra logging
+            # (concurrency limiter and breaker already logged at WARNING).
+            raise
+        finally:
+            if acquired:
+                limiter.release()
 
     # ------------------------------------------------------------------ json
     def chat_json(

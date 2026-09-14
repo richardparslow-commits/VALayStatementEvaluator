@@ -41,7 +41,8 @@ app/
   fetch_client.py         Fetch Sandbox GET client -> normalized record documents
   va_gov_client.py        VA.gov auth/fetch/merge client (real HTTPS or in-memory mock)
   telemetry.py            Agiloop Inspect telemetry helper (feature-id-neutral)
-  llm.py                  OpenAI-compatible client (retry, JSON parsing)
+  llm.py                  OpenAI-compatible client (retry, JSON parsing, circuit breaker & concurrency limiter)
+  circuit_breaker.py      Stdlib circuit breaker (fail-fast after N failures) + in-memory concurrency limiter & bounded queue
   documents.py            TXT/MD/DOCX/PDF extraction, page-aware chunking
   medical_review.py       Exhaustive chunked record review -> fact digest
   evaluate.py             Claim extraction -> verification -> rubric scoring -> topic coverage
@@ -154,6 +155,11 @@ installs on macOS and Linux CI.
 | `VA_LSE_LOG_FILE` | Filename inside `VA_LSE_LOG_DIR` | `app.log` |
 | `VA_LSE_LOG_MAX_BYTES` | Rotate size per log file (bytes) | `10485760` (10 MiB) |
 | `VA_LSE_LOG_BACKUPS` | Rotated files kept | `5` |
+| `VA_LSE_CB_FAILURE_THRESHOLD` | Consecutive LLM failures before circuit breaker opens (fail-fast while open) | `3` |
+| `VA_LSE_CB_RECOVERY_SECONDS` | Cooldown while breaker is open before allowing a probe | `60` |
+| `VA_LSE_MAX_CONCURRENT_LLM_CALLS` | Max simultaneous LLM calls (extra callers queue) | `20` |
+| `VA_LSE_LLM_QUEUE_MAX_DEPTH` | Max queued callers waiting for a concurrency slot | `50` |
+| `VA_LSE_LLM_QUEUE_TIMEOUT_SECONDS` | Seconds a queued caller waits before `QueueFullError` | `30` |
 | `VA_LSE_HEALTH_PORT` | Sidecar health server port (`0` disables `GET /health` & `GET /ready`) | `8001` |
 
 Leave the `VA_GOV_API_BASE_URL` group or the `AGILOOP_INSPECT_*` group fully unset to run
@@ -425,6 +431,17 @@ VA_LSE_HEALTH_PORT=0 streamlit run run_app.py      # disable sidecar entirely
   if the port is already in use it logs a warning and the Streamlit app still starts (health is
   best-effort). Tests (`tests/test_health.py`) cover `/health`, `/ready` (cached/mocked), `HEAD`,
   and `404` without touching the network.
+
+## Resilience (circuit breaker & concurrency limiting)
+
+`app/llm.py` (via `app/circuit_breaker.py`) wraps every LLM call with two guards so 100 concurrent users cannot turn a brief endpoint degradation into a prolonged outage:
+
+| Guard | What it does | Defaults | Tuning |
+|---|---|---|---|
+| **Circuit breaker** | Counts *logical* LLM failures (a call that exhausts its 3 retries is one). After `VA_LSE_CB_FAILURE_THRESHOLD` consecutive failures it **opens**: every new `chat` fails fast with `CircuitBreakerOpenError` in <50 ms (no network, no retries), protecting the endpoint. After `VA_LSE_CB_RECOVERY_SECONDS` it enters `HALF_OPEN` and lets one probe through — success closes it, failure re-opens it. | `threshold=3`, `recovery=60s` | Lower the threshold for faster fail-fast; raise `recovery` on flaky gateways |
+| **Concurrency limiter** | Global semaphore (`VA_LSE_MAX_CONCURRENT_LLM_CALLS`, default `20`) caps simultaneous LLM calls across all threads/users. Extras queue; up to `VA_LSE_LLM_QUEUE_MAX_DEPTH=50` are queued and block up to `VA_LSE_LLM_QUEUE_TIMEOUT_SECONDS=30s`. Beyond either limit the call is rejected with `QueueFullError` (no retry). | `concurrent=20`, `queue=50`, `timeout=30s` | Raise `MAX_CONCURRENT` on higher-tier endpoints; raise `MAX_DEPTH` on bursty multi-user hosts |
+
+* Queue + breaker interact correctly: the breaker is checked **before** queuing (immediate fail-fast when open) and **again** after queuing (in case it opened while waiting). Queue-full or breaker rejections are **not** counted as endpoint failures. All breaker state changes (`CLOSED → OPEN`, `OPEN → HALF_OPEN`, `HALF_OPEN → CLOSED/OPEN`) log at `WARNING` with `phase=circuit_breaker`; queue-full/timeout log at `WARNING` with `phase=concurrency` — wire these to your alerting. `CircuitBreakerOpenError`/`QueueFullError` are re-exported from `app/llm.py` so callers can distinguish them from `LLMError`. Tests in `tests/test_circuit_breaker.py` cover the full state machine, the fail-fast <50 ms SLO, and the limiter queue off offline (no network).
 
 ## Telemetry (Agiloop Inspect)
 

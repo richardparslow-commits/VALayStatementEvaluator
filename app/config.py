@@ -182,3 +182,16 @@ CREDITS_PER_1M_FAST = _float_env("VA_LSE_CREDITS_PER_1M_FAST", None)
 # Weekly credit quota on the QwenCloud Individual Plan Lite (informational; used
 # only for the usage gauge, never limits the run).
 CREDIT_QUOTA = _float_env("VA_LSE_CREDIT_QUOTA", 2500.0)
+
+# ---------------------------------------------------------------------------
+# Circuit breaker + concurrency limiter for LLM calls (100-user protection).
+# The breaker opens after N consecutive logical failures (a call that exhausts
+# its retries counts as one) and stays open for RECOVERY_SECONDS before
+# allowing a probe. The limiter caps simultaneous LLM calls and queues the
+# rest up to MAX_DEPTH (see app/circuit_breaker.py and app/llm.py).
+# ---------------------------------------------------------------------------
+LLM_CB_FAILURE_THRESHOLD = _positive_int_env("VA_LSE_CB_FAILURE_THRESHOLD", 3)
+LLM_CB_RECOVERY_SECONDS = _positive_int_env("VA_LSE_CB_RECOVERY_SECONDS", 60)
+LLM_MAX_CONCURRENT = _positive_int_env("VA_LSE_MAX_CONCURRENT_LLM_CALLS", 20)
+LLM_QUEUE_MAX_DEPTH = _positive_int_env("VA_LSE_LLM_QUEUE_MAX_DEPTH", 50)
+LLM_QUEUE_TIMEOUT_SECONDS = _positive_int_env("VA_LSE_LLM_QUEUE_TIMEOUT_SECONDS", 30)
