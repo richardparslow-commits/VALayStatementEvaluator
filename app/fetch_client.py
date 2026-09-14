@@ -3,10 +3,24 @@ from __future__ import annotations
 
 import base64
 import json
-from http.client import HTTPConnection, HTTPSConnection
-from typing import Any
+from http.client import HTTPConnection, HTTPResponse, HTTPSConnection
+from typing import Any, Protocol
 from urllib.parse import ParseResult, quote, urlencode, urljoin, urlparse
 
+# JSON value type — narrow enough to replace bare Any at boundaries
+JsonValue = dict[str, Any] | list[Any] | str | int | float | bool | None
+FetchPayload = JsonValue
+FetchItem = JsonValue
+
+
+class HttpResponseLike(Protocol):  # minimal surface used by _read_limited_response
+    def getheader(self, name: str, default: str | None = None) -> str | None: ...
+    def getheaders(self) -> list[tuple[str, str]]: ...
+    def read(self, amt: int = -1) -> bytes: ...
+    status: int
+    reason: str
+
+from . import config
 from .config import Settings
 from .documents import (
     ExtractionError,
@@ -73,12 +87,13 @@ class FetchClient:
             headers["X-API-Key"] = api_key
         return headers
 
-    def _request_json(self, url: str) -> Any:
+    def _request_json(self, url: str) -> FetchPayload:
         body, _, _ = self._http_get(url)
         text = body.decode("utf-8", errors="replace")
 
         try:
-            return json.loads(text)
+            parsed: FetchPayload = json.loads(text)
+            return parsed
         except json.JSONDecodeError as exc:
             raise FetchSandboxError(
                 "Fetch Sandbox returned non-JSON data for the records endpoint."
@@ -91,7 +106,7 @@ class FetchClient:
         return data, content_type, filename
 
     def _normalize_payload(
-        self, payload: Any, patient_id: str
+        self, payload: FetchPayload, patient_id: str
     ) -> list[ExtractedDocument]:
         items = self._extract_items(payload)
         if not items:
@@ -103,7 +118,7 @@ class FetchClient:
             documents.append(self._normalize_item(item, patient_id, index))
         return documents
 
-    def _extract_items(self, payload: Any) -> list[Any]:
+    def _extract_items(self, payload: FetchPayload) -> list[FetchItem]:
         if isinstance(payload, list):
             return payload
         if not isinstance(payload, dict):
@@ -121,7 +136,7 @@ class FetchClient:
         return [payload]
 
     def _normalize_item(
-        self, item: Any, patient_id: str, index: int
+        self, item: FetchItem, patient_id: str, index: int
     ) -> ExtractedDocument:
         if isinstance(item, str):
             if self._looks_like_url(item):
@@ -200,7 +215,7 @@ class FetchClient:
             ) from exc
 
     def _structured_payload_document(
-        self, payload: dict[str, Any], patient_id: str
+        self, payload: dict[str, JsonValue], patient_id: str
     ) -> ExtractedDocument:
         return document_from_text(
             self._json_filename(f"{patient_id}_records"),
@@ -234,7 +249,7 @@ class FetchClient:
         return name if name.lower().endswith(".json") else f"{name}.json"
 
     @staticmethod
-    def _json_text(value: Any) -> str:
+    def _json_text(value: JsonValue | Any) -> str:  # structured slots may carry arbitrary JSON
         if isinstance(value, str):
             return value
         return json.dumps(value, indent=2, sort_keys=True)
@@ -290,6 +305,7 @@ class FetchClient:
 
     def _http_get(self, url: str) -> tuple[bytes, dict[str, str], str]:
         parsed = urlparse(self._validated_url(url))
+        assert parsed.hostname is not None
         connection_cls = HTTPSConnection if parsed.scheme == "https" else HTTPConnection
         connection = connection_cls(
             parsed.hostname,
@@ -304,7 +320,7 @@ class FetchClient:
             connection.request("GET", path, headers=self._headers())
             response = connection.getresponse()
             data = self._read_limited_response(
-                response,
+                response,  # type: ignore[arg-type]  # HTTPResponse overloads getheader; Protocol captures needed surface
                 self._settings.fetch_max_response_bytes,
             )
             headers = {key: value for key, value in response.getheaders()}
@@ -326,7 +342,7 @@ class FetchClient:
         return data, headers, response.reason
 
     @staticmethod
-    def _read_limited_response(response: Any, max_bytes: int) -> bytes:
+    def _read_limited_response(response: HttpResponseLike, max_bytes: int) -> bytes:
         content_length = response.getheader("Content-Length")
         if content_length is not None:
             invalid_length_message = (

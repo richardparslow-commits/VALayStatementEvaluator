@@ -154,6 +154,7 @@ installs on macOS and Linux CI.
 | `VA_LSE_LOG_FILE` | Filename inside `VA_LSE_LOG_DIR` | `app.log` |
 | `VA_LSE_LOG_MAX_BYTES` | Rotate size per log file (bytes) | `10485760` (10 MiB) |
 | `VA_LSE_LOG_BACKUPS` | Rotated files kept | `5` |
+| `VA_LSE_HEALTH_PORT` | Sidecar health server port (`0` disables `GET /health` & `GET /ready`) | `8001` |
 
 Leave the `VA_GOV_API_BASE_URL` group or the `AGILOOP_INSPECT_*` group fully unset to run
 those integrations in mock mode. Partially configuring an integration (e.g. setting
@@ -290,9 +291,18 @@ the pipeline (no API calls) to verify orchestration at scale.
 ## Tests
 
 ```bash
-python -m unittest discover -s tests -v        # offline unit tests
+python -m unittest discover -s tests -v        # offline unit tests (incl. health probes)
+python -m mypy app                             # strict type check (see pyproject.toml)
 python scripts/smoke_test.py all               # live end-to-end (needs valid .env)
 ```
+
+### Type checking (mypy — strict)
+
+`pyproject.toml` enables strict `mypy` for `app/` (`disallow_untyped_defs`, `warn_return_any`,
+`no_implicit_optional`, etc.; tests/scripts are relaxed). CI runs `mypy app` as a blocking gate
+on every push/PR. Run locally with `mypy app` (install `pip install -r requirements-dev.txt` once).
+All public helpers in `app/main.py`, `app/fetch_client.py`, `app/evaluate.py` carry precise types
+(`ExtractedDocument`/`EvaluationResult`/`DraftResult`/`Settings` etc.) instead of `Any`.
 
 > GitHub Actions installs from the hash-pinned `requirements.lock` (see **Dependency locking**),
 > then runs the offline tests and scale simulation automatically on every push to `main` (and on
@@ -382,7 +392,39 @@ used for evaluation or drafting.
 - **Privacy:** VA.gov records are treated identically to every other source for extraction,
   chunking, duplicate detection, and page labeling. Fetched records and the VA.gov session token
   live only in `st.session_state` for the current browser session; credentials are **never**
-  written to disk, `.env`, or logs.
+  written to disk, `.env`, or logs.## Health checks (container orchestration)
+
+A stdlib-only sidecar (`app/health.py`, started from `run_app.py` before Streamlit) exposes two
+orchestrator-friendly probes on `0.0.0.0:$VA_LSE_HEALTH_PORT` — no extra dependencies:
+
+| Endpoint | Meaning | Status | Latency |
+|---|---|---|---|
+| `GET /health` | **Liveness** — the process is up | `200` with `{status:"ok", service, uptime_s}` | < 50 ms |
+| `GET /ready` | **Readiness** — LLM endpoint + configured models are reachable (`GET {base_url}/models`) | `200` when ready, `503` when not (JSON always includes `ready` + `detail`) | < 2 s (probe timeout 1.4 s, cached 30 s) |
+| `HEAD /health`, `HEAD /ready` | Same as GET but no body — for probes that use HEAD | same | same |
+| any other path | | `404` | — |
+
+```bash
+# Local quick check
+curl -s http://localhost:8001/health | python -m json.tool
+curl -s -w "%{http_code}\n" http://localhost:8001/ready
+# Change or disable the sidecar
+VA_LSE_HEALTH_PORT=9001 streamlit run run_app.py   # different port
+VA_LSE_HEALTH_PORT=0 streamlit run run_app.py      # disable sidecar entirely
+```
+
+- **Liveness** never touches the LLM gateway — it is `200` as soon as the Python process starts.
+- **Readiness** calls `GET {base_url}/models` with a 1.4 s timeout and is cached for 30 s so the
+  handler always meets the < 2 s SLO even when the LLM gateway is slow. Missing `OPENAI_API_KEY`,
+  missing `OPENAI_BASE_URL`, or any network/auth/parse failure → `503` with a short `detail` (no
+  key leaked). Callers should treat `503` as "not ready, keep out of the load-balancer pool."
+- **Kubernetes / Agiloop / Docker Swarm** — point `livenessProbe` at `httpGet: path:/health port:8001`
+  and `readinessProbe` at `httpGet: path:/ready port:8001` (adjust `port` if you override
+  `VA_LSE_HEALTH_PORT`). Example hints for a `Deployment` are in the docstring of `app/health.py`.
+- The sidecar binds with `ThreadingHTTPServer` (stdlib) on a **daemon thread** and is idempotent —
+  if the port is already in use it logs a warning and the Streamlit app still starts (health is
+  best-effort). Tests (`tests/test_health.py`) cover `/health`, `/ready` (cached/mocked), `HEAD`,
+  and `404` without touching the network.
 
 ## Telemetry (Agiloop Inspect)
 
@@ -391,13 +433,13 @@ The app reports usage telemetry (impressions, interactions, errors) to Agiloop I
 Inspect API key never leaves the Python process.
 
 - **Mock mode (default):** leave `AGILOOP_INSPECT_API_KEY` and `AGILOOP_PROJECT_ID` unset —
-  events are logged at debug level and dropped instead of sent. Nothing about the app's behavior
-  changes; telemetry is always best-effort and never blocks the UI.
+events are logged at debug level and dropped instead of sent. Nothing about the app's behavior
+changes; telemetry is always best-effort and never blocks the UI.
 - **Real mode:** set both `AGILOOP_INSPECT_API_KEY` and `AGILOOP_PROJECT_ID` (and optionally
-  `AGILOOP_INSPECT_URL` to point at a non-default Inspect deployment) to send real events.
+`AGILOOP_INSPECT_URL` to point at a non-default Inspect deployment) to send real events.
 - `app/telemetry.py` is feature-id-neutral shared infrastructure: it never hardcodes a feature
-  id. Each feature's call sites (e.g. `app/va_gov_client.py`, `app/main.py`) supply their own
-  `featureId` explicitly.
+id. Each feature's call sites (e.g. `app/va_gov_client.py`, `app/main.py`) supply their own
+`featureId` explicitly.
 
 ## Structured logging (diagnostics & performance traces)
 
@@ -461,6 +503,10 @@ that adds:
 
 `.streamlit/secrets.toml` is git-ignored — never store deploy keys there as a
 checked-in file.
+
+For the orchestrator probes, see **Health checks (container orchestration)** above —
+front the same `GET /health` / `GET /ready` sidecar on `VA_LSE_HEALTH_PORT` (default `8001`)
+with your proxy if the stream is TLS-terminated there.
 
 ## Compatibility & migration
 

@@ -353,6 +353,8 @@ def _https_request(
     parsed = urlparse(base_url.strip())
     if parsed.scheme != "https" or not parsed.netloc:
         raise VaGovError("VA_GOV_API_BASE_URL must be an absolute HTTPS URL.", error_class="config_error")
+    if not parsed.hostname:
+        raise VaGovError("VA_GOV_API_BASE_URL must include a hostname.", error_class="config_error")
     full_path = path if already_built_path else _validated_https_url(base_url, path)
     connection = HTTPSConnection(parsed.hostname, parsed.port, timeout=REQUEST_TIMEOUT_SECONDS)
     try:
@@ -387,7 +389,7 @@ def _read_limited_response(response: Any, max_bytes: int) -> bytes:
             "VA.gov response has invalid Content-Length " f"({content_length})."
         )
         try:
-            declared_size = int(content_length)  # type: ignore[arg-type]
+            declared_size = int(str(content_length))
         except (TypeError, ValueError):
             raise VaGovError(invalid_length_message, error_class="fetch_failed")
         if declared_size < 0:

@@ -8,6 +8,29 @@ on:
   workflow_dispatch:
 
 jobs:
+  lint:
+    name: Static checks (mypy)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.lock
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --require-hashes -r requirements.lock
+          pip install -r requirements-dev.txt
+
+      - name: mypy (strict, app/)
+        run: mypy app
+
   test:
     name: Offline tests + scale simulation
     runs-on: ubuntu-latest

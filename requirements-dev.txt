@@ -1,0 +1,6 @@
+# Development-only dependencies (not needed to run the app).
+# Install with:  pip install -r requirements-dev.txt
+# CI installs this after requirements.lock (see .github/workflows/test.yml).
+-r requirements.txt
+mypy>=1.18
+types-requests

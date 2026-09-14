@@ -154,6 +154,8 @@ def _send(payload: dict[str, Any]) -> None:
         feature_id = payload.get("featureId")
         query = f"?{urlencode({'featureId': feature_id})}" if feature_id else ""
         parsed = urlparse(base_url)
+        if not parsed.hostname:
+            return
         connection_cls = HTTPSConnection if parsed.scheme == "https" else HTTPConnection
         connection = connection_cls(parsed.hostname, parsed.port, timeout=REQUEST_TIMEOUT_SECONDS)
         try:

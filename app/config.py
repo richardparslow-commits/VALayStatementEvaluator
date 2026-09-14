@@ -122,6 +122,11 @@ def _positive_int_env(name: str, default: int) -> int:
     return value if value > 0 else default
 
 
+# Sidecar health server (liveness + readiness) for container orchestration.
+# Exposes GET /health (liveness) and GET /ready (readiness) on this port on
+# 0.0.0.0. Override with VA_LSE_HEALTH_PORT; disabled when set to 0.
+HEALTH_PORT = _int_env("VA_LSE_HEALTH_PORT", 8001)
+
 # Hard cap on total pages across all uploaded record files.
 MAX_RECORD_PAGES = _int_env("VA_LSE_MAX_RECORD_PAGES", 5000)
 

@@ -478,6 +478,7 @@ def _run_evaluation(
 
     with PhaseTimer(logger, "verify", request_id=rid, claims=len(result.claims)):
         report(0.60, "Step 3/7 — Verifying each claim against the records…")
+        assert result.digest is not None  # set by records:review above
         result.verifications = _verify_claims(llm, result.claims, result.digest, records, report)
 
     with PhaseTimer(logger, "rubric", request_id=rid):
@@ -490,7 +491,7 @@ def _run_evaluation(
             RUBRIC_USER.format(
                 statement=sanitize_for_prompt(prompt_statement, max_chars=EVALUATE_INTERNAL_MAX_CHARS),
                 verifications=sanitize_for_prompt(_verifications_text(result), max_chars=20_000),
-                digest_summary=sanitize_digest_text(result.digest.summary or "(no summary)", max_chars=20_000),
+                digest_summary=sanitize_digest_text((result.digest.summary if result.digest else "") or "(no summary)", max_chars=20_000),
                 guard_note=GUARD_NOTE,
             ),
             phase="rubric",
@@ -537,7 +538,7 @@ def _analyze_topics(
             TOPIC_USER.format(
                 statement=sanitize_for_prompt(truncated_statement, max_chars=EVALUATE_INTERNAL_MAX_CHARS),
                 verifications=sanitize_for_prompt(_verifications_text(result), max_chars=20_000),
-                digest_summary=sanitize_digest_text((result.digest.summary or "(no summary)")[:12000], max_chars=20_000),
+                digest_summary=sanitize_digest_text(((result.digest.summary if result.digest else "") or "(no summary)")[:12000], max_chars=20_000),
                 guard_note=GUARD_NOTE,
             ),
             phase="topic",
@@ -591,7 +592,7 @@ def _draft_revision(
                 verifications=sanitize_for_prompt(_verifications_text(result), max_chars=20_000),
                 improvements=sanitize_for_prompt(_json.dumps(result.improvements, indent=1)[:6000] or "(none)", max_chars=10_000),
                 omitted_facts=sanitize_for_prompt(_json.dumps(result.omitted_record_facts, indent=1)[:4000] or "(none)", max_chars=10_000),
-                digest_summary=sanitize_digest_text((result.digest.summary or "(no summary)")[:12000], max_chars=20_000),
+                digest_summary=sanitize_digest_text(((result.digest.summary if result.digest else "") or "(no summary)")[:12000], max_chars=20_000),
                 topic_analysis=sanitize_for_prompt(topic_analysis, max_chars=25_000),
                 guard_note=GUARD_NOTE,
             ),
@@ -682,8 +683,9 @@ def build_report(result: EvaluationResult, statement_text: str) -> str:
         lines.append(f"> ⚠️ **Truncated input:** {result.truncation_warning}")
         lines.append("")
     lines.append(f"**Overall rating: {result.overall_rating}**")
-    if result.claimed_condition:
-        lines.append(f"**Appears to support claim for:** {result.claimed_condition}")
+    claimed: str = result.claimed_condition  # narrow type for mypy
+    if claimed:
+        lines.append(f"**Appears to support claim for:** {claimed}")
     if result.writer_role:
         lines.append(f"**Writer role:** {result.writer_role}")
     if result.digest:
@@ -805,8 +807,8 @@ def build_report(result: EvaluationResult, statement_text: str) -> str:
         if result.added_facts_to_verify:
             lines.append("**Record-sourced facts added — the witness must confirm each before signing:**")
             lines.append("")
-            for fact in result.added_facts_to_verify:
-                lines.append(f"- {fact}")
+            for fact_str in result.added_facts_to_verify:
+                lines.append(f"- {fact_str}")
             lines.append("")
         if result.revised_statement:
             lines.append("### Revised statement (resolve every `[Confirm: …]` before signing)")

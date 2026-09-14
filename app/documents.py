@@ -8,9 +8,20 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from typing import Protocol
+
 from pypdf import PdfReader
 
 from . import config
+
+
+class UploadedFile(Protocol):
+    """Minimal surface of ``streamlit.runtime.uploaded_file_manager.UploadedFile`` needed here."""
+
+    name: str
+    size: int
+
+    def getvalue(self) -> bytes: ...
 
 SUPPORTED_EXTENSIONS = (".pdf", ".txt", ".md", ".docx")
 
@@ -233,7 +244,7 @@ def _read_docx_member_limited(
 
 
 def extract_uploaded_documents(
-    files,  # iterable of Streamlit UploadedFile-like objects (name + getvalue)
+    files: "list[UploadedFile]",
 ) -> tuple[list[ExtractedDocument], list[str]]:
     """Extract uploaded files; returns ``(documents, skipped)``.
 
@@ -354,7 +365,7 @@ class Paragraph:
     text: str
 
 
-_PARAGRAPH_CACHE: dict[tuple, list[Paragraph]] = {}
+_PARAGRAPH_CACHE: dict[tuple[str, int, int], list[Paragraph]] = {}
 
 
 def paragraph_index(doc: ExtractedDocument, min_chars: int = 40) -> list[Paragraph]:

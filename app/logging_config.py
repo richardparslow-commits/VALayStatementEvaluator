@@ -37,7 +37,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 # ---------------------------------------------------------------- request id
 
@@ -92,9 +92,9 @@ def decorate_logger_with_request_id(
             # Only fill if the caller didn't supply an explicit request_id.
             if not getattr(record, "request_id", None):
                 try:
-                    record.request_id = _request_id_var.get() or "-"  # type: ignore[attr-defined]
+                    setattr(record, "request_id", _request_id_var.get() or "-")
                 except LookupError:
-                    record.request_id = "-"  # type: ignore[attr-defined]
+                    setattr(record, "request_id", "-")
             return True
 
     logger.addFilter(_RequestIdFilter())
@@ -198,7 +198,7 @@ class PlainFormatter(logging.Formatter):
                 request_id = _request_id_var.get() or "-"
             except LookupError:
                 request_id = "-"
-            record.request_id = request_id  # type: ignore[attr-defined]
+            setattr(record, "request_id", request_id)
         # Attach request_id to the message prefix; still emit extra fields if provided.
         base = super().format(record)
         extras: list[str] = []
@@ -344,6 +344,7 @@ def configure_logging(
         "app.va_gov_client",
         "app.telemetry",
         "app.agiloop_telemetry",
+        "app.health",
     ):
         decorate_logger_with_request_id(logging.getLogger(child_name))
 
@@ -419,7 +420,12 @@ class PhaseTimer:
         )
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:  # noqa: ANN001
+    def __exit__(  # noqa: ANN001
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: object,
+    ) -> Literal[False]:
         duration_ms = int(_now_ms() - self._t0) if self._t0 else 0
         if exc_type is None:
             self.logger.log(
@@ -437,12 +443,18 @@ class PhaseTimer:
             )
             return False
         # Error path — include stack trace but never body/PII
+        from types import TracebackType as _TracebackType
+
+        _tb: _TracebackType | None = exc_tb if isinstance(exc_tb, _TracebackType) else None
+        _exc_info: tuple[type[BaseException], BaseException, _TracebackType | None] | None = None
+        if exc_type is not None and exc_val is not None:
+            _exc_info = (exc_type, exc_val, _tb)
         self.logger.error(
             "phase error: %s (%d ms): %s",
             self.phase,
             duration_ms,
             exc_val,
-            exc_info=(exc_type, exc_val, exc_tb),
+            exc_info=_exc_info,
             extra={
                 "request_id": self.request_id,
                 "phase": self.phase,

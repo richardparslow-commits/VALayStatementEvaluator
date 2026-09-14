@@ -6,6 +6,7 @@ Run with:
 from __future__ import annotations
 
 import logging
+from typing import Any, cast
 import time
 
 import streamlit as st
@@ -23,8 +24,8 @@ from .documents import (
     extract_uploaded_documents,
     records_from_local_path,
 )
-from .draft import grounding_markdown, run_draft
-from .evaluate import DIMENSION_LABELS, run_evaluation
+from .draft import DraftResult, grounding_markdown, run_draft
+from .evaluate import DIMENSION_LABELS, EvaluationResult, run_evaluation
 from .fetch_client import FetchClient, FetchSandboxError
 from .llm import LLMClient, LLMError
 from .logging_config import (
@@ -103,7 +104,7 @@ def _check_streamlit_config_hardening() -> None:
         pass
 
 
-def _check_upload_limits(files) -> tuple[list, list[str]]:
+def _check_upload_limits(files: Any) -> tuple[list[Any], list[str]]:
     """Split uploaded files into accepted vs rejected by VA_LSE_MAX_UPLOAD_BYTES.
 
     Returns (accepted_files, rejection_messages). Accepted files also pass a
@@ -114,7 +115,7 @@ def _check_upload_limits(files) -> tuple[list, list[str]]:
         return [], []
     # Each Streamlit UploadedFile exposes .name and .size (bytes). Fall back to
     # len(getvalue()) for test fakes that only expose getvalue().
-    def _size(f) -> int:
+    def _size(f: Any) -> int:
         try:
             return int(getattr(f, "size", None) or len(f.getvalue()))
         except Exception:  # noqa: BLE001
@@ -240,7 +241,8 @@ def _sidebar_settings() -> None:
 
 def _get_or_create_request_id() -> str:
     """Return the active run's correlation id, minting one if needed."""
-    rid = st.session_state.get(_REQUEST_ID_KEY, "")
+    rid_raw: Any = st.session_state.get(_REQUEST_ID_KEY, "")
+    rid: str = str(rid_raw) if isinstance(rid_raw, str) and rid_raw else ""
     if rid:
         # Ensure ContextVar mirrors session state (Streamlit reruns may reset context).
         set_request_id(rid)
@@ -285,7 +287,7 @@ def _format_error_for_user(exc: Exception, request_id: str) -> str:
     return f"{exc}{rid_suffix}"
 
 
-def _extract_uploads(files, slot: str) -> list:
+def _extract_uploads(files: Any, slot: str) -> list[Any]:
     """Extract text from uploaded files; cache results per file identity.
 
     Files that fail extraction (e.g. image-only PDFs) are reported as
@@ -319,7 +321,7 @@ def _extract_uploads(files, slot: str) -> list:
     return documents
 
 
-def _render_skip_summary(files, documents: list, skipped: list[str]) -> None:
+def _render_skip_summary(files: Any, documents: list[Any], skipped: list[str]) -> None:
     """Show a loaded-vs-skipped summary under an uploader when any file failed."""
     if not files or not skipped:
         return
@@ -452,12 +454,13 @@ def _local_records(slot: str) -> list:
                 st.session_state[skipped_key] = skipped
     for message in st.session_state.get(skipped_key, []):
         st.warning(message)
-    records = st.session_state.get(import_key, [])
-    _remember_source_records(slot, "Local folder / file", records)
-    return records
+    cached_any: Any = st.session_state.get(import_key, [])
+    cached_records: list[Any] = cached_any if isinstance(cached_any, list) else []
+    _remember_source_records(slot, "Local folder / file", cached_records)
+    return cached_records
 
 
-def _fetch_records(slot: str) -> list:
+def _fetch_records(slot: str) -> list[Any]:
     settings = st.session_state.settings
     patient_id = st.text_input(
         "Patient or record ID",
@@ -476,12 +479,13 @@ def _fetch_records(slot: str) -> list:
             st.warning(str(exc))
         else:
             st.session_state[import_key] = records
-    records = st.session_state.get(import_key, [])
-    _remember_source_records(slot, "Fetch Sandbox", records)
-    return records
+    records_any2: Any = st.session_state.get(import_key, [])
+    records2: list[Any] = records_any2 if isinstance(records_any2, list) else []
+    _remember_source_records(slot, "Fetch Sandbox", records2)
+    return records2
 
 
-def _va_gov_records(slot: str) -> list:
+def _va_gov_records(slot: str) -> list[Any]:
     """VA.gov source: per-session secure login + consent, then automatic fetch.
 
     Failure to authenticate or fetch never blocks the other record sources —
@@ -547,9 +551,9 @@ def _va_gov_records(slot: str) -> list:
         )
         col_retry, col_continue = st.columns(2)
         if col_retry.button("Retry VA.gov fetch", key=f"va_gov_retry_{slot}"):
-            session = st.session_state.get(f"va_gov_session_{slot}")
-            if session is not None:
-                st.session_state[f"va_gov_fetch_{slot}"] = va_gov_client.fetch_va_records(session)
+            session_any: Any = st.session_state.get(f"va_gov_session_{slot}")
+            if session_any is not None:
+                st.session_state[f"va_gov_fetch_{slot}"] = va_gov_client.fetch_va_records(session_any)
                 st.rerun()
         if col_continue.button(
             "Continue with available VA.gov records", key=f"va_gov_continue_{slot}"
@@ -608,7 +612,7 @@ def _save_usage_history(history: watchdog.UsageHistory) -> None:
         pass
 
 
-def _record_watchdog_run(usage) -> None:
+def _record_watchdog_run(usage: Any) -> None:
     """Append a finished run's token totals to the persisted history.
 
     Per-role token totals (main vs fast) are carried along so the watchdog can
@@ -700,10 +704,7 @@ def _credit_calibration_widget() -> None:
                     f"**Learned effective rate:** ≈{fit.blended_rate:,.0f} credits / 1M "
                     f"tokens {fit.multiline_note}"
                 )
-            enabled = all(
-                config.CREDITS_PER_1M_MAIN is None
-                and config.CREDITS_PER_1M_FAST is None
-            )
+            enabled = config.CREDITS_PER_1M_MAIN is None and config.CREDITS_PER_1M_FAST is None
             if enabled:
                 rate_desc = (
                     f"main **{fit.main_rate:,.0f}** / fast **{fit.fast_rate:,.0f} credits/1M**"
@@ -726,7 +727,7 @@ def _credit_calibration_widget() -> None:
             )
 
 
-def _compat_model_warning(settings) -> None:
+def _compat_model_warning(settings: Any) -> None:
     """Warn if the configured models are not listed at GET {base_url}/models.
 
     Advisory only: network/permission failures are silently ignored and the
@@ -758,7 +759,7 @@ def _compat_model_warning(settings) -> None:
         st.warning(msg)
 
 
-def _progress_widgets(llm: LLMClient | None = None, *, request_id: str | None = None):
+def _progress_widgets(llm: LLMClient | None = None, *, request_id: str | None = None) -> tuple[Any, Any]:
     """Progress bar whose caption appends a live estimated-usage line."""
     bar = st.progress(0.0, text="Starting…")
     rid = request_id or get_request_id() or "-"
@@ -773,7 +774,7 @@ def _progress_widgets(llm: LLMClient | None = None, *, request_id: str | None = 
     return bar, update
 
 
-def _render_usage_summary(usage) -> None:
+def _render_usage_summary(usage: Any) -> None:
     """Render an estimated per-phase usage breakdown after a successful run."""
     if usage is None:
         return
@@ -959,36 +960,37 @@ def evaluate_tab() -> None:
         st.session_state.eval_request_id = rid
         _record_watchdog_run(llm.usage)
 
-    result = st.session_state.get("eval_result")
-    if result is None:
+    cached_eval: Any = st.session_state.get("eval_result")
+    if cached_eval is None:
         return
+    eval_result: Any = cached_eval
 
     _render_usage_summary(st.session_state.get("eval_usage"))
 
-    if getattr(result, "truncation_warning", ""):
+    if getattr(eval_result, "truncation_warning", ""):
         st.warning(
-            f"⚠️ {result.truncation_warning} (input was {result.input_chars:,} chars; "
-            f"{result.truncated_chars:,} truncated). Review the report header for details."
+            f"⚠️ {eval_result.truncation_warning} (input was {eval_result.input_chars:,} chars; "
+            f"{eval_result.truncated_chars:,} truncated). Review the report header for details."
         )
 
     st.divider()
     st.subheader("📋 Evaluation Results")
 
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Overall rating", result.overall_rating)
-    col2.metric("Claims verified", len(result.verifications))
-    col3.metric("Contradictions", result.contradiction_count)
-    _applicable = [t for t in result.topic_rows if t.get("applicable")]
+    col1.metric("Overall rating", eval_result.overall_rating)
+    col2.metric("Claims verified", len(eval_result.verifications))
+    col3.metric("Contradictions", eval_result.contradiction_count)
+    _applicable = [t for t in eval_result.topic_rows if t.get("applicable")]
     _covered = [t for t in _applicable if t.get("coverage") == "covered"]
     col4.metric("Topics covered", f"{len(_covered)}/{len(_applicable)}" if _applicable else "—")
 
     with st.expander("Executive summary", expanded=True):
-        st.write(result.executive_summary)
+        st.write(eval_result.executive_summary)
 
     with st.expander("Claim-by-claim verification table", expanded=True):
         rows = []
-        claim_text = {c["id"]: c.get("text", "") for c in result.claims}
-        for v in result.verifications:
+        claim_text = {c["id"]: c.get("text", "") for c in eval_result.claims}
+        for v in eval_result.verifications:
             rows.append(
                 {
                     "Claim": claim_text.get(v.get("id"), ""),
@@ -1003,23 +1005,23 @@ def evaluate_tab() -> None:
         score_rows = [
             {
                 "Dimension": DIMENSION_LABELS.get(k, k),
-                "Score": result.scores.get(k, 0),
-                "Rationale": result.rationales.get(k, ""),
+                "Score": eval_result.scores.get(k, 0),
+                "Rationale": eval_result.rationales.get(k, ""),
             }
             for k in DIMENSION_LABELS
         ]
         st.dataframe(score_rows, use_container_width=True, hide_index=True)
         st.bar_chart(
-            {DIMENSION_LABELS[k]: result.scores.get(k, 0) for k in DIMENSION_LABELS},
+            {DIMENSION_LABELS[k]: eval_result.scores.get(k, 0) for k in DIMENSION_LABELS},
             horizontal=True,
         )
 
-    if result.topic_rows:
+    if eval_result.topic_rows:
         with st.expander(
             "🧭 Topic coverage — what the statement does and does not address", expanded=True
         ):
-            if result.topic_focus:
-                st.write(f"**Claim focus:** {result.topic_focus}")
+            if eval_result.topic_focus:
+                st.write(f"**Claim focus:** {eval_result.topic_focus}")
             topic_table = [
                 {
                     "Topic": t.get("topic", ""),
@@ -1028,34 +1030,34 @@ def evaluate_tab() -> None:
                     "Evidence in statement": t.get("evidence", ""),
                     "How to strengthen": t.get("gap_note", ""),
                 }
-                for t in result.topic_rows
+                for t in eval_result.topic_rows
             ]
             st.dataframe(topic_table, use_container_width=True, hide_index=True)
-            if result.topic_critical_gaps:
+            if eval_result.topic_critical_gaps:
                 st.warning(
                     "**Critical gaps — the highest-impact topics this statement still misses:**"
                 )
-                for gap in result.topic_critical_gaps:
+                for gap in eval_result.topic_critical_gaps:
                     st.write(f"- {gap}")
-            if result.topic_notes:
-                st.caption(result.topic_notes)
+            if eval_result.topic_notes:
+                st.caption(eval_result.topic_notes)
 
     with st.expander("Improvements & record facts to add", expanded=True):
-        for imp in result.improvements:
+        for imp in eval_result.improvements:
             st.markdown(f"**{imp.get('priority', '?')}. {imp.get('problem', '')}**")
             st.write(imp.get("suggestion", ""))
             if imp.get("example_rewrite"):
                 st.caption(f"Example: “{imp.get('example_rewrite')}”")
-        if result.omitted_record_facts:
+        if eval_result.omitted_record_facts:
             st.markdown("**Facts from the records you could add (verify first):**")
-            for fact in result.omitted_record_facts:
-                st.write(f"- {fact.get('fact', '')} _(source: {fact.get('source', '')})_")
+            for fact_dict in eval_result.omitted_record_facts:
+                st.write(f"- {fact_dict.get('fact', '')} _(source: {fact_dict.get('source', '')})_")
 
-    if result.revised_statement or result.revision_changes:
+    if eval_result.revised_statement or eval_result.revision_changes:
         with st.expander("📝 Suggested improvements — proposed rewrite", expanded=True):
-            if result.revision_notes:
-                st.info(result.revision_notes)
-            if result.revision_changes:
+            if eval_result.revision_notes:
+                st.info(eval_result.revision_notes)
+            if eval_result.revision_changes:
                 change_rows = [
                     {
                         "Category": c.get("category", ""),
@@ -1063,15 +1065,15 @@ def evaluate_tab() -> None:
                         "Suggested": c.get("revised", ""),
                         "Why": c.get("reason", ""),
                     }
-                    for c in result.revision_changes
+                    for c in eval_result.revision_changes
                 ]
                 st.dataframe(change_rows, use_container_width=True, hide_index=True)
-            if result.added_facts_to_verify:
+            if eval_result.added_facts_to_verify:
                 st.markdown(
                     "**Record-sourced facts added — the witness must confirm each before signing:**"
                 )
-                for fact in result.added_facts_to_verify:
-                    st.write(f"- {fact}")
+                for fact_str in eval_result.added_facts_to_verify:
+                    st.write(f"- {fact_str}")
             st.markdown("#### Revised statement")
             st.caption(
                 "Contradictions have been corrected to match the medical records. Resolve every "
@@ -1079,7 +1081,7 @@ def evaluate_tab() -> None:
             )
             revised = st.text_area(
                 "Revised statement (editable)",
-                value=result.revised_statement,
+                value=eval_result.revised_statement,
                 height=420,
                 key="eval_revised_statement",
             )
@@ -1098,10 +1100,10 @@ def evaluate_tab() -> None:
             )
 
     with st.expander("Full markdown report"):
-        st.markdown(result.report_markdown)
+        st.markdown(eval_result.report_markdown)
     st.download_button(
         "⬇️ Download evaluation report (.md)",
-        data=result.report_markdown.encode("utf-8"),
+        data=eval_result.report_markdown.encode("utf-8"),
         file_name="lay_statement_evaluation.md",
         mime="text/markdown",
     )
@@ -1266,16 +1268,17 @@ def draft_tab() -> None:
         st.session_state.draft_request_id = rid
         _record_watchdog_run(llm.usage)
 
-    result = st.session_state.get("draft_result")
-    if result is None:
+    cached_draft: Any = st.session_state.get("draft_result")
+    if cached_draft is None:
         return
+    draft_result: Any = cached_draft
 
     _render_usage_summary(st.session_state.get("draft_usage"))
 
     if getattr(result, "truncation_warning", ""):
         st.warning(
-            f"⚠️ {result.truncation_warning} (input was {result.input_chars:,} chars; "
-            f"{result.truncated_chars:,} truncated). Review the grounding section for details."
+            f"⚠️ {draft_result.truncation_warning} (input was {draft_result.input_chars:,} chars; "
+            f"{draft_result.truncated_chars:,} truncated). Review the grounding section for details."
         )
 
     st.divider()
@@ -1284,9 +1287,9 @@ def draft_tab() -> None:
     with st.expander("Grounding analysis — how the draft ties to the records", expanded=True):
         st.markdown(grounding_markdown(result))
 
-    if result.review_issues:
+    if draft_result.review_issues:
         with st.expander("Self-review findings (fixed in the final version)"):
-            for issue in result.review_issues:
+            for issue in draft_result.review_issues:
                 st.write(f"- {issue}")
 
     st.markdown("### Final statement (editable)")
@@ -1295,7 +1298,7 @@ def draft_tab() -> None:
         "Submit on VA Form 21-10210 (one form per witness)."
     )
     edited = st.text_area(
-        "Statement", value=result.output_statement, height=460, key="draft_edited"
+        "Statement", value=draft_result.output_statement, height=460, key="draft_edited"
     )
     col_a, col_b = st.columns(2)
     col_a.download_button(
@@ -1311,16 +1314,16 @@ def draft_tab() -> None:
         mime="text/markdown",
     )
 
-    if result.digest:
+    if draft_result.digest:
         with st.expander("Medical record digest used for grounding"):
             st.caption(
-                f"{len(result.digest.facts):,} facts extracted from "
-                f"{result.digest.pages_reviewed:,} pages "
-                f"({result.digest.chunks_reviewed} chunks, "
-                f"{result.digest.duplicates_skipped} duplicate page(s) skipped)"
+                f"{len(draft_result.digest.facts):,} facts extracted from "
+                f"{draft_result.digest.pages_reviewed:,} pages "
+                f"({draft_result.digest.chunks_reviewed} chunks, "
+                f"{draft_result.digest.duplicates_skipped} duplicate page(s) skipped)"
             )
-            st.write(result.digest.summary)
-            st.code(result.digest.timeline_text()[:20000], language=None)
+            st.write(draft_result.digest.summary)
+            st.code(draft_result.digest.timeline_text()[:20000], language=None)
 
 
 # ----------------------------------------------------------------- about tab

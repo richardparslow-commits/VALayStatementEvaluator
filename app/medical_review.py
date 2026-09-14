@@ -25,7 +25,7 @@ import logging
 import time
 
 from . import config
-from .documents import ExtractedDocument, chunk_page_labelled_text, paragraph_index
+from .documents import Chunk, ExtractedDocument, chunk_page_labelled_text, paragraph_index
 from .llm import LLMClient, LLMError
 from .logging_config import PhaseTimer, get_request_id
 from .prompt_sanitize import GUARD_NOTE, sanitize_for_prompt
@@ -299,7 +299,7 @@ def review_medical_records(
 
     _ctx_request_id = get_request_id()  # capture for worker threads
 
-    def digest_chunk(chunk) -> dict:  # type: ignore[no-untyped-def]
+    def digest_chunk(chunk: Chunk) -> dict[str, object]:
         # Propagate the run's correlation id into the worker thread.
         from .logging_config import _request_id_var  # local import to avoid cycle at import time
 
@@ -332,7 +332,7 @@ def review_medical_records(
                     "chunks": chunk.label,
                 },
             )
-            return data
+            return data  # type: ignore[no-any-return]  # LLM JSON is untyped dict
         except Exception as exc:  # noqa: BLE001
             duration_ms = int((time.perf_counter() - t0) * 1000)
             logger.warning(
@@ -376,7 +376,7 @@ def review_medical_records(
         },
     )
 
-    def run_round(pending: list) -> None:
+    def run_round(pending: list[Chunk]) -> None:
         nonlocal completed
         with ThreadPoolExecutor(max_workers=config.RECORDS_CONCURRENCY) as pool:
             future_map = {pool.submit(digest_chunk, c): c for c in pending}
@@ -550,7 +550,7 @@ def _merge_facts(
         merged_by_batch: dict[int, list[MedicalFact]] = {}
         # Capture correlation id for merge workers as well.
         _merge_ctx = _merge_rid
-        def _merge_with_ctx(batch):  # type: ignore[no-untyped-def]
+        def _merge_with_ctx(batch: list[MedicalFact]) -> list[MedicalFact]:
             from .logging_config import _request_id_var as _rid_var
 
             tok = _rid_var.set(_merge_ctx)
@@ -654,7 +654,7 @@ def _tokens(text: str) -> frozenset[str]:
 
 # Backwards-compat alias: some tooling/tests may import _TOKEN_CACHE.
 # Expose the underlying cache mapping via the LRU wrapper's cache_info.
-_TOKEN_CACHE = {}  # deprecated; _tokens is now LRU-bounded
+_TOKEN_CACHE: dict[str, frozenset[str]] = {}  # deprecated; _tokens is now LRU-bounded
 
 
 def find_relevant_excerpts(

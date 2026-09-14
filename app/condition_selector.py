@@ -51,7 +51,8 @@ TOPIC_LABELS: dict[str, str] = {
 @lru_cache(maxsize=1)
 def _load_condition_topics() -> dict[str, Any]:
     with _CONDITION_TOPICS_PATH.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
+        data: dict[str, Any] = json.load(handle)
+        return data
 
 
 def _body_systems() -> list[str]:
