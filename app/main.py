@@ -348,7 +348,6 @@ def _va_gov_records(slot: str) -> list:
         login_clicked = st.button(
             "Log in and fetch VA.gov records",
             key=f"va_gov_login_{slot}",
-            disabled=not consent,
         )
 
     if login_clicked:
