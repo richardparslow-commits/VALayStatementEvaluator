@@ -329,22 +329,20 @@ class FetchClient:
     def _read_limited_response(response: Any, max_bytes: int) -> bytes:
         content_length = response.getheader("Content-Length")
         if content_length is not None:
+            invalid_length_message = (
+                "Fetch Sandbox response has invalid Content-Length "
+                f"({content_length})."
+            )
             try:
                 declared_size = int(content_length)
-                if declared_size < 0:
-                    raise FetchSandboxError(
-                        "Fetch Sandbox response has invalid Content-Length "
-                        f"({content_length})."
-                    )
-                if declared_size > max_bytes:
-                    raise FetchSandboxError(
-                        "Fetch Sandbox response too large "
-                        f"(Content-Length {content_length} bytes, limit {max_bytes} bytes)."
-                    )
             except (TypeError, ValueError):
+                raise FetchSandboxError(invalid_length_message)
+            if declared_size < 0:
+                raise FetchSandboxError(invalid_length_message)
+            if declared_size > max_bytes:
                 raise FetchSandboxError(
-                    "Fetch Sandbox response has invalid Content-Length "
-                    f"({content_length})."
+                    "Fetch Sandbox response too large "
+                    f"(Content-Length {content_length} bytes, limit {max_bytes} bytes)."
                 )
 
         total = 0
