@@ -128,6 +128,7 @@ def _extract_docx(filename: str, data: bytes) -> ExtractedDocument:
                 archive=archive,
                 member_name="word/document.xml",
                 max_member_bytes=max_member_bytes,
+                max_total_bytes=max_total_bytes,
             )
     except ExtractionError:
         raise
@@ -184,6 +185,7 @@ def _read_docx_member_limited(
     archive: zipfile.ZipFile,
     member_name: str,
     max_member_bytes: int,
+    max_total_bytes: int,
 ) -> bytes:
     try:
         info = archive.getinfo(member_name)
@@ -206,6 +208,11 @@ def _read_docx_member_limited(
                 raise ExtractionError(
                     f"{filename}: DOCX member '{member_name}' exceeded max uncompressed "
                     f"size while reading ({len(output)} bytes > {max_member_bytes} bytes)."
+                )
+            if len(output) > max_total_bytes:
+                raise ExtractionError(
+                    f"{filename}: DOCX total uncompressed size exceeded while reading "
+                    f"({len(output)} bytes > {max_total_bytes} bytes)."
                 )
     return bytes(output)
 
