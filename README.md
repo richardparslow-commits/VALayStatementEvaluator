@@ -65,6 +65,12 @@ examples/                 Fictional sample statement + sample medical records
 Long documents are processed in overlapping, page-labelled chunks so reviews are exhaustive
 regardless of record length. See **Large record sets** below for how very large files scale.
 
+> 📐 **Design rationale & trade-offs.** The short map above covers *what*. For *why* —
+> why Streamlit, why hierarchical fact merging over a single mega-call, why chunking at
+> paragraph boundaries, why concurrency is capped at 2 and model split matters, and how the
+> evaluate/draft data flows work — see **[`ARCHITECTURE.md`](ARCHITECTURE.md)** (ADRs, data-flow
+> diagrams, scale-engine deep dive, and "constraints you must not break").
+
 ## Setup
 
 ```bash
