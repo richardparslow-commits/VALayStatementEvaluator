@@ -37,6 +37,7 @@ from .logging_config import (
 from . import telemetry
 from . import va_gov_client
 from . import watchdog
+from .prompt_sanitize import validate_api_key, validate_model_name
 
 logger = get_logger("app.main")
 _REQUEST_ID_KEY = "va_lse_request_id"
@@ -112,14 +113,32 @@ def _sidebar_settings() -> None:
             help="GET path for records. Use {patient_id} where the selected ID belongs.",
         )
         if st.button("Apply settings"):
-            settings.api_key = st.session_state.api_key_input.strip()
-            settings.base_url = st.session_state.base_url_input.strip() or DEFAULT_BASE_URL
-            settings.model_main = st.session_state.model_main_input.strip()
-            settings.model_fast = st.session_state.model_fast_input.strip()
-            settings.fetch_api_key = st.session_state.fetch_api_key_input.strip()
-            settings.fetch_base_url = st.session_state.fetch_base_url_input.strip()
-            settings.fetch_records_path = st.session_state.fetch_records_path_input.strip()
-            st.rerun()
+            api_key_val = st.session_state.api_key_input.strip()
+            fetch_key_val = st.session_state.fetch_api_key_input.strip()
+            model_main_val = st.session_state.model_main_input.strip()
+            model_fast_val = st.session_state.model_fast_input.strip()
+            errors: list[str] = []
+            for label, val, validator in (
+                ("API key", api_key_val, validate_api_key),
+                ("Fetch API key", fetch_key_val, validate_api_key),
+                ("Main model", model_main_val, validate_model_name),
+                ("Fast model", model_fast_val, validate_model_name),
+            ):
+                msg = validator(val)
+                if msg:
+                    errors.append(f"{label}: {msg}")
+            if errors:
+                for msg in errors:
+                    st.error(msg)
+            else:
+                settings.api_key = api_key_val
+                settings.base_url = st.session_state.base_url_input.strip() or DEFAULT_BASE_URL
+                settings.model_main = model_main_val
+                settings.model_fast = model_fast_val
+                settings.fetch_api_key = fetch_key_val
+                settings.fetch_base_url = st.session_state.fetch_base_url_input.strip()
+                settings.fetch_records_path = st.session_state.fetch_records_path_input.strip()
+                st.rerun()
 
         st.divider()
         _credit_calibration_widget()

@@ -28,6 +28,7 @@ from . import config
 from .documents import ExtractedDocument, chunk_page_labelled_text, paragraph_index
 from .llm import LLMClient, LLMError
 from .logging_config import PhaseTimer, get_request_id
+from .prompt_sanitize import GUARD_NOTE, sanitize_for_prompt
 
 logger = logging.getLogger("app.medical_review")
 
@@ -75,7 +76,9 @@ Rules:
 CHUNK TEXT:
 <<<
 {chunk_text}
->>>"""
+>>>
+
+{guard_note}"""
 
 MERGE_SYSTEM = """You are consolidating extracted medical facts from multiple chunks of the \
 same record set into one authoritative digest. Deduplicate identical facts, keep every \
@@ -306,9 +309,10 @@ def review_medical_records(
             data = llm.chat_json(
                 DIGEST_SYSTEM,
                 DIGEST_USER_TEMPLATE.format(
-                    label=chunk.label,
-                    source_hint=chunk.label,
-                    chunk_text=chunk.text,
+                    label=sanitize_for_prompt(chunk.label, max_chars=200),
+                    source_hint=sanitize_for_prompt(chunk.label, max_chars=200),
+                    chunk_text=sanitize_for_prompt(chunk.text, max_chars=1_000_000),
+                    guard_note=GUARD_NOTE,
                 ),
                 model=llm._settings.model_fast,
                 max_tokens=8000,

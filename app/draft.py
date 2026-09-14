@@ -17,6 +17,7 @@ from .documents import (
 )
 from .llm import LLMClient
 from .logging_config import PhaseTimer, get_request_id
+from .prompt_sanitize import GUARD_NOTE, sanitize_digest_text, sanitize_for_prompt, validate_witness_field
 
 logger = logging.getLogger("app.draft")
 from .medical_review import MedicalDigest, ProgressCallback, review_medical_records
@@ -76,7 +77,9 @@ MEDICAL RECORD DIGEST (JSON):
 TOPIC CHECKLIST:
 <<<
 {checklist}
->>>"""
+>>>
+
+{guard_note}"""
 
 DRAFT_SYSTEM_TEMPLATE = """You are drafting a VA lay/witness statement for submission on \
 VA Form 21-10210. Follow this drafting guide EXACTLY. Write only facts grounded in the \
@@ -123,6 +126,8 @@ RECORD SUMMARY:
 {digest_summary}
 >>>
 
+{guard_note}
+
 Output the statement ONLY (no meta commentary), in first person, following the guide's
 structure including the certification closing."""
 
@@ -153,7 +158,9 @@ DRAFTING GUIDE FOR REFERENCE:
 TOPIC CHECKLIST FOR REFERENCE:
 <<<
 {checklist}
->>>"""
+>>>
+
+{guard_note}"""
 
 
 @dataclass
@@ -267,12 +274,13 @@ def _run_draft(
         result.grounding = llm.chat_json(
             GROUNDING_SYSTEM,
             GROUNDING_USER.format(
-                condition=condition,
-                claim_type=claim_type,
-                relationship=witness.get("relationship", "not specified"),
-                observations=obs_for_prompt,
-                digest=result.digest.relevant_facts_text(grounding_query, max_facts=150),
+                condition=sanitize_for_prompt(condition, max_chars=500),
+                claim_type=sanitize_for_prompt(claim_type, max_chars=500),
+                relationship=sanitize_for_prompt(witness.get("relationship", "not specified"), max_chars=500),
+                observations=sanitize_for_prompt(obs_for_prompt, max_chars=DRAFT_INTERNAL_MAX_CHARS),
+                digest=sanitize_digest_text(result.digest.relevant_facts_text(grounding_query, max_facts=150), max_chars=120_000),
                 checklist=load_knowledge("topic_checklist.md"),
+                guard_note=GUARD_NOTE,
             ),
             phase="grounding",
         )
@@ -285,17 +293,18 @@ def _run_draft(
                 checklist=load_knowledge("topic_checklist.md"),
             ),
             DRAFT_USER.format(
-                witness_name=witness.get("name", "[Witness Name]"),
-                relationship=witness.get("relationship", "[relationship]"),
-                known_since=witness.get("known_since", "[how long known]"),
-                contact_frequency=witness.get("contact_frequency", "[frequency of contact]"),
-                veteran_name=witness.get("veteran_name", "[Veteran Name]"),
-                condition=condition,
-                claim_type=claim_type,
-                witnessed_event=witness.get("witnessed_event", "unknown"),
-                observations=obs_for_prompt,
-                grounding=_json_dumps(result.grounding),
-                digest_summary=result.digest.summary or "(no summary)",
+                witness_name=sanitize_for_prompt(witness.get("name", "[Witness Name]"), max_chars=500),
+                relationship=sanitize_for_prompt(witness.get("relationship", "[relationship]"), max_chars=500),
+                known_since=sanitize_for_prompt(witness.get("known_since", "[how long known]"), max_chars=500),
+                contact_frequency=sanitize_for_prompt(witness.get("contact_frequency", "[frequency of contact]"), max_chars=500),
+                veteran_name=sanitize_for_prompt(witness.get("veteran_name", "[Veteran Name]"), max_chars=500),
+                condition=sanitize_for_prompt(condition, max_chars=500),
+                claim_type=sanitize_for_prompt(claim_type, max_chars=500),
+                witnessed_event=sanitize_for_prompt(witness.get("witnessed_event", "unknown"), max_chars=500),
+                observations=sanitize_for_prompt(obs_for_prompt, max_chars=DRAFT_INTERNAL_MAX_CHARS),
+                grounding=sanitize_for_prompt(_json_dumps(result.grounding), max_chars=25_000),
+                digest_summary=sanitize_digest_text(result.digest.summary or "(no summary)", max_chars=20_000),
+                guard_note=GUARD_NOTE,
             ),
             max_tokens=6000,
             phase="draft",
@@ -306,9 +315,10 @@ def _run_draft(
         review = llm.chat_json(
             REVIEW_SYSTEM,
             REVIEW_USER.format(
-                draft=result.draft[:16000],
+                draft=sanitize_for_prompt(result.draft[:16000], max_chars=20_000),
                 guide=load_knowledge("drafting_guide.md")[:6000],
                 checklist=load_knowledge("topic_checklist.md")[:6000],
+                guard_note=GUARD_NOTE,
             ),
             phase="review",
         )

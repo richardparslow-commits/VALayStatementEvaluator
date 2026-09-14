@@ -16,6 +16,7 @@ from .documents import (
 )
 from .llm import LLMClient, LLMError
 from .logging_config import PhaseTimer, get_request_id
+from .prompt_sanitize import GUARD_NOTE, sanitize_digest_text, sanitize_for_prompt
 
 logger = logging.getLogger("app.evaluate")
 from .medical_review import (
@@ -52,7 +53,9 @@ providers, facilities). Keep each claim to one assertion. Number ids sequentiall
 STATEMENT:
 <<<
 {statement}
->>>"""
+>>>
+
+{guard_note}"""
 
 VERIFY_SYSTEM = """You are an evidence auditor for VA disability claims. You must verify each \
 factual claim from a lay statement against (1) a structured digest of the veteran's medical \
@@ -94,7 +97,9 @@ RAW RECORD EXCERPTS RELEVANT TO THESE CLAIMS:
 CLAIMS TO VERIFY:
 <<<
 {claims}
->>>"""
+>>>
+
+{guard_note}"""
 
 RUBRIC_SYSTEM_TEMPLATE = """You are a senior veterans-claims advocate grading a lay/witness \
 statement. Apply this rubric strictly and specifically, quoting the statement where useful.
@@ -146,7 +151,9 @@ CLAIM-VERIFICATION RESULTS:
 MEDICAL RECORD SUMMARY:
 <<<
 {digest_summary}
->>>"""
+>>>
+
+{guard_note}"""
 
 
 REVISE_SYSTEM = """You are a senior veterans-claims advocate rewriting a lay/witness statement \
@@ -225,7 +232,9 @@ MEDICAL RECORD SUMMARY:
 TOPIC COVERAGE ANALYSIS:
 <<<
 {topic_analysis}
->>>"""
+>>>
+
+{guard_note}"""
 
 
 TOPIC_SYSTEM_TEMPLATE = """You are a senior veterans-claims advocate auditing a lay/witness \
@@ -282,7 +291,9 @@ CLAIM-VERIFICATION RESULTS:
 MEDICAL RECORD SUMMARY:
 <<<
 {digest_summary}
->>>"""
+>>>
+
+{guard_note}"""
 
 
 @dataclass
@@ -448,7 +459,10 @@ def _run_evaluation(
         report(0.52, "Step 2/7 — Extracting factual claims from the statement…")
         claims_data = llm.chat_json(
             CLAIMS_SYSTEM,
-            CLAIMS_USER.format(statement=prompt_statement),
+            CLAIMS_USER.format(
+                statement=sanitize_for_prompt(prompt_statement, max_chars=EVALUATE_INTERNAL_MAX_CHARS),
+                guard_note=GUARD_NOTE,
+            ),
             phase="claims",
         )
         result.claimed_condition = claims_data.get("claimed_condition", "")
@@ -474,9 +488,10 @@ def _run_evaluation(
                 legal=load_knowledge("legal_framework.md"),
             ),
             RUBRIC_USER.format(
-                statement=prompt_statement,
-                verifications=_verifications_text(result),
-                digest_summary=result.digest.summary or "(no summary)",
+                statement=sanitize_for_prompt(prompt_statement, max_chars=EVALUATE_INTERNAL_MAX_CHARS),
+                verifications=sanitize_for_prompt(_verifications_text(result), max_chars=20_000),
+                digest_summary=sanitize_digest_text(result.digest.summary or "(no summary)", max_chars=20_000),
+                guard_note=GUARD_NOTE,
             ),
             phase="rubric",
         )
@@ -520,9 +535,10 @@ def _analyze_topics(
                 legal=load_knowledge("legal_framework.md"),
             ),
             TOPIC_USER.format(
-                statement=truncated_statement,
-                verifications=_verifications_text(result),
-                digest_summary=(result.digest.summary or "(no summary)")[:12000],
+                statement=sanitize_for_prompt(truncated_statement, max_chars=EVALUATE_INTERNAL_MAX_CHARS),
+                verifications=sanitize_for_prompt(_verifications_text(result), max_chars=20_000),
+                digest_summary=sanitize_digest_text((result.digest.summary or "(no summary)")[:12000], max_chars=20_000),
+                guard_note=GUARD_NOTE,
             ),
             phase="topic",
         )
@@ -571,13 +587,13 @@ def _draft_revision(
         revise_data = llm.chat_json(
             REVISE_SYSTEM,
             REVISE_USER.format(
-                statement=truncated_statement,
-                verifications=_verifications_text(result),
-                improvements=_json.dumps(result.improvements, indent=1)[:6000] or "(none)",
-                omitted_facts=_json.dumps(result.omitted_record_facts, indent=1)[:4000]
-                or "(none)",
-                digest_summary=(result.digest.summary or "(no summary)")[:12000],
-                topic_analysis=topic_analysis,
+                statement=sanitize_for_prompt(truncated_statement, max_chars=EVALUATE_INTERNAL_MAX_CHARS),
+                verifications=sanitize_for_prompt(_verifications_text(result), max_chars=20_000),
+                improvements=sanitize_for_prompt(_json.dumps(result.improvements, indent=1)[:6000] or "(none)", max_chars=10_000),
+                omitted_facts=sanitize_for_prompt(_json.dumps(result.omitted_record_facts, indent=1)[:4000] or "(none)", max_chars=10_000),
+                digest_summary=sanitize_digest_text((result.digest.summary or "(no summary)")[:12000], max_chars=20_000),
+                topic_analysis=sanitize_for_prompt(topic_analysis, max_chars=25_000),
+                guard_note=GUARD_NOTE,
             ),
             max_tokens=6000,
             phase="revision",
@@ -622,9 +638,10 @@ def _verify_claims(
         data = llm.chat_json(
             VERIFY_SYSTEM,
             VERIFY_USER.format(
-                digest=digest.relevant_facts_text(batch_query, max_facts=150),
-                excerpts=excerpts[:16000] or "(no matching raw excerpts found)",
-                claims=_json.dumps(batch, indent=1),
+                digest=sanitize_digest_text(digest.relevant_facts_text(batch_query, max_facts=150), max_chars=120_000),
+                excerpts=sanitize_digest_text(excerpts[:16000] or "(no matching raw excerpts found)", max_chars=20_000),
+                claims=sanitize_for_prompt(_json.dumps(batch, indent=1), max_chars=20_000),
+                guard_note=GUARD_NOTE,
             ),
             phase="verify",
         )
