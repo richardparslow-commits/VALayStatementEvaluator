@@ -3,6 +3,7 @@ import base64
 import sys
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -36,7 +37,7 @@ class TestFetchClient(unittest.TestCase):
             *,
             status: int = 200,
             reason: str = "OK",
-            headers: dict[str, str] | None = None,
+            headers: dict[str, Any] | None = None,
             chunks: list[bytes] | None = None,
         ) -> None:
             self.status = status
@@ -45,10 +46,10 @@ class TestFetchClient(unittest.TestCase):
             self._chunks = list(chunks or [])
             self.read_calls = 0
 
-        def getheaders(self) -> list[tuple[str, str]]:
+        def getheaders(self) -> list[tuple[str, Any]]:
             return list(self._headers.items())
 
-        def getheader(self, key: str, default: str | None = None) -> str | None:
+        def getheader(self, key: str, default: Any = None) -> Any:
             return self._headers.get(key, default)
 
         def read(self, _: int = -1) -> bytes:
@@ -196,6 +197,19 @@ class TestFetchClient(unittest.TestCase):
         client = FetchClient(self._settings(fetch_max_response_bytes=10))
         response = self._FakeResponse(
             headers={"Content-Length": "abc"},
+            chunks=[b"should-not-be-read"],
+        )
+        connection = self._FakeConnection(response)
+        with patch("app.fetch_client.HTTPSConnection", return_value=connection):
+            with self.assertRaises(FetchSandboxError):
+                client._http_get("https://demo.fetchsandbox.com/records")
+        self.assertEqual(response.read_calls, 0)
+        self.assertTrue(connection.closed)
+
+    def test_http_get_rejects_non_string_content_length_before_read(self):
+        client = FetchClient(self._settings(fetch_max_response_bytes=10))
+        response = self._FakeResponse(
+            headers={"Content-Length": ["invalid"]},
             chunks=[b"should-not-be-read"],
         )
         connection = self._FakeConnection(response)

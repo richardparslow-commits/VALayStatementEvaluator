@@ -341,7 +341,7 @@ class FetchClient:
                         "Fetch Sandbox response too large "
                         f"(Content-Length {content_length} bytes, limit {max_bytes} bytes)."
                     )
-            except ValueError:
+            except (TypeError, ValueError):
                 raise FetchSandboxError(
                     "Fetch Sandbox response has invalid Content-Length "
                     f"({content_length})."
