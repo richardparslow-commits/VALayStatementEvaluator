@@ -3,6 +3,7 @@ import base64
 import sys
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -17,6 +18,7 @@ class TestFetchClient(unittest.TestCase):
         *,
         fetch_base_url: str = "https://demo.fetchsandbox.com",
         fetch_records_path: str = "/medical_records/{patient_id}",
+        fetch_max_response_bytes: int = 100 * 1024 * 1024,
     ) -> Settings:
         return Settings(
             api_key="",
@@ -26,7 +28,50 @@ class TestFetchClient(unittest.TestCase):
             fetch_api_key="sandbox-token",
             fetch_base_url=fetch_base_url,
             fetch_records_path=fetch_records_path,
+            fetch_max_response_bytes=fetch_max_response_bytes,
         )
+
+    class _FakeResponse:
+        def __init__(
+            self,
+            *,
+            status: int = 200,
+            reason: str = "OK",
+            headers: dict[str, Any] | None = None,
+            chunks: list[bytes] | None = None,
+        ) -> None:
+            self.status = status
+            self.reason = reason
+            self._headers = headers or {}
+            self._chunks = list(chunks or [])
+            self.read_calls = 0
+
+        def getheaders(self) -> list[tuple[str, Any]]:
+            return list(self._headers.items())
+
+        def getheader(self, key: str, default: Any = None) -> Any:
+            return self._headers.get(key, default)
+
+        def read(self, _: int = -1) -> bytes:
+            self.read_calls += 1
+            if not self._chunks:
+                return b""
+            return self._chunks.pop(0)
+
+    class _FakeConnection:
+        def __init__(self, response: "TestFetchClient._FakeResponse") -> None:
+            self._response = response
+            self.closed = False
+            self.request_calls: list[tuple[str, str, dict[str, str]]] = []
+
+        def request(self, method: str, path: str, headers: dict[str, str]) -> None:
+            self.request_calls.append((method, path, headers))
+
+        def getresponse(self) -> "TestFetchClient._FakeResponse":
+            return self._response
+
+        def close(self) -> None:
+            self.closed = True
 
     def test_requires_fetch_configuration(self):
         with self.assertRaises(FetchSandboxError):
@@ -121,6 +166,84 @@ class TestFetchClient(unittest.TestCase):
         with patch.object(client, "_request_json", return_value={"documents": []}):
             with self.assertRaises(FetchSandboxError):
                 client.fetch_documents("pt-5")
+
+    def test_http_get_rejects_oversized_content_length_before_read(self):
+        client = FetchClient(self._settings(fetch_max_response_bytes=10))
+        response = self._FakeResponse(
+            headers={"Content-Length": "11"},
+            chunks=[b"should-not-be-read"],
+        )
+        connection = self._FakeConnection(response)
+        with patch("app.fetch_client.HTTPSConnection", return_value=connection):
+            with self.assertRaises(FetchSandboxError):
+                client._http_get("https://demo.fetchsandbox.com/records")
+        self.assertEqual(response.read_calls, 0)
+        self.assertTrue(connection.closed)
+
+    def test_http_get_rejects_negative_content_length_before_read(self):
+        client = FetchClient(self._settings(fetch_max_response_bytes=10))
+        response = self._FakeResponse(
+            headers={"Content-Length": "-1"},
+            chunks=[b"should-not-be-read"],
+        )
+        connection = self._FakeConnection(response)
+        with patch("app.fetch_client.HTTPSConnection", return_value=connection):
+            with self.assertRaises(FetchSandboxError):
+                client._http_get("https://demo.fetchsandbox.com/records")
+        self.assertEqual(response.read_calls, 0)
+        self.assertTrue(connection.closed)
+
+    def test_http_get_rejects_non_integer_content_length_before_read(self):
+        client = FetchClient(self._settings(fetch_max_response_bytes=10))
+        response = self._FakeResponse(
+            headers={"Content-Length": "abc"},
+            chunks=[b"should-not-be-read"],
+        )
+        connection = self._FakeConnection(response)
+        with patch("app.fetch_client.HTTPSConnection", return_value=connection):
+            with self.assertRaises(FetchSandboxError):
+                client._http_get("https://demo.fetchsandbox.com/records")
+        self.assertEqual(response.read_calls, 0)
+        self.assertTrue(connection.closed)
+
+    def test_http_get_rejects_non_string_content_length_before_read(self):
+        client = FetchClient(self._settings(fetch_max_response_bytes=10))
+        response = self._FakeResponse(
+            headers={"Content-Length": ["invalid"]},
+            chunks=[b"should-not-be-read"],
+        )
+        connection = self._FakeConnection(response)
+        with patch("app.fetch_client.HTTPSConnection", return_value=connection):
+            with self.assertRaises(FetchSandboxError):
+                client._http_get("https://demo.fetchsandbox.com/records")
+        self.assertEqual(response.read_calls, 0)
+        self.assertTrue(connection.closed)
+
+    def test_http_get_rejects_oversized_body_during_chunked_read(self):
+        client = FetchClient(self._settings(fetch_max_response_bytes=10))
+        response = self._FakeResponse(
+            headers={"Content-Length": "4"},
+            chunks=[b"123456", b"78901"],
+        )
+        connection = self._FakeConnection(response)
+        with patch("app.fetch_client.HTTPSConnection", return_value=connection):
+            with self.assertRaises(FetchSandboxError):
+                client._http_get("https://demo.fetchsandbox.com/records")
+        self.assertTrue(connection.closed)
+
+    def test_http_get_returns_normal_sized_response(self):
+        client = FetchClient(self._settings(fetch_max_response_bytes=10))
+        response = self._FakeResponse(
+            headers={"Content-Type": "application/json"},
+            chunks=[b"{", b"}"],
+        )
+        connection = self._FakeConnection(response)
+        with patch("app.fetch_client.HTTPSConnection", return_value=connection):
+            data, headers, reason = client._http_get("https://demo.fetchsandbox.com/records")
+        self.assertEqual(data, b"{}")
+        self.assertEqual(headers["Content-Type"], "application/json")
+        self.assertEqual(reason, "OK")
+        self.assertTrue(connection.closed)
 
 
 if __name__ == "__main__":

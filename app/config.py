@@ -32,6 +32,7 @@ DEFAULT_MODEL_MAIN = "qwen3.7-max"
 DEFAULT_MODEL_FAST = "qwen3.7-flash"
 DEFAULT_FETCH_SANDBOX_BASE_URL = "https://fetchsandbox.com"
 DEFAULT_FETCH_SANDBOX_RECORDS_PATH = "/medical_records/{patient_id}"
+DEFAULT_FETCH_SANDBOX_MAX_RESPONSE_BYTES = 100 * 1024 * 1024
 
 
 @dataclass
@@ -45,6 +46,7 @@ class Settings:
     fetch_api_key: str
     fetch_base_url: str
     fetch_records_path: str
+    fetch_max_response_bytes: int = DEFAULT_FETCH_SANDBOX_MAX_RESPONSE_BYTES
 
     @property
     def configured(self) -> bool:
@@ -74,6 +76,10 @@ def load_settings() -> Settings:
             "FETCH_SANDBOX_RECORDS_PATH", DEFAULT_FETCH_SANDBOX_RECORDS_PATH
         ).strip()
         or DEFAULT_FETCH_SANDBOX_RECORDS_PATH,
+        fetch_max_response_bytes=_positive_int_env(
+            "FETCH_SANDBOX_MAX_RESPONSE_BYTES",
+            DEFAULT_FETCH_SANDBOX_MAX_RESPONSE_BYTES,
+        ),
     )
 
 
