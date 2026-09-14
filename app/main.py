@@ -8,6 +8,7 @@ from __future__ import annotations
 import streamlit as st
 
 from . import config
+from .condition_selector import render_condition_selector
 from .config import DEFAULT_BASE_URL, load_settings
 from .documents import (
     ExtractionError,
@@ -23,6 +24,9 @@ from .llm import LLMClient, LLMError
 from . import telemetry
 from . import va_gov_client
 from . import watchdog
+
+# Feature: Condition-Specific Templates
+FEATURE_ID = "02f0935a-ee5e-4083-88a2-10e11753ccc9"  # condition-specific-templates
 
 st.set_page_config(
     page_title="VA Lay Statement Evaluator",
@@ -657,6 +661,8 @@ def evaluate_tab() -> None:
                 "skipped, but expect a longer run for a meticulous review."
             )
 
+    render_condition_selector("eval", FEATURE_ID)
+
     run = st.button("🔍 Run exhaustive evaluation", type="primary", key="eval_run")
     if run:
         if not statement_text.strip():
@@ -841,6 +847,8 @@ def draft_tab() -> None:
                 "Large record set: chunks are digested in parallel with duplicate pages "
                 "skipped, but expect a longer run for a meticulous review."
             )
+
+    render_condition_selector("draft", FEATURE_ID)
 
     st.subheader("Step 2 — Claim details")
     col1, col2 = st.columns(2)

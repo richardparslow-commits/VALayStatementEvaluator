@@ -1,0 +1,16 @@
+{
+  "services": [
+    {
+      "name": "streamlit-web",
+      "type": "repo",
+      "primary": true,
+      "buildCommand": "pip install -r requirements.txt",
+      "startCommand": "streamlit run run_app.py --server.port $PORT --server.address 0.0.0.0",
+      "variables": {
+        "AGILOOP_INSPECT_API_KEY": "",
+        "AGILOOP_INSPECT_URL": "",
+        "AGILOOP_PROJECT_ID": ""
+      }
+    }
+  ]
+}
