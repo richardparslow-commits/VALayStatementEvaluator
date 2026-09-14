@@ -39,6 +39,8 @@ app/
   main.py                 UI: Evaluate / Draft / About tabs
   config.py               Settings (.env), knowledge-file loader
   fetch_client.py         Fetch Sandbox GET client -> normalized record documents
+  va_gov_client.py        VA.gov auth/fetch/merge client (real HTTPS or in-memory mock)
+  telemetry.py            Agiloop Inspect telemetry helper (feature-id-neutral)
   llm.py                  OpenAI-compatible client (retry, JSON parsing)
   documents.py            TXT/MD/DOCX/PDF extraction, page-aware chunking
   medical_review.py       Exhaustive chunked record review -> fact digest
@@ -86,6 +88,17 @@ cp .env.example .env     # then put your API key in .env (never commit .env)
 | `VA_LSE_CREDITS_PER_1M_MAIN` | Approx credits per 1M tokens for the main model (enables the credit-burn gauge) | (unset — gauge shows tokens/calls only) |
 | `VA_LSE_CREDITS_PER_1M_FAST` | Approx credits per 1M tokens for the fast model (enables the credit-burn gauge) | (unset — gauge shows tokens/calls only) |
 | `VA_LSE_CREDIT_QUOTA` | Your plan's weekly credit quota, used to render %-of-quota burn | `2500` |
+| `VA_GOV_API_BASE_URL` | HTTPS base URL for the VA.gov record-retrieval API. Leave unset to run VA.gov auth/fetch in mock mode. | empty (mock mode) |
+| `FRONTEND_URL` | App origin for CORS allowlisting. Unused today (single-origin Streamlit app); documented for deploy-harness forward compatibility. | empty |
+| `AGILOOP_INSPECT_API_KEY` | Server-side Agiloop Inspect telemetry API key. Leave unset (with `AGILOOP_PROJECT_ID`) to run telemetry in mock/no-op mode. | empty (mock mode) |
+| `AGILOOP_INSPECT_URL` | Agiloop Inspect telemetry endpoint base URL | `https://inspect.api.agiloop.app` |
+| `AGILOOP_PROJECT_ID` | Agiloop project id for telemetry event routing | empty (mock mode) |
+
+Leave the `VA_GOV_API_BASE_URL` group or the `AGILOOP_INSPECT_*` group fully unset to run
+those integrations in mock mode. Partially configuring an integration (e.g. setting
+`AGILOOP_INSPECT_API_KEY` without `AGILOOP_PROJECT_ID`) does not fail startup for this app —
+telemetry simply logs that combination as mock and drops events, since telemetry must never
+block the app.
 
 All settings can also be overridden live in the app sidebar. Model availability depends on your
 gateway workspace; check `GET {base_url}/models`.
@@ -128,7 +141,9 @@ streamlit run run_app.py
 1. Upload or paste the lay statement.
 2. Choose a medical-record source:
    - **Upload files** (PDF/TXT/MD/DOCX, multiple files OK),
-   - **Fetch Sandbox** (enter a patient or record ID and import from your sandbox endpoint), or
+   - **Fetch Sandbox** (enter a patient or record ID and import from your sandbox endpoint),
+   - **VA.gov** (secure per-session login + explicit consent, then automatic fetch of all
+     available records — see **VA.gov record source** below), or
    - **Local folder / file** (local runs only — read records straight from a path on this
      machine, e.g. `~/Desktop/ClaimRecords`; hidden when the app is served remotely).
 3. Click **Run exhaustive evaluation** — watch chunked record review, claim verification,
@@ -248,7 +263,46 @@ The mock responds to both URL styles the app emits (`/medical_records/{patient_i
 `/medical_records?patient_id=...`) with a two-document JSON payload — see the script's docstring
 for full instructions.
 
+## VA.gov record source
+
+Selecting **VA.gov** as the record source (Evaluate or Draft) opens a secure, per-session login
+form with an explicit consent checkbox. After consenting and signing in, the app automatically
+fetches all available VA.gov records for that session, merges them with any other sources
+already loaded in the same workflow this session, and shows a **merged records summary** (source
+label + file + page count per row) that requires explicit confirmation before the merged set is
+used for evaluation or drafting.
+
+- **Mock mode (default):** leave `VA_GOV_API_BASE_URL` unset — `authenticate_va_gov` and
+  `fetch_va_records` return a deterministic in-memory mock session and two mock records, so the
+  full login → fetch → merge → confirm flow works with zero VA.gov env vars configured.
+- **Real mode:** set `VA_GOV_API_BASE_URL` (must be `https://`) to call a real VA.gov-compatible
+  authenticated record-retrieval API. Requests retry up to 3 times with exponential backoff.
+- **Partial/connection-error handling:** if VA.gov returns fewer records than expected or the
+  connection drops, the app shows the retrieved-vs-expected counts, a **Retry** button, and a
+  **Continue with available records** option — VA.gov failures never block using the other
+  record sources.
+- **Privacy:** VA.gov records are treated identically to every other source for extraction,
+  chunking, duplicate detection, and page labeling. Fetched records and the VA.gov session token
+  live only in `st.session_state` for the current browser session; credentials are **never**
+  written to disk, `.env`, or logs.
+
+## Telemetry (Agiloop Inspect)
+
+The app reports usage telemetry (impressions, interactions, errors) to Agiloop Inspect via
+`app/telemetry.py`. Because this is a single-origin Streamlit app with no browser JS bundle, the
+Inspect API key never leaves the Python process.
+
+- **Mock mode (default):** leave `AGILOOP_INSPECT_API_KEY` and `AGILOOP_PROJECT_ID` unset —
+  events are logged at debug level and dropped instead of sent. Nothing about the app's behavior
+  changes; telemetry is always best-effort and never blocks the UI.
+- **Real mode:** set both `AGILOOP_INSPECT_API_KEY` and `AGILOOP_PROJECT_ID` (and optionally
+  `AGILOOP_INSPECT_URL` to point at a non-default Inspect deployment) to send real events.
+- `app/telemetry.py` is feature-id-neutral shared infrastructure: it never hardcodes a feature
+  id. Each feature's call sites (e.g. `app/va_gov_client.py`, `app/main.py`) supply their own
+  `featureId` explicitly.
+
 ## Security notes
 
 - `.env`, `.venv/`, and `outputs/` are git-ignored.
-- Medical records stay local: they are only sent to the configured LLM endpoint.
+- Medical records stay local: they are only sent to the configured LLM endpoint. VA.gov
+  credentials and session tokens are never written to disk, `.env`, or logs.
