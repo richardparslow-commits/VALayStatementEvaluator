@@ -71,8 +71,13 @@ regardless of record length. See **Large record sets** below for how very large 
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --require-hashes -r requirements.lock   # exact, hash-verified versions
-cp .env.example .env     # then put your API key in .env (never commit .env)
+cp .env.example .env     # then put your API key in .env (never commit .env — see SECURITY.md)
 ```
+
+> 🔒 **Secrets safety.** Never commit `.env` or any key to git — see
+> [`SECURITY.md`](SECURITY.md) for storage, rotation, CI/CD (GitHub Secrets),
+> production secret stores (AWS Secrets Manager / Azure Key Vault), and the
+> pre-commit hook (`scripts/hooks/pre-commit`) that blocks accidental commits.
 
 Install from **`requirements.lock`** for development, CI, and production so every environment
 runs the identical tested dependency set. `requirements.txt` stays the human-edited input
@@ -413,6 +418,7 @@ Configure via env (see `.env.example`): `VA_LSE_LOG_LEVEL`, `VA_LSE_LOG_JSON` (J
 
 ## Security notes
 
-- `.env`, `.venv/`, and `outputs/` are git-ignored.
-- Medical records stay local: they are only sent to the configured LLM endpoint. VA.gov
-  credentials and session tokens are never written to disk, `.env`, or logs.
+- **Secrets are never committed.** `.env`, `.env.local`, `.env.*.local`, and `.streamlit/secrets.toml` are git-ignored (see `SECURITY.md`). Rotate keys after any leak.
+- **Pre-commit guard.** `scripts/hooks/pre-commit` rejects staged `.env` files, `*.pem`/`*.key`, and key assignments (`OPENAI_API_KEY=`, `sk-*`). Install with `cp scripts/hooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit`.
+- Medical records stay local: they are only sent to the configured LLM endpoint. VA.gov credentials and session tokens are never written to disk, `.env`, or logs.
+- See [`SECURITY.md`](SECURITY.md) for full secrets management guidance (local `.env.local` overrides, CI/CD with GitHub Secrets, managed secret stores in production).

@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Prevent accidental commit of secrets / .env files.
+# Install:
+#   cp scripts/hooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+# Or wire via pre-commit.com (see SECURITY.md).
+#
+# This hook:
+#   1. Blocks staged files matching secret-bearing path patterns.
+#   2. Scans the staged diff for lines that look like embedded API keys
+#      (sk-*, OPENAI_API_KEY=, etc.) or generic high-entropy key assignments.
+
+set -e
+
+STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACM 2>/dev/null || true)
+STAGED_DIFF=$(git diff --cached 2>/dev/null || true)
+
+FAIL=0
+
+# ---------------------------------------------------------------- files
+block_pattern=0
+for file in $STAGED_FILES; do
+  # Allow .env.example; block every other .env variant.
+  if [[ "$file" == ".env" ]] \
+    || [[ "$file" == ".env.local" ]] \
+    || [[ "$file" == .env.*".local" ]] \
+    || [[ "$file" == *".env.local" ]] \
+    || [[ "$file" == ".streamlit/secrets.toml" ]] \
+    || [[ "$file" == *.pem ]] \
+    || [[ "$file" == *.key ]]; then
+    echo "✖  Blocked: staged file '$file' is secret-bearing and must not be committed." >&2
+    echo "   Remove it from the index (git reset HEAD -- \"$file\") and ensure .gitignore covers it." >&2
+    block_pattern=1
+    FAIL=1
+  fi
+done
+
+# Also detect any .env* file not covered above (e.g. .env.dev, .env.bak in a subdirectory).
+for file in $STAGED_FILES; do
+  base=$(basename "$file")
+  if [[ "$base" == .env* ]] && [[ "$base" != ".env.example" ]]; then
+    # already reported under exact patterns above? report once.
+    if [[ "$block_pattern" == 0 || ( "$file" != ".env" && "$file" != ".env.local" && "$file" != ".streamlit/secrets.toml" ) ]]; then
+      # Avoid duplicate message for files already caught above.
+      if [[ "$file" != ".env" ]] && [[ "$file" != ".env.local" ]] && [[ "$file" != ".streamlit/secrets.toml" ]] && [[ "$file" != *.pem ]] && [[ "$file" != *.key ]]; then
+        echo "✖  Blocked: staged file '$file' looks like an env file (.env*). Only .env.example may be committed." >&2
+        FAIL=1
+      fi
+    fi
+  fi
+done
+
+# ---------------------------------------------------------------- content
+# Scan only non-example files — .env.example is intentionally allowed to
+# contain placeholder keys (e.g. OPENAI_API_KEY=sk-sp-your-key-here).
+NON_EXAMPLE_FILES=$(echo "$STAGED_FILES" | grep -v "^\.env\.example$" | grep -v "/\.env\.example$" || true)
+if [ -n "$NON_EXAMPLE_FILES" ]; then
+  # git diff filtered to non-example files (ignore errors if pathspec fails)
+  STAGED_DIFF_FOR_SECRETS=$(git diff --cached -- $NON_EXAMPLE_FILES 2>/dev/null || echo "$STAGED_DIFF")
+else
+  STAGED_DIFF_FOR_SECRETS=""
+fi
+
+# Look for staged lines that assign an API key with a non-empty value.
+# Empty assignments (OPENAI_API_KEY=) are allowed — they carry no secret.
+if echo "$STAGED_DIFF_FOR_SECRETS" | grep -E -q '^\+\s*(OPENAI_API_KEY|FETCH_SANDBOX_API_KEY|AGILOOP_INSPECT_API_KEY|VA_GOV_API_BASE_URL|API_KEY)\s*=\s*[^[:space:]#]' 2>/dev/null; then
+  echo "✖  Blocked: staged diff contains an API key assignment (e.g. OPENAI_API_KEY=...)." >&2
+  echo "   Use .env (git-ignored) or a secret store; never commit keys to tracked files." >&2
+  FAIL=1
+fi
+
+# Generic sk-* prefix (QwenCloud sk-sp-*, OpenAI sk-proj-*, etc.) on an added line.
+if echo "$STAGED_DIFF_FOR_SECRETS" | grep -E -q '^\+\s*[^#]*sk-[A-Za-z0-9]' 2>/dev/null; then
+  echo "✖  Blocked: staged diff contains a string that looks like an API key (sk- prefix)." >&2
+  echo "   Rotate the key if it was already committed and remove it from the staged files." >&2
+  FAIL=1
+fi
+
+if [[ "$FAIL" != 0 ]]; then
+  echo "" >&2
+  echo "Commit aborted. See SECURITY.md for secret-handling guidance." >&2
+  exit 1
+fi
+
+exit 0
