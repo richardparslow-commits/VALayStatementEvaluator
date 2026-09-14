@@ -330,7 +330,13 @@ class FetchClient:
         content_length = response.getheader("Content-Length")
         if content_length is not None:
             try:
-                if int(content_length) > max_bytes:
+                declared_size = int(content_length)
+                if declared_size < 0:
+                    raise FetchSandboxError(
+                        "Fetch Sandbox response has invalid Content-Length "
+                        f"({content_length})."
+                    )
+                if declared_size > max_bytes:
                     raise FetchSandboxError(
                         "Fetch Sandbox response too large "
                         f"(Content-Length {content_length} bytes, limit {max_bytes} bytes)."
