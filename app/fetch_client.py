@@ -348,7 +348,7 @@ class FetchClient:
                 )
 
         total = 0
-        chunks: list[bytes] = []
+        data = bytearray()
         while True:
             chunk = response.read(READ_CHUNK_BYTES)
             if not chunk:
@@ -359,8 +359,8 @@ class FetchClient:
                     "Fetch Sandbox response exceeded maximum size "
                     f"({total} bytes, limit {max_bytes} bytes)."
                 )
-            chunks.append(chunk)
-        return b"".join(chunks)
+            data.extend(chunk)
+        return bytes(data)
 
     @staticmethod
     def _content_type(header: str) -> str:
