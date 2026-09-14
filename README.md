@@ -62,6 +62,11 @@ scripts/
   scale_sim.py            Offline 2,000-page pipeline simulation (no API calls)
 tests/                    Offline unit tests (no API key required)
 examples/                 Fictional sample statement + sample medical records
+Dockerfile                Production container image (non-root, hash-pinned deps)
+docker-compose.yml        Multi-instance: 3 Streamlit replicas + nginx (Pattern A)
+nginx/                    Reverse proxy config with session affinity
+deploy/k8s/               Kubernetes manifests (Deployment, Service, Ingress, HPA, Redis)
+DEPLOYMENT.md             Multi-instance deployment guide (Docker Compose, K8s, session persistence)
 ```
 
 Long documents are processed in overlapping, page-labelled chunks so reviews are exhaustive
@@ -236,6 +241,11 @@ pip install --require-hashes -r requirements.lock
 # Start (binds to the platform-provided $PORT)
 streamlit run run_app.py --server.port $PORT --server.address 0.0.0.0
 ```
+
+> 🚀 **Scaling to multiple instances?** For multi-instance deployment behind a load
+> balancer, Docker Compose with nginx, Kubernetes with session affinity, or Redis-backed
+> session persistence — see **[`DEPLOYMENT.md`](DEPLOYMENT.md)** (Dockerfile, compose,
+> k8s manifests, session tradeoff analysis).
 
 ### Evaluate a statement
 

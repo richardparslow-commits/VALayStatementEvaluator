@@ -1,0 +1,62 @@
+# docker-compose.yml — VA Lay Statement Evaluator (multi-instance)
+#
+# Pattern A from DEPLOYMENT.md: three Streamlit replicas behind nginx
+# with cookie-based session affinity.
+#
+# Usage:
+#   docker compose up --build -d
+#   docker compose up -d --scale streamlit-web=5   # scale to 5
+#   docker compose logs -f
+#   docker compose down
+
+services:
+  # --- Reverse proxy with session affinity ---
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      streamlit-web:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:80/nginx-health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+  # --- Streamlit application instances ---
+  streamlit-web:
+    build: .
+    env_file: .env
+    environment:
+      - VA_LSE_HEALTH_PORT=8001
+      - VA_LSE_SHUTDOWN_GRACE_SECONDS=30
+      - VA_LSE_LLM_CALL_TIMEOUT_SECONDS=300
+      - VA_LSE_LOG_JSON=1
+      - VA_LSE_LOG_DIR=/app/logs
+      - VA_LSE_AUDIT_LOG_DIR=/app/logs
+    deploy:
+      replicas: 3
+      resources:
+        limits:
+          memory: 2g
+          cpus: "2.0"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    volumes:
+      - app-logs:/app/logs    # Shared audit + diagnostic logs
+    read_only: true
+    tmpfs:
+      - /tmp:size=256M
+    restart: unless-stopped
+
+volumes:
+  app-logs:
+    driver: local

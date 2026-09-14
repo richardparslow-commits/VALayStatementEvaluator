@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: va-lse
+  labels:
+    app.kubernetes.io/name: va-lse
+    app.kubernetes.io/part-of: va-lay-statement-evaluator

@@ -1,0 +1,26 @@
+# k8s-service.yaml — ClusterIP Service for VA Lay Statement Evaluator
+#
+# Exposes the Streamlit HTTP port (8501) and the health sidecar (8001)
+# within the cluster. Use an Ingress or LoadBalancer for external access.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: va-lse
+  namespace: va-lse
+  labels:
+    app: va-lse
+    app.kubernetes.io/name: va-lse
+spec:
+  type: ClusterIP
+  selector:
+    app: va-lse
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8501
+      protocol: TCP
+    - name: health
+      port: 8001
+      targetPort: 8001
+      protocol: TCP

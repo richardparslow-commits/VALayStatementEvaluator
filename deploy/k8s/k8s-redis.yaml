@@ -1,0 +1,90 @@
+# k8s-redis.yaml — Redis StatefulSet for session persistence (Pattern C)
+#
+# Optional: only needed if you want session state to survive pod restarts
+# (e.g., rolling upgrades, autoscaling). Without Redis, sessions are
+# in-memory per pod and lost on pod restart.
+#
+# See DEPLOYMENT.md → Pattern C for integration details.
+#
+# Usage:
+#   kubectl apply -f k8s-redis.yaml
+#   # Add VA_LSE_REDIS_URL=redis://va-lse-redis:6379/0 to your va-lse-env secret
+
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: va-lse-redis
+  namespace: va-lse
+  labels:
+    app: va-lse-redis
+spec:
+  serviceName: va-lse-redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app: va-lse-redis
+  template:
+    metadata:
+      labels:
+        app: va-lse-redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports:
+            - containerPort: 6379
+              name: redis
+          command:
+            - redis-server
+            - --maxmemory
+            - "256mb"
+            - --maxmemory-policy
+            - allkeys-lru
+            - --save
+            - "60"
+            - "1"
+          resources:
+            requests:
+              memory: 128Mi
+              cpu: "0.1"
+            limits:
+              memory: 512Mi
+              cpu: "0.5"
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          volumeMounts:
+            - name: redis-data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: redis-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: va-lse-redis
+  namespace: va-lse
+  labels:
+    app: va-lse-redis
+spec:
+  type: ClusterIP
+  selector:
+    app: va-lse-redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+      protocol: TCP

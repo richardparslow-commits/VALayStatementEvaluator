@@ -1,0 +1,113 @@
+# k8s-deployment.yaml — 3-replica Deployment for VA Lay Statement Evaluator
+#
+# Features:
+#   - Health probes (liveness + readiness + startup) via app/health.py sidecar
+#   - Graceful shutdown: terminationGracePeriodSeconds > VA_LSE_SHUTDOWN_GRACE_SECONDS
+#   - Resource limits: 3 Gi memory / 2 CPU per pod (conservative for large record sets)
+#   - Secrets via envFrom (created from .env: kubectl create secret generic va-lse-env --from-env-file=.env)
+#   - Rolling update: maxUnavailable=1, maxSurge=1 (one pod at a time)
+#
+# See DEPLOYMENT.md for full deployment guide.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: va-lse
+  namespace: va-lse
+  labels:
+    app: va-lse
+    app.kubernetes.io/name: va-lse
+    app.kubernetes.io/part-of: va-lay-statement-evaluator
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: va-lse
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: va-lse
+    spec:
+      # Graceful shutdown: must be > VA_LSE_SHUTDOWN_GRACE_SECONDS (30) + buffer
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: streamlit
+          image: va-lse:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8501
+              name: http
+              protocol: TCP
+            - containerPort: 8001
+              name: health
+              protocol: TCP
+          # Environment variables from K8s Secret (created from .env)
+          envFrom:
+            - secretRef:
+                name: va-lse-env
+          # Override some env vars for production
+          env:
+            - name: VA_LSE_LOG_DIR
+              value: "/app/logs"
+            - name: VA_LSE_AUDIT_LOG_DIR
+              value: "/app/logs"
+            - name: VA_LSE_LOG_JSON
+              value: "1"
+          # Resources: 3 Gi / 2 CPU per pod (conservative for large record sets)
+          # A single 2,000-page evaluation can peak at ~1.5 GB during parallel digest.
+          resources:
+            requests:
+              memory: 1Gi
+              cpu: "1.0"
+            limits:
+              memory: 3Gi
+              cpu: "2.0"
+          # Startup probe: prevents premature liveness kills during slow pip install
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8001
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 10    # 10 × 5s = 50s max startup time
+          # Liveness probe: is the process alive?
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8001
+            initialDelaySeconds: 0  # startupProbe handles initial delay
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # Readiness probe: can it serve traffic?
+          # Returns 503 during graceful shutdown or when LLM is unreachable.
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8001
+            initialDelaySeconds: 0  # startupProbe handles initial delay
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: app-logs
+              mountPath: /app/logs
+          # Read-only root filesystem for security
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 65534       # nobody
+      volumes:
+        - name: app-logs
+          emptyDir:
+            sizeLimit: 1Gi
+        # For persistent logs across pod restarts, replace emptyDir with a PVC:
+        # - name: app-logs
+        #   persistentVolumeClaim:
+        #     claimName: va-lse-logs

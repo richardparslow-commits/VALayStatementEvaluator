@@ -1,0 +1,48 @@
+# k8s-ingress.yaml — Ingress with cookie-based session affinity
+#
+# Requires an nginx-ingress controller installed in the cluster.
+# The cookie-based affinity ensures each user consistently hits the same
+# Streamlit backend, preserving their session state across page reloads.
+#
+# For Pattern C (Redis session store), you can remove the affinity
+# annotations — any pod can serve any session.
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: va-lse
+  namespace: va-lse
+  annotations:
+    # --- Session affinity: cookie-based (works behind NAT) ---
+    nginx.ingress.kubernetes.io/affinity: "cookie"
+    nginx.ingress.kubernetes.io/session-cookie-name: "VA_LSE_SESSION"
+    nginx.ingress.kubernetes.io/session-cookie-max-age: "3600"
+    nginx.ingress.kubernetes.io/session-cookie-path: "/"
+    # --- Streamlit WebSocket support ---
+    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      proxy_set_header Upgrade $http_upgrade;
+      proxy_set_header Connection "upgrade";
+    # --- Timeouts for long LLM calls ---
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+    # --- TLS (uncomment and configure for production) ---
+    # nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    # nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  # tls:
+  #   - hosts:
+  #       - va-lse.example.com
+  #     secretName: va-lse-tls
+  rules:
+    - host: va-lse.example.com    # Replace with your domain
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: va-lse
+                port:
+                  number: 80

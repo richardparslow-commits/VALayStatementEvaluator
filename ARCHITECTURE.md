@@ -250,6 +250,12 @@ All four produce `ExtractedDocument[]`. `merge_records` (VA.gov path) is the onl
 * **Decision.** Replace the dict with `@lru_cache(maxsize=10_000)` on `_tokens`; expose a backwards-compat `_TOKEN_CACHE={}` alias for tests that import it. `LRU` eviction preserves hit rates for repeated phrases while bounding memory.
 * **Consequences.** Large record sets no longer grow the token cache without bound, and the cache no longer bulk-discards its working set.
 
+### ADR-008 — Session affinity vs Redis session store for multi-instance deployment
+
+* **Context.** For 100 concurrent users the app must run across multiple Streamlit instances behind a load balancer. Streamlit's `st.session_state` is in-memory per process, so a user hitting a different instance after failover loses their uploaded records and in-progress results.
+* **Decision.** Document three deployment patterns in `DEPLOYMENT.md`: (A) Docker Compose + nginx with `ip_hash` session affinity, (B) Kubernetes with cookie-based affinity via Ingress annotations, (C) Kubernetes with an optional Redis-backed session store. The default recommendation for 100 users is Pattern C (Redis), but Pattern B (affinity) is sufficient for <20 users or when pod restarts are rare. The app code does not require Redis — it is an opt-in env var (`VA_LSE_REDIS_URL`).
+* **Consequences.** Operators can start with simple affinity (zero additional infra) and migrate to Redis when they need zero-interruption failover or HPA autoscaling. The Dockerfile, `docker-compose.yml`, `nginx/nginx.conf`, and `deploy/k8s/` manifests are provided as starting templates. The circuit breaker and concurrency limiter remain per-process (correct — each pod independently detects LLM degradation).
+
 ## 10. Constraints you must not break
 
 When contributing, preserve these or propose an explicit ADR change:
