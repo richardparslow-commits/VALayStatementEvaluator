@@ -173,6 +173,8 @@ installs on macOS and Linux CI.
 | `VA_LSE_AUDIT_LOG_BACKUPS` | Rotated audit files kept | `10` |
 | `VA_LSE_SHUTDOWN_GRACE_SECONDS` | Max seconds to wait for inflight runs on SIGTERM before orchestrator SIGKILL | `30` |
 | `VA_LSE_LLM_CALL_TIMEOUT_SECONDS` | Per-LLM-call timeout (prevents hung calls from blocking graceful shutdown) | `300` (5 min) |
+| `VA_LSE_PIPELINE_TIMEOUT_SECONDS` | Total wall-clock timeout for an entire Evaluate/Draft run (including digest + merge) | `1800` (30 min) |
+| `VA_LSE_MEMORY_WARN_MB` | RSS memory warning threshold (MB); run aborted below 200 MB | `500` |
 
 Leave the `VA_GOV_API_BASE_URL` group or the `AGILOOP_INSPECT_*` group fully unset to run
 those integrations in mock mode. Partially configuring an integration (e.g. setting
@@ -542,6 +544,34 @@ VA_LSE_LLM_CALL_TIMEOUT_SECONDS=300 streamlit run run_app.py
 Test locally with `kill -TERM <pid>` or Ctrl+C; inspect `logs/app.log` for
 `phase=shutdown` WARNING lines showing `draining` → `drained` or `force_exit`.
 See `ARCHITECTURE.md → Cross-cutting → Graceful shutdown` for the full design.
+
+## Pipeline timeout and memory monitoring
+
+Long-running Evaluate/Draft runs are protected by two backstops configured
+via `app/pipeline_guard.py`:
+
+| Guard | Default | What happens |
+|---|---|---|
+| **Pipeline timeout** | `VA_LSE_PIPELINE_TIMEOUT_SECONDS=1800` (30 min) | Run is aborted with `PipelineTimeoutError`; user sees a clear error message with elapsed time and the configured limit |
+| **Memory pre-check** | `VA_LSE_MEMORY_WARN_MB=500` MB RSS | Warning logged if RSS exceeds threshold; run aborted with `MemoryError` if RSS < 200 MB |
+| **Memory checkpoints** | After chunk dedup and merge | RSS logged at INFO (or WARNING if above threshold) so operators can see memory growth in structured logs |
+
+The timeout wraps `run_evaluation` and `run_draft` in a worker thread via
+`concurrent.futures.ThreadPoolExecutor`; when the deadline expires the caller
+receives a `PipelineTimeoutError` (not `signal.alarm`, which only works on
+the main thread).  Memory checks use `/proc/self/status` (Linux) or
+`resource.getrusage` (macOS) and gracefully degrade on unsupported platforms.
+
+```bash
+# Tune for very large record sets (e.g. 5,000 pages)
+VA_LSE_PIPELINE_TIMEOUT_SECONDS=3600 streamlit run run_app.py  # 60 min
+# Raise memory warning for high-RAM servers
+VA_LSE_MEMORY_WARN_MB=1024 streamlit run run_app.py
+```
+
+Both guards are also wired into `DEPLOYMENT.md` scaling guidance: with 100
+users the per-pod timeout and memory limits prevent one user's runaway
+process from destabilizing shared infrastructure.
 
 ## Structured logging (diagnostics & performance traces)
 

@@ -40,6 +40,7 @@ from . import telemetry
 from . import va_gov_client
 from . import watchdog
 from .shutdown import enter_run, exit_run, is_shutting_down
+from .pipeline_guard import PipelineTimeoutError, check_memory_before_run, memory_checkpoint, run_with_timeout
 from .prompt_sanitize import validate_api_key, validate_model_name
 
 logger = get_logger("app.main")
@@ -1001,7 +1002,37 @@ def evaluate_tab() -> None:
         bar, update = _progress_widgets(llm, request_id=rid)
         t0 = time.perf_counter()
         try:
-            result = run_evaluation(llm, statement_text.strip(), records, progress=update)
+            check_memory_before_run()
+            result = run_with_timeout(
+                run_evaluation, llm, statement_text.strip(), records, progress=update
+            )
+        except MemoryError as mem_exc:
+            bar.empty()
+            duration_ms = int((time.perf_counter() - t0) * 1000)
+            logger.error(
+                "evaluate run error duration_ms=%d error=%s",
+                duration_ms, f"{type(mem_exc).__name__}: {mem_exc}",
+                exc_info=mem_exc,
+                extra={"request_id": rid, "phase": "evaluate", "status": "error", "duration_ms": duration_ms, "error_class": type(mem_exc).__name__},
+            )
+            st.error(
+                f"Evaluation aborted: {mem_exc} "
+                f"(reference: {rid})"
+            )
+            return
+        except PipelineTimeoutError as timeout_exc:
+            bar.empty()
+            duration_ms = int((time.perf_counter() - t0) * 1000)
+            logger.error(
+                "evaluate run timeout duration_ms=%d error=%s",
+                duration_ms, str(timeout_exc),
+                extra={"request_id": rid, "phase": "evaluate", "status": "timeout", "duration_ms": duration_ms, "error_class": "PipelineTimeoutError"},
+            )
+            st.error(
+                f"Evaluation aborted: {timeout_exc} "
+                f"(reference: {rid})"
+            )
+            return
         except Exception as exc:  # noqa: BLE001
             bar.empty()
             duration_ms = int((time.perf_counter() - t0) * 1000)
@@ -1359,10 +1390,50 @@ def draft_tab() -> None:
         bar, update = _progress_widgets(llm, request_id=rid)
         t0 = time.perf_counter()
         try:
-            result = run_draft(
-                llm, records, witness, observations.strip(), condition.strip(),
-                claim_type, progress=update,
+            check_memory_before_run()
+            result = run_with_timeout(
+                run_draft, llm, records, witness, observations.strip(),
+                condition.strip(), claim_type, progress=update,
             )
+        except MemoryError as mem_exc:
+            bar.empty()
+            duration_ms = int((time.perf_counter() - t0) * 1000)
+            logger.error(
+                "draft run error duration_ms=%d error=%s",
+                duration_ms, f"{type(mem_exc).__name__}: {mem_exc}",
+                exc_info=mem_exc,
+                extra={"request_id": rid, "phase": "draft", "status": "error", "duration_ms": duration_ms, "error_class": type(mem_exc).__name__},
+            )
+            audit_log.audit_draft_error(
+                request_id=rid, duration_ms=duration_ms, error=mem_exc,
+                condition=_audit_condition_d or None,
+                record_sources=_audit_sources_d or None,
+                record_files=_audit_files_d, record_pages=_audit_pages_d,
+            )
+            st.error(
+                f"Draft aborted: {mem_exc} "
+                f"(reference: {rid})"
+            )
+            return
+        except PipelineTimeoutError as timeout_exc:
+            bar.empty()
+            duration_ms = int((time.perf_counter() - t0) * 1000)
+            logger.error(
+                "draft run timeout duration_ms=%d error=%s",
+                duration_ms, str(timeout_exc),
+                extra={"request_id": rid, "phase": "draft", "status": "timeout", "duration_ms": duration_ms, "error_class": "PipelineTimeoutError"},
+            )
+            audit_log.audit_draft_error(
+                request_id=rid, duration_ms=duration_ms, error=timeout_exc,
+                condition=_audit_condition_d or None,
+                record_sources=_audit_sources_d or None,
+                record_files=_audit_files_d, record_pages=_audit_pages_d,
+            )
+            st.error(
+                f"Draft aborted: {timeout_exc} "
+                f"(reference: {rid})"
+            )
+            return
         except Exception as exc:  # noqa: BLE001
             bar.empty()
             duration_ms = int((time.perf_counter() - t0) * 1000)
@@ -1373,13 +1444,10 @@ def draft_tab() -> None:
                 extra={"request_id": rid, "phase": "draft", "status": "error", "duration_ms": duration_ms, "error_class": type(exc).__name__},
             )
             audit_log.audit_draft_error(
-                request_id=rid,
-                duration_ms=duration_ms,
-                error=exc,
+                request_id=rid, duration_ms=duration_ms, error=exc,
                 condition=_audit_condition_d or None,
                 record_sources=_audit_sources_d or None,
-                record_files=_audit_files_d,
-                record_pages=_audit_pages_d,
+                record_files=_audit_files_d, record_pages=_audit_pages_d,
             )
             st.error(f"Drafting failed: {_format_error_for_user(exc, rid)}")
             return

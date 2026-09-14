@@ -218,3 +218,15 @@ AUDIT_LOG_BACKUPS = _positive_int_env("VA_LSE_AUDIT_LOG_BACKUPS", 10)
 # ---------------------------------------------------------------------------
 SHUTDOWN_GRACE_SECONDS = _positive_int_env("VA_LSE_SHUTDOWN_GRACE_SECONDS", 30)
 LLM_CALL_TIMEOUT_SECONDS = _positive_int_env("VA_LSE_LLM_CALL_TIMEOUT_SECONDS", 300)
+
+# ---------------------------------------------------------------------------
+# Pipeline-level timeout + memory monitoring (see app/pipeline_guard.py).
+# PIPELINE_TIMEOUT_SECONDS caps the total wall-clock time for an entire
+# Evaluate or Draft run (including record digest, merge, and all LLM calls).
+# If exceeded, the run is aborted with a user-visible error. MEMORY_WARN_MB
+# is the RSS threshold (in MB) above which a warning is logged; below 200 MB
+# the run is aborted with MemoryError. Both are advisory on platforms where
+# RSS is unavailable.
+# ---------------------------------------------------------------------------
+PIPELINE_TIMEOUT_SECONDS = _positive_int_env("VA_LSE_PIPELINE_TIMEOUT_SECONDS", 1800)
+MEMORY_WARN_MB = _positive_int_env("VA_LSE_MEMORY_WARN_MB", 500)

@@ -455,6 +455,14 @@ def review_medical_records(
 
     all_facts = _dedupe_facts(all_facts)
 
+    # Memory checkpoint: after chunk extraction + dedup (peak before merge)
+    try:
+        from .pipeline_guard import memory_checkpoint as _mem_cp
+
+        _mem_cp("records:post_dedup")
+    except Exception:  # noqa: BLE001
+        pass
+
     if progress:
         progress(0.65, f"Consolidating {len(all_facts):,} extracted facts…")
 
@@ -469,6 +477,11 @@ def review_medical_records(
 
     with PhaseTimer(logger, "records:merge", request_id=rid, facts=len(all_facts)):
         digest.facts = _merge_facts(llm, digest, progress)
+    # Memory checkpoint: after merge (fact list may have shrunk)
+    try:
+        _mem_cp("records:post_merge")
+    except Exception:  # noqa: BLE001
+        pass
     with PhaseTimer(logger, "records:summary", request_id=rid):
         digest.summary = _summarize(llm, digest)
     duration_ms = int((time.perf_counter() - _review_t0) * 1000)
