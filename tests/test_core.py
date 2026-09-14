@@ -7,11 +7,13 @@ import sys
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.documents import (  # noqa: E402
     ExtractionError,
+    _read_docx_member_limited,
     chunk_page_labelled_text,
     extract_document,
     extract_uploaded_documents,
@@ -33,6 +35,24 @@ from app.medical_review import (  # noqa: E402
 
 
 class TestExtraction(unittest.TestCase):
+    def _make_docx_bytes(
+        self,
+        text: str = "Observed pain during lifting.",
+        extra_entries: dict[str, bytes] | None = None,
+    ) -> bytes:
+        xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+            f"<w:body><w:p><w:r><w:t>{text}</w:t></w:r></w:p>"
+            "</w:body></w:document>"
+        )
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("word/document.xml", xml)
+            for name, payload in (extra_entries or {}).items():
+                archive.writestr(name, payload)
+        return buffer.getvalue()
+
     def test_txt_extraction(self):
         doc = extract_document("note.txt", b"Hello world. This is a note.")
         self.assertEqual(doc.filename, "note.txt")
@@ -48,17 +68,170 @@ class TestExtraction(unittest.TestCase):
             extract_document("file.xls", b"data")
 
     def test_docx_extraction(self):
-        xml = (
-            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-            '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
-            "<w:body><w:p><w:r><w:t>Observed pain during lifting.</w:t></w:r></w:p>"
-            "</w:body></w:document>"
-        )
-        buffer = io.BytesIO()
-        with zipfile.ZipFile(buffer, "w") as archive:
-            archive.writestr("word/document.xml", xml)
-        doc = extract_document("record.docx", buffer.getvalue())
+        doc = extract_document("record.docx", self._make_docx_bytes())
         self.assertIn("Observed pain", doc.full_text)
+
+    def test_docx_rejects_member_over_max_uncompressed_size(self):
+        docx = self._make_docx_bytes(text="A" * 300)
+        with patch.object(config, "DOCX_MAX_INTERNAL_FILE_BYTES", 200), patch.object(
+            config, "DOCX_MAX_TOTAL_UNCOMPRESSED_BYTES", 10_000
+        ):
+            with self.assertRaises(ExtractionError) as exc:
+                extract_document("oversized-member.docx", docx)
+        self.assertIn("exceeds max uncompressed size", str(exc.exception))
+
+    def test_docx_rejects_total_uncompressed_size_over_limit(self):
+        docx = self._make_docx_bytes(extra_entries={"customXml/item1.xml": b"A" * 300})
+        with patch.object(config, "DOCX_MAX_INTERNAL_FILE_BYTES", 500), patch.object(
+            config, "DOCX_MAX_TOTAL_UNCOMPRESSED_BYTES", 400
+        ):
+            with self.assertRaises(ExtractionError) as exc:
+                extract_document("oversized-total.docx", docx)
+        self.assertIn("total uncompressed size exceeds limit", str(exc.exception))
+
+    def test_docx_extracts_successfully_when_under_limits(self):
+        docx = self._make_docx_bytes(extra_entries={"docProps/core.xml": b"<p>ok</p>"})
+        with patch.object(config, "DOCX_MAX_INTERNAL_FILE_BYTES", 10_000), patch.object(
+            config, "DOCX_MAX_TOTAL_UNCOMPRESSED_BYTES", 20_000
+        ):
+            doc = extract_document("under-limit.docx", docx)
+        self.assertIn("Observed pain", doc.full_text)
+
+    def test_docx_rejects_too_many_internal_files(self):
+        extra = {f"customXml/item{i}.xml": b"x" for i in range(5)}
+        docx = self._make_docx_bytes(extra_entries=extra)
+        with patch.object(config, "DOCX_MAX_INTERNAL_FILE_COUNT", 3):
+            with self.assertRaises(ExtractionError) as exc:
+                extract_document("too-many-members.docx", docx)
+        self.assertIn("too many internal files", str(exc.exception))
+
+    def test_docx_member_runtime_overflow_guard(self):
+        class _FakeStream:
+            def __init__(self):
+                self._chunks = [b"abc", b"def", b"ghi", b""]
+
+            def read(self, _size: int) -> bytes:
+                return self._chunks.pop(0)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class _FakeArchive:
+            def getinfo(self, _name: str):
+                return type("Info", (), {"file_size": 4})()
+
+            def open(self, _info, _mode: str):
+                return _FakeStream()
+
+        with self.assertRaises(ExtractionError) as exc:
+            _read_docx_member_limited(
+                "runtime-overflow.docx",
+                archive=_FakeArchive(),
+                member_name="word/document.xml",
+                max_member_bytes=5,
+                max_total_bytes=50,
+                existing_total_bytes=0,
+            )
+        self.assertIn("exceeded max uncompressed size while reading", str(exc.exception))
+
+    def test_docx_total_runtime_overflow_guard(self):
+        class _FakeStream:
+            def __init__(self):
+                self._chunks = [b"abc", b"def", b""]
+
+            def read(self, _size: int) -> bytes:
+                return self._chunks.pop(0)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class _FakeArchive:
+            def getinfo(self, _name: str):
+                return type("Info", (), {"file_size": 3})()
+
+            def open(self, _info, _mode: str):
+                return _FakeStream()
+
+        with self.assertRaises(ExtractionError) as exc:
+            _read_docx_member_limited(
+                "runtime-total-overflow.docx",
+                archive=_FakeArchive(),
+                member_name="word/document.xml",
+                max_member_bytes=100,
+                max_total_bytes=5,
+                existing_total_bytes=0,
+            )
+        self.assertIn("total uncompressed size exceeded while reading", str(exc.exception))
+
+    def test_docx_total_runtime_overflow_guard_with_existing_members(self):
+        class _FakeStream:
+            def __init__(self):
+                self._chunks = [b"abc", b"def", b""]
+
+            def read(self, _size: int) -> bytes:
+                return self._chunks.pop(0)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class _FakeArchive:
+            def getinfo(self, _name: str):
+                return type("Info", (), {"file_size": 3})()
+
+            def open(self, _info, _mode: str):
+                return _FakeStream()
+
+        with self.assertRaises(ExtractionError) as exc:
+            _read_docx_member_limited(
+                "runtime-total-existing-overflow.docx",
+                archive=_FakeArchive(),
+                member_name="word/document.xml",
+                max_member_bytes=100,
+                max_total_bytes=10,
+                existing_total_bytes=6,
+            )
+        self.assertIn("total uncompressed size exceeded while reading", str(exc.exception))
+
+    def test_docx_member_runtime_guard_wins_with_existing_total(self):
+        class _FakeStream:
+            def __init__(self):
+                self._chunks = [b"abc", b"def", b""]
+
+            def read(self, _size: int) -> bytes:
+                return self._chunks.pop(0)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        class _FakeArchive:
+            def getinfo(self, _name: str):
+                return type("Info", (), {"file_size": 4})()
+
+            def open(self, _info, _mode: str):
+                return _FakeStream()
+
+        with self.assertRaises(ExtractionError) as exc:
+            _read_docx_member_limited(
+                "runtime-member-existing-total.docx",
+                archive=_FakeArchive(),
+                member_name="word/document.xml",
+                max_member_bytes=5,
+                max_total_bytes=100,
+                existing_total_bytes=40,
+            )
+        self.assertIn("member 'word/document.xml' exceeded max uncompressed size", str(exc.exception))
 
     def test_page_labelled_text(self):
         doc = extract_document("note.txt", b"Body text here.")
@@ -246,6 +419,22 @@ class TestChunking(unittest.TestCase):
         union = "".join(c.text for c in chunks)
         for token in text.split()[:100]:
             self.assertIn(token, union)
+
+
+class TestConfigParsing(unittest.TestCase):
+    def test_positive_int_env_uses_default_when_unset_invalid_or_non_positive(self):
+        with patch.dict("os.environ", {}, clear=False):
+            self.assertEqual(config._positive_int_env("VA_LSE_TEST_POS_INT", 123), 123)
+        with patch.dict("os.environ", {"VA_LSE_TEST_POS_INT": "bad"}, clear=False):
+            self.assertEqual(config._positive_int_env("VA_LSE_TEST_POS_INT", 123), 123)
+        with patch.dict("os.environ", {"VA_LSE_TEST_POS_INT": "0"}, clear=False):
+            self.assertEqual(config._positive_int_env("VA_LSE_TEST_POS_INT", 123), 123)
+        with patch.dict("os.environ", {"VA_LSE_TEST_POS_INT": "-5"}, clear=False):
+            self.assertEqual(config._positive_int_env("VA_LSE_TEST_POS_INT", 123), 123)
+
+    def test_positive_int_env_accepts_valid_positive_int(self):
+        with patch.dict("os.environ", {"VA_LSE_TEST_POS_INT": "456"}, clear=False):
+            self.assertEqual(config._positive_int_env("VA_LSE_TEST_POS_INT", 123), 456)
 
 
 class TestUsageWatchdog(unittest.TestCase):

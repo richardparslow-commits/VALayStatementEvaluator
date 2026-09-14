@@ -114,13 +114,7 @@ def _int_env(name: str, default: int) -> int:
 
 
 def _positive_int_env(name: str, default: int) -> int:
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return default
-    try:
-        value = int(raw)
-    except ValueError:
-        return default
+    value = _int_env(name, default)
     return value if value > 0 else default
 
 
@@ -139,6 +133,20 @@ MAX_DIGEST_FACTS = _int_env("VA_LSE_MAX_DIGEST_FACTS", 1500)
 # Characters per record chunk. Smaller chunks => more LLM calls but better
 # recall on dense pages (nothing gets truncated mid-extraction).
 DIGEST_CHUNK_CHARS = _int_env("VA_LSE_DIGEST_CHUNK_CHARS", 8000)
+
+# DOCX unzip hardening: reject oversized internal members before decompression.
+DOCX_MAX_INTERNAL_FILE_BYTES = _positive_int_env(
+    "VA_LSE_DOCX_MAX_INTERNAL_FILE_BYTES",
+    50 * 1024 * 1024,
+)
+DOCX_MAX_TOTAL_UNCOMPRESSED_BYTES = _positive_int_env(
+    "VA_LSE_DOCX_MAX_TOTAL_UNCOMPRESSED_BYTES",
+    200 * 1024 * 1024,
+)
+DOCX_MAX_INTERNAL_FILE_COUNT = _positive_int_env(
+    "VA_LSE_DOCX_MAX_INTERNAL_FILE_COUNT",
+    10_000,
+)
 
 # ---------------------------------------------------------------------------
 # Optional credit-burn gauge for the usage estimator. QwenCloud Token Plan does
