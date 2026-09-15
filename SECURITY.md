@@ -90,6 +90,10 @@ For any hosted / multi-user deployment (Agiloop, Streamlit Cloud, Docker, etc.):
   - AWS Secrets Manager / Parameter Store
   - Azure Key Vault (Container Apps / App Service → Key Vault reference)
   - GCP Secret Manager
+  - Streamlit Community Cloud **Settings → Secrets** (writes `.streamlit/secrets.toml` inside the
+    deployment; the only channel available there, since `.env` does not ship). Values are read in
+    the order environment → `.env` → secrets → code default, so the platform store is a fallback,
+    never an override, and the sidebar captions which fields came from it (`DEPLOYMENT.md` → Pattern D)
   - Agiloop / platform-managed environment secrets (preferred when available)
 - Inject secrets as **runtime environment variables** or **mounted secret files** — not baked into the image.
 - Scope roles narrowly (least privilege) and enable rotation/autorotation.

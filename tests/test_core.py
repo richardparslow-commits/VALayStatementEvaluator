@@ -3,11 +3,12 @@
 Run from project root: .venv/bin/python -m unittest discover -s tests -v
 """
 import io
+import os
 import sys
 import unittest
 import zipfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -435,6 +436,86 @@ class TestConfigParsing(unittest.TestCase):
     def test_positive_int_env_accepts_valid_positive_int(self):
         with patch.dict("os.environ", {"VA_LSE_TEST_POS_INT": "456"}, clear=False):
             self.assertEqual(config._positive_int_env("VA_LSE_TEST_POS_INT", 123), 456)
+
+
+class TestStreamlitSecrets(unittest.TestCase):
+    """Hosted deployments (Streamlit Community Cloud) ship no .env, so the key
+    and endpoint must be readable from st.secrets; environment still wins."""
+
+    _ENV_KEYS = ("OPENAI_API_KEY", "OPENAI_BASE_URL", "LLM_MODEL_MAIN", "LLM_MODEL_FAST")
+
+    def setUp(self):
+        # streamlit_secrets() memoizes per process — clear it so a test can patch
+        # in its own mapping and read it back.
+        cache_reset = patch.object(config, "_SECRETS_CACHE", None)
+        cache_reset.start()
+        self.addCleanup(cache_reset.stop)
+
+    def _load(self, secrets, env=None):
+        """load_settings() with the secrets manager faked and these env vars blank.
+
+        Blanking (rather than clearing os.environ) keeps a developer's real
+        .env from leaking the answer into a secrets-resolution test.
+        """
+        environ = {name: "" for name in self._ENV_KEYS}
+        environ.update(env or {})
+        with patch.object(config, "streamlit_secrets", return_value=secrets):
+            with patch.dict("os.environ", environ, clear=False):
+                return config.load_settings()
+
+    def test_secrets_fill_settings_and_are_recorded(self):
+        settings = self._load(
+            {
+                "OPENAI_API_KEY": "test-key-from-secrets",
+                "OPENAI_BASE_URL": "https://ws-example.example.com/v1",
+                "LLM_MODEL_MAIN": "qwen-from-secrets",
+            }
+        )
+        self.assertEqual(settings.api_key, "test-key-from-secrets")
+        self.assertEqual(settings.base_url, "https://ws-example.example.com/v1")
+        self.assertEqual(settings.model_main, "qwen-from-secrets")
+        # Not in secrets and not in the (blanked) environment → code default.
+        self.assertEqual(settings.model_fast, config.DEFAULT_MODEL_FAST)
+        self.assertEqual(
+            settings.from_secrets,
+            frozenset({"OPENAI_API_KEY", "OPENAI_BASE_URL", "LLM_MODEL_MAIN"}),
+        )
+
+    def test_environment_overrides_secrets(self):
+        settings = self._load(
+            {"OPENAI_API_KEY": "test-key-from-secrets", "OPENAI_BASE_URL": "https://secret/v1"},
+            env={"OPENAI_API_KEY": "test-key-from-env"},
+        )
+        self.assertEqual(settings.api_key, "test-key-from-env")
+        self.assertEqual(settings.base_url, "https://secret/v1")
+        self.assertNotIn("OPENAI_API_KEY", settings.from_secrets)
+        self.assertIn("OPENAI_BASE_URL", settings.from_secrets)
+
+    def test_lowercase_secret_keys_supported(self):
+        settings = self._load({"openai_api_key": "test-key-lowercase"})
+        self.assertEqual(settings.api_key, "test-key-lowercase")
+        self.assertEqual(settings.from_secrets, frozenset({"OPENAI_API_KEY"}))
+
+    def test_blank_or_nested_secrets_are_ignored(self):
+        settings = self._load({"OPENAI_API_KEY": "   ", "LLM_MODEL_MAIN": {"nested": 1}})
+        self.assertEqual(settings.api_key, "")
+        self.assertEqual(settings.model_main, config.DEFAULT_MODEL_MAIN)
+        self.assertEqual(settings.from_secrets, frozenset())
+
+    def test_no_secrets_uses_defaults(self):
+        settings = self._load({})
+        self.assertFalse(settings.configured)
+        self.assertEqual(settings.base_url, config.DEFAULT_BASE_URL)
+        self.assertEqual(settings.from_secrets, frozenset())
+
+    def test_missing_secrets_file_is_not_an_error(self):
+        """Local runs (no .streamlit/secrets.toml) must not crash on import-time reads."""
+        import streamlit as st
+
+        broken = MagicMock()
+        broken.to_dict.side_effect = RuntimeError("no secrets file")
+        with patch.object(st, "secrets", broken):
+            self.assertEqual(config._read_streamlit_secrets(), {})
 
 
 class TestUsageWatchdog(unittest.TestCase):

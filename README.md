@@ -188,6 +188,28 @@ All settings can also be overridden live in the app sidebar. Model availability 
 provider: the app checks `GET {base_url}/models` at startup and warns if `LLM_MODEL_MAIN` or
 `LLM_MODEL_FAST` is not listed (see [`COMPATIBILITY.md`](COMPATIBILITY.md)).
 
+> ⚠️ **Sidebar edits are applied unevenly.** The **API key** is read live on every run, but the
+> **base URL** and **model names** only take effect after clicking **Apply settings** — pressing
+> Enter in a field does not apply them. The sidebar warns while a change is still pending. This
+> matters most on a hosted deployment (`*.streamlit.app`) where `.env` is not present: the app
+> then starts on the default Token Plan base URL, so a key issued for a different endpoint gets
+> sent to the wrong host and is rejected with a generic auth error.
+>
+> Use **Test connection** (next to *Apply settings*) before a long run: it calls
+> `GET {base_url}/models` with the on-screen key/URL, reports the model count, and flags model
+> names the endpoint does not offer — a two-second check instead of a failed multi-minute run.
+> With no key in the environment, enter the key **and** the matching base URL, then click
+> *Apply settings*.
+
+**Configuration can also come from Streamlit secrets.** Each value above is resolved
+**process environment → `.env` → `.streamlit/secrets.toml` → code default**, so a hosted
+deployment — where `.env` is git-ignored and never ships — is configured entirely from the
+dashboard's **Settings → Secrets** editor (`OPENAI_API_KEY` and `OPENAI_BASE_URL` must come
+from the same provider account). The sidebar captions every field that came from secrets
+(`🔐 From Streamlit secrets: …`), so a pre-filled value is never mistaken for one you typed.
+See [`DEPLOYMENT.md` → Pattern D](DEPLOYMENT.md#14-pattern-d--streamlit-community-cloud) for
+the hosted checklist and its limits (ephemeral logs, one shared key).
+
 ### Telemetry (Agiloop Inspect)
 
 The app ships with usage telemetry (impressions, interactions, errors, goals) for the
@@ -711,6 +733,25 @@ grep 'req_cdaaad6d5495' logs/app.log
 grep 'req_cdaaad6d5495' logs/audit.log
 ```
 
+### Troubleshooting `Evaluate` results that look empty or instantaneous
+
+A real Evaluate run over even a single page makes several LLM calls and takes minutes
+(measured: ~7.5 min for the `examples/` sample), so a report that appears "instantly" is
+never a fresh run. Two run-log statuses identify the cases (About → Recent run log, or
+`grep req_… logs/runs.jsonl`):
+
+- `empty` — the run completed but the model returned nothing usable (0 claims, no rubric
+  scores, usually with `llm_calls=0`). The results panel shows an explicit error with the
+  reference instead of a meaningless "Not scored" report. Check `LLM_MODEL_MAIN` /
+  `LLM_MODEL_FAST` and the base URL at `GET {base_url}/models`, then re-run.
+- `interrupted` — the browser session was torn down (widget interaction / rerun / session
+  close) while the pipeline was in flight, so no report was produced. Re-run and leave the
+  tab alone until it finishes.
+
+Otherwise the panel you are looking at is the **previous** run's result, re-rendered from
+session state; the caption above it names the reference (`req_…`) it belongs to, and every
+new run mints a new one.
+
 ## Production hardening (Streamlit)
 
 `.streamlit/config.toml` is committed so shared deployments cannot silently run with
@@ -740,8 +781,9 @@ that adds:
 - `Strict-Transport-Security` (HSTS) and `X-Content-Type-Options: nosniff`
 - Rate limiting per IP and upload throttling
 
-`.streamlit/secrets.toml` is git-ignored — never store deploy keys there as a
-checked-in file.
+`.streamlit/secrets.toml` is git-ignored — it is a **runtime** secret source (the file
+Streamlit Cloud's *Settings → Secrets* editor writes, read by `app/config.py` as a fallback
+after the environment), never a checked-in file. See `DEPLOYMENT.md` → Pattern D.
 
 For the orchestrator probes, see **Health checks (container orchestration)** above —
 front the same `GET /health` / `GET /ready` sidecar on `VA_LSE_HEALTH_PORT` (default `8001`)
@@ -756,7 +798,7 @@ with your proxy if the stream is TLS-terminated there.
 ## Security notes
 
 - **Streamlit hardening:** `.streamlit/config.toml` (committed) sets XSRF, toolbar, and `maxUploadSize`; missed config triggers a startup warning (see Production hardening above).
-- **Secrets are never committed.** `.env`, `.env.local`, `.env.*.local`, and `.streamlit/secrets.toml` are git-ignored (see `SECURITY.md`). Rotate keys after any leak.
+- **Secrets are never committed.** `.env`, `.env.local`, `.env.*.local`, and `.streamlit/secrets.toml` are git-ignored (see `SECURITY.md`). Rotate keys after any leak. On a hosted deployment without `.env`, inject secrets through the platform (Streamlit *Settings → Secrets*, K8s/Docker secret, or a cloud secret manager) — never in code or `secrets.toml` in git.
 - **Pre-commit guard.** `scripts/hooks/pre-commit` rejects staged `.env` files, `*.pem`/`*.key`, and key assignments (`OPENAI_API_KEY=`, `sk-*`). Install with `cp scripts/hooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit`.
 - Medical records stay local: they are only sent to the configured LLM endpoint. VA.gov credentials and session tokens are never written to disk, `.env`, or logs.
 - See [`SECURITY.md`](SECURITY.md) for full secrets management guidance (local `.env.local` overrides, CI/CD with GitHub Secrets, managed secret stores in production).

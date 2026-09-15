@@ -1,13 +1,15 @@
 """Application settings.
 
-Settings are loaded from environment variables (optionally via a .env file) and can be
-overridden at runtime from the Streamlit sidebar.
+Settings are loaded from environment variables (optionally via a .env file), falling
+back to Streamlit secrets (``st.secrets``) for hosted deployments, and can be overridden
+at runtime from the Streamlit sidebar.
 """
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -17,6 +19,102 @@ KNOWLEDGE_DIR = Path(__file__).resolve().parent / "knowledge"
 # Load .env from the project root if present (never committed). override=True so
 # the project's .env wins over any pre-existing environment values.
 load_dotenv(PROJECT_ROOT / ".env", override=True)
+
+# ---------------------------------------------------------------------------
+# Secret resolution order.  A secret can arrive three ways, checked in order:
+#
+#   1. the process environment (orchestrator var, K8s/Docker secret, CI var),
+#   2. the project .env (local development; git-ignored, so it never ships),
+#   3. Streamlit secrets (``st.secrets`` → ``.streamlit/secrets.toml``).
+#
+# Streamlit Community Cloud is the case that matters: there is no .env in the
+# deployed image, so the API key and endpoint can only come from the secrets
+# manager.  Environment wins over secrets so a local .env always overrides a
+# hosted secret store.  See DEPLOYMENT.md → Pattern D.
+# ---------------------------------------------------------------------------
+SECRET_FIELD_LABELS: dict[str, str] = {
+    "OPENAI_API_KEY": "API key",
+    "OPENAI_BASE_URL": "base URL",
+    "LLM_MODEL_MAIN": "main model",
+    "LLM_MODEL_FAST": "fast model",
+    "FETCH_SANDBOX_API_KEY": "Fetch API key",
+    "FETCH_SANDBOX_BASE_URL": "Fetch base URL",
+    "FETCH_SANDBOX_RECORDS_PATH": "Fetch records path",
+    "VA_LSE_SHARED_CACHE_URL": "shared cache URL",
+    "VA_LSE_SHARED_CACHE_TOKEN": "shared cache token",
+}
+
+_SECRETS_CACHE: dict[str, Any] | None = None
+
+
+def _read_streamlit_secrets() -> dict[str, Any]:
+    """Return ``st.secrets`` as a flat string-keyed dict (empty when absent)."""
+    try:
+        import streamlit as st
+
+        data = st.secrets.to_dict()
+    except Exception:  # noqa: BLE001 - no secrets.toml is the normal local case
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(key): value for key, value in data.items()}
+
+
+def streamlit_secrets() -> dict[str, Any]:
+    """Read the Streamlit secrets manager once per process ({} when unset).
+
+    Read explicitly rather than relying on Streamlit's implicit promotion of
+    string secrets into ``os.environ``, which only happens the first time
+    *anything* touches ``st.secrets`` — too fragile an ordering to depend on for
+    the API key.  Streamlit is imported lazily and a missing secrets file is
+    swallowed: local runs and the test suite simply have no secrets.
+    """
+    global _SECRETS_CACHE
+    if _SECRETS_CACHE is None:
+        _SECRETS_CACHE = _read_streamlit_secrets()
+    return _SECRETS_CACHE
+
+
+def _secret_value(name: str) -> str:
+    """Return the Streamlit secrets value for ``name`` ("" when unset/non-string).
+
+    Both the exact env-var name and its lowercase form are accepted, since
+    ``secrets.toml`` is hand-written and either spelling is natural there.
+    """
+    secrets = streamlit_secrets()
+    for key in (name, name.lower()):
+        value = secrets.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _setting(
+    name: str, default: str = "", from_secrets: set[str] | None = None
+) -> str:
+    """Resolve one string setting: environment → Streamlit secrets → default.
+
+    Names recorded in ``from_secrets`` came from the secrets manager, so the
+    sidebar can show where a pre-filled value came from instead of leaving the
+    user to guess whether it is theirs, stale, or a code default.
+
+    Streamlit promotes string secrets into ``os.environ`` the first time
+    ``st.secrets`` is read, after which the two sources are indistinguishable by
+    value alone.  A name whose environment value equals its secret value is
+    therefore attributed to the secret: in a hosted deployment that env entry
+    only exists because Streamlit put it there, and a local ``.env`` carrying the
+    identical value is the same credential either way.
+    """
+    secret = _secret_value(name)
+    env = os.getenv(name, "").strip()
+    if env and env != secret:
+        return env
+    if secret:
+        if from_secrets is not None:
+            from_secrets.add(name)
+        return secret
+    return env or default
+
 
 # Default endpoint tuned for the QwenCloud Individual Plan Lite subscription
 # but the app speaks to ANY OpenAI-compatible POST {base_url}/chat/completions
@@ -51,6 +149,10 @@ class Settings:
     fetch_base_url: str
     fetch_records_path: str
     fetch_max_response_bytes: int = DEFAULT_FETCH_SANDBOX_MAX_RESPONSE_BYTES
+    # Env-var names that were satisfied by Streamlit secrets rather than the
+    # environment/.env — surfaced in the sidebar so a pre-filled value is not
+    # mistaken for one the user typed.  See SECRET_FIELD_LABELS.
+    from_secrets: frozenset[str] = frozenset()
 
     @property
     def configured(self) -> bool:
@@ -62,28 +164,25 @@ class Settings:
 
 
 def load_settings() -> Settings:
-    """Build settings from the environment with sensible defaults."""
+    """Build settings from the environment, then Streamlit secrets, then defaults."""
+    from_secrets: set[str] = set()
     return Settings(
-        api_key=os.getenv("OPENAI_API_KEY", "").strip(),
-        base_url=os.getenv("OPENAI_BASE_URL", DEFAULT_BASE_URL).strip()
-        or DEFAULT_BASE_URL,
-        model_main=os.getenv("LLM_MODEL_MAIN", DEFAULT_MODEL_MAIN).strip()
-        or DEFAULT_MODEL_MAIN,
-        model_fast=os.getenv("LLM_MODEL_FAST", DEFAULT_MODEL_FAST).strip()
-        or DEFAULT_MODEL_FAST,
-        fetch_api_key=os.getenv("FETCH_SANDBOX_API_KEY", "").strip(),
-        fetch_base_url=os.getenv(
-            "FETCH_SANDBOX_BASE_URL", DEFAULT_FETCH_SANDBOX_BASE_URL
-        ).strip()
-        or DEFAULT_FETCH_SANDBOX_BASE_URL,
-        fetch_records_path=os.getenv(
-            "FETCH_SANDBOX_RECORDS_PATH", DEFAULT_FETCH_SANDBOX_RECORDS_PATH
-        ).strip()
-        or DEFAULT_FETCH_SANDBOX_RECORDS_PATH,
+        api_key=_setting("OPENAI_API_KEY", "", from_secrets),
+        base_url=_setting("OPENAI_BASE_URL", DEFAULT_BASE_URL, from_secrets),
+        model_main=_setting("LLM_MODEL_MAIN", DEFAULT_MODEL_MAIN, from_secrets),
+        model_fast=_setting("LLM_MODEL_FAST", DEFAULT_MODEL_FAST, from_secrets),
+        fetch_api_key=_setting("FETCH_SANDBOX_API_KEY", "", from_secrets),
+        fetch_base_url=_setting(
+            "FETCH_SANDBOX_BASE_URL", DEFAULT_FETCH_SANDBOX_BASE_URL, from_secrets
+        ),
+        fetch_records_path=_setting(
+            "FETCH_SANDBOX_RECORDS_PATH", DEFAULT_FETCH_SANDBOX_RECORDS_PATH, from_secrets
+        ),
         fetch_max_response_bytes=_positive_int_env(
             "FETCH_SANDBOX_MAX_RESPONSE_BYTES",
             DEFAULT_FETCH_SANDBOX_MAX_RESPONSE_BYTES,
         ),
+        from_secrets=frozenset(from_secrets),
     )
 
 
@@ -238,8 +337,8 @@ MEMORY_WARN_MB = _positive_int_env("VA_LSE_MEMORY_WARN_MB", 500)
 # shared cache across all Streamlit instances.  A local LRU (256 entries)
 # always runs as a fallback so single-instance deployments need no Redis.
 # ---------------------------------------------------------------------------
-SHARED_CACHE_URL = os.getenv("VA_LSE_SHARED_CACHE_URL", "").strip()
-SHARED_CACHE_TOKEN = os.getenv("VA_LSE_SHARED_CACHE_TOKEN", "").strip()
+SHARED_CACHE_URL = _setting("VA_LSE_SHARED_CACHE_URL")
+SHARED_CACHE_TOKEN = _setting("VA_LSE_SHARED_CACHE_TOKEN")
 SHARED_CACHE_TIMEOUT_SECONDS = float(os.getenv("VA_LSE_SHARED_CACHE_TIMEOUT_SECONDS", "2"))
 SHARED_CACHE_LOCAL_MAXSIZE = _positive_int_env("VA_LSE_SHARED_CACHE_LOCAL_MAXSIZE", 256)
 

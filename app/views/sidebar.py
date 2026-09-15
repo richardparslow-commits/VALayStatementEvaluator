@@ -38,6 +38,7 @@ def render_sidebar_settings() -> None:
         st.session_state.base_url_input = st.text_input(
             "Base URL (OpenAI-compatible)", value=settings.base_url or DEFAULT_BASE_URL
         )
+        _secrets_source_note(settings)
         col1, col2 = st.columns(2)
         st.session_state.model_main_input = col1.text_input(
             "Main model", value=settings.model_main, help="Analysis, scoring, drafting"
@@ -92,6 +93,10 @@ def render_sidebar_settings() -> None:
                 settings.fetch_records_path = st.session_state.fetch_records_path_input.strip()
                 st.rerun()
 
+        if st.button("Test connection"):
+            _test_connection_report(settings)
+
+        _pending_settings_warning(settings)
         _compat_model_warning(settings)
 
         st.divider()
@@ -104,6 +109,106 @@ def render_sidebar_settings() -> None:
         st.caption(
             "This tool is an aid for drafting and reviewing lay statements. It is not "
             "legal, medical, or claims advice."
+        )
+
+
+def _field_value(key: str, fallback: str = "") -> str:
+    """Read a sidebar widget value as a stripped string (fallback when empty)."""
+    raw: Any = st.session_state.get(key, "")
+    value = raw.strip() if isinstance(raw, str) else ""
+    return value or fallback
+
+
+def _secrets_source_note(settings: Any) -> None:
+    """Caption which fields came from Streamlit secrets (hosted deployments).
+
+    Cloud deployments ship no ``.env``, so the fields arrive pre-filled from
+    ``.streamlit/secrets.toml``.  Without this note the user cannot tell a
+    secret-backed value from a stale one left over from a previous run, which is
+    exactly the confusion that sends a valid key to the wrong base URL.
+    """
+    names = sorted(getattr(settings, "from_secrets", None) or ())
+    if not names:
+        return
+    labels = ", ".join(config.SECRET_FIELD_LABELS.get(name, name) for name in names)
+    st.caption(
+        f"🔐 From Streamlit secrets: {labels}. Edit the field(s) here and click "
+        "**Apply settings** to override for this session."
+    )
+
+
+def _pending_settings_warning(settings: Any) -> None:
+    """Warn when on-screen sidebar values are not the ones a run will use.
+
+    The API key is read live on every run, but base URL and model names only
+    take effect when **Apply settings** is pressed. That asymmetry is invisible
+    and bites hardest on hosted deployments (Streamlit Community Cloud has no
+    ``.env``): the app then starts on the default Token Plan base URL, so a key
+    pasted for a different endpoint is sent to the wrong host and fails with a
+    rejected-key error that looks nothing like "you forgot to apply settings".
+    """
+    pending: list[str] = []
+    for label, key, applied in (
+        ("base URL", "base_url_input", settings.base_url),
+        ("main model", "model_main_input", settings.model_main),
+        ("fast model", "model_fast_input", settings.model_fast),
+    ):
+        value = _field_value(key)
+        if value and value != str(applied or "").strip():
+            pending.append(label)
+    if not pending:
+        return
+    listed = ", ".join(pending)
+    st.warning(
+        f"You edited the {listed}, but it has not been applied — runs will still use the "
+        f"saved {listed}. Click **Apply settings** to use the new value(s). "
+        "(The API key is used immediately; the base URL and model names are not.)"
+    )
+
+
+def _test_connection_report(settings: Any) -> None:
+    """Validate the on-screen key + base URL + models against ``GET /models``.
+
+    Turns a 7-minute failing run into a 2-second answer: a base URL that does
+    not match the key is the most common hosted-deployment failure, and the
+    gateway rejects it with a generic auth error.
+    """
+    base_url = _field_value("base_url_input", settings.base_url)
+    api_key = _field_value("api_key_input", settings.api_key)
+    model_main = _field_value("model_main_input", settings.model_main)
+    model_fast = _field_value("model_fast_input", settings.model_fast)
+
+    if not api_key:
+        st.error("Enter an API key first, then test the connection.")
+        return
+
+    with st.spinner("Checking the endpoint…"):
+        available = check_model_availability(base_url, api_key)
+
+    if available is None:
+        st.error(
+            "Could not list models from "
+            f"`{base_url.rstrip('/')}/models`. Either the host is unreachable or it "
+            "rejected this key — the base URL and the API key must belong to the same "
+            "provider account, and to the same plan family: a Token Plan-issued key "
+            "only works against the Token Plan base URL)."
+        )
+        return
+
+    missing = [
+        m for m in (model_main, model_fast)
+        if m and m not in available
+    ]
+    if missing:
+        st.warning(
+            f"Reached the endpoint ({len(available)} model(s) available) but it does not "
+            f"offer: {', '.join(missing)}. Fix the model name(s) or leave them blank to "
+            "use the provider default."
+        )
+    else:
+        st.success(
+            f"Endpoint reachable — {len(available)} model(s) available, including "
+            f"`{model_main}` and `{model_fast}`."
         )
 
 

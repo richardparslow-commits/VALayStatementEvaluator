@@ -9,8 +9,11 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # tests/ — log_isolation
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+from log_isolation import isolate_app_logs  # noqa: E402
 
 
 @unittest.skipUnless(
@@ -18,6 +21,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
     "requires streamlit AppTest",
 )
 class TestUploadWarnings(unittest.TestCase):
+    def setUp(self) -> None:
+        # AppTest runs the real app in-process — keep its run-log/audit-log writes
+        # out of the developer's real logs/ (see tests/log_isolation.py).
+        self._tmpdir = isolate_app_logs(self)
+
     def _app(self):
         from streamlit.testing.v1 import AppTest
 

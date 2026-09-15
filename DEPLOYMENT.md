@@ -19,6 +19,7 @@ and graceful failover. For single-user local setup, see `README.md → Setup`.
 11. [Rate limiting (reverse proxy)](#11-rate-limiting-reverse-proxy)
 12. [TLS and reverse proxy](#12-tls-and-reverse-proxy)
 13. [Distributed cache for VA reference data](#13-distributed-cache-for-va-reference-data)
+14. [Pattern D — Streamlit Community Cloud](#14-pattern-d--streamlit-community-cloud)
 
 ---
 
@@ -29,11 +30,16 @@ and graceful failover. For single-user local setup, see `README.md → Setup`.
 | **A. Docker Compose + nginx** | 3 (configurable) | Cookie-based affinity | Affinity preserves session; new instance loses state | Low — ideal for small teams |
 | **B. K8s + session affinity** | ≥ 2 via Deployment | Client-IP or cookie affinity | Same-node sessions survive pod restart; cross-node sessions lost | Medium |
 | **C. K8s + Redis session store** | ≥ 2 via Deployment | Redis-backed `st.session_state` | Full: any pod serves any session; pod kill is invisible to user | High — best for 100-user scale |
+| **D. Streamlit Community Cloud** | 1 (platform-managed) | Per-session process state | Platform restarts the app; in-memory state lost | None — no infrastructure (§14) |
 
 **Recommendation for 100 concurrent users:** Pattern C (Kubernetes + Redis). Session
 affinity (Patterns A/B) creates hot spots — a user who uploads a large record set
 keeps hitting the same pod, preventing the load balancer from spreading work. Redis
 eliminates this constraint. Patterns A/B are suitable for <20 users or development/staging.
+
+**For a demo or single-user deployment with no infrastructure**, Pattern D (Streamlit
+Community Cloud) is enough — but note it has no `VA_LSE_LOG_DIR` volume, so audit logs are
+ephemeral. See [§14](#14-pattern-d--streamlit-community-cloud).
 
 ---
 
@@ -764,6 +770,12 @@ All deployment-relevant variables (see `README.md` for the full list):
 3. **Cloud secret managers** (AWS Secrets Manager, Azure Key Vault, GCP Secret Manager):
    Use the platform's CSI driver or init container to inject secrets as env vars.
 
+4. **Platform secret stores with no env injection** (Streamlit Community Cloud): the
+dashboard's **Settings → Secrets** editor writes `.streamlit/secrets.toml` inside the
+deployment, and the app reads it as a fallback after the environment. This is the only
+channel available there, because `.env` is git-ignored and never ships. See
+[§14 Pattern D](#14-pattern-d--streamlit-community-cloud).
+
 ---
 
 ## 10. Scaling guidance
@@ -1134,10 +1146,92 @@ The health endpoint (`GET /health`) includes a `cache` field with:
 
 ---
 
+## 14. Pattern D — Streamlit Community Cloud
+
+Streamlit Community Cloud runs this repository directly: no container, no orchestrator, and
+**no `.env`** — the file is git-ignored, so it never reaches the deployment. Configuration
+arrives through the platform's secrets manager, which the app reads as a fallback after the
+process environment.
+
+### Configure the deployment
+
+In the Streamlit Cloud dashboard: your app → **⋮ → Settings → Secrets**. This writes
+`.streamlit/secrets.toml` inside the running deployment, using the same value names as the
+environment variables above. Add your provider key there under `OPENAI_API_KEY`, and the
+endpoint and models as:
+
+```toml
+OPENAI_BASE_URL = "https://your-endpoint.example.com/v1"
+LLM_MODEL_MAIN = "qwen3.7-max"
+LLM_MODEL_FAST = "qwen3.7-flash"
+```
+
+Optional extras, same file: `FETCH_SANDBOX_API_KEY`, `FETCH_SANDBOX_BASE_URL`,
+`FETCH_SANDBOX_RECORDS_PATH`, `VA_LSE_SHARED_CACHE_URL`, `VA_LSE_SHARED_CACHE_TOKEN`.
+
+Then **reboot the app** — the running process reads its configuration at startup, so secret
+edits do not affect it until it restarts.
+
+### Resolution order
+
+1. process environment (platform-injected var, K8s/Docker secret, CI secret),
+2. the project `.env` (local development only),
+3. Streamlit secrets (`.streamlit/secrets.toml`),
+4. the code defaults in `app/config.py`.
+
+Environment wins over secrets, so a local `.env` always overrides a hosted secret store. When a
+value comes from the secrets manager the sidebar captions it (`🔐 From Streamlit secrets: …`),
+so a pre-filled field is never mistaken for one the user typed.
+
+### Key → endpoint pairing is the most common hosted failure
+
+A key is only valid against the endpoint that issued it: a key issued for one plan family is
+rejected by the other's gateway, and vice versa. When the pairing is wrong the gateway returns
+a rejected-key error that looks nothing like "wrong host" — and because nothing but the auth
+check runs, the UI reports it almost instantly, which reads as a silent failure.
+
+Set the key and the base URL from the same provider account, then click **Test connection** in
+the sidebar: it calls `GET {base_url}/models` with the on-screen values and should answer
+"Endpoint reachable — N model(s) available, including `…`".
+
+Remember **Apply settings**: the API key is read live on every run, but the base URL and model
+names only take effect after clicking it (the sidebar warns while a change is pending), and
+`GET {base_url}/models` is the same check the app performs at startup.
+
+### Hosted checklist
+
+- [ ] `OPENAI_API_KEY` + `OPENAI_BASE_URL` set together in **Settings → Secrets** (same account)
+- [ ] `LLM_MODEL_MAIN` / `LLM_MODEL_FAST` name models the endpoint actually serves
+- [ ] App rebooted after editing secrets
+- [ ] Sidebar **Test connection** reports "Endpoint reachable" on the deployed URL
+- [ ] Sidebar captions the values as `🔐 From Streamlit secrets:`
+- [ ] No key typed into a chat, issue, or commit; rotate anything that was exposed
+- [ ] Long runs: leave the tab open — a real Evaluate takes minutes
+- [ ] Upload sizes fit `.streamlit/config.toml` (`maxUploadSize = 50` MB per file)
+
+### Limits to plan around
+
+- **One process serves every user.** `VA_LSE_MAX_CONCURRENT_LLM_CALLS` (default 20) and the
+  circuit breaker still apply, but there is no per-pod scaling here — set
+  `VA_LSE_SHARED_CACHE_URL/TOKEN` to keep upstream reference fetches shared rather than repeated.
+- **No persistent disk.** `logs/audit.log`, `logs/runs.jsonl`, and `outputs/` live inside the
+  container and disappear on restart/reboot. The About tab's run log is the record you have; if
+  you need a durable audit trail, deploy with Pattern A/B/C and point `VA_LSE_AUDIT_LOG_DIR` at
+  a volume.
+- **Secrets are per-deployment, not per-user.** Every visitor shares the configured key, so
+  plan quota accordingly, and treat the deployment URL as authorized-user-only.
+
+---
+
 ## Appendix: Checklist for production deployment
 
 - [ ] `.env` is NOT committed to git (see `SECURITY.md`)
 - [ ] Secrets are stored in K8s Secret / Docker secret / cloud secret manager
+- [ ] On a host with no `.env` (Streamlit Cloud), `OPENAI_API_KEY` **and** `OPENAI_BASE_URL` are
+      set together in **Settings → Secrets** and the app was rebooted afterwards ([§14](#14-pattern-d--streamlit-community-cloud))
+- [ ] Sidebar **Test connection** reports "Endpoint reachable" against the deployed base URL
+- [ ] Sidebar field(s) sourced from secrets are captioned (`🔐 From Streamlit secrets: …`)
+- [ ] Any API key pasted into a chat, issue, or commit has been rotated (`SECURITY.md`)
 - [ ] `OPENAI_API_KEY` is set and valid
 - [ ] `VA_LSE_LOG_DIR` and `VA_LSE_AUDIT_LOG_DIR` point to a persistent volume
 - [ ] Health probes are configured in the Deployment/Pod spec
@@ -1150,3 +1244,4 @@ The health endpoint (`GET /health`) includes a `cache` field with:
 - [ ] Circuit breaker + concurrency limiter env vars are tuned for your user count
 - [ ] Shared cache (`VA_LSE_SHARED_CACHE_URL/TOKEN`) is configured for multi-instance deployments
 - [ ] Cache hit rate is monitored via `GET /health` → `cache.hit_rate`
+

@@ -4,18 +4,19 @@ Drives the real app with Streamlit's AppTest, stubbing the LLM so no network or
 key is needed, and asserts that a run surfaces (a) a live caption line and
 (b) the per-phase "Estimated API usage" expander.
 """
-import os
 import sys
 import unittest
 import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # tests/ — log_isolation
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 from app.usage import UsageTracker  # noqa: E402
 from app import watchdog  # noqa: E402
+from log_isolation import isolate_app_logs  # noqa: E402
 
 
 class _FakeSettings:
@@ -72,30 +73,11 @@ class _FakeLLM:
 @unittest.skipUnless((PROJECT_ROOT / ".venv").exists(), "requires the project venv")
 class TestUsageUi(unittest.TestCase):
     def setUp(self) -> None:
-        # Keep run-log/audit side effects out of the developer's logs/runs.jsonl:
-        # these AppTest runs would otherwise be indistinguishable from real use.
-        import tempfile
-
-        self._tmpdir = tempfile.TemporaryDirectory()
-        self._env_patch = unittest.mock.patch.dict(
-            os.environ, {"VA_LSE_RUN_LOG_DIR": self._tmpdir.name}
-        )
-        self._env_patch.start()
-        self.addCleanup(self._env_patch.stop)
-        self.addCleanup(self._tmpdir.cleanup)
-        # Route the watchdog's persisted history to a temp file so test runs
-        # don't pollute (or depend on) the real usage_history.json.
-        import tempfile
-
-        self._tmp_hist = tempfile.mkdtemp()
-        self._old_env = os.environ.get("VA_LSE_WATCHDOG_PATH")
-        os.environ["VA_LSE_WATCHDOG_PATH"] = str(Path(self._tmp_hist) / "hist.json")
-
-    def tearDown(self) -> None:
-        if self._old_env is None:
-            os.environ.pop("VA_LSE_WATCHDOG_PATH", None)
-        else:
-            os.environ["VA_LSE_WATCHDOG_PATH"] = self._old_env
+        # Keep run-log, audit-log, and watchdog side effects out of the
+        # developer's real logs/ and usage history: these AppTest runs would
+        # otherwise be indistinguishable from real use (tests/log_isolation.py).
+        self._tmpdir = isolate_app_logs(self)
+        self._tmp_hist = self._tmpdir
 
     def _app(self):
         from streamlit.testing.v1 import AppTest
@@ -158,7 +140,7 @@ class TestUsageUi(unittest.TestCase):
         watchdog.record_calibration(history, credits=0.0, ts=1.0)
         watchdog.record_run(history, prompt_tokens=1000, completion_tokens=0, calls=1)
         watchdog.record_calibration(history, credits=0.1, ts=2.0)  # 100 credits/1M
-        watchdog.save_history(history, str(Path(self._tmp_hist) / "hist.json"))
+        watchdog.save_history(history, str(Path(self._tmp_hist) / "usage_history.json"))
 
         # User explicitly set only the MAIN rate in .env; watchdog knows a rate.
         with mock.patch.object(config, "CREDITS_PER_1M_MAIN", 800.0), mock.patch.object(

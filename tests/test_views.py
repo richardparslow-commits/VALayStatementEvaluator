@@ -441,5 +441,265 @@ class TestGetLLM(unittest.TestCase):
         st_mock.error.assert_called_once_with("bad endpoint")
 
 
+# ------------------------------------------------- empty-analysis guard
+class TestEmptyAnalysisResults(unittest.TestCase):
+    """An all-empty run must never render as a clean "Not scored" report."""
+
+    def _st(self) -> MagicMock:
+        st_mock, session = _fake_streamlit()
+        # _render_evaluation_results lays out four metric columns.
+        st_mock.columns.return_value = (MagicMock(), MagicMock(), MagicMock(), MagicMock())
+        session["eval_request_id"] = "req_84ab42a65e24"
+        return st_mock, session
+
+    def test_is_empty_analysis_detects_blank_result(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        self.assertTrue(evaluate_view._is_empty_analysis(EvaluationResult()))
+
+    def test_is_empty_analysis_false_with_claims_or_scores(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        with_claims = EvaluationResult(claims=[{"id": 1, "text": "Knee pain."}])
+        with_scores = EvaluationResult(scores={"factual_accuracy": 5.0})
+        self.assertFalse(evaluate_view._is_empty_analysis(with_claims))
+        self.assertFalse(evaluate_view._is_empty_analysis(with_scores))
+
+    def test_blank_result_renders_error_naming_the_reference(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        st_mock, _ = self._st()
+        with _patch_st(evaluate_view, st_mock):
+            evaluate_view._render_evaluation_results(EvaluationResult())
+
+        st_mock.error.assert_called_once()
+        message = str(st_mock.error.call_args[0][0])
+        self.assertIn("no usable analysis", message)
+        self.assertIn("req_84ab42a65e24", message)
+        # Which run the panel belongs to is stated, so a cached re-render cannot
+        # pass for a fresh run.
+        caption_text = " ".join(str(c.args[0]) for c in st_mock.caption.call_args_list)
+        self.assertIn("req_84ab42a65e24", caption_text)
+        self.assertIn("last completed run", caption_text)
+
+    def test_populated_result_renders_without_the_empty_error(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        st_mock, _ = self._st()
+        result = EvaluationResult(
+            claims=[{"id": 1, "text": "Knee pain since 2014."}],
+            verifications=[{"id": 1, "verdict": "SUPPORTED"}],
+            scores={"factual_accuracy": 7.0},
+            executive_summary="Strong statement.",
+        )
+        with _patch_st(evaluate_view, st_mock):
+            evaluate_view._render_evaluation_results(result)
+
+        st_mock.error.assert_not_called()
+
+
+# ------------------------------------------------- run bookkeeping
+class TestEvaluateRunBookkeeping(unittest.TestCase):
+    """Every run must leave a traceable completion — including interruptions.
+
+    ``RerunException``/``StopException`` derive from ``BaseException``, so the
+    ``except Exception`` handler must come first: if the control-flow clause is
+    ordered ahead of it, ordinary failures (LLM errors, timeouts, bugs) get
+    misreported as interruptions and re-raised instead of surfaced to the user.
+    """
+
+    def _drive(self, *, exc: BaseException | None = None, result=None):
+        """Run _run_evaluation_flow with stubbed plumbing; return logged events."""
+        import app.views.evaluate_view as evaluate_view
+        from collections import namedtuple
+
+        totals = namedtuple("Totals", "calls prompt_tokens completion_tokens")(0, 0, 0)
+        st_mock, _session = _fake_streamlit()
+        events: list[tuple[str, str, dict]] = []
+        llm = MagicMock()
+        llm.usage.totals.return_value = totals
+
+        pipeline = (
+            patch.object(evaluate_view, "run_with_timeout", side_effect=exc)
+            if exc is not None
+            else patch.object(evaluate_view, "run_with_timeout", return_value=result)
+        )
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "new_run_request_id", return_value="req_84ab42a65e24"
+        ), patch.object(evaluate_view, "get_llm", return_value=llm), patch.object(
+            evaluate_view, "check_shutdown_gate", return_value=True
+        ), patch.object(evaluate_view, "enter_run", return_value=True), patch.object(
+            evaluate_view, "exit_run"
+        ), patch.object(
+            evaluate_view,
+            "progress_widgets",
+            return_value=(MagicMock(), lambda *a, **k: None),
+        ), patch.object(evaluate_view, "check_memory_before_run"), pipeline, patch.object(
+            evaluate_view, "get_profiler", return_value=None
+        ), patch.object(
+            evaluate_view, "audit_record_meta", return_value=(["Upload"], 1, 1)
+        ), patch.object(
+            evaluate_view, "audit_condition_for_slot", return_value=""
+        ), patch.object(
+            evaluate_view,
+            "run_log_event",
+            side_effect=lambda action, status, **kw: events.append((action, status, kw)),
+        ), patch.object(evaluate_view, "audit_log"):
+            try:
+                evaluate_view._run_evaluation_flow("I watched the veteran limp.", [MagicMock()])
+            except BaseException as raised:  # noqa: BLE001 - control flow is re-raised
+                return events, raised
+        return events, None
+
+    def test_runtime_failure_is_logged_as_error(self) -> None:
+        events, _ = self._drive(exc=RuntimeError("boom"))
+        statuses = [status for _, status, _ in events]
+        self.assertIn("error", statuses)
+        self.assertNotIn("interrupted", statuses)
+
+    def test_control_flow_exception_is_logged_interrupted_and_reraised(self) -> None:
+        class _ScriptTornDown(BaseException):  # mirrors Streamlit's control flow
+            pass
+
+        torn_down = _ScriptTornDown("rerun requested")
+        events, raised = self._drive(exc=torn_down)
+        self.assertIs(raised, torn_down)
+        self.assertIn("interrupted", [status for _, status, _ in events])
+
+    def test_empty_analysis_logs_empty_event(self) -> None:
+        from app.evaluate import EvaluationResult
+
+        events, raised = self._drive(result=EvaluationResult())
+        self.assertIsNone(raised)
+        statuses = [status for _, status, _ in events]
+        self.assertIn("empty", statuses)
+        self.assertNotIn("interrupted", statuses)
+
+    def test_populated_analysis_logs_ok(self) -> None:
+        from app.evaluate import EvaluationResult
+
+        events, _ = self._drive(
+            result=EvaluationResult(claims=[{"id": 1, "text": "Knee pain."}], scores={"a": 5.0})
+        )
+        statuses = [status for _, status, _ in events]
+        self.assertIn("ok", statuses)
+        self.assertNotIn("empty", statuses)
+
+
+# ------------------------------------------------- sidebar settings guards
+class TestSidebarSettingsGuards(unittest.TestCase):
+    """The sidebar's key/URL/model fields are applied inconsistently by design —
+    the guards make that visible instead of leaving a silent mismatch."""
+
+    def _settings(self, **over):
+        base = dict(
+            api_key="test-workspace-key",
+            base_url="https://ws-example.us-east-1.maas.aliyuncs.com",
+            model_main="qwen3.7-max",
+            model_fast="qwen3.7-flash",
+        )
+        base.update(over)
+        return types.SimpleNamespace(**base)
+
+    def test_pending_warning_lists_unapplied_fields(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, session = _fake_streamlit()
+        session["base_url_input"] = "https://token-plan.example/v1"
+        session["model_main_input"] = "qwen3.7-max"
+        with _patch_st(sidebar, st_mock):
+            sidebar._pending_settings_warning(self._settings())
+        st_mock.warning.assert_called_once()
+        msg = str(st_mock.warning.call_args[0][0])
+        self.assertIn("base URL", msg)
+        self.assertIn("Apply settings", msg)
+
+    def test_pending_warning_silent_once_applied(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, session = _fake_streamlit()
+        session["base_url_input"] = "https://ws-example.us-east-1.maas.aliyuncs.com"
+        session["model_main_input"] = "qwen3.7-max"
+        with _patch_st(sidebar, st_mock):
+            sidebar._pending_settings_warning(self._settings())
+        st_mock.warning.assert_not_called()
+
+    def test_connection_success_names_models(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, session = _fake_streamlit()
+        session["base_url_input"] = "https://ws-example.us-east-1.maas.aliyuncs.com"
+        session["api_key_input"] = "test-workspace-key"
+        with _patch_st(sidebar, st_mock), patch.object(
+            sidebar, "check_model_availability", return_value={"qwen3.7-max", "qwen3.7-flash"}
+        ):
+            sidebar._test_connection_report(self._settings())
+        st_mock.success.assert_called_once()
+        self.assertIn("reachable", str(st_mock.success.call_args[0][0]))
+
+    def test_connection_failure_explains_key_url_pairing(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, session = _fake_streamlit()
+        session["base_url_input"] = "https://token-plan.example/v1"
+        session["api_key_input"] = "test-workspace-key"
+        with _patch_st(sidebar, st_mock), patch.object(
+            sidebar, "check_model_availability", return_value=None
+        ):
+            sidebar._test_connection_report(self._settings())
+        st_mock.error.assert_called_once()
+        self.assertIn("same provider account", str(st_mock.error.call_args[0][0]))
+
+    def test_connection_flags_models_the_endpoint_lacks(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, session = _fake_streamlit()
+        session["api_key_input"] = "test-workspace-key"
+        with _patch_st(sidebar, st_mock), patch.object(
+            sidebar, "check_model_availability", return_value={"some-other-model"}
+        ):
+            sidebar._test_connection_report(self._settings())
+        st_mock.warning.assert_called_once()
+        msg = str(st_mock.warning.call_args[0][0])
+        self.assertIn("qwen3.7-max", msg)
+        self.assertIn("qwen3.7-flash", msg)
+
+    def test_connection_requires_a_key(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        with _patch_st(sidebar, st_mock):
+            sidebar._test_connection_report(self._settings(api_key=""))
+        st_mock.error.assert_called_once_with("Enter an API key first, then test the connection.")
+
+    def test_secrets_origin_is_captioned(self) -> None:
+        """A hosted run pre-fills the fields from st.secrets — say so."""
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        settings = self._settings(
+            from_secrets=frozenset({"OPENAI_API_KEY", "OPENAI_BASE_URL"})
+        )
+        with _patch_st(sidebar, st_mock):
+            sidebar._secrets_source_note(settings)
+        st_mock.caption.assert_called_once()
+        msg = str(st_mock.caption.call_args[0][0])
+        self.assertIn("API key", msg)
+        self.assertIn("base URL", msg)
+        self.assertIn("secrets", msg)
+
+    def test_secrets_note_silent_without_secrets(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        with _patch_st(sidebar, st_mock):
+            sidebar._secrets_source_note(self._settings())
+        st_mock.caption.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

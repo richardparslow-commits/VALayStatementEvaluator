@@ -310,6 +310,42 @@ def _run_evaluation_flow(statement_text: str, records: list) -> None:
         )
         st.error(f"Evaluation failed: {format_error_for_user(exc, rid)}")
         return
+    except BaseException as ctrl:  # noqa: BLE001 - Streamlit control flow (see comment)
+        # Last clause on purpose: ``RerunException``/``StopException`` derive from
+        # ``BaseException``, not ``Exception``, so the handlers above never see
+        # them — a widget interaction or session teardown during a run unwinds
+        # the script run *mid-pipeline*, leaving a lone audit ``start`` event, no
+        # results, and no traceable completion for the reference shown on screen.
+        # Record the interruption, then re-raise so Streamlit still handles it.
+        bar.empty()
+        duration_ms = int((time.perf_counter() - t0) * 1000)
+        run_log_event(
+            "evaluate", "interrupted", request_id=rid, duration_ms=duration_ms,
+            error=f"{type(ctrl).__name__}: script run torn down mid-pipeline",
+            error_class=type(ctrl).__name__,
+        )
+        logger.warning(
+            "evaluate run interrupted duration_ms=%d error=%s",
+            duration_ms,
+            type(ctrl).__name__,
+            extra={
+                "request_id": rid,
+                "phase": "evaluate",
+                "status": "interrupted",
+                "duration_ms": duration_ms,
+                "error_class": type(ctrl).__name__,
+            },
+        )
+        audit_log.audit_evaluate_error(
+            request_id=rid,
+            duration_ms=duration_ms,
+            error=ctrl,
+            condition=_audit_condition or None,
+            record_sources=_audit_sources or None,
+            record_files=_audit_files,
+            record_pages=_audit_pages,
+        )
+        raise
     finally:
         exit_run()
     duration_ms = int((time.perf_counter() - t0) * 1000)
@@ -349,6 +385,25 @@ def _run_evaluation_flow(statement_text: str, records: list) -> None:
         outcome=_outcome or None,
     )
     run_log_event("evaluate", "ok", request_id=rid, duration_ms=duration_ms, **_outcome)
+    if _is_empty_analysis(result):
+        # Completed, but the model handed back nothing usable (e.g. ``{}`` for
+        # every phase). Log it once here — the results panel re-renders on every
+        # rerun and must not emit duplicate events.
+        logger.warning(
+            "evaluate run returned an empty analysis calls=%d claims=0 scores=0",
+            total.calls,
+            extra={
+                "request_id": rid,
+                "phase": "evaluate",
+                "status": "empty",
+                "duration_ms": duration_ms,
+                "llm_calls": total.calls,
+            },
+        )
+        run_log_event(
+            "evaluate", "empty", request_id=rid, duration_ms=duration_ms,
+            llm_calls=total.calls, claims=0, scores=0,
+        )
     bar.empty()
     # Profiler: emit per-run timing breakdown.
     if _profiler_run is not None:
@@ -362,8 +417,50 @@ def _run_evaluation_flow(statement_text: str, records: list) -> None:
 
 
 # ------------------------------------------------------------------ results UI
+def _result_reference() -> str:
+    """Reference id of the run that produced the cached results, if known."""
+    rid_raw: Any = st.session_state.get("eval_request_id", "")
+    return rid_raw if isinstance(rid_raw, str) else ""
+
+
+def _is_empty_analysis(result: Any) -> bool:
+    """True when a completed run carried no usable analysis at all.
+
+    An endpoint/model that accepts the request but answers every phase with
+    empty JSON yields zero claims, zero verifications, and no rubric scores.
+    Without this check the results panel renders a calm but meaningless
+    "Not scored" report that looks exactly like a real verdict — and, because
+    the panel is re-rendered from session state on every rerun, it also looks
+    like a run that finished instantly.
+    """
+    return not (
+        getattr(result, "claims", None)
+        or getattr(result, "verifications", None)
+        or getattr(result, "scores", None)
+    )
+
+
 def _render_evaluation_results(eval_result: Any) -> None:
     render_usage_summary(st.session_state.get("eval_usage"))
+
+    rid = _result_reference()
+    if rid:
+        # The panel is cached for the whole session, so say which run it came
+        # from: otherwise any rerun makes an old report look like a fresh run.
+        st.caption(
+            f"Results for reference `{rid}` — the last completed run in this session. "
+            "Each new run mints a new reference (see About → Recent run log)."
+        )
+
+    if _is_empty_analysis(eval_result):
+        st.error(
+            "This run returned no usable analysis: 0 claims extracted, no rubric "
+            "scores, and no rewrite. The model or endpoint accepted the request but "
+            "returned empty output."
+            + (f" Reference: {rid}." if rid else "")
+            + " Check the sidebar model names and base URL (About → Recent run log "
+            "shows the LLM call count for this run), then re-run."
+        )
 
     if getattr(eval_result, "truncation_warning", ""):
         st.warning(
