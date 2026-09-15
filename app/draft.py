@@ -17,6 +17,7 @@ from .documents import (
 )
 from .llm import LLMClient
 from .logging_config import PhaseTimer, get_request_id
+from .profiler import phase_timer
 from .prompt_sanitize import GUARD_NOTE, sanitize_digest_text, sanitize_for_prompt, validate_witness_field
 
 logger = logging.getLogger("app.draft")
@@ -263,64 +264,68 @@ def _run_draft(
 
     rid = get_request_id() or "-"
     with PhaseTimer(logger, "records:review", request_id=rid, chunks=len(records)):
-        report(0.02, "Step 1/4 — Exhaustive review of medical records…")
-        result.digest = review_medical_records(
-            llm, records, progress=lambda f, m: progress((0.02 + f * 0.45), m) if progress else None
-        )
+        with phase_timer("records:review"):
+            report(0.02, "Step 1/4 — Exhaustive review of medical records…")
+            result.digest = review_medical_records(
+                llm, records, progress=lambda f, m: progress((0.02 + f * 0.45), m) if progress else None
+            )
 
     with PhaseTimer(logger, "grounding", request_id=rid):
-        report(0.5, "Step 2/4 — Grounding witness observations against the records and topic checklist…")
-        grounding_query = f"{condition} {obs_for_prompt}"
-        result.grounding = llm.chat_json(
-            GROUNDING_SYSTEM,
-            GROUNDING_USER.format(
-                condition=sanitize_for_prompt(condition, max_chars=500),
-                claim_type=sanitize_for_prompt(claim_type, max_chars=500),
-                relationship=sanitize_for_prompt(witness.get("relationship", "not specified"), max_chars=500),
-                observations=sanitize_for_prompt(obs_for_prompt, max_chars=DRAFT_INTERNAL_MAX_CHARS),
-                digest=sanitize_digest_text(result.digest.relevant_facts_text(grounding_query, max_facts=150), max_chars=120_000),
-                checklist=load_knowledge("topic_checklist.md"),
-                guard_note=GUARD_NOTE,
-            ),
-            phase="grounding",
-        )
+        with phase_timer("grounding"):
+            report(0.5, "Step 2/4 — Grounding witness observations against the records and topic checklist…")
+            grounding_query = f"{condition} {obs_for_prompt}"
+            result.grounding = llm.chat_json(
+                GROUNDING_SYSTEM,
+                GROUNDING_USER.format(
+                    condition=sanitize_for_prompt(condition, max_chars=500),
+                    claim_type=sanitize_for_prompt(claim_type, max_chars=500),
+                    relationship=sanitize_for_prompt(witness.get("relationship", "not specified"), max_chars=500),
+                    observations=sanitize_for_prompt(obs_for_prompt, max_chars=DRAFT_INTERNAL_MAX_CHARS),
+                    digest=sanitize_digest_text(result.digest.relevant_facts_text(grounding_query, max_facts=150), max_chars=120_000),
+                    checklist=load_knowledge("topic_checklist.md"),
+                    guard_note=GUARD_NOTE,
+                ),
+                phase="grounding",
+            )
 
     with PhaseTimer(logger, "draft", request_id=rid):
-        report(0.68, "Step 3/4 — Drafting the statement…")
-        result.draft = llm.chat(
-            DRAFT_SYSTEM_TEMPLATE.format(
-                guide=load_knowledge("drafting_guide.md"),
-                checklist=load_knowledge("topic_checklist.md"),
-            ),
-            DRAFT_USER.format(
-                witness_name=sanitize_for_prompt(witness.get("name", "[Witness Name]"), max_chars=500),
-                relationship=sanitize_for_prompt(witness.get("relationship", "[relationship]"), max_chars=500),
-                known_since=sanitize_for_prompt(witness.get("known_since", "[how long known]"), max_chars=500),
-                contact_frequency=sanitize_for_prompt(witness.get("contact_frequency", "[frequency of contact]"), max_chars=500),
-                veteran_name=sanitize_for_prompt(witness.get("veteran_name", "[Veteran Name]"), max_chars=500),
-                condition=sanitize_for_prompt(condition, max_chars=500),
-                claim_type=sanitize_for_prompt(claim_type, max_chars=500),
-                witnessed_event=sanitize_for_prompt(witness.get("witnessed_event", "unknown"), max_chars=500),
-                observations=sanitize_for_prompt(obs_for_prompt, max_chars=DRAFT_INTERNAL_MAX_CHARS),
-                grounding=sanitize_for_prompt(_json_dumps(result.grounding), max_chars=25_000),
-                digest_summary=sanitize_digest_text(result.digest.summary or "(no summary)", max_chars=20_000),
-                guard_note=GUARD_NOTE,
-            ),
-            max_tokens=6000,
-            phase="draft",
-        )
+        with phase_timer("draft"):
+            report(0.68, "Step 3/4 — Drafting the statement…")
+            result.draft = llm.chat(
+                DRAFT_SYSTEM_TEMPLATE.format(
+                    guide=load_knowledge("drafting_guide.md"),
+                    checklist=load_knowledge("topic_checklist.md"),
+                ),
+                DRAFT_USER.format(
+                    witness_name=sanitize_for_prompt(witness.get("name", "[Witness Name]"), max_chars=500),
+                    relationship=sanitize_for_prompt(witness.get("relationship", "[relationship]"), max_chars=500),
+                    known_since=sanitize_for_prompt(witness.get("known_since", "[how long known]"), max_chars=500),
+                    contact_frequency=sanitize_for_prompt(witness.get("contact_frequency", "[frequency of contact]"), max_chars=500),
+                    veteran_name=sanitize_for_prompt(witness.get("veteran_name", "[Veteran Name]"), max_chars=500),
+                    condition=sanitize_for_prompt(condition, max_chars=500),
+                    claim_type=sanitize_for_prompt(claim_type, max_chars=500),
+                    witnessed_event=sanitize_for_prompt(witness.get("witnessed_event", "unknown"), max_chars=500),
+                    observations=sanitize_for_prompt(obs_for_prompt, max_chars=DRAFT_INTERNAL_MAX_CHARS),
+                    grounding=sanitize_for_prompt(_json_dumps(result.grounding), max_chars=25_000),
+                    digest_summary=sanitize_digest_text(result.digest.summary or "(no summary)", max_chars=20_000),
+                    guard_note=GUARD_NOTE,
+                ),
+                max_tokens=6000,
+                phase="draft",
+            )
 
     with PhaseTimer(logger, "review", request_id=rid):
-        report(0.85, "Step 4/4 — Self-review and improvement pass…")
-        review = llm.chat_json(
-            REVIEW_SYSTEM,
-            REVIEW_USER.format(
-                draft=sanitize_for_prompt(result.draft[:16000], max_chars=20_000),
-                guide=load_knowledge("drafting_guide.md")[:6000],
-                checklist=load_knowledge("topic_checklist.md")[:6000],
-                guard_note=GUARD_NOTE,
-            ),
-            phase="review",
+        with phase_timer("review"):
+            report(0.85, "Step 4/4 — Self-review and improvement pass…")
+            review = llm.chat_json(
+                REVIEW_SYSTEM,
+                REVIEW_USER.format(
+                    draft=sanitize_for_prompt(result.draft[:16000], max_chars=20_000),
+                    guide=load_knowledge("drafting_guide.md")[:6000],
+                    checklist=load_knowledge("topic_checklist.md")[:6000],
+                    guard_note=GUARD_NOTE,
+                ),
+                phase="review",
         )
     result.review_issues = review.get("issues_found", [])
     improved = review.get("improved_statement", "")

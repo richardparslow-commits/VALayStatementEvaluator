@@ -16,6 +16,7 @@ from .documents import (
 )
 from .llm import LLMClient, LLMError
 from .logging_config import PhaseTimer, get_request_id
+from .profiler import phase_timer
 from .prompt_sanitize import GUARD_NOTE, sanitize_digest_text, sanitize_for_prompt
 
 logger = logging.getLogger("app.evaluate")
@@ -450,69 +451,75 @@ def _run_evaluation(
 
     rid = get_request_id() or "-"
     with PhaseTimer(logger, "records:review", request_id=rid, chunks=len(records)):
-        report(0.02, "Step 1/7 — Exhaustive review of medical records…")
-        result.digest = review_medical_records(
-            llm, records, progress=lambda f, m: progress((0.02 + f * 0.48), m) if progress else None
-        )
+        with phase_timer("records:review"):
+            report(0.02, "Step 1/7 — Exhaustive review of medical records…")
+            result.digest = review_medical_records(
+                llm, records, progress=lambda f, m: progress((0.02 + f * 0.48), m) if progress else None
+            )
 
     with PhaseTimer(logger, "claims", request_id=rid):
-        report(0.52, "Step 2/7 — Extracting factual claims from the statement…")
-        claims_data = llm.chat_json(
-            CLAIMS_SYSTEM,
-            CLAIMS_USER.format(
-                statement=sanitize_for_prompt(prompt_statement, max_chars=EVALUATE_INTERNAL_MAX_CHARS),
-                guard_note=GUARD_NOTE,
-            ),
-            phase="claims",
-        )
-        result.claimed_condition = claims_data.get("claimed_condition", "")
-        result.writer_role = claims_data.get("writer_role", "")
-        result.claims = claims_data.get("claims", [])
-        logger.info(
-            "claims extracted count=%d condition=%s role=%s",
-            len(result.claims),
-            result.claimed_condition[:80] if result.claimed_condition else "-",
-            result.writer_role or "-",
-            extra={"request_id": rid, "phase": "claims", "status": "ok"},
-        )
+        with phase_timer("claims"):
+            report(0.52, "Step 2/7 — Extracting factual claims from the statement…")
+            claims_data = llm.chat_json(
+                CLAIMS_SYSTEM,
+                CLAIMS_USER.format(
+                    statement=sanitize_for_prompt(prompt_statement, max_chars=EVALUATE_INTERNAL_MAX_CHARS),
+                    guard_note=GUARD_NOTE,
+                ),
+                phase="claims",
+            )
+            result.claimed_condition = claims_data.get("claimed_condition", "")
+            result.writer_role = claims_data.get("writer_role", "")
+            result.claims = claims_data.get("claims", [])
+            logger.info(
+                "claims extracted count=%d condition=%s role=%s",
+                len(result.claims), result.claimed_condition[:80] if result.claimed_condition else "-",
+                result.writer_role or "-",
+                extra={"request_id": rid, "phase": "claims", "status": "ok"},
+            )
 
     with PhaseTimer(logger, "verify", request_id=rid, claims=len(result.claims)):
-        report(0.60, "Step 3/7 — Verifying each claim against the records…")
-        assert result.digest is not None  # set by records:review above
-        result.verifications = _verify_claims(llm, result.claims, result.digest, records, report)
+        with phase_timer("verify"):
+            report(0.60, "Step 3/7 — Verifying each claim against the records…")
+            assert result.digest is not None  # set by records:review above
+            result.verifications = _verify_claims(llm, result.claims, result.digest, records, report)
 
     with PhaseTimer(logger, "rubric", request_id=rid):
-        report(0.78, "Step 4/7 — Scoring against the lay-evidence rubric…")
-        rubric_data = llm.chat_json(
-            RUBRIC_SYSTEM_TEMPLATE.format(
-                rubric=load_knowledge("evaluation_rubric.md"),
-                legal=load_knowledge("legal_framework.md"),
-            ),
-            RUBRIC_USER.format(
-                statement=sanitize_for_prompt(prompt_statement, max_chars=EVALUATE_INTERNAL_MAX_CHARS),
-                verifications=sanitize_for_prompt(_verifications_text(result), max_chars=20_000),
-                digest_summary=sanitize_digest_text((result.digest.summary if result.digest else "") or "(no summary)", max_chars=20_000),
-                guard_note=GUARD_NOTE,
-            ),
-            phase="rubric",
-        )
-        result.scores = {k: float(v) for k, v in rubric_data.get("scores", {}).items()}
-        result.rationales = rubric_data.get("rationales", {})
-        result.improvements = rubric_data.get("improvements", [])
-        result.omitted_record_facts = rubric_data.get("omitted_record_facts", [])
-        result.executive_summary = rubric_data.get("executive_summary", "")
+        with phase_timer("rubric"):
+            report(0.78, "Step 4/7 — Scoring against the lay-evidence rubric…")
+            rubric_data = llm.chat_json(
+                RUBRIC_SYSTEM_TEMPLATE.format(
+                    rubric=load_knowledge("evaluation_rubric.md"),
+                    legal=load_knowledge("legal_framework.md"),
+                ),
+                RUBRIC_USER.format(
+                    statement=sanitize_for_prompt(prompt_statement, max_chars=EVALUATE_INTERNAL_MAX_CHARS),
+                    verifications=sanitize_for_prompt(_verifications_text(result), max_chars=20_000),
+                    digest_summary=sanitize_digest_text((result.digest.summary if result.digest else "") or "(no summary)", max_chars=20_000),
+                    guard_note=GUARD_NOTE,
+                ),
+                phase="rubric",
+            )
+            result.scores = {k: float(v) for k, v in rubric_data.get("scores", {}).items()}
+            result.rationales = rubric_data.get("rationales", {})
+            result.improvements = rubric_data.get("improvements", [])
+            result.omitted_record_facts = rubric_data.get("omitted_record_facts", [])
+            result.executive_summary = rubric_data.get("executive_summary", "")
 
     with PhaseTimer(logger, "topic", request_id=rid):
-        report(0.79, "Step 5/7 — Auditing topic coverage (hazards, care, family, progression)…")
-        _analyze_topics(llm, result, statement_text, report)
+        with phase_timer("topic"):
+            report(0.79, "Step 5/7 — Auditing topic coverage (hazards, care, family, progression)…")
+            _analyze_topics(llm, result, statement_text, report)
 
     with PhaseTimer(logger, "revision", request_id=rid):
-        report(0.86, "Step 6/7 — Drafting improvement suggestions and a revised statement…")
-        _draft_revision(llm, result, statement_text, report)
+        with phase_timer("revision"):
+            report(0.86, "Step 6/7 — Drafting improvement suggestions and a revised statement…")
+            _draft_revision(llm, result, statement_text, report)
 
     with PhaseTimer(logger, "report", request_id=rid):
-        report(0.96, "Step 7/7 — Building the report…")
-        result.report_markdown = build_report(result, statement_text)
+        with phase_timer("report"):
+            report(0.96, "Step 7/7 — Building the report…")
+            result.report_markdown = build_report(result, statement_text)
     report(1.0, "Evaluation complete.")
     return result
 

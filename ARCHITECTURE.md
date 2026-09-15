@@ -168,6 +168,7 @@ Key invariant — **every downstream prompt is retrieval-augmented, not truncate
 | `app/audit.py` | Dedicated `audit` logger (`audit.log` JSON lines) for Evaluate/Draft | Separate from diagnostic `app.log`; logs `action/status/request_id/user_session_id/condition/record_sources/outcome` — never statement/record text; env `VA_LSE_AUDIT_LOG_DIR/FILE/MAX_BYTES/BACKUPS` |
 | `app/prompt_sanitize.py` | `sanitize_for_prompt`, `sanitize_digest_text`, `GUARD_NOTE`, sidebar validators | Escapes `>>>`/`<<<`/` ``` `, caps length, appends data-boundary guard note |
 | `app/shared_cache.py` | Two-tier distributed cache (Upstash Redis → local LRU) for VA reference data | `TieredCache` reads shared first, back-fills local; `UpstashRedisCache` uses stdlib `urllib`; hit-rate stats reported via `/health`; env `VA_LSE_SHARED_CACHE_URL/TOKEN/TIMEOUT_SECONDS/LOCAL_MAXSIZE` |
+| `app/profiler.py` | Lightweight production profiler (phase-level timing, worker stats, p50/p95/p99 aggregation) | Gated by `VA_LSE_PROFILE_RUNS=1`; `phase_timer`/`worker_timer` context managers wrap pipeline phases and parallel workers; `RunProfiler` accumulates per-run data, `Profiler` aggregates across runs; `emit_summary()` logs to `phase=profiler` | |
 | `app/knowledge/*.md` | Rubric, legal framework, topic checklist (A–L), drafting guide, condition→topic map | Consumed via `load_knowledge`; checklist topics A–L are the shared vocabulary across evaluate/draft |
 
 ## 6. Large-record-set engine (deep dive)

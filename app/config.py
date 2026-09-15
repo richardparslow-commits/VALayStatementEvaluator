@@ -242,3 +242,10 @@ SHARED_CACHE_URL = os.getenv("VA_LSE_SHARED_CACHE_URL", "").strip()
 SHARED_CACHE_TOKEN = os.getenv("VA_LSE_SHARED_CACHE_TOKEN", "").strip()
 SHARED_CACHE_TIMEOUT_SECONDS = float(os.getenv("VA_LSE_SHARED_CACHE_TIMEOUT_SECONDS", "2"))
 SHARED_CACHE_LOCAL_MAXSIZE = _positive_int_env("VA_LSE_SHARED_CACHE_LOCAL_MAXSIZE", 256)
+
+# ---------------------------------------------------------------------------
+# Production profiler (see app/profiler.py).  When VA_LSE_PROFILE_RUNS=1 the
+# app emits per-phase timing breakdowns (p50/p95/p99) to the structured log
+# after each Evaluate/Draft run.  Disabled by default to avoid overhead.
+# ---------------------------------------------------------------------------
+PROFILE_RUNS = os.getenv("VA_LSE_PROFILE_RUNS", "").strip() in ("1", "true", "True", "yes")

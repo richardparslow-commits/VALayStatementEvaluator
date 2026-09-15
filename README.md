@@ -573,6 +573,27 @@ Both guards are also wired into `DEPLOYMENT.md` scaling guidance: with 100
 users the per-pod timeout and memory limits prevent one user's runaway
 process from destabilizing shared infrastructure.
 
+## Performance profiling
+
+Enable per-phase timing breakdowns with `VA_LSE_PROFILE_RUNS=1`. After each
+Evaluate or Draft run, the profiler emits p50/p95/p99 latency for every phase
+and per-worker stats for parallel record digestion.
+
+```bash
+VA_LSE_PROFILE_RUNS=1 streamlit run run_app.py
+# After a run, check the log:
+grep 'profile evaluate' logs/app.log | tail -1
+```
+
+Example output:
+```
+profile evaluate total=87542ms records:review=62340ms claims=3200ms verify=8900ms
+rubric=5100ms topic=3400ms revision=3200ms report=1402ms
+| workers: digest: n=12 p50=4200ms p95=5800ms max=6100ms
+```
+
+See `PERFORMANCE.md` for expected latencies, benchmarks, and tuning guidance.
+
 ## Rate limiting (reverse proxy)
 
 Streamlit has no built-in HTTP rate limiting. For production deployments,

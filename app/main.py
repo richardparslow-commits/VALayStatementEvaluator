@@ -41,6 +41,7 @@ from . import va_gov_client
 from . import watchdog
 from .shutdown import enter_run, exit_run, is_shutting_down
 from .pipeline_guard import PipelineTimeoutError, check_memory_before_run, memory_checkpoint, run_with_timeout
+from .profiler import RunProfiler, get_profiler, phase_timer
 from .prompt_sanitize import validate_api_key, validate_model_name
 
 logger = get_logger("app.main")
@@ -1000,6 +1001,7 @@ def evaluate_tab() -> None:
             extra={"request_id": rid, "phase": "evaluate", "status": "start"},
         )
         bar, update = _progress_widgets(llm, request_id=rid)
+        _profiler_run = RunProfiler(action="evaluate", request_id=rid, run_start_mono=time.monotonic()) if get_profiler() else None
         t0 = time.perf_counter()
         try:
             check_memory_before_run()
@@ -1081,6 +1083,11 @@ def evaluate_tab() -> None:
             outcome=_outcome or None,
         )
         bar.empty()
+        # Profiler: emit per-run timing breakdown.
+        if _profiler_run is not None:
+            _profiler_run.run_end_mono = time.monotonic()
+            _profiler_run.emit()
+            get_profiler().record_run(_profiler_run)
         st.session_state.eval_result = result
         st.session_state.eval_usage = llm.usage
         st.session_state.eval_request_id = rid
@@ -1388,6 +1395,7 @@ def draft_tab() -> None:
             "witnessed_event": witnessed_event,
         }
         bar, update = _progress_widgets(llm, request_id=rid)
+        _profiler_run = RunProfiler(action="draft", request_id=rid, run_start_mono=time.monotonic()) if get_profiler() else None
         t0 = time.perf_counter()
         try:
             check_memory_before_run()
@@ -1478,6 +1486,11 @@ def draft_tab() -> None:
             outcome=_outcome_d or None,
         )
         bar.empty()
+        # Profiler: emit per-run timing breakdown.
+        if _profiler_run is not None:
+            _profiler_run.run_end_mono = time.monotonic()
+            _profiler_run.emit()
+            get_profiler().record_run(_profiler_run)
         st.session_state.draft_result = result
         st.session_state.draft_usage = llm.usage
         st.session_state.draft_request_id = rid
