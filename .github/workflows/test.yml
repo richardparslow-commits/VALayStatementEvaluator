@@ -59,14 +59,38 @@ jobs:
       - name: Run 2,000-page scale simulation (no API calls)
         run: python scripts/scale_sim.py
 
+  # Gate for the live job below. A job-level `if` may only use the github, needs,
+  # vars and inputs contexts — `secrets` is NOT available there. Reading it in a
+  # job-level `if` made this whole workflow file invalid, which failed every run
+  # in 0 s with no jobs created (not even the lint/test jobs above). The secret is
+  # therefore read in a step — `steps.env` may use the secrets context — and
+  # published as an output for the job-level `if` to consume.
+  live-credentials:
+    name: Check LLM credentials
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    outputs:
+      present: ${{ steps.check.outputs.present }}
+    steps:
+      - name: Is OPENAI_API_KEY configured?
+        id: check
+        env:
+          HAS_KEY: ${{ secrets.OPENAI_API_KEY != '' }}
+        run: |
+          echo "present=$HAS_KEY" >> "$GITHUB_OUTPUT"
+          if [ "$HAS_KEY" != "true" ]; then
+            echo "OPENAI_API_KEY is not set — skipping the live smoke test."
+          fi
+
   # Live end-to-end run of both pathways against the configured LLM endpoint.
   # Intentionally NOT triggered automatically: it consumes real API credits and
   # requires credentials, so it only runs on manual dispatch and only when the
   # OPENAI_API_KEY secret is configured. Otherwise the job is skipped (never fails).
   smoke:
     name: Live smoke test (LLM endpoint)
+    needs: live-credentials
+    if: ${{ needs.live-credentials.outputs.present == 'true' }}
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'workflow_dispatch' && secrets.OPENAI_API_KEY != '' }}
     timeout-minutes: 45
     env:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
