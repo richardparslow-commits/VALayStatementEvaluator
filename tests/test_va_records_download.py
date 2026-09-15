@@ -162,6 +162,15 @@ class _FakePage:
     def title(self) -> str:
         return "Download your medical records | Veterans Affairs"
 
+    def inner_text(self, selector: str) -> str:
+        return "Download your medical records All time Date range Continue"
+
+    def nth(self, index: int) -> "_FakeLocator":
+        return self._resolve(vrd.Candidate("css", f"nth-{index}"))
+
+    def get_attribute(self, name: str) -> str | None:
+        return None
+
     def get_by_role(self, role: str, name: object = None) -> _FakeLocator:
         pattern = getattr(name, "pattern", str(name))
         return self._resolve(vrd.Candidate("role", str(pattern), role=role))
@@ -479,6 +488,41 @@ class _FakePlaywright:
 
 def _args(*argv: str):
     return vrd.build_parser().parse_args(list(argv))
+
+
+class TestInspectMode(unittest.TestCase):
+    """--inspect is the maintenance path: it must click nothing and say which
+    candidate selectors matched, so a broken step can be fixed from its report."""
+
+    def test_reports_matches_and_click_nothing(self) -> None:
+        page = _FakePage()
+        with TemporaryDirectory() as tmp:
+            path = _downloader(page, Path(tmp), inspect_only=True).run()
+            report = path.read_text(encoding="utf-8")
+            self.assertTrue(path.name.startswith("inspect-"))
+        self.assertIn("date-range option: ['label:all time']", report)
+        self.assertIn("continue button: ['role:button=continue']", report)
+        self.assertIn("download button: ['role:button=download report']", report)
+        self.assertIn(vrd.START_URL, report)
+        self.assertEqual([a for a in page.actions if a[0] in ("click", "check")], [])
+
+    def test_reports_no_match_when_the_markup_changed(self) -> None:
+        page = _FakePage(available=set())
+        with TemporaryDirectory() as tmp:
+            path = _downloader(page, Path(tmp), inspect_only=True).run()
+            report = path.read_text(encoding="utf-8")
+        for label in ("date-range option", "continue button", "download button"):
+            self.assertIn(f"{label}: NO MATCH", report)
+
+    def test_inspect_does_not_need_the_known_markers_to_render(self) -> None:
+        # The point of --inspect is to work when nothing matches, so it is satisfied
+        # by being on the wizard route even though no marker is visible.
+        logs: list[str] = []
+        page = _FakePage(available=set())
+        with TemporaryDirectory() as tmp:
+            _downloader(page, Path(tmp), inspect_only=True, log=logs.append).run()
+        self.assertTrue(any("dumping the page for inspection" in line for line in logs))
+        self.assertFalse(any("Timed out" in line for line in logs))
 
 
 class TestBrowserSelection(unittest.TestCase):

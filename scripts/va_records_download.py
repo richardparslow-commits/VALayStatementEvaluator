@@ -290,6 +290,7 @@ class VaGovDownloader:
         poll_seconds: float = 2.0,
         dry_run: bool = False,
         pause: bool = False,
+        inspect_only: bool = False,
         start_url: str = START_URL,
         log: Any = print,
     ) -> None:
@@ -302,12 +303,15 @@ class VaGovDownloader:
         self._poll_seconds = poll_seconds
         self._dry_run = dry_run
         self._pause = pause
+        self._inspect_only = inspect_only
         self._start_url = start_url
         self._log = log
 
     # -- run -----------------------------------------------------------------
     def run(self) -> Path:
         """Drive the wizard end to end and return the saved PDF path."""
+        if self._inspect_only:
+            return self._inspect_wizard()
         self._open_wizard()
         self._select(ALL_TIME_OPTIONS, step="date-range", description="select 'All time'")
         self._click(CONTINUE_BUTTONS, step="date-range", description="press Continue")
@@ -327,7 +331,90 @@ class VaGovDownloader:
         return self._download()
 
     # -- steps ---------------------------------------------------------------
-    def _open_wizard(self) -> None:
+    def _inspect_wizard(self) -> Path:
+        """Dump what the wizard actually contains, clicking nothing.
+
+        The maintenance path for "a step stopped matching": sign in (or attach), then
+        compare this report against the Candidate lists above. It is deliberately
+        URL-based rather than marker-based — if the markers no longer match, that is
+        exactly what the report needs to reveal.
+        """
+        try:
+            self._open_wizard(require_wizard_content=False)
+        except LoginTimeout as exc:
+            # Still worth dumping: whatever page it is stuck on is the answer to
+            # "why is this not working" (usually the login modal, not the wizard).
+            self._log(f"[inspect] {exc}")
+        report = self._page_report()
+        self._artifacts_dir.mkdir(parents=True, exist_ok=True)
+        path = self._artifacts_dir / f"inspect-{time.strftime('%Y%m%d-%H%M%S')}.txt"
+        path.write_text(report, encoding="utf-8")
+        for line in report.splitlines():
+            self._log(line)
+        self._log(f"[inspect] wrote {path}")
+        return path
+
+    def _page_report(self) -> str:
+        """Describe the current page: URL, text, element counts, and selectors."""
+        lines: list[str] = []
+        try:
+            lines += [f"url: {self._page.url}", f"title: {self._page.title()}", ""]
+        except Exception as exc:  # noqa: BLE001 - a report must never raise
+            lines += [f"url: (unavailable: {type(exc).__name__})", ""]
+
+        try:
+            body = " ".join(self._page.inner_text("body").split())[:600]
+            lines += ["body text (first 600 chars):", body, ""]
+        except Exception as exc:  # noqa: BLE001
+            lines += [f"body text: (unavailable: {type(exc).__name__})", ""]
+
+        for selector in (
+            "va-radio", "va-checkbox", "va-button", "va-radio-group",
+            "input[type=radio]", "input[type=checkbox]", "button", "label", "select",
+        ):
+            try:
+                lines.append(f"{selector}: {self._page.locator(selector).count()}")
+            except Exception as exc:  # noqa: BLE001
+                lines.append(f"{selector}: error {type(exc).__name__}")
+        lines.append("")
+
+        for role in ("radio", "checkbox", "button", "heading", "link"):
+            try:
+                group = self._page.get_by_role(role)
+                count = group.count()
+                lines.append(f"role={role}: {count}")
+                for index in range(min(count, 25)):
+                    element = group.nth(index)
+                    text = " ".join(str(element.inner_text() or "").split())[:80]
+                    lines.append(
+                        f"  [{index}] text={text!r} "
+                        f"aria-label={element.get_attribute('aria-label') or ''!r} "
+                        f"value={element.get_attribute('value') or ''!r}"
+                    )
+            except Exception as exc:  # noqa: BLE001
+                lines.append(f"role={role}: error {type(exc).__name__}")
+        lines.append("")
+
+        lines.append("candidate matches (what the driver would click; add or fix these):")
+        for label, candidates in (
+            ("date-range option", ALL_TIME_OPTIONS),
+            ("continue button", CONTINUE_BUTTONS),
+            ("record-type option", SELECT_ALL_RECORDS_OPTIONS),
+            ("file-type option", PDF_FILE_TYPE_OPTIONS),
+            ("download button", DOWNLOAD_BUTTONS),
+        ):
+            found = [c.describe() for c in candidates if self._candidate_visible(c)]
+            lines.append(f"  {label}: {found if found else 'NO MATCH'}")
+        return "\n".join(lines) + "\n"
+
+    def _candidate_visible(self, candidate: Candidate) -> bool:
+        try:
+            locator = candidate.locator(self._page).first
+            return bool(locator.count() and locator.is_visible())
+        except Exception:  # noqa: BLE001 - an unusable candidate is simply not a match
+            return False
+
+    def _open_wizard(self, *, require_wizard_content: bool = True) -> None:
         """Wait until the download wizard is genuinely on screen and signed in.
 
         Two traps this avoids, both of which were observed live against the real
@@ -347,6 +434,11 @@ class VaGovDownloader:
         self._goto(self._start_url)
         if self._wizard_rendered(timeout_ms=self._ready_timeout_ms):
             self._log(f"Signed in — opened {self._start_url}")
+            return
+        if not require_wizard_content and is_wizard_url(self._page.url):
+            # --inspect: the URL is all that is needed, because the whole point is to
+            # report what the page contains even when no known marker matches it.
+            self._log("Wizard route open — dumping the page for inspection.")
             return
         if is_wizard_url(self._page.url):
             # On the right route but nothing rendered within the ready budget: this is
@@ -562,6 +654,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Per-step timeout for finding/clicking an element.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Walk the wizard but stop before pressing 'Download report'.")
+    parser.add_argument("--inspect", action="store_true",
+                        help="Click nothing: dump the wizard's URL, text, element counts and "
+                             "which candidate selectors match. Use when a step stops matching.")
     parser.add_argument("--pause", action="store_true",
                         help="Confirm each step in the terminal before it happens.")
     parser.add_argument("--keep-open", action="store_true",
@@ -599,6 +694,7 @@ def main(argv: list[str] | None = None) -> int:
                     step_timeout_ms=args.step_timeout_ms,
                     dry_run=args.dry_run,
                     pause=args.pause,
+                    inspect_only=args.inspect,
                     start_url=args.start_url,
                 )
                 saved = downloader.run()
@@ -614,6 +710,10 @@ def main(argv: list[str] | None = None) -> int:
         print("\n✖ Aborted.", file=sys.stderr)
         return 130
 
+    if args.inspect:
+        print(f"✔ Inspection written to {saved}")
+        print("  Send it back if a selector needs fixing — it lists what matched per step.")
+        return 0
     if args.dry_run:
         print("✔ Dry run finished: the wizard was walked but nothing was downloaded.")
         return 0
