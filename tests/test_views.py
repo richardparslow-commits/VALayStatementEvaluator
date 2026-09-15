@@ -258,6 +258,53 @@ class TestExtractUploadsCaching(unittest.TestCase):
 
 
 # ----------------------------------------------------------------- records.py
+class TestUploadedVaGovExportLabelling(unittest.TestCase):
+    """A VA.gov export downloaded by the user and uploaded is a real record set:
+    the uploader should label it as the VA.gov source rather than an anonymous file."""
+
+    _VA_GOV_TEXT = (
+        "Download your medical records\nva.gov | My HealtheVet\n"
+        "Facility: VA Medical Center\nProvider: Smith, John MD\n"
+    )
+    _PRIVATE_TEXT = "Valley Regional Clinic\nProvider: Dr. Jane Doe\nMedications follow\n"
+
+    def _run_uploader(self, filename: str, text: str):
+        import app.views.records as records
+        from app.documents import DocumentPage, ExtractedDocument
+
+        doc = ExtractedDocument(
+            filename=filename,
+            pages=[DocumentPage(filename=filename, page=1, text=text)],
+        )
+        st_mock, session = _fake_streamlit()
+        uploaded = _UploadedFile(filename, 2048)
+        st_mock.file_uploader.return_value = [uploaded]
+        with _patch_st(records, st_mock), patch.object(
+            records, "check_upload_limits", return_value=([uploaded], [])
+        ), patch.object(records, "extract_uploads", return_value=[doc]):
+            records.records_uploader("eval")
+        return st_mock, session, doc
+
+    def test_va_gov_export_is_recorded_as_va_gov_source(self) -> None:
+        st_mock, session, doc = self._run_uploader("va_records.pdf", self._VA_GOV_TEXT)
+        store = session["source_records_eval"]
+        self.assertEqual(store["VA.gov"], [doc])
+        self.assertEqual(store["Upload"], [doc])
+        captions = [str(call.args[0]) for call in st_mock.caption.call_args_list]
+        self.assertTrue(
+            any("Detected a VA.gov medical-records export" in c for c in captions),
+            msg=captions,
+        )
+
+    def test_private_records_are_left_as_a_plain_upload(self) -> None:
+        st_mock, session, doc = self._run_uploader("clinic.pdf", self._PRIVATE_TEXT)
+        store = session["source_records_eval"]
+        self.assertEqual(store["Upload"], [doc])
+        self.assertNotIn("VA.gov", store)
+        captions = [str(call.args[0]) for call in st_mock.caption.call_args_list]
+        self.assertFalse(any("Detected a VA.gov" in c for c in captions), msg=captions)
+
+
 class TestIsLocalRun(unittest.TestCase):
     def test_env_opt_in_forces_true(self) -> None:
         from app.views.records import is_local_run

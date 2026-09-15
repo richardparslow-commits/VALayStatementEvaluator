@@ -13,6 +13,7 @@ import streamlit as st
 from .. import config
 from .. import telemetry
 from .. import va_gov_client
+from .. import va_gov_export
 from ..documents import ExtractionError, records_from_local_path
 from ..fetch_client import FetchClient, FetchSandboxError
 from ..logging_config import get_logger
@@ -114,7 +115,25 @@ def records_uploader(slot: str) -> list:
         )
         return []
     remember_source_records(slot, "Upload", documents)
+    _label_detected_va_gov_exports(slot, documents)
     return documents
+
+
+def _label_detected_va_gov_exports(slot: str, documents: list[Any]) -> None:
+    """Record uploaded VA.gov exports under the VA.gov source, and say so.
+
+    Downloading the report from VA.gov and uploading the PDF is the supported way
+    to get a real record set, so recognising it keeps the merged records summary
+    honest about where those pages came from.
+    """
+    exports, names = va_gov_export.split_va_gov_exports(documents)
+    if not exports:
+        return
+    remember_source_records(slot, "VA.gov", exports)
+    st.caption(
+        f"🔎 Detected a VA.gov medical-records export ({', '.join(names)}) — labelled as "
+        "the **VA.gov** source so the merged records summary shows where it came from."
+    )
 
 
 def _local_records(slot: str) -> list:

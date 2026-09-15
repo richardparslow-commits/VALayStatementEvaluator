@@ -424,6 +424,101 @@ class TestSignInWait(unittest.TestCase):
         self.assertNotIn("check", [action[0] for action in page.actions])
 
 
+class _FakeContext:
+    def __init__(self, pages: list[object]) -> None:
+        self.pages = pages
+        self.new_pages = 0
+
+    def new_page(self) -> object:
+        self.new_pages += 1
+        return object()
+
+
+class _FakeBrowser:
+    def __init__(self, contexts: list[_FakeContext] | None = None) -> None:
+        self.contexts = contexts or []
+        self.new_contexts = 0
+        self.closed = False
+
+    def new_context(self) -> _FakeContext:
+        self.new_contexts += 1
+        return _FakeContext([])
+
+    def new_page(self) -> object:
+        return object()
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeChromium:
+    def __init__(self, contexts: list[_FakeContext] | None = None) -> None:
+        self.browser = _FakeBrowser(contexts)
+        self.context = _FakeContext([object()])
+        self.connected_to: str | None = None
+        self.launch_kwargs: dict | None = None
+        self.persistent_kwargs: dict | None = None
+
+    def connect_over_cdp(self, url: str) -> _FakeBrowser:
+        self.connected_to = url
+        return self.browser
+
+    def launch(self, **kwargs: object) -> _FakeBrowser:
+        self.launch_kwargs = dict(kwargs)
+        return self.browser
+
+    def launch_persistent_context(self, profile: str, **kwargs: object) -> _FakeContext:
+        self.persistent_kwargs = {"profile": profile, **kwargs}
+        return self.context
+
+
+class _FakePlaywright:
+    def __init__(self, contexts: list[_FakeContext] | None = None) -> None:
+        self.chromium = _FakeChromium(contexts)
+
+
+def _args(*argv: str):
+    return vrd.build_parser().parse_args(list(argv))
+
+
+class TestBrowserSelection(unittest.TestCase):
+    """--cdp must attach to a browser the human owns, and never close it."""
+
+    def test_cdp_attaches_to_the_existing_context(self) -> None:
+        existing_page = object()
+        playwright = _FakePlaywright([_FakeContext([existing_page])])
+        browser, page, owned = vrd._open_browser(
+            playwright, _args("--cdp", "http://127.0.0.1:9222")
+        )
+        self.assertEqual(playwright.chromium.connected_to, "http://127.0.0.1:9222")
+        self.assertIs(page, existing_page)
+        self.assertFalse(owned)
+        self.assertIsNone(playwright.chromium.launch_kwargs)
+        self.assertIsNone(playwright.chromium.persistent_kwargs)
+        self.assertFalse(browser.closed)
+
+    def test_cdp_without_an_open_context_creates_one(self) -> None:
+        playwright = _FakePlaywright([])
+        _, _, owned = vrd._open_browser(playwright, _args("--cdp", "http://127.0.0.1:9222"))
+        self.assertEqual(playwright.chromium.browser.new_contexts, 1)
+        self.assertFalse(owned)
+
+    def test_default_launches_a_persistent_profile(self) -> None:
+        playwright = _FakePlaywright()
+        _, _, owned = vrd._open_browser(playwright, _args())
+        self.assertEqual(playwright.chromium.persistent_kwargs["profile"], str(vrd.DEFAULT_PROFILE_DIR))
+        self.assertFalse(playwright.chromium.persistent_kwargs["headless"])
+        self.assertTrue(owned)
+
+    def test_no_persist_launches_a_throwaway_browser(self) -> None:
+        playwright = _FakePlaywright()
+        browser, _, owned = vrd._open_browser(playwright, _args("--no-persist"))
+        self.assertEqual(playwright.chromium.launch_kwargs, {"headless": False})
+        self.assertTrue(owned)
+        browser.close()
+        self.assertTrue(browser.closed)
+
+
 class TestPlaywrightSetup(unittest.TestCase):
     def test_missing_playwright_explains_the_install(self) -> None:
         with patch.dict(sys.modules, {"playwright": None, "playwright.sync_api": None}):

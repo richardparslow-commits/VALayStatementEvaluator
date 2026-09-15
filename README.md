@@ -460,6 +460,16 @@ python scripts/va_records_download.py                 # saves the PDF to ~/Deskt
 python scripts/va_records_download.py --dry-run       # walk the wizard, stop before download
 ```
 
+Prefer signing in with the Chrome you already use? Start it with a debugging port and let
+the script attach to it instead — the attached browser is never closed or navigated during
+sign-in (Chrome 136+ requires a non-default profile for remote debugging):
+
+```bash
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+    --remote-debugging-port=9222 --user-data-dir="$HOME/.va_lse_debug_chrome"
+python scripts/va_records_download.py --cdp http://127.0.0.1:9222
+```
+
 The script opens a visible Chromium window and **waits while you sign in** through ID.me,
 including the SMS code — it never types, reads, or stores your credentials or code, has no
 headless mode, and does not attempt any MFA/CAPTCHA bypass. Once you are signed in it clicks
@@ -478,7 +488,10 @@ VA.gov's and ID.me's terms, and for using only your own records.
 2. Date range → **All time** → **Continue**
 3. Record type → **Select all VA records** → **Continue**
 4. File type → **PDF** → **Download report**
-5. Upload the saved PDF in the app as an *Upload files* record source
+5. Upload the saved PDF in the app as an *Upload files* record source — the app recognises a
+   VA.gov export from its **text** (not its filename) and labels it as the **VA.gov** source in
+   the merged records summary, so the pages are attributed rather than looking like an anonymous
+   upload. A private provider's records are left as a plain upload.
 
 ## Health checks (container orchestration)
 

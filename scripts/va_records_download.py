@@ -34,6 +34,14 @@ RUN
     .venv/bin/python scripts/va_records_download.py --dry-run          # stop before download
     .venv/bin/python scripts/va_records_download.py --pause            # confirm each step
 
+    # Or sign in with your own Chrome and let the script attach to it:
+    #   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+    #       --remote-debugging-port=9222 --user-data-dir="$HOME/.va_lse_debug_chrome"
+    .venv/bin/python scripts/va_records_download.py --cdp http://127.0.0.1:9222
+
+    A dedicated --user-data-dir is required: Chrome refuses remote debugging against
+    its default profile, and the attached browser is never closed by this script.
+
 IF A STEP FAILS (VA.gov changed its markup)
     The script names the failing step and writes a screenshot plus the page HTML to
     ``--artifacts-dir`` so the candidate selectors below can be updated. Treat that
@@ -542,6 +550,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Persistent Chromium profile (reuses your VA.gov session).")
     parser.add_argument("--no-persist", action="store_true",
                         help="Use a throwaway profile (no session cookies kept, full MFA again).")
+    parser.add_argument("--cdp", default="",
+                        help="Attach to a Chrome you already started with "
+                             "--remote-debugging-port (e.g. http://127.0.0.1:9222) instead of "
+                             "launching a browser. Nothing is closed at the end.")
     parser.add_argument("--start-url", default=START_URL,
                         help="Wizard entry page, if VA.gov renames the route.")
     parser.add_argument("--wait-login", type=int, default=DEFAULT_WAIT_LOGIN_SECONDS,
@@ -565,13 +577,19 @@ def main(argv: list[str] | None = None) -> int:
         print(f"✖ {exc}", file=sys.stderr)
         return 2
 
-    print(
-        "This opens a visible browser. Sign in at VA.gov yourself — including the SMS "
-        "code — and leave the rest to the script.\n"
-    )
+    if args.cdp:
+        print(
+            f"Attaching to the browser at {args.cdp}. It is left running afterwards, and "
+            "its existing VA.gov session is used as-is.\n"
+        )
+    else:
+        print(
+            "This opens a visible browser. Sign in at VA.gov yourself — including the SMS "
+            "code — and leave the rest to the script.\n"
+        )
     try:
         with sync_playwright() as playwright:
-            browser, page = _open_browser(playwright, args)
+            browser, page, owned = _open_browser(playwright, args)
             try:
                 downloader = VaGovDownloader(
                     page,
@@ -585,9 +603,10 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 saved = downloader.run()
             finally:
-                if args.keep_open:
-                    input("Leaving the browser open — press Enter to close it: ")
-                browser.close()
+                if owned:
+                    if args.keep_open:
+                        input("Leaving the browser open — press Enter to close it: ")
+                    browser.close()
     except DownloadError as exc:
         print(f"✖ {exc}", file=sys.stderr)
         return 1
@@ -603,16 +622,30 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _open_browser(playwright: Any, args: argparse.Namespace) -> tuple[Any, Any]:
-    """Launch a visible Chromium, persistent (session reuse) unless told otherwise."""
-    launch_args = {"headless": False, "slow_mo": 0}
+def _open_browser(playwright: Any, args: argparse.Namespace) -> tuple[Any, Any, bool]:
+    """Open the browser for the run, returning ``(browser, page, owned)``.
+
+    Three modes: attach to a Chrome the human already signed in to (``--cdp``),
+    launch a throwaway Chromium (``--no-persist``), or launch Chromium with a
+    persistent profile so the VA.gov session can be reused (the default).
+
+    ``owned`` is False when the browser belongs to the human: an attached Chrome is
+    never closed out from under them, and never navigated while they are signing in
+    (see ``VaGovDownloader._open_wizard``).
+    """
+    if args.cdp:
+        browser = playwright.chromium.connect_over_cdp(args.cdp)
+        contexts = browser.contexts
+        context = contexts[0] if contexts else browser.new_context()
+        page = context.pages[0] if context.pages else context.new_page()
+        return browser, page, False
     if args.no_persist:
-        browser = playwright.chromium.launch(**launch_args)
-        return browser, browser.new_page()
-    ctx = playwright.chromium.launch_persistent_context(
+        browser = playwright.chromium.launch(headless=False)
+        return browser, browser.new_page(), True
+    context = playwright.chromium.launch_persistent_context(
         str(args.profile_dir), headless=False
     )
-    return ctx, ctx.pages[0] if ctx.pages else ctx.new_page()
+    return context, (context.pages[0] if context.pages else context.new_page()), True
 
 
 if __name__ == "__main__":
