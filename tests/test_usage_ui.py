@@ -91,10 +91,10 @@ class TestUsageUi(unittest.TestCase):
         return AppTest.from_file(str(PROJECT_ROOT / "run_app.py"), default_timeout=30)
 
     def test_live_caption_and_usage_expander_render_after_run(self):
-        import app.main as main
+        import app.views.evaluate_view as evaluate_view
 
         fake = _FakeLLM()
-        main._get_llm = lambda: fake
+        evaluate_view.get_llm = lambda: fake  # type: ignore[assignment]
         at = self._app()
         at.run()
 
@@ -152,9 +152,9 @@ class TestUsageUi(unittest.TestCase):
         with mock.patch.object(config, "CREDITS_PER_1M_MAIN", 800.0), mock.patch.object(
             config, "CREDITS_PER_1M_FAST", None
         ):
-            import app.main as main
+            import app.views.shared as shared
 
-            rates, label = main._effective_credit_rates()
+            rates, label = shared.effective_credit_rates()
 
         # MAIN keeps its explicit 800; only FAST borrows from the watchdog (100).
         self.assertEqual(rates[config.DEFAULT_MODEL_MAIN], 800.0)

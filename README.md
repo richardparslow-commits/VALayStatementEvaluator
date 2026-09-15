@@ -36,7 +36,9 @@ contradicted; only an explicit record conflict is **CONTRADICTED**.
 ```
 run_app.py                Streamlit launcher
 app/
-  main.py                 UI: Evaluate / Draft / About tabs
+  main.py                 Thin router: logging, tabs, error boundary
+  views/                  Streamlit view layer: shared.py, sidebar.py,
+                          evaluate_view.py, draft_view.py, about_view.py
   config.py               Settings (.env), knowledge-file loader
   fetch_client.py         Fetch Sandbox GET client -> normalized record documents
   va_gov_client.py        VA.gov auth/fetch/merge client (real HTTPS or in-memory mock)

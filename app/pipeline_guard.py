@@ -10,12 +10,12 @@ Wraps the long-running ``run_evaluation`` and ``run_draft`` calls with:
   the main thread and has platform quirks; ``ThreadPoolExecutor`` works from
   any thread and on every OS.
 
-* **Memory pre-check** — before the pipeline starts, the available system
-  memory is sampled.  If it falls below ``VA_LSE_MEMORY_WARN_MB`` (default
-  500 MB) the run proceeds but emits a ``st.warning`` so the user can reduce
-  the record set.  If memory is critically low (< 200 MB) the run is aborted
-  with ``MemoryError``.  The check is advisory on platforms where memory info
-  is unavailable (Windows without ``psutil``).
+* **Memory pre-check** — before the pipeline starts, the *available system
+  memory* is sampled.  If it falls below ``VA_LSE_MEMORY_WARN_MB`` (default
+  500 MB) the run proceeds but the operator is warned that the host is under
+  memory pressure.  If available memory is critically low (< 200 MB) the run
+  is aborted with ``MemoryError``.  The check is advisory on platforms where
+  the figure is unavailable.
 
 * **Memory checkpoints** — ``memory_checkpoint`` is called at key pipeline
   stages (after chunk extraction, after digest merge, after summary).  It
@@ -86,9 +86,67 @@ class PipelineTimeoutError(RuntimeError):
 # --------------------------------------------------------- memory helpers
 
 
+def _read_available_memory_mb() -> float | None:
+    """Return available system memory in MB, or None if unavailable.
+
+    The pre-run guard answers "can this machine absorb a long pipeline?" —
+    that is *available* memory, not the process's own RSS. A small/idle
+    process is healthy, and aborting because RSS is low (the old behavior)
+    falsely rejected runs on quiet machines while doing nothing when the
+    system was actually exhausted.
+
+    - Linux: ``/proc/meminfo`` MemAvailable (exact; no dependencies).
+    - macOS: ``vm_stat`` page counts via stdlib subprocess (free + inactive
+      + speculative pages — Apple keeps caches warm, so this is the honest
+      "truly free" figure). Purgeable/swap headroom is ignored on purpose:
+      this is a conservative gate, not a swappiness model.
+    - Everything else: ``None`` → the guard degrades to advisory-only.
+    """
+    # Linux: MemAvailable from /proc/meminfo.
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return int(parts[1]) / 1024.0  # kB → MB
+    except (OSError, ValueError):
+        pass
+
+    # macOS: vm_stat free+inactive+speculative pages.
+    try:
+        import subprocess
+
+        proc = subprocess.run(  # noqa: S603, S607 - fixed argv, no shell
+            ["vm_stat"], capture_output=True, text=True, timeout=2
+        )
+        if proc.returncode == 0:
+            page_size = 4096
+            free = inactive = speculative = 0
+            for line in proc.stdout.splitlines():
+                if line.startswith("page size of"):
+                    try:
+                        page_size = int(line.split()[-2])
+                    except (ValueError, IndexError):
+                        pass
+                elif line.startswith("Pages free:"):
+                    free = int(line.split()[-1].rstrip("."))
+                elif line.startswith("Pages inactive:"):
+                    inactive = int(line.split()[-1].rstrip("."))
+                elif line.startswith("Pages speculative:"):
+                    speculative = int(line.split()[-1].rstrip("."))
+            return (free + inactive + speculative) * page_size / (1024 * 1024)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+
+    return None
+
+
 def _read_rss_mb() -> float | None:
     """Return current process RSS in MB, or None if unavailable.
 
+    Kept for ``memory_checkpoint`` observability: checkpoint logging wants to
+    see how big *the app itself* is getting as records are digested.
     Uses /proc/self/status on Linux (no dependencies), resource.getrusage on
     macOS (peak RSS, not current — less useful but better than nothing), and
     falls back to None on platforms where neither is available.
@@ -122,40 +180,47 @@ def _read_rss_mb() -> float | None:
 
 
 def check_memory_before_run() -> None:
-    """Check available memory before starting a pipeline run.
+    """Check *available system memory* before starting a pipeline run.
 
-    Logs the current RSS.  If below 200 MB, raises MemoryError to abort.
-    If below VA_LSE_MEMORY_WARN_MB, logs a warning (caller should show
-    st.warning to the user).
+    Logs the current availability. If below 200 MB, raises MemoryError to
+    abort. If above VA_LSE_MEMORY_WARN_MB, logs a warning that the host is
+    already under memory pressure (the run proceeds). Advisory no-op on
+    platforms where the figure is unavailable.
+
+    Historically this checked the *process's own* RSS, which inverted the
+    intent: an idle app (low RSS) was "critical" while a bloated one on an
+    exhausted host sailed through. That false abort killed Evaluate/Draft
+    runs in fresh AppTest/test processes (~100 MB RSS) and lightweight
+    deployments.
     """
-    rss_mb = _read_rss_mb()
-    if rss_mb is None:
-        logger.debug("memory check skipped: RSS not available on this platform")
+    avail_mb = _read_available_memory_mb()
+    if avail_mb is None:
+        logger.debug("memory check skipped: available-memory figure unavailable on this platform")
         return
 
     logger.info(
-        "pipeline memory pre-check rss_mb=%.0f",
-        rss_mb,
-        extra={"phase": "pipeline_guard", "status": "ok", "rss_mb": round(rss_mb)},
+        "pipeline memory pre-check available_mb=%.0f",
+        avail_mb,
+        extra={"phase": "pipeline_guard", "status": "ok", "available_mb": round(avail_mb)},
     )
 
-    if rss_mb < 200:
+    if avail_mb < 200:
         raise MemoryError(
-            f"Critical memory shortage: only {rss_mb:.0f} MB RSS available. "
-            f"Reduce the record set or restart the app. "
-            f"(threshold: 200 MB minimum)"
+            f"Critical memory shortage: only {avail_mb:.0f} MB of system memory available. "
+            f"Free memory (close other apps / reduce other workloads) or reduce the record set. "
+            f"(threshold: 200 MB minimum available)"
         )
 
     warn_mb = _memory_warn_mb()
-    if rss_mb > warn_mb:
+    if avail_mb < warn_mb:
         logger.warning(
-            "pipeline memory high rss_mb=%.0f warn_threshold_mb=%d",
-            rss_mb,
+            "pipeline memory low available_mb=%.0f warn_threshold_mb=%d",
+            avail_mb,
             warn_mb,
             extra={
                 "phase": "pipeline_guard",
                 "status": "warning",
-                "rss_mb": round(rss_mb),
+                "available_mb": round(avail_mb),
                 "warn_threshold_mb": warn_mb,
             },
         )
@@ -191,6 +256,44 @@ def memory_checkpoint(phase: str) -> None:
 # -------------------------------------------------------- timeout wrapper
 
 
+def _propagate_streamlit_ctx(fn: Callable[..., T], *args: Any, **kwargs: Any) -> Callable[..., T]:
+    """Wrap *fn* so the pool worker inherits the caller's Streamlit context.
+
+    The pipeline calls ``st.progress``/``st.empty`` from inside the worker
+    thread (progress callbacks). Without the caller's ``ScriptRunContext``
+    those calls raise ``NoSessionContext`` and kill an otherwise healthy run —
+    under ``AppTest`` and in real deployments alike (regression introduced
+    when the timeout wrapper moved pipelines off the script thread).
+
+    The context is captured in the *calling* thread (the wrapper is built
+    there) and self-attached inside the worker via the documented
+    ``add_script_run_ctx`` pattern. Best-effort: no-op when no context
+    exists (bare scripts/tests).
+    """
+    try:
+        from streamlit.runtime.scriptrunner_utils.script_run_context import (
+            get_script_run_ctx,
+        )
+
+        ctx = get_script_run_ctx(suppress_warning=True)
+    except Exception:  # noqa: BLE001 - context propagation is best-effort
+        ctx = None
+
+    def _wrapped() -> T:
+        if ctx is not None:
+            try:
+                from streamlit.runtime.scriptrunner_utils.script_run_context import (
+                    add_script_run_ctx,
+                )
+
+                add_script_run_ctx(ctx=ctx)
+            except Exception:  # noqa: BLE001 - context propagation is best-effort
+                pass
+        return fn(*args, **kwargs)
+
+    return _wrapped
+
+
 def run_with_timeout(
     fn: Callable[..., T],
     *args: Any,
@@ -205,6 +308,10 @@ def run_with_timeout(
     background but the caller is no longer blocked) — this matches the
     graceful-shutdown model where the orchestrator's SIGKILL handles stuck
     processes.
+
+    The worker inherits the caller's Streamlit ``ScriptRunContext`` (see
+    :func:`_propagate_streamlit_ctx`) so pipeline progress callbacks using
+    ``st.*`` keep working from the pool thread.
 
     The timeout defaults to ``VA_LSE_PIPELINE_TIMEOUT_SECONDS`` (30 min).
     """
@@ -228,7 +335,7 @@ def run_with_timeout(
     )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(fn, *args, **kwargs)
+        future = pool.submit(_propagate_streamlit_ctx(fn, *args, **kwargs))
         try:
             result = future.result(timeout=timeout_seconds)
             elapsed = time.perf_counter() - t0

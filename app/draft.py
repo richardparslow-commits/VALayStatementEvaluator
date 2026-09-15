@@ -15,7 +15,7 @@ from .documents import (
     ExtractedDocument,
     MAX_OBSERVATIONS_CHARS,
 )
-from .llm import LLMClient
+from .llm import LLMClient, LLMError
 from .logging_config import PhaseTimer, get_request_id
 from .profiler import phase_timer
 from .prompt_sanitize import GUARD_NOTE, sanitize_digest_text, sanitize_for_prompt, validate_witness_field
@@ -317,16 +317,32 @@ def _run_draft(
     with PhaseTimer(logger, "review", request_id=rid):
         with phase_timer("review"):
             report(0.85, "Step 4/4 — Self-review and improvement pass…")
-            review = llm.chat_json(
-                REVIEW_SYSTEM,
-                REVIEW_USER.format(
-                    draft=sanitize_for_prompt(result.draft[:16000], max_chars=20_000),
-                    guide=load_knowledge("drafting_guide.md")[:6000],
-                    checklist=load_knowledge("topic_checklist.md")[:6000],
-                    guard_note=GUARD_NOTE,
-                ),
-                phase="review",
-        )
+            try:
+                review = llm.chat_json(
+                    REVIEW_SYSTEM,
+                    REVIEW_USER.format(
+                        draft=sanitize_for_prompt(result.draft[:16000], max_chars=20_000),
+                        guide=load_knowledge("drafting_guide.md")[:6000],
+                        checklist=load_knowledge("topic_checklist.md")[:6000],
+                        guard_note=GUARD_NOTE,
+                    ),
+                    phase="review",
+                )
+            except LLMError as exc:
+                # The review pass is cosmetic — grounding and the draft are
+                # already complete. A filter/retry failure here must not
+                # discard the finished draft, so keep it and note the miss.
+                logger.warning(
+                    "review pass unavailable — keeping unreviewed draft error=%s",
+                    f"{type(exc).__name__}: {exc}",
+                    extra={"request_id": rid, "phase": "review", "status": "error", "error_class": type(exc).__name__},
+                )
+                result.review_issues = [
+                    "Self-review pass was skipped (the model call failed) — the statement below is the "
+                    "unreviewed draft. Re-run to get the polished version."
+                ]
+                report(1.0, "Draft complete (self-review skipped — model call failed).")
+                return result
     result.review_issues = review.get("issues_found", [])
     improved = review.get("improved_statement", "")
     if improved and len(improved) > max(200, int(len(result.draft) * 0.4)):

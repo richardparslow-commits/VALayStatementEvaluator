@@ -1,0 +1,231 @@
+"""Shared view-layer helpers for the Evaluate/Draft/About tabs.
+
+Since the split into focused modules, this file re-exports their public
+surface so tab modules (and tests) keep one import point:
+
+- ``app.views.uploads``  — upload size gate + extraction caching
+- ``app/views/records``  — record-source widget (Upload/Fetch/VA.gov/Local)
+- ``app/views/usage``    — usage watchdog, credit rates, usage summary
+
+plus the genuinely shared bits that live here: correlation ids, the LLM
+handle, the shutdown gate, progress widgets, and audit metadata.
+"""
+from __future__ import annotations
+
+import traceback
+from datetime import datetime, timezone
+from typing import Any
+
+import streamlit as st
+
+from .. import telemetry
+from ..logging_config import get_logger, get_request_id, new_request_id, set_request_id
+from ..llm import LLMClient, LLMError
+from ..run_log import run_log_event
+from ..shutdown import is_shutting_down
+from .records import is_local_run, records_uploader, remember_source_records  # noqa: F401
+from .uploads import check_upload_limits, extract_uploads  # noqa: F401
+from .usage import (  # noqa: F401
+    effective_credit_rates,
+    load_usage_history,
+    record_watchdog_run,
+    render_usage_summary,
+    save_usage_history,
+)
+
+logger = get_logger("app.views.shared")
+
+REQUEST_ID_KEY = "va_lse_request_id"
+
+# Feature: Condition-Specific Templates
+FEATURE_ID = "02f0935a-ee5e-4083-88a2-10e11753ccc9"  # condition-specific-templates
+
+
+# ------------------------------------------------------------- correlation ids
+def get_or_create_request_id() -> str:
+    """Return the active run's correlation id, minting one if needed."""
+    rid_raw: Any = st.session_state.get(REQUEST_ID_KEY, "")
+    rid: str = str(rid_raw) if isinstance(rid_raw, str) and rid_raw else ""
+    if rid:
+        # Ensure ContextVar mirrors session state (Streamlit reruns may reset context).
+        set_request_id(rid)
+        return rid
+    rid = new_request_id()
+    st.session_state[REQUEST_ID_KEY] = rid
+    set_request_id(rid)
+    return rid
+
+
+def new_run_request_id() -> str:
+    """Mint a fresh correlation id for a new Evaluate/Draft run."""
+    rid = new_request_id()
+    st.session_state[REQUEST_ID_KEY] = rid
+    set_request_id(rid)
+    return rid
+
+
+def format_error_for_user(exc: Exception, request_id: str) -> str:
+    """User-facing error string that carries the correlation id without PII."""
+    rid_suffix = f" (reference: {request_id})" if request_id and request_id != "-" else ""
+    return f"{exc}{rid_suffix}"
+
+
+# Fallback locations tried (in order) when no file logging is configured, so
+# ``req_…`` references stay correlatable even without VA_LSE_LOG_DIR set.
+_RUN_LOG_FALLBACK_DIRS = ("logs", "outputs")
+
+
+def log_unhandled_render_error(exc: Exception, rid: str, phase: str = "app") -> None:
+    """Best-effort persistence for an error outside the run flow.
+
+    Mirrors the run-log contract: a ``rejected`` event keyed by the same
+    reference the UI shows, plus a short traceback, so no failure is ever
+    "unexpected" in the logs — even when it happens outside
+    ``_run_draft_flow``/``_run_evaluation_flow`` (e.g. results rendering).
+    """
+    run_log_event(
+        "app", "rejected", request_id=rid, phase=phase,
+        error=f"{type(exc).__name__}: {exc}", error_class=type(exc).__name__,
+        traceback=traceback.format_exc(limit=8),
+    )
+    # File-logging fallback: if no VA_LSE_LOG_DIR is configured the structured
+    # logger goes to stdout only; duplicate the digest to a stable file so the
+    # reference can always be resolved on this machine.
+    try:
+        import os
+        from pathlib import Path
+
+        if not os.getenv("VA_LSE_LOG_DIR", "").strip() and not os.getenv("VA_LSE_RUN_LOG_DIR", "").strip():
+            for cand in _RUN_LOG_FALLBACK_DIRS:
+                try:
+                    p = Path(cand)
+                    p.mkdir(parents=True, exist_ok=True)
+                    with open(p / "unhandled_errors.log", "a", encoding="utf-8") as fh:
+                        fh.write(
+                            f"{datetime.now(timezone.utc).isoformat()} {rid} "
+                            f"{type(exc).__name__}: {exc}\n{traceback.format_exc(limit=8)}\n"
+                        )
+                    break
+                except Exception:  # noqa: BLE001 - try next candidate
+                    continue
+    except Exception:  # noqa: BLE001 - best-effort only
+        pass
+
+
+# ---------------------------------------------------------------- LLM handle
+def get_llm() -> LLMClient | None:
+    """Build the session's LLMClient, or show the reason and return None."""
+    rid = st.session_state.get(REQUEST_ID_KEY, "") or get_request_id() or "-"
+    try:
+        settings = st.session_state.settings
+    except AttributeError:
+        # Session state exists but settings not initialized yet (edge reruns).
+        from ..config import load_settings
+
+        settings = st.session_state.settings = load_settings()
+    settings.api_key = st.session_state.get("api_key_input", settings.api_key).strip()
+    if not settings.configured:
+        logger.warning(
+            "LLM not configured — missing API key",
+            extra={"request_id": rid, "phase": "llm_config", "status": "error"},
+        )
+        st.error("Enter your LLM API key in the sidebar before running.")
+        return None
+    try:
+        return LLMClient(settings)
+    except LLMError as exc:
+        logger.error(
+            "LLM client init failed: %s",
+            exc,
+            exc_info=exc,
+            extra={
+                "request_id": rid,
+                "phase": "llm_config",
+                "status": "error",
+                "error_class": type(exc).__name__,
+            },
+        )
+        st.error(str(exc))
+        return None
+
+
+def check_shutdown_gate(action: str) -> bool:
+    """Return True when a new run may start; otherwise show why not.
+
+    ``action`` is "evaluation" or "draft" — used only in the user message.
+    """
+    if is_shutting_down():
+        st.error(
+            f"The app is shutting down to finish a deployment or restart. "
+            f"No new {action} runs can start right now — please try again in a moment."
+        )
+        return False
+    return True
+
+
+# ------------------------------------------------------------- progress + audit
+def progress_widgets(llm: LLMClient | None = None, *, request_id: str | None = None) -> tuple[Any, Any]:
+    """Progress bar whose caption appends a live estimated-usage line."""
+    bar = st.progress(0.0, text="Starting…")
+    rid = request_id or get_request_id() or "-"
+
+    def update(frac: float, msg: str) -> None:
+        logger.debug(
+            "progress %.0f%% — %s",
+            frac * 100,
+            msg,
+            extra={"request_id": rid, "phase": "progress", "status": "ok"},
+        )
+        text = msg
+        if llm is not None:
+            text += llm.usage.live_line()
+        bar.progress(min(max(frac, 0.0), 1.0), text=text)
+
+    return bar, update
+
+
+def audit_record_meta(slot: str, records: list[Any]) -> tuple[list[str], int, int]:
+    """Return (record_sources, file_count, page_count) for audit events."""
+    try:
+        store_any: Any = st.session_state.get(f"source_records_{slot}", {})
+        if isinstance(store_any, dict) and store_any:
+            sources = [str(k) for k in store_any.keys() if str(k).strip()]
+        else:
+            sources = []
+    except Exception:  # noqa: BLE001
+        sources = []
+    # Fallback label when store is empty but records exist (e.g. direct upload in tests).
+    if not sources and records:
+        sources = ["Upload"]
+    files = len(records)
+    try:
+        pages = sum(len(getattr(d, "pages", [])) for d in records)
+    except Exception:  # noqa: BLE001
+        pages = 0
+    return sources, files, pages
+
+
+def audit_condition_for_slot(slot: str) -> str:
+    """Best-effort claimed-condition label for the audit (no PII)."""
+    try:
+        selected_any: Any = st.session_state.get(f"selected_conditions_{slot}", [])
+        if isinstance(selected_any, list) and selected_any:
+            names: list[str] = []
+            for item in selected_any:
+                if isinstance(item, (list, tuple)) and len(item) == 2:
+                    names.append(str(item[1]).strip())
+                elif isinstance(item, str):
+                    names.append(item.strip())
+            names = [n for n in names if n]
+            if names:
+                return ", ".join(names)[:120]
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def render_condition_selector_for_slot(slot: str) -> None:
+    """Fire the selector impression once and render the condition selector."""
+    from ..condition_selector import render_condition_selector
+
+    render_condition_selector(slot, FEATURE_ID)

@@ -302,6 +302,39 @@ class TestRunDraftEdgeCases(unittest.TestCase):
         self.assertEqual(seen[-1][1], "Draft complete.")
 
 
+class TestRunDraftReviewFailure(unittest.TestCase):
+    """The review pass is cosmetic — its failure must not discard the draft."""
+
+    @patch("app.draft.review_medical_records")
+    @patch("app.draft.load_knowledge", return_value="k")
+    def test_review_llm_error_keeps_draft(self, _mk, mock_review):
+        from app.llm import LLMError
+
+        mock_review.return_value = _fake_digest()
+        llm = _FakeLLM(overrides={"review": LLMError("LLM call failed after 3 attempts: boom")})
+        result = run_draft(llm, [_doc()], WITNESS, "Daily knee pain observed.", "knee pain", "Service connection")
+        # Draft + grounding survive; final_statement not replaced by a review.
+        self.assertTrue(result.draft)
+        self.assertTrue(result.grounding)
+        self.assertEqual(result.final_statement, "")
+        self.assertEqual(result.output_statement, result.draft)
+        # The user is told the review was skipped.
+        self.assertTrue(any("skipped" in issue.lower() for issue in result.review_issues))
+
+    @patch("app.draft.review_medical_records")
+    @patch("app.draft.load_knowledge", return_value="k")
+    def test_review_moderation_error_keeps_draft(self, _mk, mock_review):
+        from app.llm import LLMError
+
+        mock_review.return_value = _fake_digest()
+        llm = _FakeLLM(overrides={"review": LLMError(
+            "The LLM provider's content filter rejected this run (HTTP 400 data_inspection_failed)."
+        )})
+        result = run_draft(llm, [_doc()], WITNESS, "obs", "cond", "Service connection")
+        self.assertEqual(result.output_statement, result.draft)
+        self.assertTrue(result.review_issues)
+
+
 class TestRunDraftIntegration(unittest.TestCase):
     @patch("app.draft.load_knowledge", return_value="k")
     def test_real_digest_integration(self, _mk):

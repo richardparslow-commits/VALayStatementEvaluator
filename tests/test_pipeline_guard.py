@@ -2,8 +2,10 @@
 
 Covers:
   - PipelineTimeoutError raised on timeout
-  - Memory pre-check (abort on low RSS, warn on high RSS)
-  - Memory checkpoint logging
+  - Memory pre-check (abort on low *available system memory*, warn when the
+    host is under pressure; the old low-RSS abort semantics were inverted —
+    an idle process with small RSS is healthy)
+  - Memory checkpoint logging (process RSS observability)
   - run_with_timeout returns result on success
   - run_with_timeout re-raises pipeline errors
   - Config env var wiring
@@ -90,30 +92,45 @@ class TestPipelineTimeout(unittest.TestCase):
 class TestMemoryCheck(unittest.TestCase):
     """Test memory pre-check and checkpoint."""
 
-    def test_check_passes_when_rss_available(self) -> None:
-        """With a fake RSS of 300 MB, should pass (above 200 MB minimum)."""
-        with patch("app.pipeline_guard._read_rss_mb", return_value=300.0):
+    def test_check_passes_when_plenty_available(self) -> None:
+        """With 300 MB available, should pass (above 200 MB minimum)."""
+        with patch("app.pipeline_guard._read_available_memory_mb", return_value=300.0):
             # Should not raise
             check_memory_before_run()
 
-    def test_check_aborts_when_rss_critical(self) -> None:
-        """With a fake RSS of 150 MB, should raise MemoryError."""
-        with patch("app.pipeline_guard._read_rss_mb", return_value=150.0):
+    def test_check_passes_when_process_rss_is_tiny(self) -> None:
+        """Regression: a small/idle process must NOT abort the run.
+
+        The old guard checked process RSS, so a fresh ~100 MB-RSS process
+        (AppTest runs, lightweight deploys) was rejected as 'critical memory
+        shortage' even on an idle machine with gigabytes free.
+        """
+        with (
+            patch("app.pipeline_guard._read_rss_mb", return_value=105.0),
+            patch("app.pipeline_guard._read_available_memory_mb", return_value=8_000.0),
+        ):
+            # Should not raise
+            check_memory_before_run()
+
+    def test_check_aborts_when_available_memory_critical(self) -> None:
+        """With only 150 MB available, should raise MemoryError."""
+        with patch("app.pipeline_guard._read_available_memory_mb", return_value=150.0):
             with self.assertRaises(MemoryError) as ctx:
                 check_memory_before_run()
             self.assertIn("Critical memory shortage", str(ctx.exception))
+            self.assertIn("system memory", str(ctx.exception))
 
-    def test_check_warns_when_rss_high(self) -> None:
-        """With a fake RSS above warn threshold, should log warning but not abort."""
-        with patch("app.pipeline_guard._read_rss_mb", return_value=600.0):
+    def test_check_warns_when_host_under_pressure(self) -> None:
+        """Available memory below the warn threshold warns but does not abort."""
+        with patch("app.pipeline_guard._read_available_memory_mb", return_value=400.0):
             with patch("app.pipeline_guard._memory_warn_mb", return_value=500):
                 with self.assertLogs("app.pipeline_guard", level="INFO") as cm:
                     check_memory_before_run()
-                self.assertTrue(any("memory high" in msg or "600" in msg for msg in cm.output))
+                self.assertTrue(any("memory low" in msg for msg in cm.output))
 
-    def test_check_skips_when_rss_unavailable(self) -> None:
-        """When RSS cannot be read, should skip silently."""
-        with patch("app.pipeline_guard._read_rss_mb", return_value=None):
+    def test_check_skips_when_memory_figure_unavailable(self) -> None:
+        """When the availability figure cannot be read, should skip silently."""
+        with patch("app.pipeline_guard._read_available_memory_mb", return_value=None):
             # Should not raise, should not log anything significant
             check_memory_before_run()
 
