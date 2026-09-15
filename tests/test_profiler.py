@@ -17,7 +17,9 @@ from app.profiler import (
     PhaseTiming,
     WorkerTiming,
     _percentile_stats,
+    bind_run_profiler,
     get_profiler,
+    get_current_run_profiler,
     reset_profiler_for_tests,
     phase_timer,
     worker_timer,
@@ -188,6 +190,16 @@ class TestPhaseTimer(unittest.TestCase):
                 time.sleep(0.01)
             # Just verifying it doesn't raise when enabled
 
+    def test_records_on_bound_run_profiler(self) -> None:
+        run = RunProfiler(action="evaluate")
+        with mock.patch.dict(config.__dict__, {"PROFILE_RUNS": True}):
+            with bind_run_profiler(run):
+                with phase_timer("claims"):
+                    time.sleep(0.01)
+        self.assertEqual(len(run.phases), 1)
+        self.assertEqual(run.phases[0].phase, "claims")
+        self.assertGreater(run.phases[0].duration_ms, 0.0)
+
 
 class TestWorkerTimer(unittest.TestCase):
     """Verify the worker_timer context manager."""
@@ -203,6 +215,17 @@ class TestWorkerTimer(unittest.TestCase):
             with worker_timer("digest", index=1):
                 time.sleep(0.01)
 
+    def test_records_on_bound_run_profiler(self) -> None:
+        run = RunProfiler(action="evaluate")
+        with mock.patch.dict(config.__dict__, {"PROFILE_RUNS": True}):
+            with bind_run_profiler(run):
+                with worker_timer("digest", index=1):
+                    time.sleep(0.01)
+        self.assertEqual(len(run.workers), 1)
+        self.assertEqual(run.workers[0].phase, "digest")
+        self.assertEqual(run.workers[0].index, 1)
+        self.assertGreater(run.workers[0].duration_ms, 0.0)
+
 
 class TestConfigGate(unittest.TestCase):
     """Verify the env var gate."""
@@ -212,6 +235,17 @@ class TestConfigGate(unittest.TestCase):
             self.assertTrue(config.PROFILE_RUNS)
         with mock.patch.dict(config.__dict__, {"PROFILE_RUNS": False}):
             self.assertFalse(config.PROFILE_RUNS)
+
+    def test_bind_run_profiler_restores_previous_context(self) -> None:
+        outer = RunProfiler(action="evaluate")
+        inner = RunProfiler(action="draft")
+        self.assertIsNone(get_current_run_profiler())
+        with bind_run_profiler(outer):
+            self.assertIs(get_current_run_profiler(), outer)
+            with bind_run_profiler(inner):
+                self.assertIs(get_current_run_profiler(), inner)
+            self.assertIs(get_current_run_profiler(), outer)
+        self.assertIsNone(get_current_run_profiler())
 
 
 if __name__ == "__main__":

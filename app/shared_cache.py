@@ -82,7 +82,7 @@ class CacheBackend(Protocol):
     def is_shared(self) -> bool: ...
     @property
     def stats(self) -> CacheStats: ...
-    def health(self) -> dict[str, Any]: ...
+    def health(self, *, probe: bool = True) -> dict[str, Any]: ...
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +142,7 @@ class LocalLRUCache:
     def stats(self) -> CacheStats:
         return self._stats
 
-    def health(self) -> dict[str, Any]:
+    def health(self, *, probe: bool = True) -> dict[str, Any]:
         return {
             "backend": "local_lru",
             "is_shared": False,
@@ -278,8 +278,10 @@ class UpstashRedisCache:
             self._last_ping_at = now
         return ok
 
-    def health(self) -> dict[str, Any]:
-        reachable = self.ping()
+    def health(self, *, probe: bool = True) -> dict[str, Any]:
+        reachable: bool | None = self.ping() if probe else (
+            self._last_ping_ok if self._last_ping_at != 0.0 else None
+        )
         return {
             "backend": "upstash_redis",
             "is_shared": True,
@@ -372,10 +374,10 @@ class TieredCache:
     def shared_stats(self) -> CacheStats:
         return self._shared_stats
 
-    def health(self) -> dict[str, Any]:
-        local_health = self._local.health()
+    def health(self, *, probe: bool = True) -> dict[str, Any]:
+        local_health = self._local.health(probe=False)
         if self._shared is not None:
-            shared_health = self._shared.health()
+            shared_health = self._shared.health(probe=probe)
             return {
                 "tiered": True,
                 "shared": shared_health,
