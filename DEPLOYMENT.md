@@ -16,7 +16,9 @@ and graceful failover. For single-user local setup, see `README.md → Setup`.
 8. [Graceful shutdown at scale](#8-graceful-shutdown-at-scale)
 9. [Environment variables reference](#9-environment-variables-reference)
 10. [Scaling guidance](#10-scaling-guidance)
-11. [TLS and reverse proxy](#11-tls-and-reverse-proxy)
+11. [Rate limiting (reverse proxy)](#11-rate-limiting-reverse-proxy)
+12. [TLS and reverse proxy](#12-tls-and-reverse-proxy)
+13. [Distributed cache for VA reference data](#13-distributed-cache-for-va-reference-data)
 
 ---
 
@@ -836,7 +838,198 @@ a pod that cannot reach the LLM should fail fast on its own, not affect other po
 
 ---
 
-## 11. TLS and reverse proxy
+## 11. Rate limiting (reverse proxy)
+
+Streamlit has no built-in HTTP rate limiting. For production deployments,
+protect the app from request floods with rate limiting at the reverse proxy
+layer. The app's per-request work (file upload, LLM call) is expensive — a
+flood of concurrent Evaluate/Draft runs can exhaust the LLM endpoint and
+cascade to all users.
+
+### nginx rate limiting
+
+nginx's `limit_req` module enforces request-rate limits per client IP.
+Add these directives to the `http` block in `nginx/nginx.conf`:
+
+```nginx
+http {
+    # --- Rate limiting zones ---
+    # Zone 1: General requests (page loads, static assets).
+    # 100 requests/minute per client IP, burst of 20.
+    limit_req_zone $binary_remote_addr zone=general:10m rate=100r/m;
+
+    # Zone 2: Action endpoints (Evaluate/Draft runs).
+    # 10 requests/minute per client IP — these are expensive LLM calls.
+    limit_req_zone $binary_remote_addr zone=actions:10m rate=10r/m;
+
+    # Zone 3: Upload endpoints (file ingestion).
+    # 20 requests/minute — uploads are CPU-bound (PDF extraction).
+    limit_req_zone $binary_remote_addr zone=uploads:10m rate=20r/m;
+
+    # Custom error page for rate-limited requests.
+    limit_req_status 429;
+
+    upstream streamlit_backends {
+        ip_hash;
+        server streamlit-web-1:8501;
+        server streamlit-web-2:8501;
+        server streamlit-web-3:8501;
+    }
+
+    server {
+        listen 80;
+        server_name _;
+
+        # Health probes — never rate-limited.
+        location /nginx-health {
+            access_log off;
+            return 200 '{"status":"ok","service":"nginx"}';
+            add_header Content-Type application/json;
+        }
+
+        location /health {
+            limit_req zone=general burst=5 nodelay;
+            proxy_pass http://streamlit_backends;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+        }
+
+        location /ready {
+            limit_req zone=general burst=5 nodelay;
+            proxy_pass http://streamlit_backends;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+        }
+
+        # --- Main Streamlit traffic ---
+        location / {
+            limit_req zone=general burst=20 nodelay;
+            proxy_pass http://streamlit_backends;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_read_timeout 600s;
+            proxy_send_timeout 600s;
+            proxy_buffering off;
+            client_max_body_size 60m;
+        }
+
+        # --- Upload endpoint (if exposed separately) ---
+        # Streamlit handles uploads on the main path, but if you add a
+        # dedicated upload route, apply the stricter upload zone:
+        # location /upload {
+        #     limit_req zone=uploads burst=5 nodelay;
+        #     proxy_pass http://streamlit_backends;
+        #     proxy_http_version 1.1;
+        #     client_max_body_size 60m;
+        # }
+    }
+}
+```
+
+**Key parameters:**
+
+| Zone | Rate | Burst | Why |
+|---|---|---|---|
+| `general` | 100r/m per IP | 20 | Page loads, static assets, health probes |
+| `actions` | 10r/m per IP | 5 | Evaluate/Draft runs — each triggers multiple LLM calls |
+| `uploads` | 20r/m per IP | 5 | File uploads — CPU-bound PDF extraction |
+
+**Rate-limit response:** nginx returns `429 Too Many Requests` with the
+`Retry-After` header. Streamlit's frontend will show an error; users should
+wait and retry. For a friendlier UX, add a custom error page:
+
+```nginx
+error_page 429 = @rate_limited;
+location @rate_limited {
+    default_type application/json;
+    return 429 '{"error": "rate_limited", "message": "Too many requests. Please wait a moment and try again."}';
+}
+```
+
+### Cloudflare rate limiting
+
+If you use Cloudflare as a reverse proxy, configure rate limiting via
+**Security → WAF → Rate limiting rules**:
+
+| Rule | Expression | Rate | Action |
+|---|---|---|---|
+| **General flood** | `http.request.uri.path eq "/"` | 100 req/min per IP | Challenge (CAPTCHA) |
+| **Action flood** | `http.request.uri.path eq "/"` AND `http.request.method eq "POST"` | 10 req/min per IP | Block |
+| **Upload flood** | `http.request.uri.path contains "upload"` OR `http.request.uri.path eq "/"` | 20 req/min per IP | Challenge |
+| **Health probe** | `http.request.uri.path in {"/health" "/ready"}` | 300 req/min per IP | Allow (never block health) |
+
+**Cloudflare Page Rules** (legacy, simpler):
+
+```
+*va-lse.example.com/*
+  → Rate Limiting: 100 requests per minute per IP
+  → Action: Challenge
+```
+
+### Per-user session limits
+
+Beyond IP-level rate limiting, enforce per-user concurrency limits in
+the Streamlit app itself. The circuit breaker and concurrency limiter
+(`app/circuit_breaker.py`) already cap global LLM calls per pod, but
+per-session limits prevent one user from monopolizing a pod:
+
+```python
+# In app/main.py (already implemented via session state):
+# - One concurrent Evaluate run per session (st.session_state['eval_running'])
+# - One concurrent Draft run per session (st.session_state['draft_running'])
+# - Shutdown gate rejects new runs during drain
+```
+
+These are enforced by the Streamlit rerun model — clicking "Run" while a
+current run is in progress is a no-op (the button is disabled). For
+additional server-side enforcement:
+
+| Limit | Mechanism | Default |
+|---|---|---|
+| Concurrent runs per session | Streamlit button disable + `enter_run()` gate | 1 Evaluate + 1 Draft |
+| Concurrent LLM calls per pod | `VA_LSE_MAX_CONCURRENT_LLM_CALLS` semaphore | 20 |
+| Queue depth before rejection | `VA_LSE_LLM_QUEUE_MAX_DEPTH` | 50 |
+| Circuit breaker failure threshold | `VA_LSE_CB_FAILURE_THRESHOLD` | 3 consecutive failures |
+
+### Monitoring rate-limit rejections
+
+Monitor nginx access logs for `429` responses. Alert if the rejection
+rate exceeds 5% of total traffic:
+
+```bash
+# Count 429s in the last 5 minutes
+tail -n 10000 /var/log/nginx/access.log | \
+  awk -v cutoff="$(date -d '5 minutes ago' '+%d/%b/%Y:%H:%M')" '$4 > "["cutoff' | \
+  grep '" 429 ' | wc -l
+
+# Or with Prometheus + nginx-exporter:
+# rate(nginx_http_requests_total{status="429"}[5m])
+#   / rate(nginx_http_requests_total[5m]) > 0.05
+```
+
+**Recommended alerts:**
+- Warning: 429 rate > 2% of traffic for 5 minutes
+- Critical: 429 rate > 5% of traffic for 2 minutes
+- Info: any single IP hitting 50+ requests/minute (potential abuse)
+
+### Rate-limiting checklist
+
+- [ ] nginx `limit_req_zone` configured for general, action, and upload zones
+- [ ] Health probes (`/health`, `/ready`) are exempt from rate limiting
+- [ ] `429` response includes `Retry-After` header or custom error page
+- [ ] Cloudflare rate-limiting rules mirror nginx config (if using Cloudflare)
+- [ ] Per-user session limits enforced by Streamlit button disable + `enter_run()`
+- [ ] Monitoring dashboard shows 429 rate, top offending IPs, and trends
+- [ ] Alert configured for >5% rejection rate
+
+---
+
+## 12. TLS and reverse proxy
 
 Streamlit cannot set arbitrary HTTP response headers. For production,
 always front the app with a TLS-terminating reverse proxy that adds:
@@ -893,7 +1086,7 @@ server {
 
 ---
 
-## 5. Distributed cache for VA reference data
+## 13. Distributed cache for VA reference data
 
 For multi-instance deployments, VA reference data (condition topics, rating
 tables) benefits from a shared cache so every pod serves the same data without

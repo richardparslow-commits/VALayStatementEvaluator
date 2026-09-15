@@ -573,6 +573,31 @@ Both guards are also wired into `DEPLOYMENT.md` scaling guidance: with 100
 users the per-pod timeout and memory limits prevent one user's runaway
 process from destabilizing shared infrastructure.
 
+## Rate limiting (reverse proxy)
+
+Streamlit has no built-in HTTP rate limiting. For production deployments,
+configure rate limiting at the reverse proxy layer (nginx, Cloudflare, or
+your load balancer) to protect the app from request floods.
+
+| Zone | Rate | Burst | Protects |
+|---|---|---|---|
+| **General** | 100 req/min per IP | 20 | Page loads, static assets |
+| **Actions** | 10 req/min per IP | 5 | Evaluate/Draft runs (expensive LLM calls) |
+| **Uploads** | 20 req/min per IP | 5 | File uploads (CPU-bound PDF extraction) |
+
+Health probes (`/health`, `/ready`) are **never** rate-limited — orchestrators
+need them for load-balancing decisions.
+
+```bash
+# Verify rate limiting is active
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/  # 200
+# Flood test (should get 429s after burst)
+for i in $(seq 1 30); do curl -s -o /dev/null -w "%{http_code} " http://localhost:8080/; done
+```
+
+See `DEPLOYMENT.md → Rate limiting` for full nginx config, Cloudflare page
+rules, per-user session limits, and alerting thresholds.
+
 ## Distributed cache (VA reference data)
 
 For multi-instance deployments, condition topics and other VA reference data
