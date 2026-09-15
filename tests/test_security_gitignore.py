@@ -139,6 +139,18 @@ class TestPreCommitHook(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td)
             subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True)
+            subprocess.run(
+                ["git", "config", "user.name", "Test User"],
+                cwd=str(repo),
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.com"],
+                cwd=str(repo),
+                check=True,
+                capture_output=True,
+            )
             (repo / "README.md").write_text("hello\n")
             subprocess.run(["git", "add", "README.md"], cwd=str(repo), check=True)
             subprocess.run(

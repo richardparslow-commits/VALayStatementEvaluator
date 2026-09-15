@@ -4,6 +4,10 @@ Regression coverage for the QwenCloud/Aliyun ``data_inspection_failed`` content
 filter: it rejects the *model output* stochastically with HTTP 400, retrying
 cannot fix it, and the user used to see only a generic "Drafting failed" error.
 No network — the OpenAI client stub raises the simulated provider exceptions.
+
+Uses the merged error taxonomy (``LLMUpstreamError`` with ``retriable`` /
+``status_code`` / ``upstream_request_id``) plus the moderation-specific
+``_ModerationFilteredError`` and one-shot clinical-tone nudge.
 """
 
 from __future__ import annotations
@@ -20,9 +24,13 @@ from app.llm import (  # noqa: E402
     MODERATION_NUDGE_MAX_USER_CHARS,
     LLMClient,
     LLMError,
-    _classify_provider_error,
-    _error_status_code,
+    LLMTimeoutError,
+    LLMUpstreamError,
+    _is_moderation_filtered,
+    _is_transient_provider_error,
     _moderation_nudge_user,
+    _normalize_provider_error,
+    _provider_status_code,
 )
 
 
@@ -51,33 +59,55 @@ def _client_with_create_raises(exc: Exception) -> tuple[LLMClient, MagicMock]:
     return client, create_mock
 
 
-class TestClassifyProviderError(unittest.TestCase):
+class TestNormalizeProviderError(unittest.TestCase):
+    """The merged taxonomy: moderation / timeout / transient / deterministic."""
+
     def test_moderation_by_code(self):
         exc = _ProviderError(
             "Error code: 400 - {'error': {'code': 'data_inspection_failed', "
             "'message': 'Output data may contain inappropriate content.'}}",
             status_code=400,
         )
-        self.assertEqual(_classify_provider_error(exc), "moderation")
+        normalized = _normalize_provider_error(exc)
+        self.assertIsInstance(normalized, LLMUpstreamError)
+        self.assertFalse(normalized.retriable)
+        self.assertTrue(_is_moderation_filtered(exc))
+        self.assertIn("content filter", str(normalized))
 
     def test_moderation_by_message_without_status(self):
         exc = _ProviderError("Output data may contain inappropriate content.")
-        self.assertEqual(_classify_provider_error(exc), "moderation")
+        self.assertTrue(_is_moderation_filtered(exc))
 
-    def test_client_4xx_without_429(self):
-        self.assertEqual(_classify_provider_error(_ProviderError("bad key", 401)), "client")
-        self.assertEqual(_classify_provider_error(_ProviderError("no model", 404)), "client")
-        self.assertEqual(_classify_provider_error(_ProviderError("bad request", 400)), "client")
+    def test_timeout_maps_to_llm_timeout_error(self):
+        normalized = _normalize_provider_error(TimeoutError("timed out"))
+        self.assertIsInstance(normalized, LLMTimeoutError)
+        self.assertTrue(normalized.retriable)
 
-    def test_429_and_5xx_and_transport_retry(self):
-        self.assertEqual(_classify_provider_error(_ProviderError("rate limited", 429)), "retry")
-        self.assertEqual(_classify_provider_error(_ProviderError("server oops", 503)), "retry")
-        self.assertEqual(_classify_provider_error(RuntimeError("connection reset")), "retry")
-        self.assertEqual(_classify_provider_error(TimeoutError("timed out")), "retry")
+    def test_deterministic_4xx_not_retriable(self):
+        for status in (400, 401, 404):
+            normalized = _normalize_provider_error(_ProviderError("nope", status))
+            self.assertIsInstance(normalized, LLMUpstreamError)
+            self.assertFalse(normalized.retriable)
+            self.assertEqual(normalized.status_code, status)
+
+    def test_429_and_5xx_and_transport_retriable(self):
+        for exc in (
+            _ProviderError("rate limited", 429),
+            _ProviderError("server oops", 503),
+            RuntimeError("connection reset"),
+        ):
+            normalized = _normalize_provider_error(exc)
+            self.assertTrue(normalized.retriable, msg=str(exc))
+
+    def test_transient_classification(self):
+        self.assertTrue(_is_transient_provider_error(_ProviderError("x", 503)))
+        self.assertTrue(_is_transient_provider_error(_ProviderError("x", 429)))
+        self.assertFalse(_is_transient_provider_error(_ProviderError("x", 401)))
+        self.assertFalse(_is_transient_provider_error(_ProviderError("x", 404)))
 
     def test_status_extraction(self):
-        self.assertEqual(_error_status_code(_ProviderError("x", 418)), 418)
-        self.assertIsNone(_error_status_code(RuntimeError("no status")))
+        self.assertEqual(_provider_status_code(_ProviderError("x", 418)), 418)
+        self.assertIsNone(_provider_status_code(RuntimeError("no status")))
 
 
 class TestModerationNudgeScope(unittest.TestCase):

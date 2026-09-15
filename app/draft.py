@@ -10,6 +10,7 @@ import time
 
 from .agiloop_telemetry import track_feature_error
 from .config import load_knowledge
+from .drafting_service import error_extra, map_drafting_exception, validate_drafting_request
 from .documents import (
     DRAFT_INTERNAL_MAX_CHARS,
     ExtractedDocument,
@@ -201,6 +202,12 @@ def run_draft(
         extra={"request_id": rid, "phase": "draft_pipeline", "status": "start"},
     )
     try:
+        validate_drafting_request(
+            observations=observations,
+            condition=condition,
+            claim_type=claim_type,
+            witness=witness,
+        )
         result = _run_draft(llm, records, witness, observations, condition, claim_type, progress)
         duration_ms = int((time.perf_counter() - t0) * 1000)
         logger.info(
@@ -212,16 +219,24 @@ def run_draft(
         )
         return result
     except Exception as exc:  # noqa: BLE001 - feature-error boundary
+        mapped = map_drafting_exception(exc, request_id=rid, phase="draft_pipeline")
         duration_ms = int((time.perf_counter() - t0) * 1000)
         logger.error(
             "draft error duration_ms=%d error=%s",
             duration_ms,
-            f"{type(exc).__name__}: {exc}",
+            mapped.diagnostics,
             exc_info=exc,
-            extra={"request_id": rid, "phase": "draft_pipeline", "status": "error", "duration_ms": duration_ms, "error_class": type(exc).__name__},
+            extra={
+                "request_id": rid,
+                "phase": "draft_pipeline",
+                "status": "error",
+                "duration_ms": duration_ms,
+                "error_class": type(exc).__name__,
+                **error_extra(mapped),
+            },
         )
         track_feature_error(FEATURE_ID, exc)
-        raise
+        raise mapped from exc
 
 
 def _truncate_for_prompt(text: str, limit: int = DRAFT_INTERNAL_MAX_CHARS) -> tuple[str, int]:
@@ -266,53 +281,62 @@ def _run_draft(
     with PhaseTimer(logger, "records:review", request_id=rid, chunks=len(records)):
         with phase_timer("records:review"):
             report(0.02, "Step 1/4 — Exhaustive review of medical records…")
-            result.digest = review_medical_records(
-                llm, records, progress=lambda f, m: progress((0.02 + f * 0.45), m) if progress else None
-            )
+            try:
+                result.digest = review_medical_records(
+                    llm, records, progress=lambda f, m: progress((0.02 + f * 0.45), m) if progress else None
+                )
+            except Exception as exc:  # noqa: BLE001
+                raise map_drafting_exception(exc, request_id=rid, phase="records:review") from exc
 
     with PhaseTimer(logger, "grounding", request_id=rid):
         with phase_timer("grounding"):
             report(0.5, "Step 2/4 — Grounding witness observations against the records and topic checklist…")
             grounding_query = f"{condition} {obs_for_prompt}"
-            result.grounding = llm.chat_json(
-                GROUNDING_SYSTEM,
-                GROUNDING_USER.format(
-                    condition=sanitize_for_prompt(condition, max_chars=500),
-                    claim_type=sanitize_for_prompt(claim_type, max_chars=500),
-                    relationship=sanitize_for_prompt(witness.get("relationship", "not specified"), max_chars=500),
-                    observations=sanitize_for_prompt(obs_for_prompt, max_chars=DRAFT_INTERNAL_MAX_CHARS),
-                    digest=sanitize_digest_text(result.digest.relevant_facts_text(grounding_query, max_facts=150), max_chars=120_000),
-                    checklist=load_knowledge("topic_checklist.md"),
-                    guard_note=GUARD_NOTE,
-                ),
-                phase="grounding",
-            )
+            try:
+                result.grounding = llm.chat_json(
+                    GROUNDING_SYSTEM,
+                    GROUNDING_USER.format(
+                        condition=sanitize_for_prompt(condition, max_chars=500),
+                        claim_type=sanitize_for_prompt(claim_type, max_chars=500),
+                        relationship=sanitize_for_prompt(witness.get("relationship", "not specified"), max_chars=500),
+                        observations=sanitize_for_prompt(obs_for_prompt, max_chars=DRAFT_INTERNAL_MAX_CHARS),
+                        digest=sanitize_digest_text(result.digest.relevant_facts_text(grounding_query, max_facts=150), max_chars=120_000),
+                        checklist=load_knowledge("topic_checklist.md"),
+                        guard_note=GUARD_NOTE,
+                    ),
+                    phase="grounding",
+                )
+            except Exception as exc:  # noqa: BLE001
+                raise map_drafting_exception(exc, request_id=rid, phase="grounding") from exc
 
     with PhaseTimer(logger, "draft", request_id=rid):
         with phase_timer("draft"):
             report(0.68, "Step 3/4 — Drafting the statement…")
-            result.draft = llm.chat(
-                DRAFT_SYSTEM_TEMPLATE.format(
-                    guide=load_knowledge("drafting_guide.md"),
-                    checklist=load_knowledge("topic_checklist.md"),
-                ),
-                DRAFT_USER.format(
-                    witness_name=sanitize_for_prompt(witness.get("name", "[Witness Name]"), max_chars=500),
-                    relationship=sanitize_for_prompt(witness.get("relationship", "[relationship]"), max_chars=500),
-                    known_since=sanitize_for_prompt(witness.get("known_since", "[how long known]"), max_chars=500),
-                    contact_frequency=sanitize_for_prompt(witness.get("contact_frequency", "[frequency of contact]"), max_chars=500),
-                    veteran_name=sanitize_for_prompt(witness.get("veteran_name", "[Veteran Name]"), max_chars=500),
-                    condition=sanitize_for_prompt(condition, max_chars=500),
-                    claim_type=sanitize_for_prompt(claim_type, max_chars=500),
-                    witnessed_event=sanitize_for_prompt(witness.get("witnessed_event", "unknown"), max_chars=500),
-                    observations=sanitize_for_prompt(obs_for_prompt, max_chars=DRAFT_INTERNAL_MAX_CHARS),
-                    grounding=sanitize_for_prompt(_json_dumps(result.grounding), max_chars=25_000),
-                    digest_summary=sanitize_digest_text(result.digest.summary or "(no summary)", max_chars=20_000),
-                    guard_note=GUARD_NOTE,
-                ),
-                max_tokens=6000,
-                phase="draft",
-            )
+            try:
+                result.draft = llm.chat(
+                    DRAFT_SYSTEM_TEMPLATE.format(
+                        guide=load_knowledge("drafting_guide.md"),
+                        checklist=load_knowledge("topic_checklist.md"),
+                    ),
+                    DRAFT_USER.format(
+                        witness_name=sanitize_for_prompt(witness.get("name", "[Witness Name]"), max_chars=500),
+                        relationship=sanitize_for_prompt(witness.get("relationship", "[relationship]"), max_chars=500),
+                        known_since=sanitize_for_prompt(witness.get("known_since", "[how long known]"), max_chars=500),
+                        contact_frequency=sanitize_for_prompt(witness.get("contact_frequency", "[frequency of contact]"), max_chars=500),
+                        veteran_name=sanitize_for_prompt(witness.get("veteran_name", "[Veteran Name]"), max_chars=500),
+                        condition=sanitize_for_prompt(condition, max_chars=500),
+                        claim_type=sanitize_for_prompt(claim_type, max_chars=500),
+                        witnessed_event=sanitize_for_prompt(witness.get("witnessed_event", "unknown"), max_chars=500),
+                        observations=sanitize_for_prompt(obs_for_prompt, max_chars=DRAFT_INTERNAL_MAX_CHARS),
+                        grounding=sanitize_for_prompt(_json_dumps(result.grounding), max_chars=25_000),
+                        digest_summary=sanitize_digest_text(result.digest.summary or "(no summary)", max_chars=20_000),
+                        guard_note=GUARD_NOTE,
+                    ),
+                    max_tokens=6000,
+                    phase="draft",
+                )
+            except Exception as exc:  # noqa: BLE001
+                raise map_drafting_exception(exc, request_id=rid, phase="draft") from exc
 
     with PhaseTimer(logger, "review", request_id=rid):
         with phase_timer("review"):
@@ -328,7 +352,7 @@ def _run_draft(
                     ),
                     phase="review",
                 )
-            except LLMError as exc:
+            except Exception as exc:  # noqa: BLE001
                 # The review pass is cosmetic — grounding and the draft are
                 # already complete. A filter/retry failure here must not
                 # discard the finished draft, so keep it and note the miss.

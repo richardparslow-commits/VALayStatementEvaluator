@@ -22,6 +22,7 @@ Usage::
 """
 from __future__ import annotations
 
+import contextvars
 import logging
 import os
 import statistics
@@ -40,11 +41,20 @@ logger = logging.getLogger("app.profiler")
 # ---------------------------------------------------------------------------
 
 _ENABLED: bool = os.getenv("VA_LSE_PROFILE_RUNS", "").strip() in ("1", "true", "True", "yes")
+_current_run_var: contextvars.ContextVar["RunProfiler | None"] = contextvars.ContextVar(
+    "va_lse_run_profiler",
+    default=None,
+)
 
 
 def is_enabled() -> bool:
     """Return True when profiling is active (VA_LSE_PROFILE_RUNS=1)."""
-    return _ENABLED
+    try:
+        from . import config as _config
+
+        return bool(getattr(_config, "PROFILE_RUNS", False) or _ENABLED)
+    except Exception:  # noqa: BLE001
+        return _ENABLED
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +106,7 @@ class RunProfiler:
     workers: list[WorkerTiming] = field(default_factory=list)
     run_start_mono: float = 0.0
     run_end_mono: float = 0.0
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     @property
     def total_duration_ms(self) -> float:
@@ -119,6 +130,23 @@ class RunProfiler:
         for phase, durations in by_phase.items():
             result[phase] = _percentile_stats(durations)
         return result
+
+    def add_phase_timing(self, phase: str, start_mono: float, end_mono: float) -> None:
+        with self._lock:
+            self.phases.append(
+                PhaseTiming(phase=phase, start_mono=start_mono, end_mono=end_mono)
+            )
+
+    def add_worker_timing(self, phase: str, index: int, start_mono: float, end_mono: float) -> None:
+        with self._lock:
+            self.workers.append(
+                WorkerTiming(
+                    phase=phase,
+                    index=index,
+                    start_mono=start_mono,
+                    end_mono=end_mono,
+                )
+            )
 
     def emit(self) -> None:
         """Log the full profiling summary at INFO level."""
@@ -272,6 +300,22 @@ def reset_profiler_for_tests() -> None:
     global _profiler  # noqa: PLW0603
     with _lock:
         _profiler = None
+    _current_run_var.set(None)
+
+
+def get_current_run_profiler() -> RunProfiler | None:
+    """Return the currently bound run profiler, if any."""
+    return _current_run_var.get()
+
+
+@contextmanager
+def bind_run_profiler(run: RunProfiler | None) -> Generator[None, None, None]:
+    """Bind a run profiler to the current context for nested timers."""
+    token = _current_run_var.set(run)
+    try:
+        yield
+    finally:
+        _current_run_var.reset(token)
 
 
 # ---------------------------------------------------------------------------
@@ -281,12 +325,15 @@ def reset_profiler_for_tests() -> None:
 @contextmanager
 def phase_timer(phase: str) -> Generator[None, None, None]:
     """Time a pipeline phase.  Only active when ``VA_LSE_PROFILE_RUNS=1``."""
-    if not _ENABLED:
+    if not is_enabled():
         yield
         return
     start = time.monotonic()
     yield
     end = time.monotonic()
+    run = get_current_run_profiler()
+    if run is not None:
+        run.add_phase_timing(phase, start, end)
     try:
         from .logging_config import get_request_id
         rid = get_request_id() or "-"
@@ -308,12 +355,15 @@ def phase_timer(phase: str) -> Generator[None, None, None]:
 @contextmanager
 def worker_timer(phase: str, *, index: int = 0) -> Generator[None, None, None]:
     """Time a single worker invocation (e.g. one chunk digest)."""
-    if not _ENABLED:
+    if not is_enabled():
         yield
         return
     start = time.monotonic()
     yield
     end = time.monotonic()
+    run = get_current_run_profiler()
+    if run is not None:
+        run.add_worker_timing(phase, index, start, end)
     try:
         from .logging_config import get_request_id
         rid = get_request_id() or "-"

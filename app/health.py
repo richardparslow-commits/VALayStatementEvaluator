@@ -139,7 +139,7 @@ def _cached_readiness(*, force: bool = False) -> tuple[bool, str]:
     return ready, detail
 
 
-def _health_payload() -> dict[str, Any]:
+def _health_payload(*, probe_cache: bool = False) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "status": "ok",
         "service": "va-lay-statement-evaluator",
@@ -150,7 +150,7 @@ def _health_payload() -> dict[str, Any]:
     try:
         from .shared_cache import get_cache as _gc
         cache = _gc()
-        payload["cache"] = cache.health()
+        payload["cache"] = cache.health(probe=probe_cache)
     except Exception:  # noqa: BLE001
         payload["cache"] = {"backend": "unavailable"}
     return payload

@@ -6,12 +6,14 @@ import json
 import logging
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 from openai import OpenAI
 
 from .circuit_breaker import CircuitBreakerOpenError, QueueFullError, get_llm_breaker, get_llm_limiter
 from .config import Settings
 from .logging_config import get_request_id
+from .prompt_sanitize import validate_model_name
 from .usage import UsageTracker
 
 try:
@@ -24,10 +26,21 @@ except ImportError:  # pragma: no cover - httpx not always installed in tests
 logger = logging.getLogger("app.llm")
 
 # Re-export for callers that want to catch these specifically.
-__all__ = ["LLMClient", "LLMError", "CircuitBreakerOpenError", "QueueFullError", "check_model_availability"]
+__all__ = [
+    "LLMClient",
+    "LLMError",
+    "LLMConfigurationError",
+    "LLMUpstreamError",
+    "LLMTimeoutError",
+    "LLMParseError",
+    "CircuitBreakerOpenError",
+    "QueueFullError",
+    "check_model_availability",
+]
 
 MAX_RETRIES = 3
-RETRY_BACKOFF_SECONDS = 2.0
+RETRY_BACKOFF_SECONDS = 1.0
+MAX_RETRY_BACKOFF_SECONDS = 4.0
 MODELS_ENDPOINT_TIMEOUT_SECONDS = 6
 
 # ---------------------------------------------------------------- moderation filter
@@ -65,51 +78,22 @@ _MODERATION_MARKERS = (
 
 def _error_status_code(exc: BaseException) -> int | None:
     """Best-effort HTTP status extraction from an OpenAI SDK exception."""
-    status = getattr(exc, "status_code", None)
-    if isinstance(status, int):
+    status = _provider_status_code(exc)
+    if status is not None:
         return status
-    # Some SDK versions expose .response.status_code instead.
-    response = getattr(exc, "response", None)
-    resp_status = getattr(response, "status_code", None)
-    if isinstance(resp_status, int):
-        return resp_status
     return None
 
 
-def _classify_provider_error(exc: BaseException) -> str:
-    """Classify a provider exception as 'moderation', 'client', or 'retry'.
+def _is_moderation_filtered(exc: BaseException) -> bool:
+    """True when the provider's content-moderation filter rejected the call.
 
-    * ``moderation`` — content-filter rejection (data_inspection_failed or
-      explicit filter wording). Never retried.
-    * ``client``    — other deterministic HTTP 4xx (bad key, bad model id,
-      malformed request). Never retried; retrying cannot change the answer.
-    * ``retry``     — everything else (5xx, timeouts, connection errors, 429s).
+    Matched by the gateway's error code/message (``data_inspection_failed``,
+    "inappropriate content", …) rather than status alone — see the module
+    comment above ``_MODERATION_MARKERS`` for why.
     """
     text = str(exc).lower()
-    if any(marker in text for marker in _MODERATION_MARKERS):
-        return "moderation"
-    status = _error_status_code(exc)
-    if status is not None and 400 <= status < 500 and status != 429:
-        return "client"
-    return "retry"
+    return any(marker in text for marker in _MODERATION_MARKERS)
 
-
-def _rewritten_error(exc: Exception, classification: str) -> Exception:
-    """Return the exception the retry loop should carry forward.
-
-    Moderation 400s get an actionable rewrite; other client 4xxs
-    keep their original text (already specific). Network/5xx errors pass
-    through unchanged for normal retry handling.
-    """
-    if classification == "moderation":
-        return _ModerationFilteredError(
-            "The LLM provider's content filter rejected this run "
-            "(HTTP 400 data_inspection_failed). Medical/trauma wording in the "
-            "draft triggers it intermittently — this is not a bug in your input. "
-            "Retry the run; if it keeps failing, rewording the observations "
-            "(fewer graphic injury details) usually clears it."
-        )
-    return exc
 
 
 # One output-filter rejection gets exactly one rephrased retry: the filter
@@ -193,12 +177,201 @@ class LLMError(RuntimeError):
     """Raised when the LLM call ultimately fails or returns unusable output."""
 
 
-class _ModerationFilteredError(LLMError):
+class LLMConfigurationError(LLMError):
+    """Raised when runtime LLM settings are missing or malformed."""
+
+
+class LLMUpstreamError(LLMError):
+    """Raised when the upstream LLM provider fails or rejects the request."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retriable: bool = False,
+        status_code: int | None = None,
+        upstream_request_id: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.retriable = retriable
+        self.status_code = status_code
+        self.upstream_request_id = upstream_request_id
+
+
+class LLMTimeoutError(LLMUpstreamError):
+    """Raised when the upstream LLM call times out."""
+
+
+class LLMParseError(LLMError):
+    """Raised when the model response cannot be parsed into the expected format."""
+
+
+class _ModerationFilteredError(LLMUpstreamError):
     """Provider content filter rejected the request or output (HTTP 400).
 
-    Non-retryable: identical input reproduces the rejection. Raised with an
-    actionable, PII-free message for the UI.
+    Non-retryable as-is: identical input reproduces the rejection. The retry
+    loop may still take the one-shot clinical-tone nudge (see
+    ``_moderation_nudge_user``), which rephrases the prompt and retries.
+    Carries an actionable, PII-free message for the UI.
     """
+
+
+# ------------------------------------------------------------------ config helpers
+def _configured_timeout_seconds() -> float:
+    try:
+        from . import config as _cfg
+
+        timeout_seconds = float(getattr(_cfg, "LLM_CALL_TIMEOUT_SECONDS", 300))
+    except (TypeError, ValueError):
+        raise LLMConfigurationError(
+            "LLM call timeout must be a positive number (VA_LSE_LLM_CALL_TIMEOUT_SECONDS)."
+        ) from None
+    if timeout_seconds <= 0:
+        raise LLMConfigurationError(
+            "LLM call timeout must be greater than 0 seconds (VA_LSE_LLM_CALL_TIMEOUT_SECONDS)."
+        )
+    return max(1.0, timeout_seconds)
+
+
+def _validate_settings(settings: Settings) -> None:
+    if not settings.configured:
+        raise LLMConfigurationError(
+            "No API key configured. Add your key in the sidebar or in a .env file."
+        )
+    base_url = (getattr(settings, "base_url", "") or "").strip()
+    parsed = urlparse(base_url)
+    if not base_url or parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise LLMConfigurationError(
+            "Base URL must be a valid http(s) URL for an OpenAI-compatible endpoint."
+        )
+    for label, model in (
+        ("Main model", getattr(settings, "model_main", "")),
+        ("Fast model", getattr(settings, "model_fast", "")),
+    ):
+        msg = validate_model_name(str(model or ""))
+        if msg:
+            raise LLMConfigurationError(f"{label}: {msg}")
+
+
+def _provider_status_code(exc: BaseException) -> int | None:
+    value = getattr(exc, "status_code", None)
+    if value is None:
+        return None
+    try:
+        status_code = int(value)
+    except (TypeError, ValueError):
+        return None
+    return status_code if status_code > 0 else None
+
+
+def _provider_request_id(exc: BaseException) -> str:
+    for attr in ("request_id", "requestId"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers:
+        for key in ("x-request-id", "request-id", "openai-request-id"):
+            value = headers.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def _is_timeout_error(exc: BaseException) -> bool:
+    if isinstance(exc, _HttpxTimeoutError) or isinstance(exc, TimeoutError):
+        return True
+    return type(exc).__name__.endswith("TimeoutError")
+
+
+def _is_transient_status(status_code: int | None) -> bool:
+    return bool(
+        status_code is not None and (status_code in {408, 409, 425, 429} or 500 <= status_code < 600)
+    )
+
+
+def _is_transient_provider_error(exc: BaseException) -> bool:
+    """True when retrying the same request could plausibly succeed."""
+    if _is_timeout_error(exc):
+        return True
+    if isinstance(exc, (ConnectionError, OSError)):
+        return True
+    status_code = _provider_status_code(exc)
+    if status_code is not None:
+        return _is_transient_status(status_code)
+    name = type(exc).__name__.lower()
+    if any(token in name for token in ("badrequest", "authentication", "permission", "notfound", "unprocessable")):
+        return False
+    if any(token in name for token in ("timeout", "ratelimit", "apiconnection", "serviceunavailable", "internalserver")):
+        return True
+    return True
+
+
+def _provider_details(exc: BaseException) -> str:
+    details = [f"{type(exc).__name__}: {exc}"]
+    status_code = _provider_status_code(exc)
+    if status_code is not None:
+        details.append(f"status={status_code}")
+    upstream_request_id = _provider_request_id(exc)
+    if upstream_request_id:
+        details.append(f"upstream_request_id={upstream_request_id}")
+    return "; ".join(details)
+
+
+def _normalize_provider_error(exc: Exception) -> LLMError:
+    """Map a raw provider exception onto the LLM error taxonomy.
+
+    Content-filter rejections (``data_inspection_failed`` or explicit filter
+    wording) map to :class:`_ModerationFilteredError` with an actionable,
+    PII-free message and ``retriable=False`` — the retry loop may still take
+    its one-shot tone nudge, but blind retries of a deterministic 400 are
+    pointless. Everything else keeps the remote taxonomy: timeouts →
+    ``LLMTimeoutError`` (retriable), transient statuses/connection errors →
+    retriable ``LLMUpstreamError``, deterministic rejections →
+    non-retriable ``LLMUpstreamError``.
+    """
+    status_code = _provider_status_code(exc)
+    upstream_request_id = _provider_request_id(exc)
+    details = _provider_details(exc)
+    if _is_moderation_filtered(exc):
+        return _ModerationFilteredError(
+            "The LLM provider's content filter rejected this run "
+            "(HTTP 400 data_inspection_failed). Medical/trauma wording in the "
+            "draft triggers it intermittently — this is not a bug in your input. "
+            "Retry the run; if it keeps failing, rewording the observations "
+            "(fewer graphic injury details) usually clears it.",
+            retriable=False,
+            status_code=status_code,
+            upstream_request_id=upstream_request_id,
+        )
+    if _is_timeout_error(exc):
+        timeout_seconds = int(_configured_timeout_seconds())
+        return LLMTimeoutError(
+            f"LLM call timed out after {timeout_seconds}s — the endpoint did not respond in time. "
+            f"Try again or raise VA_LSE_LLM_CALL_TIMEOUT_SECONDS. ({details})",
+            retriable=True,
+            status_code=status_code,
+            upstream_request_id=upstream_request_id,
+        )
+    retriable = _is_transient_provider_error(exc)
+    if retriable:
+        return LLMUpstreamError(
+            f"Transient LLM provider error — retry may succeed. ({details})",
+            retriable=True,
+            status_code=status_code,
+            upstream_request_id=upstream_request_id,
+        )
+    return LLMUpstreamError(
+        f"LLM provider rejected the request — check model, endpoint, and payload settings. ({details})",
+        retriable=False,
+        status_code=status_code,
+        upstream_request_id=upstream_request_id,
+    )
+
+
+def _retry_backoff_seconds(attempt: int) -> float:
+    return min(MAX_RETRY_BACKOFF_SECONDS, RETRY_BACKOFF_SECONDS * (2.0 ** attempt))
 
 
 class LLMClient:
@@ -214,19 +387,9 @@ class LLMClient:
     """
 
     def __init__(self, settings: Settings) -> None:
-        if not settings.configured:
-            raise LLMError(
-                "No API key configured. Add your key in the sidebar or in a .env file."
-            )
+        _validate_settings(settings)
         self._settings = settings
-        # Per-call timeout so a hung LLM call cannot block graceful shutdown
-        # forever. Tuned via VA_LSE_LLM_CALL_TIMEOUT_SECONDS (default 300 s / 5 min).
-        try:
-            from . import config as _cfg  # local import to avoid cycle
-
-            _timeout_s = float(getattr(_cfg, "LLM_CALL_TIMEOUT_SECONDS", 300))
-        except Exception:  # noqa: BLE001
-            _timeout_s = 300.0
+        _timeout_s = _configured_timeout_seconds()
         self._client = OpenAI(
             api_key=settings.api_key, base_url=settings.base_url, timeout=max(1.0, _timeout_s)
         )
@@ -330,12 +493,13 @@ class LLMClient:
                     # Never count limiter/breaker rejections as endpoint failures.
                     raise
                 except Exception as exc:  # noqa: BLE001 - retry on any provider error
-                    # Classify first: deterministic 4xxs (content-filter 400s,
-                    # bad key/model) must not be retried — identical input
-                    # reproduces them, so retries only burn credits and delay
-                    # the user's error by ~12 s of backoff.
-                    classification = _classify_provider_error(exc)
-                    exc = _rewritten_error(exc, classification)
+                    # Normalize onto the error taxonomy. Deterministic failures
+                    # (moderation filter 400s, bad key/model, malformed request)
+                    # come back with retriable=False — identical input would
+                    # reproduce them, so retrying only burns credits and delays
+                    # the user's error by seconds of backoff.
+                    normalized = exc if isinstance(exc, LLMError) else _normalize_provider_error(exc)
+                    retriable = bool(getattr(normalized, "retriable", False))
 
                     # One-shot moderation nudge (see _moderation_nudge_user):
                     # on the first output-filter rejection, retry once with a
@@ -343,7 +507,7 @@ class LLMClient:
                     # away. Exactly one nudge per chat call, small prompts only.
                     nudge_next = False
                     if (
-                        classification == "moderation"
+                        isinstance(normalized, _ModerationFilteredError)
                         and attempt < MAX_RETRIES - 1
                         and not nudged
                     ):
@@ -353,41 +517,16 @@ class LLMClient:
                             user_len = len(user)
                             nudged = True
                             nudge_next = True
+                            # The nudged retry is a genuine second chance, so
+                            # the filter rejection itself stays retriable for
+                            # exactly this one follow-up attempt.
+                            retriable = True
 
-                    # Detect per-call timeout (httpx/APITimeoutError or stdlib TimeoutError)
-                    # and surface a clear, user-visible message. Timeout is not
-                    # special-cased for breaker counting — it is a logical call
-                    # failure like any other provider error, but the message names
-                    # the configured timeout so the user can tune it.
-                    is_timeout = isinstance(exc, _HttpxTimeoutError) or isinstance(
-                        exc, TimeoutError
-                    )
-                    # OpenAI SDK wraps httpx timeouts in APITimeoutError which
-                    # ends with "TimeoutError" in its class name even when httpx
-                    # is not importable directly.
-                    if not is_timeout and type(exc).__name__.endswith("TimeoutError"):
-                        is_timeout = True
-                    if is_timeout:
-                        try:
-                            from . import config as _cfg2
-
-                            _ts = int(getattr(_cfg2, "LLM_CALL_TIMEOUT_SECONDS", 300))
-                        except Exception:  # noqa: BLE001
-                            _ts = 300
-                        # Rewrite to a concise, actionable message for the UI.
-                        exc = LLMError(
-                            f"LLM call timed out after {_ts}s — the endpoint did not respond in time. "
-                            f"Try again or raise VA_LSE_LLM_CALL_TIMEOUT_SECONDS. ({type(exc).__name__}: {exc})"
-                        )
-                    last_error = exc
+                    last_error = normalized
                     duration_ms = int((time.perf_counter() - attempt_t0) * 1000)
-                    is_last = (
-                        attempt >= MAX_RETRIES - 1
-                        or classification == "client"
-                        or (classification == "moderation" and not nudge_next)
-                    )
+                    is_last = attempt >= MAX_RETRIES - 1 or not retriable
                     logger.log(
-                        logging.ERROR if is_last else logging.WARNING,
+                        logging.ERROR if is_last and not nudge_next else logging.WARNING,
                         "llm call %s phase=%s model=%s attempt=%d/%d duration_ms=%d error=%s",
                         "failed" if is_last else "retry",
                         phase,
@@ -395,33 +534,53 @@ class LLMClient:
                         attempt + 1,
                         MAX_RETRIES,
                         duration_ms,
-                        f"{type(exc).__name__}: {exc}",
-                        exc_info=exc if is_last else None,
+                        f"{type(normalized).__name__}: {normalized}",
+                        exc_info=exc if is_last and not nudge_next else None,
                         extra={
                             "request_id": rid,
                             "phase": phase,
-                            "status": "error" if is_last else "retry",
+                            "status": "error" if is_last and not nudge_next else "retry",
                             "model": model,
                             "attempt": attempt + 1,
                             "retries": MAX_RETRIES,
                             "duration_ms": duration_ms,
-                            "error_class": type(exc).__name__,
-                            "error_category": "moderation_nudge" if nudge_next else classification,
+                            "error_class": type(normalized).__name__,
+                            "error_category": (
+                                "moderation_nudge" if nudge_next
+                                else "moderation" if isinstance(normalized, _ModerationFilteredError)
+                                else "retry" if retriable else "client"
+                            ),
+                            "retryable": retriable,
+                            "status_code": getattr(normalized, "status_code", None),
+                            "upstream_request_id": getattr(normalized, "upstream_request_id", ""),
                         },
                     )
-                    if is_last:
-                        break
-                    if not nudge_next:
+                    if is_last and not nudge_next:
+                        breaker.record_failure()
+                        raise normalized
+                    if not is_last:
                         # A nudge retry does not sleep: the rejection was
                         # instantaneous, not a load/rate-limit signal.
-                        time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
-            # Exhausted retries (or a non-retryable 4xx) — one logical failure
-            # for the breaker. The final error is preserved verbatim so the UI
-            # shows the specific cause (moderation filter, auth, model id…)
-            # instead of a generic "call failed" wrapper.
+                        if not nudge_next:
+                            time.sleep(_retry_backoff_seconds(attempt))
+            # Exhausted retries — counts as one logical failure for the breaker.
             breaker.record_failure()
+            if isinstance(last_error, LLMTimeoutError):
+                raise LLMTimeoutError(
+                    f"LLM call failed after {MAX_RETRIES} attempts: {last_error}",
+                    retriable=True,
+                    status_code=last_error.status_code,
+                    upstream_request_id=last_error.upstream_request_id,
+                )
             if isinstance(last_error, _ModerationFilteredError):
                 raise last_error
+            if isinstance(last_error, LLMUpstreamError):
+                raise LLMUpstreamError(
+                    f"LLM call failed after {MAX_RETRIES} attempts: {last_error}",
+                    retriable=last_error.retriable,
+                    status_code=last_error.status_code,
+                    upstream_request_id=last_error.upstream_request_id,
+                )
             raise LLMError(f"LLM call failed after {MAX_RETRIES} attempts: {last_error}")
         except (CircuitBreakerOpenError, QueueFullError):
             # Re-raise without counting as a breaker failure and without extra logging
@@ -451,7 +610,12 @@ class LLMClient:
             max_tokens=max_tokens,
             phase=phase,
         )
-        return _parse_json(text)
+        try:
+            return _parse_json(text)
+        except LLMParseError as exc:
+            raise LLMParseError(
+                f"Could not parse JSON for phase '{phase}' (response chars={len(text)})."
+            ) from exc
 
 
 def _parse_json(text: str) -> Any:
@@ -473,4 +637,4 @@ def _parse_json(text: str) -> Any:
                     return json.loads(candidate[start : end + 1])
                 except json.JSONDecodeError:
                     continue
-    raise LLMError(f"Could not parse JSON from model output: {text[:300]}")
+    raise LLMParseError(f"Could not parse JSON from model output (chars={len(text)}).")

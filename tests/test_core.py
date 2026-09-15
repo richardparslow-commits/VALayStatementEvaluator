@@ -696,6 +696,7 @@ class TestUsageTracker(unittest.TestCase):
             api_key = "k"
             base_url = "http://example.invalid"
             model_main = "m"
+            model_fast = "f"
 
         client = LLMClient(_S())
         self.assertIsInstance(client.usage, UsageTracker)

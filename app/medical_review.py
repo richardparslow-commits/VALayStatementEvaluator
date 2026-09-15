@@ -28,7 +28,7 @@ from . import config
 from .documents import Chunk, ExtractedDocument, chunk_page_labelled_text, paragraph_index
 from .llm import LLMClient, LLMError
 from .logging_config import PhaseTimer, get_request_id
-from .profiler import worker_timer
+from .profiler import get_current_run_profiler, worker_timer
 from .prompt_sanitize import GUARD_NOTE, sanitize_for_prompt
 
 logger = logging.getLogger("app.medical_review")
@@ -299,12 +299,15 @@ def review_medical_records(
         )
 
     _ctx_request_id = get_request_id()  # capture for worker threads
+    _ctx_profiler_run = get_current_run_profiler()
 
     def digest_chunk(chunk: Chunk) -> dict[str, object]:
         # Propagate the run's correlation id into the worker thread.
         from .logging_config import _request_id_var  # local import to avoid cycle at import time
+        from .profiler import _current_run_var  # local import to avoid cycle at import time
 
         token = _request_id_var.set(_ctx_request_id)
+        profiler_token = _current_run_var.set(_ctx_profiler_run)
         t0 = time.perf_counter()
         try:
             with worker_timer("digest", index=chunk.index):
@@ -354,6 +357,7 @@ def review_medical_records(
         finally:
             try:
                 _request_id_var.reset(token)
+                _current_run_var.reset(profiler_token)
             except ValueError:
                 pass
 

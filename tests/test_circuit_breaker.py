@@ -29,7 +29,7 @@ from app.circuit_breaker import (  # noqa: E402
     reset_llm_limiter,
 )
 from app.config import Settings  # noqa: E402
-from app.llm import LLMClient, LLMError  # noqa: E402
+from app.llm import LLMClient, LLMError, LLMUpstreamError  # noqa: E402
 
 
 class _FakeSettings:
@@ -37,6 +37,7 @@ class _FakeSettings:
     api_key = "test-key"
     base_url = "http://example.invalid"
     model_main = "test-model"
+    model_fast = "test-fast-model"
 
 
 def _make_client_with_fake_openai(*, fail_times: int = 0) -> tuple[LLMClient, MagicMock]:
@@ -307,6 +308,34 @@ class TestLLMIntegration(unittest.TestCase):
             self.assertEqual(breaker.state, "OPEN")
         finally:
             self.sleep_patch.start()
+
+    def test_transient_failure_then_success_uses_bounded_exponential_backoff(self) -> None:
+        client = LLMClient(_FakeSettings())  # type: ignore[arg-type]
+        resp = MagicMock()
+        resp.choices = [MagicMock(message=MagicMock(content="ok response"))]
+        resp.usage = None
+        client._client.chat.completions.create = MagicMock(  # type: ignore[attr-defined]
+            side_effect=[TimeoutError("t1"), TimeoutError("t2"), resp]
+        )
+        sleeps: list[float] = []
+        with patch("app.llm.time.sleep", side_effect=lambda seconds: sleeps.append(seconds)):
+            result = client.chat("sys", "user", phase="test")
+        self.assertEqual(result, "ok response")
+        self.assertEqual(sleeps, [1.0, 2.0])
+
+    def test_non_retriable_error_returns_immediately(self) -> None:
+        class _BadRequestError(RuntimeError):
+            status_code = 400
+
+        client = LLMClient(_FakeSettings())  # type: ignore[arg-type]
+        create_mock = MagicMock(side_effect=_BadRequestError("bad request"))
+        client._client.chat.completions.create = create_mock  # type: ignore[attr-defined]
+        with patch("app.llm.time.sleep", return_value=None) as sleep_mock:
+            with self.assertRaises(LLMUpstreamError) as ctx:
+                client.chat("sys", "user", phase="test")
+        self.assertFalse(ctx.exception.retriable)
+        self.assertEqual(create_mock.call_count, 1)
+        sleep_mock.assert_not_called()
 
     def test_queue_full_rejected_without_breaker_failure(self) -> None:
         breaker = reset_llm_breaker(failure_threshold=10, recovery_timeout=60.0)

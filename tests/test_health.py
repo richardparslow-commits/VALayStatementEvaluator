@@ -12,7 +12,7 @@ import urllib.error
 import urllib.request
 from http.client import HTTPConnection
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -76,6 +76,14 @@ class TestHealthPure(unittest.TestCase):
         self.assertGreaterEqual(payload["uptime_s"], 0)
         self.assertIn("T", payload["timestamp"])
         self.assertTrue(payload["timestamp"].endswith("Z"))
+
+    def test_health_payload_does_not_probe_cache(self):
+        fake_cache = Mock()
+        fake_cache.health.return_value = {"backend": "local_lru"}
+        with patch("app.shared_cache.get_cache", return_value=fake_cache):
+            payload = health._health_payload()
+        self.assertEqual(payload["cache"]["backend"], "local_lru")
+        fake_cache.health.assert_called_once_with(probe=False)
 
     def test_ready_payload_ready_true(self):
         payload = health._ready_payload(True, "ready")
@@ -371,6 +379,24 @@ class TestHealthServer(unittest.TestCase):
             self.assertEqual(status, 200)
         finally:
             _cleanup(patcher)
+
+    def test_liveness_does_not_probe_shared_cache(self):
+        health.stop_health_server()
+        fake_cache = Mock()
+        fake_cache.health.return_value = {"backend": "upstash_redis", "reachable": None}
+        cache_patcher = patch("app.shared_cache.get_cache", return_value=fake_cache)
+        cache_patcher.start()
+        server = health.start_health_server(port=0, host="127.0.0.1")
+        assert server is not None
+        time.sleep(0.15)
+        port = server.server_address[1]
+        try:
+            status, payload, _ = _get_json(f"http://127.0.0.1:{port}/health")
+            self.assertEqual(status, 200)
+            self.assertEqual(payload["cache"]["backend"], "upstash_redis")
+            fake_cache.health.assert_called_with(probe=False)
+        finally:
+            _cleanup(cache_patcher)
 
 
 if __name__ == "__main__":
