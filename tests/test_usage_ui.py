@@ -7,6 +7,7 @@ key is needed, and asserts that a run surfaces (a) a live caption line and
 import os
 import sys
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -71,6 +72,17 @@ class _FakeLLM:
 @unittest.skipUnless((PROJECT_ROOT / ".venv").exists(), "requires the project venv")
 class TestUsageUi(unittest.TestCase):
     def setUp(self) -> None:
+        # Keep run-log/audit side effects out of the developer's logs/runs.jsonl:
+        # these AppTest runs would otherwise be indistinguishable from real use.
+        import tempfile
+
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._env_patch = unittest.mock.patch.dict(
+            os.environ, {"VA_LSE_RUN_LOG_DIR": self._tmpdir.name}
+        )
+        self._env_patch.start()
+        self.addCleanup(self._env_patch.stop)
+        self.addCleanup(self._tmpdir.cleanup)
         # Route the watchdog's persisted history to a temp file so test runs
         # don't pollute (or depend on) the real usage_history.json.
         import tempfile
