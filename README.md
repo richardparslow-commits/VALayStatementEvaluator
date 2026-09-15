@@ -573,6 +573,38 @@ Both guards are also wired into `DEPLOYMENT.md` scaling guidance: with 100
 users the per-pod timeout and memory limits prevent one user's runaway
 process from destabilizing shared infrastructure.
 
+## Distributed cache (VA reference data)
+
+For multi-instance deployments, condition topics and other VA reference data
+are cached in a shared backend (Upstash Redis / Vercel KV) so every Streamlit
+pod serves the same data without redundant upstream fetches.  A process-local
+LRU (256 entries) always runs as a fallback so single-instance deployments
+need no Redis.
+
+| Config | Default | Purpose |
+|---|---|---|
+| `VA_LSE_SHARED_CACHE_URL` | *(empty = local LRU only)* | Upstash REST URL (or Vercel KV endpoint) |
+| `VA_LSE_SHARED_CACHE_TOKEN` | *(empty = disabled)* | Authentication token for the REST API |
+| `VA_LSE_SHARED_CACHE_TIMEOUT_SECONDS` | `2` | HTTP timeout per cache call |
+| `VA_LSE_SHARED_CACHE_LOCAL_MAXSIZE` | `256` | Local LRU fallback entries |
+
+**Setup (Upstash free tier):**
+1. Create a Redis database at [console.upstash.com](https://console.upstash.com/)
+2. Copy the **REST URL** and **token** (HTTP API — not the `redis://` URL)
+3. Set the two env vars above
+4. Restart — `GET /health` reports cache backend and hit rate
+
+```bash
+# Quick verify
+curl -s http://localhost:8001/health | python -c "import sys,json; d=json.load(sys.stdin); print(d.get('cache',{}))"
+# Should show {backend: 'upstash_redis', is_shared: true, reachable: true, ...}
+```
+
+**How it works:** Reads check shared first, then local LRU.  Writes populate
+both tiers.  If the shared backend is unreachable the local LRU absorbs
+traffic transparently — the app never hangs on cache I/O.  Hit rates are
+reported in the health endpoint and structured logs.
+
 ## Structured logging (diagnostics & performance traces)
 
 Every Evaluate/Draft run mints a correlation id (`req_…`) stored in `st.session_state` and a

@@ -893,6 +893,54 @@ server {
 
 ---
 
+## 5. Distributed cache for VA reference data
+
+For multi-instance deployments, VA reference data (condition topics, rating
+tables) benefits from a shared cache so every pod serves the same data without
+redundant upstream fetches. The app uses `app/shared_cache.py` — a two-tier
+cache with Upstash Redis as the shared tier and a process-local LRU as fallback.
+
+### Quick setup (Upstash free tier)
+
+```bash
+# 1. Create a Redis database at https://console.upstash.com/
+# 2. Copy the REST URL and token (HTTP API, not the redis:// URL)
+# 3. Add to .env:
+VA_LSE_SHARED_CACHE_URL=https://your-db.upstash.io
+VA_LSE_SHARED_CACHE_TOKEN=AYxx...
+
+# 4. Verify after deploy:
+curl -s http://localhost:8001/health | python -c "import sys,json; d=json.load(sys.stdin); print(d['cache'])"
+# Should show: {backend: 'upstash_redis', is_shared: true, reachable: true, hit_rate: 0.0, ...}
+```
+
+### K8s deployment
+
+```bash
+# Add to your K8s secret:
+kubectl patch secret va-lse-env -p \
+  '{"stringData":{"VA_LSE_SHARED_CACHE_URL":"https://your-db.upstash.io","VA_LSE_SHARED_CACHE_TOKEN":"AYxx..."}}'
+```
+
+### Docker Compose deployment
+
+Add to `docker-compose.yml` environment section:
+```yaml
+environment:
+  - VA_LSE_SHARED_CACHE_URL=https://your-db.upstash.io
+  - VA_LSE_SHARED_CACHE_TOKEN=${VA_LSE_SHARED_CACHE_TOKEN}
+```
+
+### Monitoring
+
+The health endpoint (`GET /health`) includes a `cache` field with:
+- `backend`: `upstash_redis` or `local_lru`
+- `is_shared`: `true`/`false`
+- `reachable`: `true`/`false` (for Upstash)
+- `hits`, `misses`, `hit_rate`, `errors` — effective cache utilization
+
+---
+
 ## Appendix: Checklist for production deployment
 
 - [ ] `.env` is NOT committed to git (see `SECURITY.md`)
@@ -907,3 +955,5 @@ server {
 - [ ] LLM endpoint can handle `N_pods × VA_LSE_MAX_CONCURRENT_LLM_CALLS` concurrent requests
 - [ ] Audit logs (`logs/audit.log`) are retained per your compliance policy
 - [ ] Circuit breaker + concurrency limiter env vars are tuned for your user count
+- [ ] Shared cache (`VA_LSE_SHARED_CACHE_URL/TOKEN`) is configured for multi-instance deployments
+- [ ] Cache hit rate is monitored via `GET /health` → `cache.hit_rate`

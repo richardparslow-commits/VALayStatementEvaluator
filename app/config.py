@@ -230,3 +230,15 @@ LLM_CALL_TIMEOUT_SECONDS = _positive_int_env("VA_LSE_LLM_CALL_TIMEOUT_SECONDS", 
 # ---------------------------------------------------------------------------
 PIPELINE_TIMEOUT_SECONDS = _positive_int_env("VA_LSE_PIPELINE_TIMEOUT_SECONDS", 1800)
 MEMORY_WARN_MB = _positive_int_env("VA_LSE_MEMORY_WARN_MB", 500)
+
+# ---------------------------------------------------------------------------
+# Distributed cache for VA reference data (see app/shared_cache.py).
+# When SHARED_CACHE_URL + SHARED_CACHE_TOKEN are set the app uses Upstash Redis
+# (or any Upstash-compatible HTTP REST endpoint, including Vercel KV) as a
+# shared cache across all Streamlit instances.  A local LRU (256 entries)
+# always runs as a fallback so single-instance deployments need no Redis.
+# ---------------------------------------------------------------------------
+SHARED_CACHE_URL = os.getenv("VA_LSE_SHARED_CACHE_URL", "").strip()
+SHARED_CACHE_TOKEN = os.getenv("VA_LSE_SHARED_CACHE_TOKEN", "").strip()
+SHARED_CACHE_TIMEOUT_SECONDS = float(os.getenv("VA_LSE_SHARED_CACHE_TIMEOUT_SECONDS", "2"))
+SHARED_CACHE_LOCAL_MAXSIZE = _positive_int_env("VA_LSE_SHARED_CACHE_LOCAL_MAXSIZE", 256)

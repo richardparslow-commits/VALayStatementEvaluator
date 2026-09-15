@@ -140,12 +140,20 @@ def _cached_readiness(*, force: bool = False) -> tuple[bool, str]:
 
 
 def _health_payload() -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "status": "ok",
         "service": "va-lay-statement-evaluator",
         "uptime_s": int(time.time() - _STARTED_WALL),
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+    # Include shared cache status when available.
+    try:
+        from .shared_cache import get_cache as _gc
+        cache = _gc()
+        payload["cache"] = cache.health()
+    except Exception:  # noqa: BLE001
+        payload["cache"] = {"backend": "unavailable"}
+    return payload
 
 
 def _ready_payload(ready: bool, detail: str) -> dict[str, Any]:

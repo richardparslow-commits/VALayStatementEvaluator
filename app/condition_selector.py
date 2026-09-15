@@ -50,9 +50,24 @@ TOPIC_LABELS: dict[str, str] = {
 
 @lru_cache(maxsize=1)
 def _load_condition_topics() -> dict[str, Any]:
+    # Check shared cache first (condition_topics rarely changes).
+    try:
+        from .shared_cache import get_cache
+        _cache = get_cache()
+        cached = _cache.get("va:condition_topics")
+        if cached is not None:
+            return json.loads(cached)  # type: ignore[no-any-return]
+    except Exception:  # noqa: BLE001
+        pass
     with _CONDITION_TOPICS_PATH.open("r", encoding="utf-8") as handle:
         data: dict[str, Any] = json.load(handle)
-        return data
+    # Populate shared cache (TTL 1 hour — condition topics rarely change).
+    try:
+        from .shared_cache import get_cache as _gc
+        _gc().set("va:condition_topics", json.dumps(data), ttl_seconds=3600)
+    except Exception:  # noqa: BLE001
+        pass
+    return data
 
 
 def _body_systems() -> list[str]:
