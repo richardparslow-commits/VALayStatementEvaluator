@@ -4,6 +4,7 @@ from __future__ import annotations
 import streamlit as st
 
 from ..config import load_knowledge
+from .ops import render_run_log_tail
 
 
 def render_about_tab() -> None:
@@ -74,3 +75,6 @@ statement text, observations, or medical-record content; only sizes, counts,
 and classifications.
 """
     )
+
+    with st.expander("Recent run log (live)", expanded=False):
+        render_run_log_tail()
