@@ -14,6 +14,7 @@ import streamlit as st
 from . import config
 from .condition_selector import render_condition_selector
 from .config import DEFAULT_BASE_URL, load_settings
+from .drafting_service import format_error_for_user as format_drafting_error_for_user
 from .documents import (
     DRAFT_INTERNAL_MAX_CHARS,
     EVALUATE_INTERNAL_MAX_CHARS,
@@ -327,8 +328,7 @@ def _get_llm() -> LLMClient | None:
 # ------------------------------------------------------------- shared uploads
 def _format_error_for_user(exc: Exception, request_id: str) -> str:
     """User-facing error string that carries the correlation id without PII."""
-    rid_suffix = f" (reference: {request_id})" if request_id and request_id != "-" else ""
-    return f"{exc}{rid_suffix}"
+    return format_drafting_error_for_user(exc, request_id)
 
 
 def _extract_uploads(files: Any, slot: str) -> list[Any]:

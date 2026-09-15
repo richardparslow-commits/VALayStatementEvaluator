@@ -6,12 +6,14 @@ import json
 import logging
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 from openai import OpenAI
 
 from .circuit_breaker import CircuitBreakerOpenError, QueueFullError, get_llm_breaker, get_llm_limiter
 from .config import Settings
 from .logging_config import get_request_id
+from .prompt_sanitize import validate_model_name
 from .usage import UsageTracker
 
 try:
@@ -24,10 +26,21 @@ except ImportError:  # pragma: no cover - httpx not always installed in tests
 logger = logging.getLogger("app.llm")
 
 # Re-export for callers that want to catch these specifically.
-__all__ = ["LLMClient", "LLMError", "CircuitBreakerOpenError", "QueueFullError", "check_model_availability"]
+__all__ = [
+    "LLMClient",
+    "LLMError",
+    "LLMConfigurationError",
+    "LLMUpstreamError",
+    "LLMTimeoutError",
+    "LLMParseError",
+    "CircuitBreakerOpenError",
+    "QueueFullError",
+    "check_model_availability",
+]
 
 MAX_RETRIES = 3
-RETRY_BACKOFF_SECONDS = 2.0
+RETRY_BACKOFF_SECONDS = 1.0
+MAX_RETRY_BACKOFF_SECONDS = 4.0
 MODELS_ENDPOINT_TIMEOUT_SECONDS = 6
 
 
@@ -81,6 +94,169 @@ class LLMError(RuntimeError):
     """Raised when the LLM call ultimately fails or returns unusable output."""
 
 
+class LLMConfigurationError(LLMError):
+    """Raised when runtime LLM settings are missing or malformed."""
+
+
+class LLMUpstreamError(LLMError):
+    """Raised when the upstream LLM provider fails or rejects the request."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retriable: bool = False,
+        status_code: int | None = None,
+        upstream_request_id: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.retriable = retriable
+        self.status_code = status_code
+        self.upstream_request_id = upstream_request_id
+
+
+class LLMTimeoutError(LLMUpstreamError):
+    """Raised when the upstream LLM call times out."""
+
+
+class LLMParseError(LLMError):
+    """Raised when the model response cannot be parsed into the expected format."""
+
+
+def _configured_timeout_seconds() -> float:
+    try:
+        from . import config as _cfg
+
+        timeout_seconds = float(getattr(_cfg, "LLM_CALL_TIMEOUT_SECONDS", 300))
+    except (TypeError, ValueError):
+        raise LLMConfigurationError(
+            "LLM call timeout must be a positive number (VA_LSE_LLM_CALL_TIMEOUT_SECONDS)."
+        ) from None
+    if timeout_seconds <= 0:
+        raise LLMConfigurationError(
+            "LLM call timeout must be greater than 0 seconds (VA_LSE_LLM_CALL_TIMEOUT_SECONDS)."
+        )
+    return max(1.0, timeout_seconds)
+
+
+def _validate_settings(settings: Settings) -> None:
+    if not settings.configured:
+        raise LLMConfigurationError(
+            "No API key configured. Add your key in the sidebar or in a .env file."
+        )
+    base_url = (getattr(settings, "base_url", "") or "").strip()
+    parsed = urlparse(base_url)
+    if not base_url or parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise LLMConfigurationError(
+            "Base URL must be a valid http(s) URL for an OpenAI-compatible endpoint."
+        )
+    for label, model in (
+        ("Main model", getattr(settings, "model_main", "")),
+        ("Fast model", getattr(settings, "model_fast", "")),
+    ):
+        msg = validate_model_name(str(model or ""))
+        if msg:
+            raise LLMConfigurationError(f"{label}: {msg}")
+
+
+def _provider_status_code(exc: BaseException) -> int | None:
+    value = getattr(exc, "status_code", None)
+    if value is None:
+        return None
+    try:
+        status_code = int(value)
+    except (TypeError, ValueError):
+        return None
+    return status_code if status_code > 0 else None
+
+
+def _provider_request_id(exc: BaseException) -> str:
+    for attr in ("request_id", "requestId"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers:
+        for key in ("x-request-id", "request-id", "openai-request-id"):
+            value = headers.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def _is_timeout_error(exc: BaseException) -> bool:
+    if isinstance(exc, _HttpxTimeoutError) or isinstance(exc, TimeoutError):
+        return True
+    return type(exc).__name__.endswith("TimeoutError")
+
+
+def _is_transient_status(status_code: int | None) -> bool:
+    return bool(
+        status_code is not None and (status_code in {408, 409, 425, 429} or 500 <= status_code < 600)
+    )
+
+
+def _is_transient_provider_error(exc: BaseException) -> bool:
+    if _is_timeout_error(exc):
+        return True
+    if isinstance(exc, (ConnectionError, OSError)):
+        return True
+    status_code = _provider_status_code(exc)
+    if status_code is not None:
+        return _is_transient_status(status_code)
+    name = type(exc).__name__.lower()
+    if any(token in name for token in ("badrequest", "authentication", "permission", "notfound", "unprocessable")):
+        return False
+    if any(token in name for token in ("timeout", "ratelimit", "apiconnection", "serviceunavailable", "internalserver")):
+        return True
+    return True
+
+
+def _provider_details(exc: BaseException) -> str:
+    details = [f"{type(exc).__name__}: {exc}"]
+    status_code = _provider_status_code(exc)
+    if status_code is not None:
+        details.append(f"status={status_code}")
+    upstream_request_id = _provider_request_id(exc)
+    if upstream_request_id:
+        details.append(f"upstream_request_id={upstream_request_id}")
+    return "; ".join(details)
+
+
+def _normalize_provider_error(exc: Exception) -> LLMError:
+    status_code = _provider_status_code(exc)
+    upstream_request_id = _provider_request_id(exc)
+    details = _provider_details(exc)
+    if _is_timeout_error(exc):
+        timeout_seconds = int(_configured_timeout_seconds())
+        return LLMTimeoutError(
+            f"LLM call timed out after {timeout_seconds}s — the endpoint did not respond in time. "
+            f"Try again or raise VA_LSE_LLM_CALL_TIMEOUT_SECONDS. ({details})",
+            retriable=True,
+            status_code=status_code,
+            upstream_request_id=upstream_request_id,
+        )
+    retriable = _is_transient_provider_error(exc)
+    if retriable:
+        return LLMUpstreamError(
+            f"Transient LLM provider error — retry may succeed. ({details})",
+            retriable=True,
+            status_code=status_code,
+            upstream_request_id=upstream_request_id,
+        )
+    return LLMUpstreamError(
+        f"LLM provider rejected the request — check model, endpoint, and payload settings. ({details})",
+        retriable=False,
+        status_code=status_code,
+        upstream_request_id=upstream_request_id,
+    )
+
+
+def _retry_backoff_seconds(attempt: int) -> float:
+    return min(MAX_RETRY_BACKOFF_SECONDS, RETRY_BACKOFF_SECONDS * (2 ** attempt))
+
+
 class LLMClient:
     """Thin wrapper around any OpenAI-compatible endpoint.
 
@@ -94,19 +270,9 @@ class LLMClient:
     """
 
     def __init__(self, settings: Settings) -> None:
-        if not settings.configured:
-            raise LLMError(
-                "No API key configured. Add your key in the sidebar or in a .env file."
-            )
+        _validate_settings(settings)
         self._settings = settings
-        # Per-call timeout so a hung LLM call cannot block graceful shutdown
-        # forever. Tuned via VA_LSE_LLM_CALL_TIMEOUT_SECONDS (default 300 s / 5 min).
-        try:
-            from . import config as _cfg  # local import to avoid cycle
-
-            _timeout_s = float(getattr(_cfg, "LLM_CALL_TIMEOUT_SECONDS", 300))
-        except Exception:  # noqa: BLE001
-            _timeout_s = 300.0
+        _timeout_s = _configured_timeout_seconds()
         self._client = OpenAI(
             api_key=settings.api_key, base_url=settings.base_url, timeout=max(1.0, _timeout_s)
         )
@@ -209,34 +375,11 @@ class LLMClient:
                     # Never count limiter/breaker rejections as endpoint failures.
                     raise
                 except Exception as exc:  # noqa: BLE001 - retry on any provider error
-                    # Detect per-call timeout (httpx/APITimeoutError or stdlib TimeoutError)
-                    # and surface a clear, user-visible message. Timeout is not
-                    # special-cased for breaker counting — it is a logical call
-                    # failure like any other provider error, but the message names
-                    # the configured timeout so the user can tune it.
-                    is_timeout = isinstance(exc, _HttpxTimeoutError) or isinstance(
-                        exc, TimeoutError
-                    )
-                    # OpenAI SDK wraps httpx timeouts in APITimeoutError which
-                    # ends with "TimeoutError" in its class name even when httpx
-                    # is not importable directly.
-                    if not is_timeout and type(exc).__name__.endswith("TimeoutError"):
-                        is_timeout = True
-                    if is_timeout:
-                        try:
-                            from . import config as _cfg2
-
-                            _ts = int(getattr(_cfg2, "LLM_CALL_TIMEOUT_SECONDS", 300))
-                        except Exception:  # noqa: BLE001
-                            _ts = 300
-                        # Rewrite to a concise, actionable message for the UI.
-                        exc = LLMError(
-                            f"LLM call timed out after {_ts}s — the endpoint did not respond in time. "
-                            f"Try again or raise VA_LSE_LLM_CALL_TIMEOUT_SECONDS. ({type(exc).__name__}: {exc})"
-                        )
-                    last_error = exc
+                    normalized = exc if isinstance(exc, LLMError) else _normalize_provider_error(exc)
+                    retriable = bool(getattr(normalized, "retriable", False))
+                    last_error = normalized
                     duration_ms = int((time.perf_counter() - attempt_t0) * 1000)
-                    is_last = attempt >= MAX_RETRIES - 1
+                    is_last = attempt >= MAX_RETRIES - 1 or not retriable
                     logger.log(
                         logging.ERROR if is_last else logging.WARNING,
                         "llm call %s phase=%s model=%s attempt=%d/%d duration_ms=%d error=%s",
@@ -246,7 +389,7 @@ class LLMClient:
                         attempt + 1,
                         MAX_RETRIES,
                         duration_ms,
-                        f"{type(exc).__name__}: {exc}",
+                        f"{type(normalized).__name__}: {normalized}",
                         exc_info=exc if is_last else None,
                         extra={
                             "request_id": rid,
@@ -256,13 +399,33 @@ class LLMClient:
                             "attempt": attempt + 1,
                             "retries": MAX_RETRIES,
                             "duration_ms": duration_ms,
-                            "error_class": type(exc).__name__,
+                            "error_class": type(normalized).__name__,
+                            "retryable": retriable,
+                            "status_code": getattr(normalized, "status_code", None),
+                            "upstream_request_id": getattr(normalized, "upstream_request_id", ""),
                         },
                     )
+                    if is_last and not retriable:
+                        breaker.record_failure()
+                        raise normalized
                     if not is_last:
-                        time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
+                        time.sleep(_retry_backoff_seconds(attempt))
             # Exhausted retries — counts as one logical failure for the breaker.
             breaker.record_failure()
+            if isinstance(last_error, LLMTimeoutError):
+                raise LLMTimeoutError(
+                    f"LLM call failed after {MAX_RETRIES} attempts: {last_error}",
+                    retriable=True,
+                    status_code=last_error.status_code,
+                    upstream_request_id=last_error.upstream_request_id,
+                )
+            if isinstance(last_error, LLMUpstreamError):
+                raise LLMUpstreamError(
+                    f"LLM call failed after {MAX_RETRIES} attempts: {last_error}",
+                    retriable=last_error.retriable,
+                    status_code=last_error.status_code,
+                    upstream_request_id=last_error.upstream_request_id,
+                )
             raise LLMError(f"LLM call failed after {MAX_RETRIES} attempts: {last_error}")
         except (CircuitBreakerOpenError, QueueFullError):
             # Re-raise without counting as a breaker failure and without extra logging
@@ -292,7 +455,12 @@ class LLMClient:
             max_tokens=max_tokens,
             phase=phase,
         )
-        return _parse_json(text)
+        try:
+            return _parse_json(text)
+        except LLMParseError as exc:
+            raise LLMParseError(
+                f"Could not parse JSON for phase '{phase}' (response chars={len(text)})."
+            ) from exc
 
 
 def _parse_json(text: str) -> Any:
@@ -314,4 +482,4 @@ def _parse_json(text: str) -> Any:
                     return json.loads(candidate[start : end + 1])
                 except json.JSONDecodeError:
                     continue
-    raise LLMError(f"Could not parse JSON from model output: {text[:300]}")
+    raise LLMParseError(f"Could not parse JSON from model output (chars={len(text)}).")

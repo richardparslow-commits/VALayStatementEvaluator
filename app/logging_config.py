@@ -163,6 +163,7 @@ class JsonFormatter(logging.Formatter):
         for key in ("phase", "status", "duration_ms", "model", "attempt", "retries",
                     "tokens_in", "tokens_out", "prompt_tokens", "completion_tokens",
                     "total_tokens", "calls", "chunks", "pages", "facts", "error_class",
+                    "error_kind", "retryable", "status_code", "upstream_request_id",
                     "workflow", "requestId"):
             val = getattr(record, key, None)
             if val is not None:

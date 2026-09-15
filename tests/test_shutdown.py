@@ -225,6 +225,19 @@ class TestHealthDraining(unittest.TestCase):
 class TestLLMTimeout(unittest.TestCase):
     """Verify the LLM client surfaces timeout errors with actionable messages."""
 
+    def test_missing_config_raises_clear_error(self) -> None:
+        from app.llm import LLMClient, LLMConfigurationError
+
+        fake_settings = MagicMock()
+        fake_settings.configured = False
+        fake_settings.api_key = ""
+        fake_settings.base_url = "http://invalid"
+        fake_settings.model_main = "m"
+        fake_settings.model_fast = "f"
+        with self.assertRaises(LLMConfigurationError) as ctx:
+            LLMClient(fake_settings)
+        self.assertIn("No API key configured", str(ctx.exception))
+
     def test_timeout_error_message_is_user_friendly(self) -> None:
         from app.llm import LLMClient, LLMError
 

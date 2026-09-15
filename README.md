@@ -682,6 +682,33 @@ Configure via env (see `.env.example`): `VA_LSE_LOG_LEVEL`, `VA_LSE_LOG_JSON` (J
 `VA_LSE_LOG_BACKUPS`. With `VA_LSE_LOG_DIR` unset the app still logs to stdout so platform drains
 (`docker logs`, Agiloop build harness) stay useful; setting it adds a `RotatingFileHandler`.
 
+### Troubleshooting `Drafting failed`
+
+When the Draft tab shows `Drafting failed: ... (reference: req_...)`, keep the reference id and
+look it up in the structured logs:
+
+- Diagnostic log: `${VA_LSE_LOG_DIR:-stdout}/app.log`
+- Audit trail: `${VA_LSE_AUDIT_LOG_DIR:-logs}/audit.log`
+
+Typical causes now surface as distinct log categories:
+
+- `error_kind=upstream_timeout` — upstream model timeout; retry, shorten the input, or raise
+  `VA_LSE_LLM_CALL_TIMEOUT_SECONDS`
+- `error_kind=upstream_error` with `retryable=true` — transient upstream/network/rate-limit style
+  failure; retry after a short delay
+- `error_kind=parse_error` — the model returned invalid JSON for a structured drafting step
+- `error_kind=payload_too_large` / `payload_invalid` — shorten the observations or fix malformed
+  witness/claim fields before retrying
+- `error_kind=config_error` — check `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `LLM_MODEL_MAIN`,
+  `LLM_MODEL_FAST`, and timeout settings
+
+Example log lookup:
+
+```bash
+grep 'req_cdaaad6d5495' logs/app.log
+grep 'req_cdaaad6d5495' logs/audit.log
+```
+
 ## Production hardening (Streamlit)
 
 `.streamlit/config.toml` is committed so shared deployments cannot silently run with

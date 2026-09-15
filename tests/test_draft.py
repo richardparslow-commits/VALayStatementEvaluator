@@ -3,6 +3,7 @@
 Mocks LLMClient so the full grounding → draft → review pipeline is exercised
 without network, Streamlit, or API keys.
 """
+import logging
 import sys
 import unittest
 from pathlib import Path
@@ -10,9 +11,16 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from app.drafting_service import (  # noqa: E402
+    MAX_DRAFT_OBSERVATIONS_PAYLOAD_CHARS,
+    DraftingError,
+    DraftingPayloadError,
+    format_error_for_user,
+)
 from app.documents import DRAFT_INTERNAL_MAX_CHARS, document_from_text  # noqa: E402
 from app.draft import DraftResult, _truncate_for_prompt, grounding_markdown, run_draft  # noqa: E402
-from app.llm import LLMError  # noqa: E402
+from app.llm import LLMError, LLMTimeoutError, LLMUpstreamError  # noqa: E402
+from app.logging_config import clear_request_id, set_request_id  # noqa: E402
 from app.medical_review import MedicalDigest, MedicalFact  # noqa: E402
 
 # ---------------------------------------------------------------- helpers
@@ -205,8 +213,9 @@ class TestRunDraftEdgeCases(unittest.TestCase):
     @patch("app.draft.review_medical_records")
     def test_records_failure_propagates(self, mock_review):
         mock_review.side_effect = ValueError("No records")
-        with self.assertRaises(ValueError):
+        with self.assertRaises(DraftingError) as ctx:
             run_draft(_FakeLLM(), [], WITNESS, "obs", "cond", "Service connection")
+        self.assertIn("unexpected drafting error", ctx.exception.format_for_user().lower())
 
     @patch("app.draft.review_medical_records")
     @patch("app.draft.load_knowledge", return_value="k")
@@ -300,6 +309,52 @@ class TestRunDraftEdgeCases(unittest.TestCase):
         run_draft(_FakeLLM(), [_doc()], WITNESS, "obs", "cond", "Service connection", progress=lambda f, m: seen.append((f, m)))
         self.assertTrue(any("Step" in m for _, m in seen))
         self.assertEqual(seen[-1][1], "Draft complete.")
+
+    def test_payload_too_large_rejected_before_model_call(self):
+        llm = _FakeLLM()
+        observations = "x" * (MAX_DRAFT_OBSERVATIONS_PAYLOAD_CHARS + 1)
+        with self.assertRaises(DraftingPayloadError) as ctx:
+            run_draft(llm, [_doc()], WITNESS, observations, "cond", "Service connection")
+        self.assertEqual(llm.calls, [])
+        self.assertIn("too large", ctx.exception.format_for_user())
+
+    @patch("app.draft.review_medical_records")
+    @patch("app.draft.load_knowledge", return_value="k")
+    def test_non_retriable_error_path_maps_to_safe_message(self, _mk, mock_review):
+        mock_review.return_value = _fake_digest()
+        llm = _FakeLLM(overrides={"grounding": LLMUpstreamError("bad request", retriable=False, status_code=400)})
+        with self.assertRaises(DraftingError) as ctx:
+            run_draft(llm, [_doc()], WITNESS, "obs", "cond", "Service connection")
+        self.assertIn("rejected", ctx.exception.format_for_user())
+
+    @patch("app.draft.review_medical_records")
+    @patch("app.draft.load_knowledge", return_value="k")
+    def test_reference_id_propagates_to_logs_and_user_message(self, _mk, mock_review):
+        mock_review.return_value = _fake_digest()
+        llm = _FakeLLM(overrides={"grounding": LLMTimeoutError("timed out", retriable=True)})
+        captured: list[logging.LogRecord] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record):  # type: ignore[no-untyped-def]
+                captured.append(record)
+
+        logger = logging.getLogger("app.draft")
+        handler = _Capture()
+        old_level = logger.level
+        logger.addHandler(handler)
+        logger.setLevel(logging.ERROR)
+        token = set_request_id("req_testref1234")
+        try:
+            with self.assertRaises(DraftingError) as ctx:
+                run_draft(llm, [_doc()], WITNESS, "obs", "cond", "Service connection")
+        finally:
+            clear_request_id(token)
+            logger.removeHandler(handler)
+            logger.setLevel(old_level)
+        self.assertTrue(captured)
+        self.assertEqual(getattr(captured[-1], "request_id", ""), "req_testref1234")
+        self.assertEqual(getattr(captured[-1], "error_kind", ""), "upstream_timeout")
+        self.assertIn("reference: req_testref1234", format_error_for_user(ctx.exception, "req_testref1234"))
 
 
 class TestRunDraftIntegration(unittest.TestCase):
