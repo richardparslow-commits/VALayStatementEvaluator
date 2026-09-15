@@ -1,14 +1,25 @@
-"""VA.gov medical-record source client.
+"""VA.gov medical-record source client — **sandbox/simulator only**.
 
-Handles per-session authenticated login and automatic record retrieval from
-VA.gov. Credentials and session tokens live only in memory for the duration
-of the call chain (and, at the UI layer, in ``st.session_state``) — they are
-never written to disk, ``.env``, or logs.
+Handles per-session authenticated login and automatic record retrieval against
+an OpenAI-style authenticated records endpoint. Credentials and session tokens
+live only in memory for the duration of the call chain (and, at the UI layer, in
+``st.session_state``) — they are never written to disk, ``.env``, or logs.
 
-Real vs. mock: when ``VA_GOV_API_BASE_URL`` is unset, authentication and
+Scope, stated plainly: **real VA.gov is not reachable this way.** Actual VA.gov
+access is OAuth via ID.me with SMS multi-factor authentication, and VA.gov
+publishes no patient-facing medical-records API, so ``VA_GOV_API_BASE_URL`` can
+only ever point at a sandbox, simulator, or mock. Do not type real VA.gov
+credentials into this form; use sandbox credentials.
+
+Mock vs. configured: when ``VA_GOV_API_BASE_URL`` is unset, authentication and
 fetch run against an in-memory mock so the golden-path flow (login -> fetch ->
-merge -> confirm) works with zero env vars configured. When it is set, real
-HTTPS calls are made and retried with exponential backoff.
+merge -> confirm) works with zero env vars configured. When it is set, HTTPS
+calls are made to that sandbox and retried with exponential backoff.
+
+To obtain a real record set, download it from VA.gov instead — see
+``scripts/va_records_download.py`` (local browser automation of the download
+wizard, with the human doing the ID.me sign-in and SMS code) or the manual steps
+in ``README.md -> VA.gov record source``.
 """
 from __future__ import annotations
 
@@ -108,12 +119,22 @@ def _va_gov_configured() -> bool:
     return bool(_va_gov_base_url())
 
 
-def authenticate_va_gov(username: str, password: str, *, patient_id: str = "") -> VaGovSession:
-    """Authenticate against VA.gov and return a per-session token.
+def va_gov_configured() -> bool:
+    """True when ``VA_GOV_API_BASE_URL`` points at a sandbox/simulator endpoint.
 
-    Real mode requires ``VA_GOV_API_BASE_URL``; when unset, a deterministic
-    mock session is issued (no network call, nothing persisted) so the rest of
-    the fetch/merge/confirm flow can be exercised without any env vars set.
+    Never implies real VA.gov access: no patient-facing records API exists, and
+    real access is ID.me + MFA protected (see the module docstring).
+    """
+    return _va_gov_configured()
+
+
+def authenticate_va_gov(username: str, password: str, *, patient_id: str = "") -> VaGovSession:
+    """Authenticate against the configured sandbox and return a per-session token.
+
+    Configured mode requires ``VA_GOV_API_BASE_URL`` (a sandbox/simulator — real
+    VA.gov does not work this way); when unset, a deterministic mock session is
+    issued (no network call, nothing persisted) so the rest of the
+    fetch/merge/confirm flow can be exercised without any env vars set.
     """
     username = (username or "").strip()
     password = (password or "").strip()

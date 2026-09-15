@@ -429,11 +429,15 @@ already loaded in the same workflow this session, and shows a **merged records s
 label + file + page count per row) that requires explicit confirmation before the merged set is
 used for evaluation or drafting.
 
-- **Mock mode (default):** leave `VA_GOV_API_BASE_URL` unset — `authenticate_va_gov` and
+- **Sandbox mode (default):** leave `VA_GOV_API_BASE_URL` unset — `authenticate_va_gov` and
   `fetch_va_records` return a deterministic in-memory mock session and two mock records, so the
-  full login → fetch → merge → confirm flow works with zero VA.gov env vars configured.
-- **Real mode:** set `VA_GOV_API_BASE_URL` (must be `https://`) to call a real VA.gov-compatible
-  authenticated record-retrieval API. Requests retry up to 3 times with exponential backoff.
+  full login → fetch → merge → confirm flow works with zero env vars configured.
+- **Configured mode:** set `VA_GOV_API_BASE_URL` (must be `https://`) to call an authenticated
+  records endpoint on a **sandbox or simulator**. Requests retry up to 3 times with exponential
+  backoff. Real VA.gov is *not* reachable this way: access is OAuth via ID.me with SMS
+  multi-factor authentication and VA.gov publishes no patient-facing records API — so this base
+  URL is always a stand-in, and the login form asks for **sandbox credentials** (never your real
+  VA.gov password).
 - **Partial/connection-error handling:** if VA.gov returns fewer records than expected or the
   connection drops, the app shows the retrieved-vs-expected counts, a **Retry** button, and a
   **Continue with available records** option — VA.gov failures never block using the other
@@ -441,7 +445,42 @@ used for evaluation or drafting.
 - **Privacy:** VA.gov records are treated identically to every other source for extraction,
   chunking, duplicate detection, and page labeling. Fetched records and the VA.gov session token
   live only in `st.session_state` for the current browser session; credentials are **never**
-  written to disk, `.env`, or logs.## Health checks (container orchestration)
+  written to disk, `.env`, or logs.
+
+### Getting your real records
+
+Real records have to come from VA.gov itself. Two ways, both local to your machine:
+
+**1. Automate the download wizard** (recommended — you still sign in yourself):
+
+```bash
+python -m pip install -r requirements-local.txt
+python -m playwright install chromium
+python scripts/va_records_download.py                 # saves the PDF to ~/Desktop
+python scripts/va_records_download.py --dry-run       # walk the wizard, stop before download
+```
+
+The script opens a visible Chromium window and **waits while you sign in** through ID.me,
+including the SMS code — it never types, reads, or stores your credentials or code, has no
+headless mode, and does not attempt any MFA/CAPTCHA bypass. Once you are signed in it clicks
+only VA.gov's own wizard: date range **All time** → **Select all VA records** → **PDF** →
+**Download report**, then saves the PDF (default `~/Desktop`) for uploading as an *Upload files*
+source. A browser profile is kept at `~/.va_lse_va_gov_profile` so your VA.gov session can be
+reused (fewer SMS rounds) — that directory holds session cookies, so delete it to sign out, or
+pass `--no-persist` for a throwaway session. If VA.gov changes its markup the script names the
+failing step and writes a screenshot + page HTML to re-run against (`--pause` to confirm each
+step). Those artifacts are signed-in pages — treat them as sensitive. You are responsible for
+VA.gov's and ID.me's terms, and for using only your own records.
+
+**2. Download it by hand** — sign in at [va.gov](https://www.va.gov/), then:
+
+1. **My Health** → **Medical records** → **Download** (`/my-health/medical-records/download`)
+2. Date range → **All time** → **Continue**
+3. Record type → **Select all VA records** → **Continue**
+4. File type → **PDF** → **Download report**
+5. Upload the saved PDF in the app as an *Upload files* record source
+
+## Health checks (container orchestration)
 
 A stdlib-only sidecar (`app/health.py`, started from `run_app.py` before Streamlit) exposes two
 orchestrator-friendly probes on `0.0.0.0:$VA_LSE_HEALTH_PORT` — no extra dependencies:

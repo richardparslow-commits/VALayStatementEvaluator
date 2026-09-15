@@ -186,21 +186,43 @@ def _va_gov_records(slot: str) -> list[Any]:
         "Review privacy before fetching sensitive records — the same warning shown for "
         "every other record source applies equally here."
     )
+    configured = va_gov_client.va_gov_configured()
     st.caption(
-        "Signs in to VA.gov for this session only, then automatically fetches your "
-        "available records. Credentials are never stored to disk or `.env`; records "
-        "stay local after fetch."
+        ("🔌 **Records API mode** — talking to `VA_GOV_API_BASE_URL`. This is a "
+         "sandbox/simulator path: real VA.gov access is ID.me + SMS-MFA protected and "
+         "exposes no patient-facing records API.")
+        if configured
+        else ("🧪 **Sandbox mode** — `VA_GOV_API_BASE_URL` is unset, so this fetches "
+              "deterministic mock records. Real VA.gov cannot be reached this way "
+              "(ID.me + SMS MFA, no patient-facing records API), so a configured base "
+              "URL here is always a sandbox or simulator — use sandbox credentials, "
+              "never your real VA.gov password.")
+    )
+    st.caption(
+        "For **your own** records, download them from VA.gov instead: "
+        "`scripts/va_records_download.py` automates the download wizard locally "
+        "(you sign in and enter the SMS code yourself), or follow "
+        "**My Health → Medical records → Download** by hand and upload the PDF as an "
+        "*Upload files* source. See `README.md → VA.gov record source`."
+    )
+    st.caption(
+        "Signs in for this session only, then automatically fetches the available "
+        "records. Credentials are never stored to disk or `.env`; records stay local "
+        "after fetch."
     )
     consent = st.checkbox(
-        "I consent to VA.gov fetching my medical records for this session only. "
+        "I consent to fetching my medical records for this session only. "
         "Records are not stored beyond this session and my credentials are never saved.",
         key=f"va_gov_consent_{slot}",
     )
     authed = bool(st.session_state.get(f"va_gov_authed_{slot}"))
     with st.expander("🔒 VA.gov secure login", expanded=not authed):
-        username = st.text_input("VA.gov username", key=f"va_gov_user_{slot}")
+        st.caption(
+            "Sandbox/simulator credentials — not your VA.gov password."
+        )
+        username = st.text_input("Sandbox username", key=f"va_gov_user_{slot}")
         password = st.text_input(
-            "VA.gov password", type="password", key=f"va_gov_pass_{slot}"
+            "Sandbox password", type="password", key=f"va_gov_pass_{slot}"
         )
         login_clicked = st.button(
             "Log in and fetch VA.gov records",

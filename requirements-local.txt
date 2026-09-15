@@ -1,0 +1,10 @@
+# Local-only extras for browser automation (scripts/va_records_download.py).
+#
+# NOT needed to run the app and NOT installed by CI — the Streamlit app and its
+# test suite never import Playwright, and the automation is useless on a hosted
+# deployment anyway (it needs a real browser and a human for the ID.me SMS code).
+#
+# Install with:
+#   python -m pip install -r requirements-local.txt
+#   python -m playwright install chromium
+playwright>=1.49
