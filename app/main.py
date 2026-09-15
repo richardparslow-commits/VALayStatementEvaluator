@@ -41,7 +41,7 @@ from . import va_gov_client
 from . import watchdog
 from .shutdown import enter_run, exit_run, is_shutting_down
 from .pipeline_guard import PipelineTimeoutError, check_memory_before_run, memory_checkpoint, run_with_timeout
-from .profiler import RunProfiler, get_profiler, phase_timer
+from .profiler import RunProfiler, bind_run_profiler, get_profiler, is_enabled, phase_timer
 from .prompt_sanitize import validate_api_key, validate_model_name
 
 logger = get_logger("app.main")
@@ -1001,13 +1001,14 @@ def evaluate_tab() -> None:
             extra={"request_id": rid, "phase": "evaluate", "status": "start"},
         )
         bar, update = _progress_widgets(llm, request_id=rid)
-        _profiler_run = RunProfiler(action="evaluate", request_id=rid, run_start_mono=time.monotonic()) if get_profiler() else None
+        _profiler_run = RunProfiler(action="evaluate", request_id=rid, run_start_mono=time.monotonic()) if is_enabled() else None
         t0 = time.perf_counter()
         try:
             check_memory_before_run()
-            result = run_with_timeout(
-                run_evaluation, llm, statement_text.strip(), records, progress=update
-            )
+            with bind_run_profiler(_profiler_run):
+                result = run_with_timeout(
+                    run_evaluation, llm, statement_text.strip(), records, progress=update
+                )
         except MemoryError as mem_exc:
             bar.empty()
             duration_ms = int((time.perf_counter() - t0) * 1000)
@@ -1395,14 +1396,15 @@ def draft_tab() -> None:
             "witnessed_event": witnessed_event,
         }
         bar, update = _progress_widgets(llm, request_id=rid)
-        _profiler_run = RunProfiler(action="draft", request_id=rid, run_start_mono=time.monotonic()) if get_profiler() else None
+        _profiler_run = RunProfiler(action="draft", request_id=rid, run_start_mono=time.monotonic()) if is_enabled() else None
         t0 = time.perf_counter()
         try:
             check_memory_before_run()
-            result = run_with_timeout(
-                run_draft, llm, records, witness, observations.strip(),
-                condition.strip(), claim_type, progress=update,
-            )
+            with bind_run_profiler(_profiler_run):
+                result = run_with_timeout(
+                    run_draft, llm, records, witness, observations.strip(),
+                    condition.strip(), claim_type, progress=update,
+                )
         except MemoryError as mem_exc:
             bar.empty()
             duration_ms = int((time.perf_counter() - t0) * 1000)
