@@ -128,6 +128,45 @@ class TestDetectUnconfirmedPlaceholders(unittest.TestCase):
     def test_false_for_empty_string(self):
         self.assertFalse(detect_unconfirmed_placeholders(""))
 
+    def test_case_insensitive_match(self):
+        self.assertTrue(detect_unconfirmed_placeholders("please [confirm: date] this"))
+
+
+class TestPlaceholderDisclaimerIntegration(unittest.TestCase):
+    """F2.S2 — placeholder check drives the conditional disclaimer end-to-end."""
+
+    def test_explicit_false_suppresses_disclaimer_even_if_marker_present(self):
+        # An explicit has_unconfirmed_placeholders=False always wins over
+        # auto-detection (e.g. an upstream caller has already resolved the
+        # placeholders in its own copy but the raw text still shows one).
+        pdf_bytes = generate_statement_pdf(
+            STATEMENT_WITH_PLACEHOLDER,
+            "PTSD",
+            "Spouse",
+            has_unconfirmed_placeholders=False,
+        )
+        text = _extract_text(pdf_bytes)
+        self.assertNotIn("VERIFICATION REQUIRED", text)
+
+    def test_pdf_with_disclaimer_still_contains_full_statement_body(self):
+        pdf_bytes = generate_statement_pdf(
+            STATEMENT_WITH_PLACEHOLDER, "PTSD", "Spouse"
+        )
+        text = _extract_text(pdf_bytes)
+        self.assertIn("trouble", text)
+        self.assertIn("standing", text)
+
+    def test_pdf_without_disclaimer_contains_only_header_and_body(self):
+        pdf_bytes = generate_statement_pdf(
+            STATEMENT_WITHOUT_PLACEHOLDER, "PTSD", "Spouse"
+        )
+        text = _extract_text(pdf_bytes)
+        self.assertIn("VA Form 21-10210", text)
+        self.assertIn("PTSD", text)
+        self.assertIn("Spouse", text)
+        self.assertIn("household chores", text)
+        self.assertNotIn("VERIFICATION", text)
+
 
 if __name__ == "__main__":
     unittest.main()
