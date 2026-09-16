@@ -1,12 +1,15 @@
 """Agiloop Inspect telemetry client for the VA Lay Statement Evaluator.
 
 This is the Python/Streamlit equivalent of the TypeScript `lib/agiloop-telemetry.ts`
-client SDK described by the `agiloop-instrumentation` skill. Streamlit apps run
-entirely server-side (there is no separate browser bundle), so sending events
-directly from this module already satisfies the "same-origin proxy route"
-requirement in the skill: the rendered page never sees or transmits
-`AGILOOP_INSPECT_API_KEY` — only this server-side module reads it from the
-environment and attaches it to outbound requests.
+client SDK described by the `agiloop-instrumentation` skill: it is the module
+every feature call site imports to fire impression/interaction/error/goal
+events. It contains NO reference to `AGILOOP_INSPECT_API_KEY` or any other
+Inspect secret — building the outbound payload here and physically attaching
+the API key happen in two different modules, mirroring the browser-SDK /
+same-origin-proxy split the skill describes for split-origin apps. The actual
+network call (and the only place the API key is read) lives in
+`app/telemetry_proxy.py`; this module only ever calls
+`telemetry_proxy.forward_event(payload)`.
 
 Feature-id neutrality: this module is SHARED telemetry infrastructure. It must
 never hardcode a feature id. Every public function accepts `feature_id` as a
@@ -14,20 +17,17 @@ parameter and forwards it dynamically to the event payload/query string.
 """
 from __future__ import annotations
 
-import json
 import logging
-import os
-import urllib.error
-import urllib.request
+import traceback
 import uuid
 from datetime import datetime, timezone
 from typing import Any
 
 import streamlit as st
 
-logger = logging.getLogger(__name__)
+from . import telemetry_proxy
 
-_DEFAULT_INSPECT_URL = "https://inspect.api.agiloop.app"
+logger = logging.getLogger(__name__)
 
 _ANON_ID_KEY = "agiloop_anonymous_id"
 _SESSION_ID_KEY = "agiloop_session_id"
@@ -35,29 +35,8 @@ _INITIALIZED_KEY = "agiloop_telemetry_initialized"
 _ENV_LOGGED_KEY = "agiloop_telemetry_env_logged"
 
 
-def _inspect_api_key() -> str:
-    return os.getenv("AGILOOP_INSPECT_API_KEY", "").strip()
-
-
-def _inspect_url() -> str:
-    return (os.getenv("AGILOOP_INSPECT_URL", "").strip() or _DEFAULT_INSPECT_URL)
-
-
-def _project_id() -> str:
-    return os.getenv("AGILOOP_PROJECT_ID", "").strip()
-
-
-def _missing_vars() -> list[str]:
-    missing = []
-    if not _inspect_api_key():
-        missing.append("AGILOOP_INSPECT_API_KEY")
-    if not _project_id():
-        missing.append("AGILOOP_PROJECT_ID")
-    return missing
-
-
 def _telemetry_enabled() -> bool:
-    return not _missing_vars()
+    return telemetry_proxy.is_configured()
 
 
 def _log_env_mode_once() -> None:
@@ -65,7 +44,7 @@ def _log_env_mode_once() -> None:
     if st.session_state.get(_ENV_LOGGED_KEY):
         return
     st.session_state[_ENV_LOGGED_KEY] = True
-    missing = _missing_vars()
+    missing = telemetry_proxy.missing_env_vars()
     if missing:
         logger.info("[ENV] agiloop-telemetry: mock (missing: %s)", ", ".join(missing))
     else:
@@ -127,12 +106,37 @@ def _sanitize_error_message(error: BaseException) -> str:
     return f"{type(error).__name__}: {truncated}" if truncated else type(error).__name__
 
 
+_MAX_ERROR_STACK_LEN = 2000
+
+
+def _sanitize_error_stack(error: BaseException) -> str:
+    """Bound the outbound stack trace similarly to the error message.
+
+    `traceback.format_exception` includes file/line/function context and the
+    literal source line, but never runtime variable values — so it cannot leak
+    the *content* of a statement/record that was being processed when the
+    error occurred. It is still truncated defensively so a single event
+    cannot balloon in size.
+    """
+    try:
+        frames = traceback.format_exception(type(error), error, error.__traceback__)
+    except Exception:  # noqa: BLE001 - formatting the stack must never raise
+        return ""
+    joined = "".join(frames).replace("\r", "")
+    if len(joined) > _MAX_ERROR_STACK_LEN:
+        return joined[:_MAX_ERROR_STACK_LEN] + "…[truncated]"
+    return joined
+
+
 def track_feature_error(feature_id: str, error: BaseException) -> None:
     """Track a feature-level error caught at a feature boundary."""
     _send_event(
         "feature.error",
         feature_id=feature_id,
-        metadata={"errorMessage": _sanitize_error_message(error)},
+        metadata={
+            "errorMessage": _sanitize_error_message(error),
+            "errorStack": _sanitize_error_stack(error),
+        },
     )
 
 
@@ -152,12 +156,12 @@ def track_goal(feature_id: str, goal_description: str, **attributes: Any) -> Non
 def _send_event(
     event_type: str, *, feature_id: str | None, metadata: dict[str, Any] | None
 ) -> None:
-    """Fire-and-forget telemetry send.
+    """Build the event payload and hand it to the telemetry proxy.
 
-    Never raises — telemetry must never break the app (Rule 7). No-ops
-    (mock mode) whenever `AGILOOP_INSPECT_API_KEY` or `AGILOOP_PROJECT_ID`
-    is unset; this is gated solely on env-var presence, never on any
-    NODE_ENV/build-flag equivalent.
+    Never raises — telemetry must never break the app (Rule 7). The proxy
+    itself no-ops (mock mode) whenever `AGILOOP_INSPECT_API_KEY` or
+    `AGILOOP_PROJECT_ID` is unset; this module never reads those vars or the
+    API key directly (see module docstring).
     """
     if not _telemetry_enabled():
         logger.debug("telemetry mock mode — dropping event %s", event_type)
@@ -173,21 +177,6 @@ def _send_event(
             payload["featureId"] = feature_id
         if metadata:
             payload["metadata"] = metadata
-
-        url = f"{_inspect_url().rstrip('/')}/{_project_id()}/event"
-        if feature_id:
-            url = f"{url}?featureId={feature_id}"
-
-        request = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "X-API-Key": _inspect_api_key(),
-            },
-            method="POST",
-        )
-        urllib.request.urlopen(request, timeout=3)
-    except (urllib.error.URLError, TimeoutError, ValueError, OSError):
-        # Telemetry failures must never propagate to the user.
+        telemetry_proxy.forward_event(payload)
+    except Exception:  # noqa: BLE001 - telemetry must never propagate to the user
         logger.debug("telemetry send failed for event %s", event_type, exc_info=True)
