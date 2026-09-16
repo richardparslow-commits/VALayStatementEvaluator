@@ -13,12 +13,14 @@ from typing import Any
 import streamlit as st
 
 from .. import audit as audit_log
+from ..agiloop_telemetry import track_goal, track_impression, track_interaction
 from ..documents import (
     DRAFT_INTERNAL_MAX_CHARS,
     MAX_OBSERVATIONS_CHARS,
 )
 from ..draft import DraftResult, grounding_markdown, run_draft
 from ..logging_config import get_logger
+from ..pdf_export import detect_unconfirmed_placeholders, generate_statement_pdf
 from ..pipeline_guard import (
     PipelineTimeoutError,
     check_memory_before_run,
@@ -42,6 +44,9 @@ from .shared import (
 )
 
 logger = get_logger("app.views.draft")
+
+# Feature: Final Statement PDF Export
+PDF_EXPORT_FEATURE_ID = "0d76d70b-8dd6-4561-a874-f768d5929222"  # final-statement-pdf-export
 
 CLAIM_TYPES = [
     "Service connection (new claim)",
@@ -468,6 +473,54 @@ def _finish_draft_run(
 
 
 # ------------------------------------------------------------------ results UI
+def _render_pdf_export(statement_text: str) -> None:
+    """Render the "export final statement as PDF" download button.
+
+    Fires the telemetry required for the Final Statement PDF Export feature
+    (`.implement/FEATURE-BRIEF.md`): one `impression` per rendered panel, one
+    `interaction` + `goal` per actual download click. No statement/condition
+    text is ever attached to a telemetry payload — only booleans/labels.
+    """
+    impression_key = "pdf_export_impression_sent_draft"
+    if not st.session_state.get(impression_key):
+        try:
+            track_impression(PDF_EXPORT_FEATURE_ID, entry_point="draft")
+        except Exception:  # noqa: BLE001 - telemetry must never break the UI
+            pass
+        st.session_state[impression_key] = True
+
+    condition = str(st.session_state.get("draft_condition", "") or "")
+    witness_role = str(st.session_state.get("draft_rel", "") or "")
+    try:
+        pdf_bytes = generate_statement_pdf(statement_text, condition, witness_role)
+    except Exception as exc:  # noqa: BLE001 - PDF generation is best-effort in the UI
+        st.error(f"Could not generate the PDF export: {exc}")
+        return
+
+    has_placeholders = detect_unconfirmed_placeholders(statement_text)
+    clicked = st.download_button(
+        "📄 Export final statement as PDF",
+        data=pdf_bytes,
+        file_name="VA_Statement.pdf",
+        mime="application/pdf",
+        key="pdf_export_button_draft",
+    )
+    if clicked:
+        try:
+            track_interaction(
+                PDF_EXPORT_FEATURE_ID,
+                action="pdf_export_click",
+                has_unconfirmed_placeholders=has_placeholders,
+            )
+            track_goal(
+                PDF_EXPORT_FEATURE_ID,
+                "final statement exported as PDF",
+                view="draft",
+            )
+        except Exception:  # noqa: BLE001 - telemetry must never break the UI
+            pass
+
+
 def _render_draft_results(draft_result: Any) -> None:
     render_usage_summary(st.session_state.get("draft_usage"))
 
@@ -509,6 +562,7 @@ def _render_draft_results(draft_result: Any) -> None:
         file_name="lay_statement_draft.md",
         mime="text/markdown",
     )
+    _render_pdf_export(edited)
 
     if draft_result.digest:
         with st.expander("Medical record digest used for grounding"):
