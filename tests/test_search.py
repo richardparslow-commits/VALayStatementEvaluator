@@ -167,6 +167,27 @@ class TestExportCitationIndex(unittest.TestCase):
         self.assertIn("excerpt", csv_bytes)
         self.assertIn("source", csv_bytes)
 
+    def test_csv_export_neutralizes_formula_injection(self) -> None:
+        """A malicious record excerpt/source starting with =, +, -, or @ must
+        not be written as a live spreadsheet formula (CSV injection guard)."""
+        import csv
+        import io
+
+        dangerous = [
+            {"excerpt": "=cmd|' /C calc'!A1", "source": "@SUM(1+1)*cmd|'/C calc'"},
+            {"excerpt": "+1+1", "source": "-2+3"},
+        ]
+        data = export_citation_index(dangerous, "csv")
+        rows = list(csv.DictReader(io.StringIO(data.decode("utf-8"))))
+        for row in rows:
+            self.assertFalse(row["excerpt"].startswith(("=", "+", "-", "@")))
+            self.assertFalse(row["source"].startswith(("=", "+", "-", "@")))
+            # original content is preserved (minus the leading quote guard)
+        self.assertTrue(rows[0]["excerpt"].startswith("'="))
+        self.assertTrue(rows[0]["source"].startswith("'@"))
+        self.assertTrue(rows[1]["excerpt"].startswith("'+"))
+        self.assertTrue(rows[1]["source"].startswith("'-"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -556,6 +556,23 @@ def search_records(
 # ------------------------------------------------------------ citation index
 # Feature: Medical Record Search & Citation Index (F2.S2)
 _CITATION_EXPORT_FIELDS = ("excerpt", "source")
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_formula_guard(value: str) -> str:
+    """Neutralize CSV/spreadsheet formula injection (OWASP CSV Injection).
+
+    Excerpt/source text originates from uploaded medical-record content,
+    which is untrusted input. If a cell's value begins with ``=``, ``+``,
+    ``-``, or ``@`` (or a leading tab/CR), spreadsheet applications such as
+    Excel or Google Sheets may interpret it as a formula when the exported
+    file is opened, enabling formula-injection attacks against whoever opens
+    the download. Prefixing with a single quote forces the cell to be
+    treated as literal text while leaving the visible content unchanged.
+    """
+    if value.startswith(_CSV_FORMULA_PREFIXES):
+        return "'" + value
+    return value
 
 
 def export_citation_index(citations: list[dict[str, str]], fmt: str) -> bytes:
@@ -575,8 +592,8 @@ def export_citation_index(citations: list[dict[str, str]], fmt: str) -> bytes:
         for citation in citations:
             writer.writerow(
                 {
-                    "excerpt": citation.get("excerpt", ""),
-                    "source": citation.get("source", ""),
+                    "excerpt": _csv_formula_guard(str(citation.get("excerpt", ""))),
+                    "source": _csv_formula_guard(str(citation.get("source", ""))),
                 }
             )
         return buffer.getvalue().encode("utf-8")
