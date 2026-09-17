@@ -1,0 +1,352 @@
+# Prometheus alerting rules for the VA Lay Statement Evaluator.
+#
+# Loaded via `rule_files` in prometheus.yml; AlertManager consumes whatever these
+# produce. Severity is the routing key: `critical` should reach a human out of
+# hours, `warning` should open a ticket for the next business day.
+#
+# Two conventions worth knowing before editing:
+#
+#  * `for:` is not decoration. A single scrape of a counter that resets, a burst
+#    of retries the breaker absorbs, or one slow phase is normal. Every rule below
+#    holds its condition long enough that only a sustained condition pages you.
+#  * Rules over *labelled* families wrap the metric in `sum()`/`max_over_time()`.
+#    A labelled series only exists once that label combination has been observed,
+#    so a rule that matches on a specific label would silently never fire on a
+#    fresh deployment — the alert would be missing exactly when it mattered.
+groups:
+  - name: va-lse-availability
+    interval: 30s
+    rules:
+      - alert: VaElseInstanceDown
+        expr: up{job=~"va-lse-.*"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.job }} is not being scraped ({{ $labels.instance }})"
+          description: >-
+            The metrics endpoint has been unreachable for a minute. The process is
+            dead, wedged, or the port stopped binding. /health sharing this port
+            means the orchestrator's liveness probe is failing too, so a restart is
+            probably already happening.
+
+      - alert: VaElseReadinessFailing
+        expr: probe_success{job="va-lse-readiness"} == 0
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Readiness is failing — the app cannot serve a run"
+          description: >-
+            /ready has answered non-200 for three minutes: the LLM gateway is
+            unreachable, or a configured model is no longer listed at
+            {base_url}/models. Check the key/base-URL pairing first — a Token Plan
+            key against a different endpoint is the most common cause, and the app
+            is otherwise healthy (liveness still passes).
+
+  - name: va-lse-llm
+    interval: 30s
+    rules:
+      # The headline rule from the spec: an OPEN breaker is a user-visible outage
+      # even though every process is up. One minute, not zero, so a single probe
+      # failure that immediately recovers does not page anyone.
+      - alert: VaElseCircuitBreakerOpen
+        expr: va_lse_circuit_breaker_open == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "LLM circuit breaker is OPEN ({{ $labels.breaker }})"
+          description: >-
+            Calls have been failing fast without touching the endpoint for over a
+            minute. Every user who tries a run right now gets a "temporarily
+            unavailable, retry in Ns" error. Check the endpoint's own status and
+            the key/quota before touching the app; the breaker is working as
+            designed and will re-probe by itself.
+
+      - alert: VaElseCircuitBreakerFlapping
+        expr: changes(va_lse_circuit_breaker_state[30m]) > 4
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LLM endpoint is flapping (breaker changed state {{ $value }} times in 30m)"
+          description: >-
+            The endpoint is recovering and failing repeatedly. Users are getting
+            intermittent failures rather than a clean outage, which is harder to
+            report and harder to diagnose. Usually a saturated or rate-limited
+            gateway.
+
+      - alert: VaElseBreakerRejections
+        expr: sum(rate(va_lse_circuit_breaker_rejections_total[10m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Requests are being rejected fast by the circuit breaker"
+          description: >-
+            The breaker is (or was, within the last 10 minutes) open and rejecting
+            work. These are requests users were told to retry, not endpoint
+            failures. Fires alongside VaElseCircuitBreakerOpen for a sustained
+            outage and on its own for an intermittent one.
+
+      - alert: VaElseLlmLatencyHigh
+        expr: >-
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(va_lse_llm_call_duration_ms_bucket{outcome="ok"}[5m]))
+          ) > 60000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LLM p95 call latency is above 60s"
+          description: >-
+            Successful calls are taking over a minute at p95. A single call is
+            capped by VA_LSE_LLM_CALL_TIMEOUT_SECONDS, so sustained latency here
+            usually precedes timeouts and then breaker failures. Compare against
+            the endpoint's own status page before changing anything.
+
+      - alert: VaElseLlmErrorRate
+        expr: >-
+          sum(rate(va_lse_llm_errors_total[10m]))
+          / clamp_min(sum(rate(va_lse_llm_calls_total[10m])), 0.001) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Over 10% of LLM calls are failing"
+          description: >-
+            More than one call in ten has exhausted its retries. Split by
+            `category` to see whether this is the endpoint (`retry`), the request
+            (`client`), or the content filter (`moderation`). A `client` spike with
+            a healthy endpoint means a bad key, model name, or prompt.
+
+      - alert: VaElseLlmRetryStorm
+        expr: >-
+          sum(rate(va_lse_llm_attempts_total[10m]))
+          / clamp_min(sum(rate(va_lse_llm_calls_total[10m])), 0.001) > 1.6
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Heavy retrying — most calls take more than one attempt"
+          description: >-
+            Attempts per logical call above 1.6 means the endpoint is rejecting a
+            large share of first attempts (rate limiting, transient 5xx). This
+            burns the credit quota and slows every run without necessarily failing
+            anything, so it will not show up as an error rate.
+
+      # Failover. Two separate signals on purpose: `active` is "users are being
+      # served by the backup provider right now", `enabled` is "a backup exists".
+      # A deployment with no fallback configured must not be paged about either.
+      - alert: VaElseLlmRunningOnFallback
+        expr: va_lse_llm_failover_active == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LLM calls are being served by the fallback endpoint"
+          description: >-
+            The primary endpoint has been unhealthy past
+            LLM_ENDPOINT_FALLBACK_TIMEOUT_SECONDS, so runs are being served by the
+            backup provider. Users are still served — readiness stays green, which
+            is why this alert exists separately. Check the primary's status, and
+            remember the backup provider bills differently and may produce
+            slightly different text, so runs during this window are stamped with
+            the endpoint that served them.
+
+      - alert: VaElseLlmPrimaryUnhealthy
+        expr: va_lse_llm_primary_unhealthy_seconds > 120
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Primary LLM endpoint unhealthy for over {{ $value | humanizeDuration }}"
+          description: >-
+            The primary has been failing continuously. With a fallback configured
+            this precedes failover; without one, requests are failing fast and
+            users are being told to retry.
+
+      - alert: VaElseLlmConcurrencySaturated
+        expr: va_lse_llm_active_calls >= va_lse_llm_max_concurrent_calls
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LLM concurrency cap is saturated"
+          description: >-
+            Every slot in VA_LSE_MAX_CONCURRENT_LLM_CALLS has been busy for ten
+            minutes, so runs are queuing. Raise the cap only if the endpoint's own
+            rate limit allows it — otherwise the queue is protecting you.
+
+      - alert: VaElseLlmQueueBacklog
+        expr: va_lse_llm_queued_calls > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Callers are queued waiting for an LLM slot"
+          description: >-
+            Queued waiters for five minutes. Beyond
+            VA_LSE_LLM_QUEUE_MAX_DEPTH callers start being rejected outright with
+            QueueFullError, which users see as a failed run.
+
+  - name: va-lse-pipeline
+    interval: 30s
+    rules:
+      # Latency p50/p95/p99 are dashboards (see grafana-dashboard.json); this is
+      # the "a phase has started hanging" rule, which is what actually needs a
+      # human. 15 minutes at p95 is well beyond any healthy phase including the
+      # record digest on a large bundle.
+      - alert: VaElsePhaseLatencyHigh
+        expr: >-
+          histogram_quantile(
+            0.95,
+            sum by (le, phase) (rate(va_lse_phase_duration_ms_bucket[15m]))
+          ) > 900000
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Phase {{ $labels.phase }} p95 is above 15 minutes"
+          description: >-
+            A pipeline phase is running far longer than normal at p95. Check the
+            trace or the run log for that phase before assuming it is the LLM —
+            record digest latency scales with the uploaded bundle, so a switch to
+            larger record sets looks like this.
+
+      - alert: VaElsePhaseErrors
+        expr: sum by (phase) (rate(va_lse_phase_duration_ms_count{outcome="error"}[10m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Phase {{ $labels.phase }} is failing"
+          description: >-
+            Runs are reaching an error in this phase. The audit stream records the
+            same event with an `error_class` and a correlation id, so
+            `logs/audit.log` narrows this to a specific run quickly.
+
+      - alert: VaElseRunsStuck
+        expr: va_lse_active_requests > 0
+        for: 60m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A run has been in flight for over an hour"
+          description: >-
+            va_lse_active_requests has not returned to zero for an hour, which
+            also means a SIGTERM drain would time out and the run would be lost.
+            Check for a hung LLM call (bounded by
+            VA_LSE_LLM_CALL_TIMEOUT_SECONDS) or a stuck pipeline worker.
+
+      - alert: VaElseSessionLoadHigh
+        expr: va_lse_session_count > 100
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 100 active browser sessions"
+          description: >-
+            Above the documented 100-concurrent-user profile. Check whether pods
+            are scaling (k8s-hpa.yaml) and whether LLM concurrency is keeping up;
+            a saturated concurrency cap with rising session count is the shape of
+            an overload rather than an outage.
+
+  - name: va-lse-compliance
+    interval: 30s
+    rules:
+      # These protect the audit record, which is a compliance artifact and the one
+      # thing here that cannot be regenerated from anything else.
+      - alert: VaElseAuditWriteFailures
+        expr: increase(va_lse_audit_write_failures_total[10m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Audit records are being dropped"
+          description: >-
+            Writes to the audit stream are failing, which means compliance records
+            were lost — the app keeps serving while that happens by design, so
+            nothing else will tell you. Almost always a full or read-only log
+            volume; check va_lse_disk_free_bytes.
+
+      - alert: VaElseAuditBackupStopped
+        expr: max_over_time(va_lse_audit_backup_state[6h]) > 1
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Audit backup is not running (state {{ $value }})"
+          description: >-
+            2 = never ran, 3 = stale, 4 = error. Audit logs currently exist only on
+            the pod, so a restart loses them. Check `kubectl get jobs` for the
+            backup CronJob and the `last_error` field in the backup state file.
+
+      - alert: VaElseAuditBackupNotOffPod
+        expr: va_lse_audit_backup_configured == 1 and va_lse_audit_backup_off_pod == 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Audit backup destination is on the pod's own volume"
+          description: >-
+            The destination shares the audit log's volume, so it does not survive
+            the failure a backup exists for. Point
+            VA_LSE_AUDIT_BACKUP_DESTINATION at object storage or a separate mount.
+
+      - alert: VaElseDiskBelowFloor
+        expr: va_lse_disk_below_floor == 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Log volume is below VA_LSE_DISK_MIN_FREE_BYTES"
+          description: >-
+            Rotation is by size and count, so a volume this full will start
+            deleting audit files that are younger than the retention window, and
+            then fail writes outright. Free space or lower
+            VA_LSE_AUDIT_LOG_MAX_BYTES before that happens.
+
+      - alert: VaElseJobQueueBacklog
+        expr: va_lse_job_queue_depth > 20
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Job queue backlog is growing"
+          description: >-
+            Runs are being submitted faster than workers claim them. Scale
+            workers (k8s-worker.yaml) or check that they are healthy — a queue
+            depth that climbs and never falls is the signature of workers that
+            are down rather than of too much demand.
+
+      - alert: VaElseJobQueueNotDistributed
+        expr: va_lse_job_queue_enabled == 1 and va_lse_job_queue_distributed == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Job queue is enabled but cannot serve a worker"
+          description: >-
+            The active backend is single-process (in-process), so queued runs can
+            never be claimed by a separate worker deployment. Set
+            VA_LSE_REDIS_URL or the shared-cache credentials on both tiers.
+
+  - name: va-lse-self
+    interval: 60s
+    rules:
+      # Monitoring hygiene: if the app is dropping metric series, the dashboards
+      # above are quietly incomplete rather than obviously broken.
+      - alert: VaElseMetricsSeriesDropped
+        expr: increase(va_lse_metrics_series_dropped_total[1h]) > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Metric series are being dropped (label cardinality cap)"
+          description: >-
+            A metric family hit MAX_SERIES_PER_METRIC, which means one of its
+            labels is carrying unbounded data. Dashboards and alerts over that
+            family are now incomplete. Check the `metric` label for the culprit.

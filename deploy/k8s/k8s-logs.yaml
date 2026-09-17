@@ -1,0 +1,53 @@
+# k8s-logs.yaml — shared, persistent log storage for the audit + run logs
+#
+# This file is the prerequisite for any audit backup story. In the original
+# manifests `/app/logs` was an `emptyDir` on the web Deployment *and* on the worker
+# Deployment, which has two consequences:
+#
+#   1. A pod restart (or eviction, or a rolling update) reclaimed the entire audit
+#      stream. Nothing can back up a volume that disappears with its owner — not a
+#      sidecar, not a CronJob, not a cloud bucket. The data has to exist first.
+#   2. In Pattern C the web pod and the worker each kept their *own* audit.log, so
+#      "the audit log" was silently two partial streams on two ephemeral disks, and
+#      a queued run's audit entries were on a different volume from the run that
+#      submitted it.
+#
+# So: one ReadWriteMany claim, mounted by the web tier, the workers, and the backup
+# job. RWX is required for the same reason it is required for blobs — the backup
+# runs in its own pod (see k8s-audit-backup.yaml).
+#
+#   !!! Check your storage class before applying:
+#   !!!   kubectl get storageclass
+#   !!! `local-path`, `gp2`, and most block-storage classes are ReadWriteOnce,
+#   !!! which would leave this PVC Pending forever.
+#
+# Sizing: the audit log is capped at AUDIT_LOG_MAX_BYTES x (AUDIT_LOG_BACKUPS + 1)
+# (~110 MiB by default) and the diagnostic run log at RUN_LOG_MAX_BYTES x
+# (RUN_LOG_BACKUPS + 1) (~60 MiB). 1Gi leaves generous headroom for app.log.
+#
+# Permissions: the app containers run as uid 65534 (nobody) with a read-only root
+# filesystem, so the volume must be *writable by 65534*. On NFS/EFS mounts that
+# usually means either `fsGroup` in the pod securityContext (defaults on most
+# CSI drivers) or a share exported with a matching uid. A permission mismatch here
+# shows up as `--mount ... permission denied` at startup and as
+# audit.write_failures climbing in /health — not as a silent failure.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: va-lse-logs
+  namespace: va-lse
+spec:
+  accessModes:
+    - ReadWriteMany          # REQUIRED — the backup CronJob reads this from another pod
+  resources:
+    requests:
+      storage: 1Gi
+  # Set your RWX-capable class explicitly (e.g. azurefile-csi, efs-sc, nfs-client).
+  # Leaving this unset uses the default class, which is often RWO-only.
+  # storageClassName: nfs-client
+---
+# Retention is enforced by the backup job, not by the cluster, so nothing here
+# needs a TTL. If you would rather not run the CronJob at all, the minimum
+# viable substitute is this PVC plus a bucket lifecycle rule — but note that a
+# PVC alone still loses the pod's *recent* audit entries on eviction, because
+# nothing has copied them anywhere.

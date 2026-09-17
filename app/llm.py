@@ -5,13 +5,15 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urlparse
 
 from openai import OpenAI
 
+from . import tracing
+from . import metrics
 from .circuit_breaker import CircuitBreakerOpenError, QueueFullError, get_llm_breaker, get_llm_limiter
-from .config import Settings
+from .config import FALLBACK_ENDPOINT, PRIMARY_ENDPOINT, Settings
 from .logging_config import get_request_id
 from .prompt_sanitize import validate_model_name
 from .usage import UsageTracker
@@ -42,6 +44,115 @@ MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 1.0
 MAX_RETRY_BACKOFF_SECONDS = 4.0
 MODELS_ENDPOINT_TIMEOUT_SECONDS = 6
+
+# --------------------------------------------------------------- endpoints
+#
+# "Endpoint" means one configured (base_url, api_key, model names) triple. There
+# is exactly one unless OPENAI_BASE_URL_FALLBACK is set, in which case calls can
+# be served by either. See `failover_status` for the live state and
+# `_endpoint_candidates` for the routing rule. The names live in config so the
+# usage record and the queued-job payload use the same strings.
+
+
+def _endpoint_breaker_name(endpoint: str) -> str:
+    """The circuit-breaker name for an endpoint (also its metrics label)."""
+    from .circuit_breaker import LLM_BREAKER_NAME, LLM_FALLBACK_BREAKER_NAME
+
+    return LLM_FALLBACK_BREAKER_NAME if endpoint == FALLBACK_ENDPOINT else LLM_BREAKER_NAME
+
+
+class _FallbackTarget(NamedTuple):
+    """The resolved failover endpoint: URL, key, and the two model names."""
+
+    base_url: str
+    api_key: str
+    model_main: str
+    model_fast: str
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.base_url)
+
+
+def _as_text(raw: Any) -> str:
+    """A configuration value as a stripped string, or "" if it is not a string.
+
+    Only a ``str`` counts. A non-string is not a URL, key, or model name, and
+    treating one as if it were (``str(mock)`` is non-empty) would make an object
+    that merely *has* such an attribute look like a configured second endpoint.
+    """
+    return raw.strip() if isinstance(raw, str) else ""
+
+
+def _fallback_target(settings: Settings) -> _FallbackTarget:
+    """Resolve the failover endpoint from *settings*, tolerating settings without one.
+
+    Read through ``getattr``/``hasattr`` because this is reached from the
+    ``LLMClient`` constructor, which test doubles and older callers also invoke: an
+    object that declares no fallback URL has no fallback, which is exactly the
+    behaviour before this feature existed, rather than an ``AttributeError``. The
+    ``Settings`` accessors are preferred when present so the inheritance rules
+    ("an unset fallback key/model means the primary's") live in one place.
+    """
+    base_url = _as_text(getattr(settings, "fallback_base_url", ""))
+    if hasattr(settings, "fallback_api_key_or_primary"):
+        api_key = _as_text(settings.fallback_api_key_or_primary())
+        model_main = _as_text(settings.fallback_model_main_or_primary())
+        model_fast = _as_text(settings.fallback_model_fast_or_primary())
+    else:
+        api_key = _as_text(getattr(settings, "fallback_api_key", "")) or _as_text(
+            getattr(settings, "api_key", "")
+        )
+        model_main = _as_text(getattr(settings, "fallback_model_main", "")) or _as_text(
+            getattr(settings, "model_main", "")
+        )
+        model_fast = _as_text(getattr(settings, "fallback_model_fast", "")) or _as_text(
+            getattr(settings, "model_fast", "")
+        )
+    return _FallbackTarget(base_url, api_key, model_main, model_fast)
+
+
+def failover_after_seconds() -> float:
+    """Grace period the primary must be unhealthy for before calls move over.
+
+    Named for ``LLM_ENDPOINT_FALLBACK_TIMEOUT_SECONDS``; it is not an HTTP
+    timeout. Returns a large number when config is unavailable, so a broken
+    config fails *closed* (never failover) rather than failing over eagerly.
+    """
+    try:
+        from . import config as _cfg
+
+        return max(0.0, float(getattr(_cfg, "LLM_FAILOVER_AFTER_SECONDS", 300)))
+    except Exception:  # noqa: BLE001
+        return 300.0
+
+
+def failover_status() -> dict[str, Any]:
+    """Live failover state for /health and /metrics. Performs no I/O.
+
+    Read from the primary's breaker rather than remembered anywhere: the breaker
+    is the process-wide owner of "how long has this endpoint been unhealthy", and
+    a client instance is rebuilt on every Streamlit rerun, so a client-side flag
+    would forget an outage between reruns.
+    """
+    try:
+        from . import config as _cfg
+
+        configured = _fallback_target(_cfg.load_settings()).configured
+    except Exception:  # noqa: BLE001
+        configured = False
+
+    from .circuit_breaker import get_llm_breaker
+
+    threshold = failover_after_seconds()
+    unhealthy = get_llm_breaker(_endpoint_breaker_name(PRIMARY_ENDPOINT)).unhealthy_for_seconds()
+    active = bool(configured and unhealthy is not None and unhealthy >= threshold)
+    return {
+        "configured": configured,
+        "active": active,
+        "after_seconds": threshold,
+        "primary_unhealthy_seconds": unhealthy,
+    }
 
 # ---------------------------------------------------------------- moderation filter
 #
@@ -153,6 +264,38 @@ def check_model_availability(base_url: str, api_key: str) -> set[str] | None:
         return ids
     except Exception:  # noqa: BLE001 - availability check is advisory only
         return None
+
+
+def _validate_fallback_settings(settings: Settings) -> None:
+    """Validate the failover endpoint — only called when one is configured."""
+    target = _fallback_target(settings)
+    if not target.configured:
+        return
+    base_url = target.base_url
+    parsed = urlparse(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise LLMConfigurationError(
+            "OPENAI_BASE_URL_FALLBACK must be a valid http(s) URL for an "
+            "OpenAI-compatible endpoint."
+        )
+    if base_url.rstrip("/") == (settings.base_url or "").strip().rstrip("/"):
+        # Not fatal, but it is certainly not a failover: the same endpoint will
+        # fail the same way, and the logs would claim two providers were tried.
+        logger.warning(
+            "OPENAI_BASE_URL_FALLBACK is the same URL as OPENAI_BASE_URL — "
+            "failover to it cannot help (no second endpoint is configured).",
+            extra={"phase": "llm_config", "status": "warn"},
+        )
+    # No key check here: ``target.api_key`` is ``OPENAI_API_KEY_FALLBACK or
+    # OPENAI_API_KEY``, and ``_validate_settings`` has already rejected an empty
+    # primary key, so a missing key cannot reach this point.
+    for label, model in (
+        ("Fallback main model", target.model_main),
+        ("Fallback fast model", target.model_fast),
+    ):
+        msg = validate_model_name(str(model or ""))
+        if msg:
+            raise LLMConfigurationError(f"{label}: {msg}")
 
 
 def _usage_tokens(response: Any) -> tuple[int | None, int | None]:
@@ -388,12 +531,97 @@ class LLMClient:
 
     def __init__(self, settings: Settings) -> None:
         _validate_settings(settings)
+        _validate_fallback_settings(settings)
         self._settings = settings
         _timeout_s = _configured_timeout_seconds()
         self._client = OpenAI(
             api_key=settings.api_key, base_url=settings.base_url, timeout=max(1.0, _timeout_s)
         )
+        # Built once here (not lazily on the failover path) so a bad fallback URL
+        # or key is reported at startup rather than discovered mid-outage.
+        self._fallback_client: OpenAI | None = None
+        fallback = _fallback_target(settings)
+        if fallback.configured:
+            self._fallback_client = OpenAI(
+                api_key=fallback.api_key,
+                base_url=fallback.base_url,
+                timeout=max(1.0, _timeout_s),
+            )
         self.usage = UsageTracker()
+
+    # -------------------------------------------------------------- endpoints
+
+    @property
+    def fallback_available(self) -> bool:
+        """Whether this client can serve a call from a second endpoint."""
+        return self._fallback_client is not None
+
+    def _endpoint_client(self, endpoint: str) -> OpenAI:
+        if endpoint == FALLBACK_ENDPOINT:
+            if self._fallback_client is None:
+                raise LLMConfigurationError(
+                    "The fallback endpoint was selected but is not configured."
+                )
+            return self._fallback_client
+        return self._client
+
+    def _resolve_model(self, endpoint: str, requested: str | None) -> str:
+        """The model name to send to *endpoint* for the model the caller asked for.
+
+        Callers name the primary's models (``settings.model_main`` / ``model_fast``
+        or nothing at all). A fallback is usually a different provider whose model
+        names differ, so those two roles are translated onto the fallback's names.
+        A caller passing some *other* model name is naming one for this
+        deployment; it is passed through untouched, because inventing an
+        equivalent on another provider would be guesswork.
+        """
+        settings = self._settings
+        requested_name = (requested or settings.model_main).strip()
+        if endpoint != FALLBACK_ENDPOINT:
+            return requested_name
+        target = _fallback_target(settings)
+        if requested_name == (settings.model_main or "").strip():
+            return target.model_main
+        if requested_name == (settings.model_fast or "").strip():
+            return target.model_fast
+        return requested_name
+
+    def _endpoint_candidates(self) -> list[str]:
+        """Which endpoint(s) a call may use, in the order they should be tried.
+
+        * No fallback configured -> the primary only, exactly as before.
+        * Primary healthy, **or** unhealthy for less than the grace period -> the
+          primary only. A blip must not move the business onto another provider,
+          and a short outage is better absorbed than routed around.
+        * Primary unhealthy for at least the grace period -> the fallback. If the
+          primary's own recovery window has elapsed, the primary is tried first so
+          this call doubles as its probe: a failure falls through to the fallback
+          (see :meth:`chat`) instead of failing the user's run.
+        """
+        if not self.fallback_available:
+            return [PRIMARY_ENDPOINT]
+        primary = get_llm_breaker(_endpoint_breaker_name(PRIMARY_ENDPOINT))
+        unhealthy = primary.unhealthy_for_seconds()
+        if unhealthy is None or unhealthy < failover_after_seconds():
+            return [PRIMARY_ENDPOINT]
+        if primary.allow_request():
+            return [PRIMARY_ENDPOINT, FALLBACK_ENDPOINT]
+        return [FALLBACK_ENDPOINT]
+
+    def _failover_note(self) -> str:
+        """Extra sentence for a fast-fail error when a fallback is armed."""
+        if not self.fallback_available:
+            return ""
+        primary = get_llm_breaker(_endpoint_breaker_name(PRIMARY_ENDPOINT))
+        unhealthy = primary.unhealthy_for_seconds()
+        threshold = failover_after_seconds()
+        if unhealthy is None:
+            return ""
+        remaining = max(0.0, threshold - unhealthy)
+        return (
+            f"A backup endpoint is configured: it will be used automatically once the "
+            f"primary has been failing for {threshold:.0f}s (in {remaining:.0f}s)."
+        )
 
     # ------------------------------------------------------------------ core
     def chat(
@@ -406,20 +634,92 @@ class LLMClient:
         max_tokens: int = 8000,
         phase: str = "general",
     ) -> str:
-        """Single-turn chat completion with retry, breaker, and concurrency guards.
+        """Single-turn chat completion, with failover to a second endpoint.
 
-        Raises ``CircuitBreakerOpenError`` (fail-fast, <2 s, no network) when
-        the breaker is OPEN, ``QueueFullError`` when the concurrency queue is
-        full or times out, and ``LLMError`` when the provider call exhausts its
-        retries. The breaker counts only *logical* call failures (one per
-        ``chat`` that exhausts retries), not per-attempt retries.
+        Tries the endpoints from :meth:`_endpoint_candidates` in order (one, unless
+        failover is engaged and the primary's probe is due). A fast-fail rejection
+        is never retried on the other endpoint — it means "do not call this
+        provider right now" — but a genuine call failure is, so the primary's
+        recovery probe costs the user nothing.
         """
-        model = model or self._settings.model_main  # noqa: A001 - reassign param
+        request_model = (model or self._settings.model_main).strip()
+        candidates = self._endpoint_candidates()
+        last_error: Exception | None = None
+        for index, endpoint in enumerate(candidates):
+            try:
+                return self._chat_on_endpoint(
+                    endpoint,
+                    system,
+                    user,
+                    model=request_model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    phase=phase,
+                )
+            except (CircuitBreakerOpenError, QueueFullError) as exc:
+                # Fail fast all the way to the caller. If the primary is simply
+                # still inside its grace period, say when failover will engage —
+                # otherwise the message reads as "endpoint is down" with no hint
+                # that a backup is coming.
+                note = self._failover_note() if endpoint == PRIMARY_ENDPOINT else ""
+                if not note:
+                    raise
+                raise type(exc)(f"{exc} {note}") from exc
+            except LLMError as exc:
+                last_error = exc
+                if index + 1 >= len(candidates):
+                    raise
+                metrics.observe_llm_failover(reason="primary_call_failed")
+                logger.warning(
+                    "failover: primary call failed (%s: %s) — serving this call from "
+                    "the fallback endpoint",
+                    type(exc).__name__,
+                    exc,
+                    extra={
+                        "request_id": get_request_id() or "-",
+                        "phase": phase,
+                        "status": "failover",
+                        "from_endpoint": endpoint,
+                        "to_endpoint": candidates[index + 1],
+                        "error_class": type(exc).__name__,
+                    },
+                )
+        assert last_error is not None  # pragma: no cover - loop always returns/raises
+        raise last_error
+
+    # ------------------------------------------------------------------ core
+    def _chat_on_endpoint(
+        self,
+        endpoint: str,
+        system: str,
+        user: str,
+        *,
+        model: str | None = None,
+        temperature: float = 0.2,
+        max_tokens: int = 8000,
+        phase: str = "general",
+    ) -> str:
+        """One endpoint's attempt at a chat completion (retries, breaker, limiter).
+
+        Raises ``CircuitBreakerOpenError`` (fail-fast, <2 s, no network) when this
+        endpoint's breaker is OPEN, ``QueueFullError`` when the concurrency queue
+        is full or times out, and ``LLMError`` when the provider call exhausts its
+        retries. The breaker counts only *logical* call failures (one per call that
+        exhausts retries), not per-attempt retries.
+        """
+        model = self._resolve_model(endpoint, model)  # noqa: A001 - reassign param
         rid = get_request_id() or "-"
 
         # Fail fast before touching the limiter or the network.
-        breaker = get_llm_breaker()
-        breaker.check_or_raise()
+        breaker = get_llm_breaker(_endpoint_breaker_name(endpoint))
+        try:
+            breaker.check_or_raise()
+        except CircuitBreakerOpenError:
+            # Counted separately from endpoint failures: these are calls the user
+            # was told to retry, and a rising count is what makes an open breaker
+            # visible to an alert rather than only to whoever reads logs.
+            metrics.observe_breaker_rejection(breaker.name)
+            raise
 
         limiter = get_llm_limiter()
         # Acquire a concurrency slot (queues up to max_queue_depth, else QueueFullError).
@@ -427,7 +727,11 @@ class LLMClient:
         acquired = True
         try:
             # Re-check breaker after queuing — it may have opened while we waited.
-            breaker.check_or_raise()
+            try:
+                breaker.check_or_raise()
+            except CircuitBreakerOpenError:
+                metrics.observe_breaker_rejection(breaker.name)
+                raise
 
             sys_len = len(system or "")
             user_len = len(user or "")
@@ -437,15 +741,21 @@ class LLMClient:
             for attempt in range(MAX_RETRIES):
                 attempt_t0 = time.perf_counter()
                 try:
-                    response = self._client.chat.completions.create(
-                        model=model,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        messages=[
-                            {"role": "system", "content": system},
-                            {"role": "user", "content": user},
-                        ],
-                    )
+                    # Opt-in span around the provider call itself
+                    # (VA_LSE_TRACE_LLM_CALLS) — this is where endpoint latency
+                    # and retries show up, as opposed to phase-level totals.
+                    with tracing.llm_call_span(
+                        phase, model=model, attempt=attempt + 1, endpoint=endpoint
+                    ):
+                        response = self._endpoint_client(endpoint).chat.completions.create(
+                            model=model,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            messages=[
+                                {"role": "system", "content": system},
+                                {"role": "user", "content": user},
+                            ],
+                        )
                     content = response.choices[0].message.content
                     if not content or not content.strip():
                         raise LLMError("Model returned an empty response.")
@@ -453,6 +763,7 @@ class LLMClient:
                     prompt_tokens, completion_tokens = _usage_tokens(response)
                     self.usage.record(
                         model=model,
+                        endpoint=endpoint,
                         phase=phase,
                         system=system,
                         user=user,
@@ -480,6 +791,7 @@ class LLMClient:
                             "phase": phase,
                             "status": "ok",
                             "model": model,
+                            "endpoint": endpoint,
                             "attempt": attempt + 1,
                             "retries": MAX_RETRIES,
                             "duration_ms": duration_ms,
@@ -488,6 +800,15 @@ class LLMClient:
                         },
                     )
                     breaker.record_success()
+                    # Every provider attempt is counted, including the one that
+                    # succeeded. Without this the attempts counter would only ever
+                    # see failures, so `attempts / calls` would sit near zero on a
+                    # healthy system and the retry-overhead alert could never fire.
+                    metrics.observe_llm_attempt(phase, "ok")
+                    # One observation per *logical* call: total_ms includes any
+                    # retries that preceded this success, which is what a user
+                    # actually waited through.
+                    metrics.observe_llm_call(phase, "ok", total_ms, endpoint=endpoint)
                     return content
                 except (CircuitBreakerOpenError, QueueFullError):
                     # Never count limiter/breaker rejections as endpoint failures.
@@ -525,6 +846,12 @@ class LLMClient:
                     last_error = normalized
                     duration_ms = int((time.perf_counter() - attempt_t0) * 1000)
                     is_last = attempt >= MAX_RETRIES - 1 or not retriable
+                    metrics.observe_llm_attempt(phase, "error" if is_last else "retry")
+                    if is_last and not nudge_next:
+                        metrics.observe_llm_error(
+                            "moderation" if isinstance(normalized, _ModerationFilteredError)
+                            else "retry" if retriable else "client"
+                        )
                     logger.log(
                         logging.ERROR if is_last and not nudge_next else logging.WARNING,
                         "llm call %s phase=%s model=%s attempt=%d/%d duration_ms=%d error=%s",
@@ -541,6 +868,7 @@ class LLMClient:
                             "phase": phase,
                             "status": "error" if is_last and not nudge_next else "retry",
                             "model": model,
+                            "endpoint": endpoint,
                             "attempt": attempt + 1,
                             "retries": MAX_RETRIES,
                             "duration_ms": duration_ms,
@@ -557,6 +885,17 @@ class LLMClient:
                     )
                     if is_last and not nudge_next:
                         breaker.record_failure()
+                        # The logical failed call is recorded *here* as well as after
+                        # the loop. A deterministic failure (bad key, moderation
+                        # filter) raises from inside the loop, so recording only at
+                        # the bottom would omit the failures the error-rate alert is
+                        # actually watching, and inflate errors/calls above 1.
+                        metrics.observe_llm_call(
+                            phase,
+                            "error",
+                            int((time.perf_counter() - t0) * 1000),
+                            endpoint=endpoint,
+                        )
                         raise normalized
                     if not is_last:
                         # A nudge retry does not sleep: the rejection was
@@ -565,6 +904,9 @@ class LLMClient:
                             time.sleep(_retry_backoff_seconds(attempt))
             # Exhausted retries — counts as one logical failure for the breaker.
             breaker.record_failure()
+            metrics.observe_llm_call(
+                phase, "error", int((time.perf_counter() - t0) * 1000), endpoint=endpoint
+            )
             if isinstance(last_error, LLMTimeoutError):
                 raise LLMTimeoutError(
                     f"LLM call failed after {MAX_RETRIES} attempts: {last_error}",

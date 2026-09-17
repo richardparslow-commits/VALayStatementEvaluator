@@ -1,0 +1,340 @@
+{
+  "annotations": { "list": [] },
+  "description": "Operator view of the VA Lay Statement Evaluator: availability, pipeline phase latency, LLM health, and the compliance stream. Provisioned from deploy/monitoring/grafana-dashboard.json.",
+  "editable": true,
+  "graphTooltip": 1,
+  "links": [
+    { "title": "Runbook (DEPLOYMENT.md)", "type": "link", "url": "https://github.com/your-org/va-lay-statement-evaluator/blob/main/DEPLOYMENT.md", "targetBlank": true }
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Availability",
+      "description": "Instances being scraped.",
+      "gridPos": { "h": 4, "w": 3, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "sum(up{job=~\"va-lse-.*\"})", "legendFormat": "up" }
+      ],
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "value" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 1 } ] }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Readiness",
+      "description": "/ready as probed by blackbox_exporter. 0 means the LLM gateway or a configured model is unreachable.",
+      "gridPos": { "h": 4, "w": 3, "x": 3, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "min(probe_success{job=\"va-lse-readiness\"})", "legendFormat": "ready" }
+      ],
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "value" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "NOT READY", "color": "red" }, "1": { "text": "READY", "color": "green" } } }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null } ] }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Active sessions",
+      "description": "Browser sessions seen within VA_LSE_METRICS_SESSION_TTL_SECONDS (default 300s). Not sockets open: Streamlit re-runs the script on each interaction.",
+      "gridPos": { "h": 4, "w": 3, "x": 6, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "sum(va_lse_session_count)", "legendFormat": "sessions" }
+      ],
+      "options": { "colorMode": "value", "graphMode": "area", "textMode": "value" },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 100 } ] } },
+        "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Runs in flight",
+      "description": "Evaluate/Draft runs executing in this process. Must reach zero before a SIGTERM drain completes.",
+      "gridPos": { "h": 4, "w": 3, "x": 9, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "sum(va_lse_active_requests)", "legendFormat": "runs" }
+      ],
+      "options": { "colorMode": "value", "graphMode": "area", "textMode": "value" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Circuit breaker",
+      "description": "0=CLOSED, 1=HALF_OPEN, 2=OPEN. OPEN means calls are failing fast without touching the endpoint.",
+      "gridPos": { "h": 4, "w": 3, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "max(va_lse_circuit_breaker_state)", "legendFormat": "state" }
+      ],
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "value" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "CLOSED", "color": "green", "index": 0 }, "1": { "text": "HALF_OPEN", "color": "orange", "index": 1 }, "2": { "text": "OPEN", "color": "red", "index": 2 } } }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null } ] }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "LLM concurrency",
+      "description": "Active calls against the configured cap, plus queued waiters.",
+      "gridPos": { "h": 4, "w": 4, "x": 15, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "sum(va_lse_llm_active_calls)", "legendFormat": "active" },
+        { "refId": "B", "expr": "sum(va_lse_llm_max_concurrent_calls)", "legendFormat": "cap" },
+        { "refId": "C", "expr": "sum(va_lse_llm_queued_calls)", "legendFormat": "queued" }
+      ],
+      "options": { "colorMode": "value", "graphMode": "area", "textMode": "value" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] }
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Audit backup",
+      "description": "0=ok, 1=disabled, 2=never_ran, 3=stale, 4=error, 5=unavailable. Anything above 0 means audit logs may exist only on the pod.",
+      "gridPos": { "h": 4, "w": 5, "x": 19, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "max(va_lse_audit_backup_state)", "legendFormat": "state" }
+      ],
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "value" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "OK", "color": "green", "index": 0 }, "1": { "text": "DISABLED", "color": "orange", "index": 1 }, "2": { "text": "NEVER RAN", "color": "orange", "index": 2 }, "3": { "text": "STALE", "color": "red", "index": 3 }, "4": { "text": "ERROR", "color": "red", "index": 4 }, "5": { "text": "UNAVAILABLE", "color": "red", "index": 5 } } }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Pipeline phase latency (p50 / p95 / p99)",
+      "description": "Every phase of every run, from the same call sites that log phase=. This is where \"which phase is the bottleneck\" is answered.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.50, sum by (le) (rate(va_lse_phase_duration_ms_bucket{outcome=\"ok\"}[$__rate_interval])))", "legendFormat": "p50" },
+        { "refId": "B", "expr": "histogram_quantile(0.95, sum by (le) (rate(va_lse_phase_duration_ms_bucket{outcome=\"ok\"}[$__rate_interval])))", "legendFormat": "p95" },
+        { "refId": "C", "expr": "histogram_quantile(0.99, sum by (le) (rate(va_lse_phase_duration_ms_bucket{outcome=\"ok\"}[$__rate_interval])))", "legendFormat": "p99" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms", "custom": { "drawStyle": "line", "fillOpacity": 8, "lineWidth": 2, "showPoints": "never" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Phase p95 by phase",
+      "description": "The same p95 split per phase — the panel that names the bottleneck. Filter with the $phase variable above.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.95, sum by (le, phase) (rate(va_lse_phase_duration_ms_bucket{phase=~\"$phase\", outcome=\"ok\"}[$__rate_interval])))", "legendFormat": "{{phase}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms", "custom": { "drawStyle": "line", "fillOpacity": 0, "lineWidth": 2, "showPoints": "never" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "LLM call latency (p50 / p95 / p99)",
+      "description": "Logical calls (retries included), so this is what a user actually waited for. Compare with the per-phase panels to tell \"slow model\" from \"slow pipeline\".",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.50, sum by (le) (rate(va_lse_llm_call_duration_ms_bucket{outcome=\"ok\"}[$__rate_interval])))", "legendFormat": "p50" },
+        { "refId": "B", "expr": "histogram_quantile(0.95, sum by (le) (rate(va_lse_llm_call_duration_ms_bucket{outcome=\"ok\"}[$__rate_interval])))", "legendFormat": "p95" },
+        { "refId": "C", "expr": "histogram_quantile(0.99, sum by (le) (rate(va_lse_llm_call_duration_ms_bucket{outcome=\"ok\"}[$__rate_interval])))", "legendFormat": "p99" },
+        { "refId": "D", "expr": "histogram_quantile(0.95, sum by (le, endpoint) (rate(va_lse_llm_endpoint_duration_ms_bucket{outcome=\"ok\"}[$__rate_interval])))", "legendFormat": "p95 {{endpoint}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms", "custom": { "drawStyle": "line", "fillOpacity": 8, "lineWidth": 2, "showPoints": "never" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "LLM calls by outcome",
+      "description": "Calls per second, split by whether they succeeded. A falling ok rate with a flat error rate means fewer runs are being started, not that calls are failing.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "sum by (outcome) (rate(va_lse_llm_calls_total[$__rate_interval]))", "legendFormat": "{{outcome}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never", "stacking": { "mode": "normal" } } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } }
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Circuit breaker state and rejections",
+      "description": "State over time (CLOSED/HALF_OPEN/OPEN) with the rate of calls rejected fast. A flat OPEN with a rising rejection rate is a hard outage.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "max by (breaker) (va_lse_circuit_breaker_state)", "legendFormat": "{{breaker}} state" },
+        { "refId": "B", "expr": "sum(rate(va_lse_circuit_breaker_rejections_total[$__rate_interval]))", "legendFormat": "rejections/s" },
+        { "refId": "C", "expr": "sum(rate(va_lse_circuit_breaker_transitions_total[$__rate_interval]))", "legendFormat": "transitions/s" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 0, "lineWidth": 2, "showPoints": "never" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } }
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "LLM retry overhead and error mix",
+      "description": "Attempts per call (1.0 = no retrying) and failures by category. A category of `client` with a healthy endpoint means a bad key, model, or prompt rather than an outage.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(va_lse_llm_attempts_total[$__rate_interval])) / clamp_min(sum(rate(va_lse_llm_calls_total[$__rate_interval])), 0.001)", "legendFormat": "attempts per call" },
+        { "refId": "B", "expr": "sum by (category) (rate(va_lse_llm_errors_total[$__rate_interval]))", "legendFormat": "errors: {{category}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 0, "lineWidth": 2, "showPoints": "never" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } }
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Job queue depth",
+      "description": "Runs waiting for a worker. Only populated when the queue is enabled (Pattern C); a depth that climbs and never falls means workers are down, not that demand is high.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "sum(va_lse_job_queue_depth)", "legendFormat": "waiting" },
+        { "refId": "B", "expr": "max(va_lse_job_queue_enabled)", "legendFormat": "enabled" },
+        { "refId": "C", "expr": "max(va_lse_job_queue_distributed)", "legendFormat": "distributed" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 8, "lineWidth": 2, "showPoints": "never" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } }
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "Audit backup health",
+      "description": "Un-shipped audit bytes (what a pod death would lose) and hours since the last successful pass. Both are on the critical alert path.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "sum(va_lse_audit_backup_pending_bytes)", "legendFormat": "pending bytes" },
+        { "refId": "B", "expr": "(time() - max(va_lse_audit_backup_last_success_timestamp_seconds)) / 3600", "legendFormat": "hours since success" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 0, "lineWidth": 2, "showPoints": "never" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } }
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "Log volume headroom",
+      "description": "Free space on the log volume against VA_LSE_DISK_MIN_FREE_BYTES. Below the floor, rotation starts deleting audit files younger than the retention window.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 36 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "min(va_lse_disk_free_bytes)", "legendFormat": "free" },
+        { "refId": "B", "expr": "max(va_lse_disk_min_free_bytes)", "legendFormat": "floor" },
+        { "refId": "C", "expr": "max(va_lse_disk_below_floor)", "legendFormat": "below floor" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "drawStyle": "line", "fillOpacity": 8, "lineWidth": 2, "showPoints": "never" } }, "overrides": [ { "matcher": { "id": "byName", "options": "below floor" }, "properties": [ { "id": "unit", "value": "short" } ] } ] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } }
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "Monitoring hygiene: dropped series and audit write failures",
+      "description": "Both are silent failures. Dropped series mean a dashboard above is quietly incomplete; audit write failures mean compliance records were lost while the app kept serving.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 36 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "increase(va_lse_metrics_series_dropped_total[$__range])", "legendFormat": "series dropped ({{metric}})" },
+        { "refId": "B", "expr": "increase(va_lse_audit_write_failures_total[$__range])", "legendFormat": "audit writes failed" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "bars", "fillOpacity": 40, "lineWidth": 1, "showPoints": "never" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } }
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "LLM endpoint failover",
+      "description": "Whether calls are being served by the backup endpoint, what the primary costs in requests, and how much traffic each endpoint carried. readiness stays green during a healthy failover, so this panel is what tells on-call that users are on the backup provider.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 44 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "max(va_lse_llm_failover_active)", "legendFormat": "serving from fallback" },
+        { "refId": "B", "expr": "max(va_lse_llm_failover_enabled)", "legendFormat": "failover configured" },
+        { "refId": "C", "expr": "max(va_lse_llm_primary_unhealthy_seconds)", "legendFormat": "primary unhealthy (s)" },
+        { "refId": "D", "expr": "max(va_lse_llm_failover_after_seconds)", "legendFormat": "failover threshold (s)" },
+        { "refId": "E", "expr": "sum(rate(va_lse_llm_failover_total[$__rate_interval]))", "legendFormat": "calls moved to fallback/s" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } }
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "LLM calls by serving endpoint",
+      "description": "Call volume split primary vs fallback. A non-zero fallback line means users are being served by the backup provider.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 52 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "sum by (endpoint) (rate(va_lse_llm_endpoint_calls_total[$__rate_interval]))", "legendFormat": "{{endpoint}}" },
+        { "refId": "B", "expr": "sum by (breaker) (va_lse_circuit_breaker_unhealthy_seconds)", "legendFormat": "unhealthy: {{breaker}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } }
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["va-lse", "streamlit", "llm"],
+  "templating": {
+    "list": [
+      {
+        "name": "phase",
+        "label": "Phase",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": { "query": "label_values(va_lse_phase_duration_ms_count, phase)", "refId": "va-lse-phases" },
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": { "selected": true, "text": ["All"], "value": ["$__all"] }
+      }
+    ]
+  },
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "VA Lay Statement Evaluator — Operations",
+  "uid": "va-lse-ops",
+  "version": 1,
+  "weekStart": ""
+}

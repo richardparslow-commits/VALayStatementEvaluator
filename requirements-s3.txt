@@ -1,0 +1,14 @@
+# Optional dependency for the S3 blob-store backend (VA_LSE_BLOB_STORE=s3).
+#
+# Not part of requirements.txt / requirements.lock on purpose: the default
+# filesystem blob store (VA_LSE_BLOB_DIR, a shared volume) needs no extra
+# package, and nothing else in the app imports boto3. Install this only when
+# queued job documents should live in object storage (AWS S3, Cloudflare R2,
+# MinIO, DigitalOcean Spaces) instead of a shared filesystem:
+#
+#   pip install -r requirements-s3.txt
+#
+# Then set VA_LSE_BLOB_S3_BUCKET plus the usual AWS_* credentials and, for
+# non-AWS endpoints, VA_LSE_BLOB_S3_ENDPOINT_URL. See app/blob_store.py and
+# DEPLOYMENT.md -> Pattern C -> Job documents.
+boto3>=1.34

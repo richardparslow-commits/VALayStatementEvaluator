@@ -60,6 +60,50 @@ both at the expensive model unless you accept the cost.
 
 Add a new row here whenever defaults, prompt templates, or API contracts change.
 
+## Running two endpoints at once (failover)
+
+The app can hold **two** endpoint configurations at the same time: the primary
+(`OPENAI_BASE_URL`) and an optional fallback (`OPENAI_BASE_URL_FALLBACK`). They are
+usually *different providers*, which is why the fallback has its own key and model
+names:
+
+| Role | Primary | Fallback |
+|------|---------|----------|
+| Endpoint | `OPENAI_BASE_URL` | `OPENAI_BASE_URL_FALLBACK` |
+| Credentials | `OPENAI_API_KEY` | `OPENAI_API_KEY_FALLBACK` (default: the primary's) |
+| Heavy calls | `LLM_MODEL_MAIN` | `LLM_MODEL_MAIN_FALLBACK` (default: the primary's) |
+| Bulk calls | `LLM_MODEL_FAST` | `LLM_MODEL_FAST_FALLBACK` (default: the primary's) |
+
+**A key is provider-specific, and so are model names.** The documented example —
+OpenAI as the backup for a QwenCloud primary — needs all four fallback values;
+`OPENAI_BASE_URL_FALLBACK` alone can only reach a second gateway that accepts the
+*same* key and serves the *same* model names (a second region, or a proxy in front
+of the same account).
+
+Both models of the fallback are checked against its `/models` list by the
+readiness probe, exactly as the primary's are, and it is only probed when the
+primary fails — so a healthy deployment still costs one round trip.
+
+Things worth knowing before you point the two at different vendors:
+
+- **The backup may write differently.** These are legal work products. Output from
+gpt-4-turbo is not byte-identical to output from qwen3.7-max, and the prompt
+tuning in this repo (including the QwenCloud moderation-nudge handling) targets the
+configured model. A run served by the fallback is stamped `llm_endpoints` in the
+audit record and the run log so the distinction is recoverable afterwards.
+- **Model names are not interchangeable across providers.** The two *roles*
+  (heavy/bulk) are mapped onto the fallback's names — see
+  `LLMClient._resolve_model`. A caller that names some other model gets that name
+  passed through unchanged, because guessing an equivalent on another vendor would
+  be guesswork.
+- **Costs differ.** The fallback bills at its own rates, and
+  `VA_LSE_CREDITS_PER_1M_*` describes the *primary*. A long failover window is a
+  real (if small) budget event; `va_lse_llm_failover_active` tells you it is
+  happening.
+- **Rate limits differ.** The concurrency limiter
+  (`VA_LSE_MAX_CONCURRENT_LLM_CALLS`) is shared by both endpoints, so it must fit
+  whichever of the two has the tighter limit.
+
 ## Detecting an outdated or unsupported configuration
 
 On every app launch the sidebar runs a best-effort **model availability check**:

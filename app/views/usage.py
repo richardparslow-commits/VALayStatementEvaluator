@@ -87,6 +87,18 @@ def render_usage_summary(usage: Any) -> None:
     if not total.calls:
         return
 
+    # Shown outside (and above) the collapsed expander on purpose: a failover means
+    # a different model wrote part of this document, and for a document that goes
+    # into a claim file that is something the reader should not have to open a
+    # details panel to discover. The audit record is the durable record of it.
+    if getattr(usage, "used_fallback", False):
+        st.warning(
+            "⚠️ Part of this run was served by the **backup LLM endpoint**: the primary "
+            "endpoint was unavailable. The result is complete and reviewed the same way, "
+            "but its wording may differ from a normal run. This run's audit record "
+            "(`llm_endpoints`) and the run log name the endpoint(s) that produced it."
+        )
+
     with st.expander("⚙️ Estimated API usage (tokens / calls)", expanded=False):
         rows = []
         for phase, stats in usage.per_phase().items():

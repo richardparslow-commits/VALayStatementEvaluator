@@ -1,13 +1,33 @@
 # docker-compose.yml — VA Lay Statement Evaluator (multi-instance)
 #
-# Pattern A from DEPLOYMENT.md: three Streamlit replicas behind nginx
-# with cookie-based session affinity.
+# Two patterns live here (see DEPLOYMENT.md):
 #
-# Usage:
-#   docker compose up --build -d
-#   docker compose up -d --scale streamlit-web=5   # scale to 5
-#   docker compose logs -f
-#   docker compose down
+#   Pattern A (default) — three Streamlit replicas behind nginx with cookie-based
+#   session affinity. Every run executes inside the pod serving the browser
+#   session. Nothing extra to start:
+#
+#     docker compose up --build -d
+#     docker compose up -d --scale streamlit-web=5   # scale to 5
+#
+#   Pattern C (worker pool) — the same web tier, plus Redis and worker pods, so a
+#   large digest runs off the pod that owns the user's session. Sticky sessions
+#   stay on either way: a Streamlit session is a live WebSocket bound to one
+#   process, so affinity is required, not a workaround. What Pattern C removes is
+#   the *heavy work* from the web pod. The Redis and worker services are behind
+#   the "pattern-c" profile so the default `up` stays Pattern A:
+#
+#     VA_LSE_JOB_QUEUE=1 docker compose --profile pattern-c up --build -d
+#     docker compose up -d --scale worker=4           # scale workers
+#     docker compose logs -f worker
+#
+#   Start the profile BEFORE (or together with) setting VA_LSE_JOB_QUEUE=1 on the
+#   web tier — queueing with no consumer just accumulates jobs. If you do flip the
+#   flag without a worker, runs fail with a clear connection error rather than
+#   hanging, and GET /health reports `job_queue`.
+#
+# The worker needs OPENAI_API_KEY in its own environment. A key typed into the
+# sidebar lives in a browser session and cannot reach a worker process; the submit
+# path checks for this and refuses to queue rather than failing the run later.
 
 services:
   # --- Reverse proxy with session affinity ---
@@ -27,7 +47,7 @@ services:
       retries: 3
     restart: unless-stopped
 
-  # --- Streamlit application instances ---
+  # --- Streamlit application instances (the thin web tier) ---
   streamlit-web:
     build: .
     env_file: .env
@@ -38,6 +58,15 @@ services:
       - VA_LSE_LOG_JSON=1
       - VA_LSE_LOG_DIR=/app/logs
       - VA_LSE_AUDIT_LOG_DIR=/app/logs
+      # Pattern C switches. `environment` beats `env_file`, so these are the only
+      # place the queue is enabled for this stack; the values interpolate from the
+      # shell or .env (compose reads .env for interpolation).
+      - VA_LSE_JOB_QUEUE=${VA_LSE_JOB_QUEUE:-0}
+      - VA_LSE_REDIS_URL=${VA_LSE_REDIS_URL:-redis://redis:6379/0}
+      # Shared blob volume: large jobs put their extracted record text here and
+      # send the worker a reference (see app/blob_store.py). With the default
+      # 256 KB inline threshold most jobs never touch it.
+      - VA_LSE_BLOB_DIR=/app/blobs
     deploy:
       replicas: 3
       resources:
@@ -51,12 +80,202 @@ services:
       retries: 3
       start_period: 15s
     volumes:
-      - app-logs:/app/logs    # Shared audit + diagnostic logs
+      - app-logs:/app/logs      # Shared audit + diagnostic logs
+      - job-blobs:/app/blobs    # Shared with the workers (Pattern C)
     read_only: true
     tmpfs:
       - /tmp:size=256M
     restart: unless-stopped
 
+  # --- Redis: queue, job status, and results (Pattern C) ---
+  redis:
+    image: redis:7-alpine
+    profiles: ["pattern-c"]
+    command:
+      - redis-server
+      # noeviction, NOT allkeys-lru: under LRU a queued job can be evicted and
+      # vanish with no error anywhere. Better that a write fails loudly once the
+      # cap is hit. Payloads are small now that large ones go to the blob volume.
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - noeviction
+      # Jobs must survive a Redis restart; losing the queue loses users' runs.
+      - --appendonly
+      - "yes"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # --- Workers: run the pipeline off the web pods (Pattern C) ---
+  worker:
+    build: .
+    profiles: ["pattern-c"]
+    command: ["python", "-m", "app.worker"]
+    env_file: .env
+    environment:
+      - VA_LSE_JOB_QUEUE=1
+      - VA_LSE_REDIS_URL=${VA_LSE_REDIS_URL:-redis://redis:6379/0}
+      - VA_LSE_BLOB_DIR=/app/blobs
+      - VA_LSE_LOG_JSON=1
+      - VA_LSE_LOG_DIR=/app/logs
+      - VA_LSE_AUDIT_LOG_DIR=/app/logs
+      - VA_LSE_WORKER_HEALTH_PORT=8002
+      # One job per container by default: a 2,000-page digest peaks near 1.8 GB
+      # (PERFORMANCE.md). Raise this only alongside the memory limit below.
+      - VA_LSE_WORKER_CONCURRENCY=${VA_LSE_WORKER_CONCURRENCY:-1}
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          memory: 3g
+          cpus: "2.0"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8002/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    volumes:
+      - app-logs:/app/logs
+      - job-blobs:/app/blobs
+    # SIGTERM drains the in-flight job (registered via app/shutdown) instead of
+    # dropping up to 35 minutes of work; then SIGKILL.
+    stop_grace_period: 120s
+    read_only: true
+    tmpfs:
+      - /tmp:size=256M
+    restart: unless-stopped
+
+  # --- Audit log backup + retention (see DEPLOYMENT.md) ---
+  #
+  # Not gated behind pattern-c: retention applies in every pattern, and the audit
+  # log is the one artifact that must outlive the container that wrote it. Enable
+  # it by setting VA_LSE_AUDIT_BACKUP_DESTINATION in .env; with no destination the
+  # job logs "nothing to do" and exits 0, so an unconfigured backup is harmless.
+  #
+  # Two ways to make the destination genuinely off-host:
+  #   * filesystem -> VA_LSE_AUDIT_BACKUP_DIR pointing at a bind-mounted host path
+  #     or an NFS mount. The /backup volume below is a *named volume*, i.e. still
+  #     on this host: it demonstrates the mechanism and survives `docker compose
+  #     down`, but it does not survive losing the host. Point it at real storage.
+  #   * s3/gcs/azure -> install requirements-backup.txt in the image and set the
+  #     bucket + credentials in .env.
+  audit-backup:
+    build: .
+    command:
+      - python
+      - scripts/backup_audit_logs.py
+      - --loop
+      - --prune
+    env_file: .env
+    environment:
+      - VA_LSE_LOG_DIR=/app/logs
+      - VA_LSE_AUDIT_LOG_DIR=/app/logs
+      - VA_LSE_AUDIT_BACKUP_DIR=${VA_LSE_AUDIT_BACKUP_DIR:-/backup}
+      - VA_LSE_LOG_JSON=1
+    volumes:
+      - app-logs:/app/logs
+      - audit-backup-store:/backup
+    read_only: true
+    tmpfs:
+      - /tmp:size=128M
+    restart: unless-stopped
+
+  # --- Metrics, dashboards, and alerting (see DEPLOYMENT.md → Alerting) ---
+  #
+  #   docker compose --profile monitoring up -d
+  #   open http://localhost:3000  (the dashboard is provisioned; no import step)
+  #
+  # The app needs no change to be scraped: Prometheus text format is served on the
+  # existing health port (8001 web, 8002 workers), and a scrape performs no network
+  # I/O inside the app (ADR-011), so this adds no failure mode to it.
+  #
+  # `worker` is part of the pattern-c profile. Prometheus is configured to scrape
+  # it unconditionally, so without Pattern C that target shows as down — expected,
+  # and the VaElseInstanceDown rule is scoped to jobs that exist.
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    profiles: ["monitoring"]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # 15 days is a small-business default: long enough to compare this week with
+      # last, short enough to fit on a modest disk.
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    volumes:
+      - ./deploy/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    profiles: ["monitoring"]
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    volumes:
+      - ./deploy/monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    ports:
+      - "9093:9093"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    profiles: ["monitoring"]
+    environment:
+      # Change this before exposing the port anywhere but localhost.
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      # Anonymous viewing keeps the dashboard reachable for a team without handing
+      # out the admin login; it is read-only.
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+    volumes:
+      - ./deploy/monitoring/grafana-provisioning:/etc/grafana/provisioning:ro
+      # The dashboard provider looks in /var/lib/grafana/dashboards; the JSON is
+      # mounted in (not copied), so editing the repository copy is the update path.
+      - ./deploy/monitoring/grafana-dashboard.json:/var/lib/grafana/dashboards/va-lse-ops.json:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+
+  # Readiness is an HTTP status, not a metric, so it is probed from outside.
+  blackbox-exporter:
+    image: prom/blackbox-exporter:v0.25.0
+    profiles: ["monitoring"]
+    command:
+      - --config.file=/etc/blackbox_exporter/blackbox.yml
+    volumes:
+      - ./deploy/monitoring/blackbox.yml:/etc/blackbox_exporter/blackbox.yml:ro
+    restart: unless-stopped
+
 volumes:
   app-logs:
+    driver: local
+  job-blobs:
+    driver: local
+  redis-data:
+    driver: local
+  audit-backup-store:
+    driver: local
+  prometheus-data:
+    driver: local
+  alertmanager-data:
+    driver: local
+  grafana-data:
     driver: local

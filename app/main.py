@@ -17,6 +17,7 @@ import streamlit as st
 
 from . import audit as audit_log
 from . import telemetry
+from . import tracing
 from .logging_config import (
     configure_logging,
     get_logger,
@@ -92,12 +93,26 @@ def main() -> None:
         audit_log.configure_audit_logging()
     except Exception:  # noqa: BLE001 - audit is best-effort
         pass
+    # No-op unless VA_LSE_TRACING=1 (and the OTel packages are installed): the
+    # provider is process-global, so one call here covers every session.
+    tracing.setup_tracing(role="web")
     _check_streamlit_config_hardening()
     # Ensure every browser session has a baseline correlation id (also used
     # for pre-run validation / upload errors so those logs are correlatable).
     try:
         get_or_create_request_id()
     except Exception:  # noqa: BLE001
+        pass
+    # Stamp this browser session for va_lse_session_count. Streamlit re-executes
+    # this function on every widget interaction, which is what makes a per-run stamp
+    # an accurate "active recently" signal — the session id is the same one the
+    # audit stream already carries, so there is no second identity to keep in sync.
+    try:
+        from .metrics import touch_session
+        from .audit import get_audit_session_id
+
+        touch_session(get_audit_session_id())
+    except Exception:  # noqa: BLE001 - instrumentation is best-effort by design
         pass
     logger.info(
         "app start",

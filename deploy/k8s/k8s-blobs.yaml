@@ -1,0 +1,52 @@
+# k8s-blobs.yaml — shared blob storage for large job payloads (Pattern C)
+#
+# The web tier extracts uploaded files (it is the only place that parses
+# PDFs/DOCX), and Pattern C hands the extracted record text to a worker. Small
+# jobs travel inline in the queue; anything over VA_LSE_JOB_QUEUE_INLINE_MAX_BYTES
+# (256 KB default) goes to a blob store and the queue carries a reference. See
+# app/blob_store.py.
+#
+# That store MUST be readable by every worker and writable by every web pod. This
+# manifest provides the filesystem option.
+#
+#   !!! ReadWriteMany is a hard requirement. An emptyDir or a ReadWriteOnce PVC
+#   !!! "works" on the writing pod and fails on the worker — the exact silent
+#   !!! misconfiguration the reader-side error message warns about.
+#
+# Not every cluster has an RWX storage class. Check first:
+#
+#   kubectl get storageclass
+#
+# `local-path`, `gp2`, and most default block-storage classes are RWO-only. RWX
+# usually means NFS/CephFS, Azure Files, AWS EFS, or GCP Filestore. If you have
+# none, use the S3 backend instead and skip this file entirely:
+#
+#   kubectl create secret generic va-lse-blob-s3 -n va-lse \
+#     --from-literal=AWS_ACCESS_KEY_ID=... \
+#     --from-literal=AWS_SECRET_ACCESS_KEY=...
+#   # then set, on BOTH the web tier and the workers:
+#   #   VA_LSE_BLOB_STORE=s3
+#   #   VA_LSE_BLOB_S3_BUCKET=my-bucket
+#   #   VA_LSE_BLOB_S3_PREFIX=va-lse
+#   # and install requirements-s3.txt in the image (boto3).
+#   # MinIO / R2 / DO Spaces also work: set VA_LSE_BLOB_S3_ENDPOINT_URL.
+#
+# Files are content-addressed and expire on a TTL sweep (VA_LSE_JOB_QUEUE_TTL_SECONDS,
+# 24 h default), so size the volume for roughly one day of peak traffic:
+# concurrent_jobs x extracted_text_per_job. A 2,000-page bundle is single-digit MB
+# of text, not the size of the PDF.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: va-lse-blobs
+  namespace: va-lse
+spec:
+  accessModes:
+    - ReadWriteMany          # REQUIRED — see the warning above
+  resources:
+    requests:
+      storage: 10Gi
+  # Set your RWX-capable class explicitly (e.g. azurefile-csi, efs-sc, nfs-client).
+  # Leaving this unset uses the default class, which is often RWO-only and will
+  # leave this PVC Pending forever.
+  # storageClassName: nfs-client

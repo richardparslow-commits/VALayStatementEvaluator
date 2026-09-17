@@ -12,8 +12,15 @@ import traceback
 from typing import Any
 
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
+
+try:  # Chart library — guarded like the Redis queue backend (app/job_queue.py): a
+    # slim image or a stale dev venv that lacks it still loads the Evaluate tab,
+    # and the timeline panel degrades to its event list instead of taking the tab
+    # down at import time.
+    import plotly.graph_objects as go
+except ImportError:  # pragma: no cover - the degradation path is covered by tests
+    go = None
 
 from .. import audit as audit_log
 from ..agiloop_telemetry import (
@@ -22,8 +29,15 @@ from ..agiloop_telemetry import (
     track_impression,
     track_interaction,
 )
-from ..evaluate import DIMENSION_LABELS, VERDICTS, build_evidence_dashboard, run_evaluation
+from ..evaluate import (
+    DIMENSION_LABELS,
+    VERDICTS,
+    build_evidence_dashboard,
+    compute_score_band,
+    run_evaluation,
+)
 from ..exporter import export_facts, filter_facts
+from ..job_payload import EvaluateJob
 from ..logging_config import get_logger, get_request_id
 from ..documents import (
     EVALUATE_INTERNAL_MAX_CHARS,
@@ -45,6 +59,8 @@ from .follow_up import (
     mark_follow_up_answers_consumed,
     render_follow_up_questions,
 )
+
+from . import job_runner
 from .shared import (
     FEATURE_ID,
     audit_condition_for_slot,
@@ -86,6 +102,15 @@ _TIMELINE_FILTER_LABELS: dict[str, str] = {
     "All": "all",
     "Diagnostic only": "diagnostic",
     "Treatment only": "treatment",
+}
+
+# Feature: Statement Effectiveness Score & Improvement Recommendations
+EFFECTIVENESS_SCORE_FEATURE_ID = "94104045-aa12-4018-95c6-e6912e659803"  # statement-effectiveness-score-improvement-recommendations
+
+_SCORE_BAND_DISPLAY = {
+    "green": ("🟢", "Strong statement"),
+    "yellow": ("🟡", "Needs improvement"),
+    "red": ("🔴", "Weak — act on recommendations below"),
 }
 
 
@@ -137,11 +162,21 @@ def render_evaluate_tab() -> None:
 
     render_condition_selector_for_slot("eval")
 
+    if job_runner.queue_mode_active():
+        st.caption(
+            f"⚙️ This run is processed by a background worker ({job_runner.queue_status_line()}). "
+            "You can close this tab — the results will be waiting when you come back."
+        )
+
     run = st.button("🔍 Run exhaustive evaluation", type="primary", key="eval_run")
     if run:
         if not _validate_evaluate_inputs(statement_text, records):
             return
         _run_evaluation_flow(statement_text, records)
+
+    # A queued run outlives this browser session, so re-attach to one started
+    # earlier (a reload mid-digest would otherwise look like nothing happened).
+    job_runner.resume_pending_job("eval", action_label="Evaluation")
 
     cached_eval: Any = st.session_state.get("eval_result")
     if cached_eval is None:
@@ -226,6 +261,9 @@ def _validate_evaluate_inputs(statement_text: str, records: list) -> bool:
 # -------------------------------------------------------------- run pipeline
 def _run_evaluation_flow(statement_text: str, records: list) -> None:
     """Mint a run id, gate shutdown, run the pipeline, persist the result."""
+    if job_runner.queue_mode_active():
+        _run_evaluation_queued(statement_text, records)
+        return
     rid = new_run_request_id()
     llm = get_llm()
     if llm is None:
@@ -396,6 +434,9 @@ def _run_evaluation_flow(statement_text: str, records: list) -> None:
         exit_run()
     duration_ms = int((time.perf_counter() - t0) * 1000)
     total = llm.usage.totals()
+    # Which endpoint(s) actually served this run. Stamped on the audit record and
+    # the run log, because a failover changes who wrote the output.
+    _endpoints = llm.usage.endpoints_used()
     logger.info(
         "evaluate run done duration_ms=%d calls=%d tokens_in=%d tokens_out=%d",
         duration_ms,
@@ -429,8 +470,16 @@ def _run_evaluation_flow(statement_text: str, records: list) -> None:
         record_files=_audit_files,
         record_pages=_audit_pages,
         outcome=_outcome or None,
+        llm_endpoints=_endpoints,
     )
-    run_log_event("evaluate", "ok", request_id=rid, duration_ms=duration_ms, **_outcome)
+    run_log_event(
+        "evaluate",
+        "ok",
+        request_id=rid,
+        duration_ms=duration_ms,
+        endpoints=",".join(_endpoints),
+        **_outcome,
+    )
     if _is_empty_analysis(result):
         # Completed, but the model handed back nothing usable (e.g. ``{}`` for
         # every phase). Log it once here — the results panel re-renders on every
@@ -464,6 +513,49 @@ def _run_evaluation_flow(statement_text: str, records: list) -> None:
 
 
 # ------------------------------------------------------------------ results UI
+def _run_evaluation_queued(statement_text: str, records: list) -> None:
+    """Submit the run to a worker and wait for its result (Pattern C).
+
+    No audit start is emitted here: the worker writes the start/ok/error pair so
+    a run produces exactly one audit record whether it ran in-process or on a
+    worker. The web pod only records that the work was handed off.
+    """
+    rid = new_run_request_id()
+    if not check_shutdown_gate("evaluation"):
+        run_log_event(
+            "evaluate", "rejected", request_id=rid,
+            error="app shutting down", reason="draining",
+        )
+        return
+    config_error = job_runner.worker_config_error()
+    if config_error:
+        run_log_event(
+            "evaluate", "rejected", request_id=rid,
+            error=config_error, reason="worker_key_missing",
+        )
+        st.error(config_error)
+        return
+    _sources, _files, _pages = audit_record_meta("eval", records)
+    _condition = audit_condition_for_slot("eval")
+    outcome = job_runner.submit_job(
+        slot="eval",
+        job=EvaluateJob(
+            statement_text=statement_text.strip(),
+            records=records,
+            request_id=rid,
+            record_sources=_sources,
+        ),
+        request_id=rid,
+        condition=_condition,
+        sources=_sources,
+        files=_files,
+        pages=_pages,
+        action_label="Evaluation",
+    )
+    if outcome is not None and outcome.ok:
+        st.success(f"Evaluation complete — reference `{rid}`.")
+
+
 def _result_reference() -> str:
     """Reference id of the run that produced the cached results, if known."""
     rid_raw: Any = st.session_state.get("eval_request_id", "")
@@ -840,6 +932,10 @@ def _build_timeline_figure(
     back to the full fact for the details panel. Gap periods are shaded as
     horizontal bands behind the markers.
     """
+    if go is None:
+        raise RuntimeError(
+            "plotly is not installed, so the interactive timeline chart cannot be drawn"
+        )
     fig = go.Figure()
 
     for gap in gaps:
@@ -971,8 +1067,10 @@ def _render_medical_timeline(eval_result: Any, *, request_reference: str) -> Non
 
         clicked_event: dict[str, Any] | None = None
         if dated_in_view:
-            fig = _build_timeline_figure(filtered, timeline_data.get("gaps") or [])
+            # The figure build sits *inside* the guard: an unavailable/broken chart
+            # library must cost the chart, not the whole results panel.
             try:
+                fig = _build_timeline_figure(filtered, timeline_data.get("gaps") or [])
                 chart_state = st.plotly_chart(
                     fig,
                     width="stretch",
@@ -987,12 +1085,16 @@ def _render_medical_timeline(eval_result: Any, *, request_reference: str) -> Non
                         idx = int(customdata[0])
                         if 0 <= idx < len(filtered):
                             clicked_event = filtered[idx]
-            except Exception as exc:  # noqa: BLE001 - chart rendering must never break the panel
-                logger.warning("timeline chart render failed error=%s", exc, exc_info=True)
+            except Exception as exc:  # noqa: BLE001 - chart build/render must never break the panel
+                logger.warning("timeline chart unavailable error=%s", exc, exc_info=True)
                 try:
                     track_feature_error(TIMELINE_FEATURE_ID, exc, phase="chart_render")
                 except Exception:  # noqa: BLE001 - telemetry must never break the UI
                     pass
+                st.info(
+                    "The interactive timeline chart is unavailable — use the event "
+                    "list below instead."
+                )
 
         if undated_in_view:
             st.caption(f"{len(undated_in_view)} undated event(s) — select below to view details.")
@@ -1018,6 +1120,76 @@ def _render_medical_timeline(eval_result: Any, *, request_reference: str) -> Non
             except Exception:  # noqa: BLE001 - telemetry must never break the UI
                 pass
             _render_timeline_event_details(clicked_event)
+
+
+def _render_effectiveness_score(eval_result: Any) -> None:
+    """Render the effectiveness score badge and ranked recommendations (F4.S2).
+
+    Fires `impression` once per rendered run (`entryPoint` attribute) when
+    the score becomes visible, and `interaction` on each recommendation
+    button click (`recommendationIndex` + `action`). The `goal` event for the
+    computed score itself is fired at the compute boundary in
+    `app/evaluate.py::_score_and_recommend` — not here — since it must fire
+    exactly once per computation, not once per render.
+    """
+    score = int(getattr(eval_result, "effectiveness_score", 0) or 0)
+    band = getattr(eval_result, "score_band", "") or compute_score_band(score)
+    rid = _result_reference() or "no-ref"
+
+    impression_key = f"effectiveness_score_impression_sent_{rid}"
+    if not st.session_state.get(impression_key):
+        try:
+            track_impression(EFFECTIVENESS_SCORE_FEATURE_ID, entry_point="evaluate_report_tab")
+        except Exception:  # noqa: BLE001 - telemetry must never break the UI
+            pass
+        st.session_state[impression_key] = True
+
+    st.subheader("🎯 Statement Effectiveness Score")
+    emoji, label = _SCORE_BAND_DISPLAY.get(band, _SCORE_BAND_DISPLAY["red"])
+    st.metric("Effectiveness score", f"{score}/100")
+    banner = {"green": st.success, "yellow": st.warning, "red": st.error}.get(band, st.error)
+    banner(f"{emoji} {label} ({band.upper()} band)")
+
+    recommendations = getattr(eval_result, "recommendations", None) or []
+    if not recommendations:
+        return
+
+    st.markdown("**Top improvement recommendations (ranked by estimated impact):**")
+    claims = getattr(eval_result, "claims", None) or []
+    claim_text = {c.get("id"): c.get("text", "") for c in claims}
+    for index, rec in enumerate(recommendations, start=1):
+        title = str(rec.get("title", ""))
+        impact = str(rec.get("impact", ""))
+        explanation = str(rec.get("explanation", ""))
+        claim_id = rec.get("claim_id")
+        st.markdown(f"**{index}. {title}** _{impact}_")
+        st.caption(explanation)
+        has_matching_claim = claim_id is not None and claim_id in claim_text
+        action_label = (
+            f"🔍 Jump to claim #{claim_id}" if has_matching_claim else "✏️ Apply to rewrite"
+        )
+        clicked = st.button(action_label, key=f"eval_rec_action_{rid}_{index}")
+        if clicked:
+            action = "jump_to_claim" if has_matching_claim else "trigger_rewrite"
+            st.session_state["eval_recommendation_target"] = {
+                "claim_id": claim_id,
+                "recommendation_index": index,
+                "action": action,
+            }
+            try:
+                track_interaction(
+                    EFFECTIVENESS_SCORE_FEATURE_ID,
+                    recommendationIndex=index,
+                    action=action,
+                )
+            except Exception:  # noqa: BLE001 - telemetry must never break the UI
+                pass
+            if has_matching_claim:
+                st.info(f"📍 Claim #{claim_id}: {claim_text.get(claim_id, '')}")
+            else:
+                st.info(
+                    "✏️ Marked for rewrite — see 'Suggested improvements — proposed rewrite' below."
+                )
 
 
 def _render_evaluation_results(eval_result: Any) -> None:
@@ -1047,6 +1219,9 @@ def _render_evaluation_results(eval_result: Any) -> None:
             f"⚠️ {eval_result.truncation_warning} (input was {eval_result.input_chars:,} chars; "
             f"{eval_result.truncated_chars:,} truncated). Review the report header for details."
         )
+
+    st.divider()
+    _render_effectiveness_score(eval_result)
 
     st.divider()
     st.subheader("📋 Evaluation Results")

@@ -1,0 +1,19 @@
+# Dashboard provider: loads every JSON in the mounted dashboards directory, so a
+# change to grafana-dashboard.json plus a container restart is the whole update
+# path (no import step, and no dashboard that drifts from the repository copy).
+apiVersion: 1
+
+providers:
+  - name: va-lse
+    orgId: 1
+    folder: "VA Lay Statement Evaluator"
+    type: file
+    disableDeletion: false
+    # The file on disk is the source of truth; an edit made in the UI is
+    # overwritten on the next restart, which is the intended behaviour for a
+    # provisioned dashboard.
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
