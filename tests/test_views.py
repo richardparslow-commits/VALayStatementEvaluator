@@ -711,6 +711,182 @@ class TestEmptyAnalysisResults(unittest.TestCase):
         st_mock.error.assert_not_called()
 
 
+# ------------------------------------------------- fact citation exporter (F7.S1)
+class TestRubricAndPositiveSources(unittest.TestCase):
+    def _digest(self, facts):
+        from app.medical_review import MedicalDigest
+
+        return MedicalDigest(facts=facts)
+
+    def _fact(self, **overrides):
+        from app.medical_review import MedicalFact
+
+        base = dict(
+            date="2020-01-01", type="diagnosis", description="d", source="records.pdf p.3",
+            quote="q",
+        )
+        base.update(overrides)
+        return MedicalFact(**base)
+
+    def test_no_digest_returns_empty_sets(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        cited, positive = evaluate_view._rubric_and_positive_sources(EvaluationResult())
+        self.assertEqual(cited, set())
+        self.assertEqual(positive, set())
+
+    def test_matches_fact_source_substring_in_record_reference(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        fact = self._fact(source="records.pdf p.3")
+        result = EvaluationResult(
+            digest=self._digest([fact]),
+            verifications=[
+                {"id": 1, "verdict": "SUPPORTED", "record_reference": "records.pdf p.3, 2020-01-01"}
+            ],
+        )
+        cited, positive = evaluate_view._rubric_and_positive_sources(result)
+        self.assertEqual(cited, {"records.pdf p.3"})
+        self.assertEqual(positive, {"records.pdf p.3"})
+
+    def test_contradicted_verdict_is_cited_but_not_positive(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        fact = self._fact(source="records.pdf p.5")
+        result = EvaluationResult(
+            digest=self._digest([fact]),
+            verifications=[
+                {"id": 1, "verdict": "CONTRADICTED", "record_reference": "records.pdf p.5"}
+            ],
+        )
+        cited, positive = evaluate_view._rubric_and_positive_sources(result)
+        self.assertEqual(cited, {"records.pdf p.5"})
+        self.assertEqual(positive, set())
+
+    def test_fact_not_referenced_anywhere_is_excluded(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        fact = self._fact(source="unreferenced.pdf p.1")
+        result = EvaluationResult(
+            digest=self._digest([fact]),
+            verifications=[{"id": 1, "verdict": "SUPPORTED", "record_reference": "other.pdf p.9"}],
+        )
+        cited, positive = evaluate_view._rubric_and_positive_sources(result)
+        self.assertEqual(cited, set())
+        self.assertEqual(positive, set())
+
+
+class TestRenderFactExportSection(unittest.TestCase):
+    def _digest(self):
+        from app.medical_review import MedicalDigest, MedicalFact
+
+        fact = MedicalFact(
+            date="2020-01-01", type="diagnosis", description="d",
+            source="records.pdf p.3", quote="q",
+        )
+        return MedicalDigest(facts=[fact], conditions=["PTSD"], pages_reviewed=10)
+
+    def test_no_digest_renders_nothing(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        st_mock, _ = _fake_streamlit()
+        with _patch_st(evaluate_view, st_mock):
+            evaluate_view._render_fact_export_section(EvaluationResult())
+        st_mock.expander.assert_not_called()
+
+    def test_impression_fires_once_per_session(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        st_mock, session = _fake_streamlit()
+        st_mock.checkbox.return_value = False
+        st_mock.button.return_value = False
+        result = EvaluationResult(digest=self._digest())
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "track_impression"
+        ) as mock_impression:
+            evaluate_view._render_fact_export_section(result)
+            evaluate_view._render_fact_export_section(result)
+        mock_impression.assert_called_once()
+        self.assertEqual(
+            mock_impression.call_args.args[0], evaluate_view.EXPORT_FACTS_FEATURE_ID
+        )
+
+    def test_export_click_generates_all_three_formats_and_fires_goal(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        st_mock, _session = _fake_streamlit()
+        st_mock.checkbox.return_value = False
+        st_mock.button.return_value = True
+        st_mock.columns.return_value = (MagicMock(), MagicMock(), MagicMock())
+        result = EvaluationResult(digest=self._digest())
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "export_facts", wraps=evaluate_view.export_facts
+        ) as mock_export, patch.object(evaluate_view, "track_goal") as mock_goal, patch.object(
+            evaluate_view, "track_interaction"
+        ), patch.object(evaluate_view, "track_impression"):
+            evaluate_view._render_fact_export_section(result)
+
+        formats = {c.args[1] for c in mock_export.call_args_list}
+        self.assertEqual(formats, {"csv", "pdf", "md"})
+        mock_goal.assert_called_once()
+        self.assertEqual(mock_goal.call_args.args[0], evaluate_view.EXPORT_FACTS_FEATURE_ID)
+
+    def test_download_click_fires_interaction_telemetry(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        st_mock, session = _fake_streamlit()
+        st_mock.checkbox.return_value = False
+        st_mock.button.return_value = False
+        session["export_facts_files"] = {"csv": b"data", "pdf": b"%PDF", "md": b"# md"}
+        col_csv, col_pdf, col_md = MagicMock(), MagicMock(), MagicMock()
+        col_csv.download_button.return_value = True
+        col_pdf.download_button.return_value = False
+        col_md.download_button.return_value = False
+        st_mock.columns.return_value = (col_csv, col_pdf, col_md)
+        result = EvaluationResult(digest=self._digest())
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "track_interaction"
+        ) as mock_interaction, patch.object(evaluate_view, "track_impression"):
+            evaluate_view._render_fact_export_section(result)
+
+        mock_interaction.assert_called_once()
+        self.assertEqual(mock_interaction.call_args.kwargs.get("action"), "download")
+        self.assertEqual(mock_interaction.call_args.kwargs.get("format"), "csv")
+
+    def test_export_error_in_one_format_does_not_block_others(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        st_mock, _session = _fake_streamlit()
+        st_mock.checkbox.return_value = False
+        st_mock.button.return_value = True
+        st_mock.columns.return_value = (MagicMock(), MagicMock(), MagicMock())
+        result = EvaluationResult(digest=self._digest())
+
+        def _flaky(digest, fmt, **kwargs):
+            if fmt == "pdf":
+                raise RuntimeError("boom")
+            return b"ok"
+
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "export_facts", side_effect=_flaky
+        ), patch.object(evaluate_view, "track_goal"), patch.object(
+            evaluate_view, "track_interaction"
+        ), patch.object(evaluate_view, "track_impression"):
+            evaluate_view._render_fact_export_section(result)
+
+        st_mock.error.assert_called_once()
+        self.assertIn("pdf", str(st_mock.error.call_args[0][0]))
+
+
 # ------------------------------------------------- run bookkeeping
 class TestEvaluateRunBookkeeping(unittest.TestCase):
     """Every run must leave a traceable completion — including interruptions.
