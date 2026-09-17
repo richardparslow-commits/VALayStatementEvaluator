@@ -35,6 +35,9 @@ FEATURE_ID = "02f0935a-ee5e-4083-88a2-10e11753ccc9"  # condition-specific-templa
 # Feature: Medical Record Search & Citation Index
 SEARCH_FEATURE_ID = "22bc7e10-dcda-431e-b3fb-4e8ff9b532cb"  # medical-record-search-citation-index
 
+# Feature: Statement Effectiveness Score & Improvement Recommendations
+EFFECTIVENESS_FEATURE_ID = "94104045-aa12-4018-95c6-e6912e659803"  # statement-effectiveness-score-improvement-recommendations
+
 CLAIMS_SYSTEM = """You are a VA claims evidence analyst. Decompose a lay/witness statement \
 into atomic factual assertions so each can be checked against medical records. Distinguish \
 firsthand observations from hearsay and from medical/legal conclusions."""
@@ -327,6 +330,9 @@ class EvaluationResult:
     input_chars: int = 0
     truncated_chars: int = 0
     truncation_warning: str = ""
+    # Statement Effectiveness Score & Improvement Recommendations (F4)
+    effectiveness_score: int = 0
+    recommendations: list[dict] = field(default_factory=list)
 
     @property
     def contradiction_count(self) -> int:
@@ -348,6 +354,11 @@ class EvaluationResult:
         if avg >= 5.0:
             return "Adequate"
         return "Needs Substantial Work"
+
+    @property
+    def score_band(self) -> str:
+        """Color band for ``effectiveness_score`` (green >75, yellow 50-75, red <50)."""
+        return compute_score_band(self.effectiveness_score)
 
 
 DIMENSION_LABELS = {
@@ -518,12 +529,17 @@ def _run_evaluation(
 
     with PhaseTimer(logger, "revision", request_id=rid):
         with phase_timer("revision"):
-            report(0.86, "Step 6/7 — Drafting improvement suggestions and a revised statement…")
+            report(0.86, "Step 6/8 — Drafting improvement suggestions and a revised statement…")
             _draft_revision(llm, result, statement_text, report)
+
+    with PhaseTimer(logger, "score", request_id=rid):
+        with phase_timer("score"):
+            report(0.92, "Step 7/8 — Computing effectiveness score and recommendations…")
+            _score_and_recommend(llm, result, report)
 
     with PhaseTimer(logger, "report", request_id=rid):
         with phase_timer("report"):
-            report(0.96, "Step 7/7 — Building the report…")
+            report(0.96, "Step 8/8 — Building the report…")
             result.report_markdown = build_report(
                 result, statement_text, citations=_citation_index_snapshot()
             )
@@ -694,6 +710,352 @@ def _verifications_text(result: EvaluationResult) -> str:
     return "\n".join(lines) or "(no claims extracted)"
 
 
+# ------------------------------------------------------ effectiveness score
+# Weights are exact per .implement/functional-spec.md: rubric dimension
+# scores 40%, claim verdict distribution 30%, evidence density (citations per
+# claim) 20%, statement length/complexity 10%.
+_RUBRIC_WEIGHT = 0.40
+_VERDICT_WEIGHT = 0.30
+_DENSITY_WEIGHT = 0.20
+_LENGTH_WEIGHT = 0.10
+
+_VERDICT_POINTS = {
+    "SUPPORTED": 1.0,
+    "PARTIALLY SUPPORTED": 0.5,
+    "NOT FOUND": 0.0,
+    "CONTRADICTED": -1.0,
+}
+
+_LENGTH_FLOOR_CHARS = 300
+_LENGTH_CEILING_CHARS = 40_000
+
+
+def compute_score_band(score: int) -> str:
+    """Color band for an effectiveness score: green >75, yellow 50-75, red <50."""
+    if score > 75:
+        return "green"
+    if score >= 50:
+        return "yellow"
+    return "red"
+
+
+def _rubric_component(result: "EvaluationResult") -> float:
+    """0-100 rubric component: mean of the 8 dimension scores (each 0-10)."""
+    if not result.scores:
+        return 0.0
+    values = list(result.scores.values())
+    avg = sum(values) / len(values)
+    return max(0.0, min(100.0, avg * 10.0))
+
+
+def _verdict_component(result: "EvaluationResult") -> float:
+    """0-100 claim-verdict-distribution component.
+
+    SUPPORTED claims boost the score and CONTRADICTED claims penalize it;
+    NOT FOUND is neutral — absence from records is not negative evidence
+    (Buchanan v. Nicholson; Barr v. Nicholson). With zero verifications this
+    is the neutral midpoint (50) rather than dividing by zero.
+    """
+    if not result.verifications:
+        return 50.0
+    points = [_VERDICT_POINTS.get(str(v.get("verdict", "")), 0.0) for v in result.verifications]
+    avg = sum(points) / len(points)  # in [-1, 1]
+    return max(0.0, min(100.0, (avg + 1.0) * 50.0))
+
+
+def _evidence_density_component(result: "EvaluationResult") -> float:
+    """0-100 evidence-density component: share of claims with a cited record reference.
+
+    With zero claims there is no evidence to cite, so this is defined as 0
+    rather than dividing by zero — ``generate_improvement_recommendations``
+    surfaces that gap explicitly.
+    """
+    if not result.claims:
+        return 0.0
+    cited = sum(1 for v in result.verifications if str(v.get("record_reference", "")).strip())
+    return max(0.0, min(100.0, (cited / len(result.claims)) * 100.0))
+
+
+def _length_complexity_component(result: "EvaluationResult") -> float:
+    """0-100 length/complexity component derived from the raw statement length.
+
+    Very short statements rarely carry enough detail to be persuasive, so the
+    component ramps up from 0 below the floor; very long statements are still
+    fully credited here (truncation is handled/warned about elsewhere).
+    """
+    chars = result.input_chars
+    if chars <= 0:
+        return 0.0
+    if chars < _LENGTH_FLOOR_CHARS:
+        return max(0.0, (chars / _LENGTH_FLOOR_CHARS) * 60.0)
+    if chars > _LENGTH_CEILING_CHARS:
+        return 70.0
+    return 100.0
+
+
+def compute_effectiveness_score(result: "EvaluationResult") -> int:
+    """Weighted 0-100 effectiveness score for a completed evaluation.
+
+    Weights (exact, per functional spec): rubric dimension scores 40%, claim
+    verdict distribution 30%, evidence density 20%, statement length/
+    complexity 10%. Always returns an integer in [0, 100], including when
+    *result* carries zero claims (verdict/density components fall back to
+    defined neutrals instead of raising ``ZeroDivisionError``).
+    """
+    weighted = (
+        _rubric_component(result) * _RUBRIC_WEIGHT
+        + _verdict_component(result) * _VERDICT_WEIGHT
+        + _evidence_density_component(result) * _DENSITY_WEIGHT
+        + _length_complexity_component(result) * _LENGTH_WEIGHT
+    )
+    return int(round(max(0.0, min(100.0, weighted))))
+
+
+RECOMMENDATIONS_SYSTEM = """You are a veterans-claims advocate advising a witness how to raise \
+the effectiveness of their lay statement before submission. Recommend the highest-impact, most \
+concrete edits — grounded strictly in the evaluation results provided. NEVER invent facts."""
+
+RECOMMENDATIONS_USER = """Based on the completed evaluation below, propose 3 to 5 ranked \
+improvement recommendations, ordered by expected score impact (highest first).
+
+Return JSON:
+{{
+  "recommendations": [
+    {{
+      "title": "short, specific action (e.g., 'Add supporting evidence for onset claim')",
+      "impact": "estimated score impact, e.g. '+8 points'",
+      "explanation": "1-2 sentences explaining why this matters",
+      "claim_id": <id of the related claim if this recommendation targets one specific claim, else null>
+    }}
+  ]
+}}
+Return between 3 and 5 recommendations. If the statement has few or no factual claims, \
+recommend adding verifiable, specific factual assertions the witness can support from personal \
+knowledge — do not fabricate any.
+
+EFFECTIVENESS SCORE: {score}/100
+
+CLAIM VERIFICATION SUMMARY:
+<<<
+{verifications}
+>>>
+
+RUBRIC IMPROVEMENTS IDENTIFIED:
+<<<
+{improvements}
+>>>
+
+TOPIC COVERAGE GAPS:
+<<<
+{topic_gaps}
+>>>
+
+{guard_note}"""
+
+
+def _fallback_recommendations(result: "EvaluationResult", minimum: int) -> list[dict]:
+    """Deterministic, data-driven recommendations derived from already-computed fields.
+
+    Used when the LLM call fails or returns fewer than the required minimum,
+    so ``generate_improvement_recommendations`` always satisfies the "3-5
+    items" acceptance criterion — including the zero-claims case, where the
+    recommendations must reflect missing evidence rather than invent content.
+    """
+    candidates: list[dict] = []
+    if not result.claims:
+        candidates.append(
+            {
+                "title": "Add specific, verifiable factual claims",
+                "impact": "+15 points",
+                "explanation": (
+                    "No checkable factual assertions were found in the statement. Add concrete "
+                    "dates, events, symptoms, or treatments the witness personally observed."
+                ),
+                "claim_id": None,
+            }
+        )
+        candidates.append(
+            {
+                "title": "Cite supporting medical record evidence",
+                "impact": "+10 points",
+                "explanation": (
+                    "There are no claims yet to cite evidence for — once factual claims are "
+                    "added, cite the record source (filename + page) for each where available."
+                ),
+                "claim_id": None,
+            }
+        )
+    if result.contradiction_count:
+        candidates.append(
+            {
+                "title": "Resolve contradictions with the medical records",
+                "impact": "+10 points",
+                "explanation": (
+                    f"{result.contradiction_count} claim(s) conflict with the medical records — "
+                    "correct them or add a written explanation before submitting."
+                ),
+                "claim_id": None,
+            }
+        )
+    for gap in result.topic_critical_gaps:
+        candidates.append(
+            {
+                "title": f"Address gap: {gap}"[:160],
+                "impact": "+5 points",
+                "explanation": "This checklist topic is applicable but weakly covered in the statement.",
+                "claim_id": None,
+            }
+        )
+    for imp in result.improvements:
+        candidates.append(
+            {
+                "title": (str(imp.get("problem", "")) or "Improve statement detail")[:160],
+                "impact": "+5 points",
+                "explanation": str(imp.get("suggestion", "")) or "Add more specific, record-grounded detail.",
+                "claim_id": None,
+            }
+        )
+    generic_fillers = [
+        {
+            "title": "Improve overall specificity and detail",
+            "impact": "+3 points",
+            "explanation": "Add concrete dates, frequencies, and specific incidents where possible.",
+            "claim_id": None,
+        },
+        {
+            "title": "Strengthen functional-impact descriptions",
+            "impact": "+3 points",
+            "explanation": "Describe a specific daily activity the condition limits, not just the diagnosis.",
+            "claim_id": None,
+        },
+        {
+            "title": "Add clearer before/after timeline detail",
+            "impact": "+3 points",
+            "explanation": "Contrast functioning before and after onset so continuity is unmistakable.",
+            "claim_id": None,
+        },
+    ]
+    for filler in generic_fillers:
+        if len(candidates) >= minimum:
+            break
+        candidates.append(filler)
+    return candidates[:5]
+
+
+def _parse_recommendation_items(data: Any) -> list[dict]:
+    """Extract and normalize recommendation entries from a parsed LLM response."""
+    raw = data.get("recommendations", []) if isinstance(data, dict) else []
+    items: list[dict] = []
+    seen_titles: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        title = str(entry.get("title", "")).strip()
+        if not title or title in seen_titles:
+            continue
+        seen_titles.add(title)
+        claim_id = entry.get("claim_id")
+        items.append(
+            {
+                "title": title[:160],
+                "impact": str(entry.get("impact", "")).strip()[:40] or "+0 points",
+                "explanation": str(entry.get("explanation", "")).strip()[:400],
+                "claim_id": claim_id if isinstance(claim_id, int) else None,
+            }
+        )
+    return items
+
+
+def _pad_recommendations(items: list[dict], result: "EvaluationResult", minimum: int) -> list[dict]:
+    """Top up *items* to *minimum* using data-driven fallbacks, de-duplicated by title."""
+    seen = {it["title"] for it in items}
+    for fallback in _fallback_recommendations(result, minimum):
+        if len(items) >= minimum:
+            break
+        if fallback["title"] in seen:
+            continue
+        seen.add(fallback["title"])
+        items.append(fallback)
+    return items
+
+
+def generate_improvement_recommendations(result: "EvaluationResult", llm: LLMClient) -> list[dict]:
+    """Generate 3-5 ranked improvement recommendations via exactly one LLM call.
+
+    Each item has ``title``, ``impact``, and ``explanation`` (plus an
+    optional ``claim_id`` the UI can use to jump to the matching claim). Reuses
+    the already-computed verifications/rubric/topic fields on *result* — no
+    additional record or statement text is sent to the model. Pads with
+    data-driven (never invented) fallback recommendations if the model
+    returns fewer than 3 items, so this always returns 3-5 items, including
+    when *result* carries zero claims.
+    """
+    import json as _json
+
+    topic_gaps = "\n".join(f"- {g}" for g in result.topic_critical_gaps) or "(none identified)"
+    improvements_text = (
+        _json.dumps(result.improvements[:6], indent=1) if result.improvements else "(none)"
+    )
+    data = llm.chat_json(
+        RECOMMENDATIONS_SYSTEM,
+        RECOMMENDATIONS_USER.format(
+            score=compute_effectiveness_score(result),
+            verifications=sanitize_for_prompt(_verifications_text(result), max_chars=8_000),
+            improvements=sanitize_for_prompt(improvements_text, max_chars=4_000),
+            topic_gaps=sanitize_for_prompt(topic_gaps, max_chars=2_000),
+            guard_note=GUARD_NOTE,
+        ),
+        phase="recommendations",
+    )
+    items = _parse_recommendation_items(data)
+    if len(items) < 3:
+        items = _pad_recommendations(items, result, 3)
+    return items[:5]
+
+
+def _score_and_recommend(llm: LLMClient, result: "EvaluationResult", report: ProgressCallback) -> None:
+    """Compute the effectiveness score and improvement recommendations.
+
+    Telemetry call sites for the Statement Effectiveness Score & Improvement
+    Recommendations feature (feature id EFFECTIVENESS_FEATURE_ID) live here,
+    at the compute/generate boundary: a ``goal`` event on completion carrying
+    scoreValue/scoreBand/recommendationCount, and a ``feature.error`` event
+    if recommendation generation fails (score computation itself never
+    raises). A failure here must not discard the completed evaluation.
+    """
+    result.effectiveness_score = compute_effectiveness_score(result)
+    try:
+        result.recommendations = generate_improvement_recommendations(result, llm)
+    except Exception as exc:  # noqa: BLE001 - feature-error boundary
+        logger.warning(
+            "recommendation generation unavailable error=%s",
+            f"{type(exc).__name__}: {exc}",
+            extra={
+                "request_id": get_request_id() or "-",
+                "phase": "recommendations",
+                "status": "error",
+                "error_class": type(exc).__name__,
+            },
+        )
+        try:
+            track_feature_error(EFFECTIVENESS_FEATURE_ID, exc, phase="recommendations")
+        except Exception:  # noqa: BLE001 - telemetry must never break the pipeline
+            pass
+        result.recommendations = _fallback_recommendations(result, 3)[:5]
+
+    try:
+        track_goal(
+            EFFECTIVENESS_FEATURE_ID,
+            "effectiveness score computed",
+            scoreValue=result.effectiveness_score,
+            scoreBand=compute_score_band(result.effectiveness_score),
+            recommendationCount=len(result.recommendations),
+        )
+    except Exception:  # noqa: BLE001 - telemetry must never break the pipeline
+        pass
+    report(0.965, "Effectiveness score and recommendations ready.")
+
+
 _VERDICT_EMOJI = {
     "SUPPORTED": "✅",
     "PARTIALLY SUPPORTED": "🟡",
@@ -720,6 +1082,10 @@ def build_report(
         lines.append(f"> ⚠️ **Truncated input:** {result.truncation_warning}")
         lines.append("")
     lines.append(f"**Overall rating: {result.overall_rating}**")
+    lines.append(
+        f"**Effectiveness score: {result.effectiveness_score}/100 "
+        f"({result.score_band.upper()})**"
+    )
     claimed: str = result.claimed_condition  # narrow type for mypy
     if claimed:
         lines.append(f"**Appears to support claim for:** {claimed}")
@@ -784,6 +1150,14 @@ def build_report(
         rationale = (result.rationales.get(key) or "").replace("|", "/")[:200]
         lines.append(f"| {label} | {score:.1f}/10 | {rationale} |")
     lines.append("")
+
+    if result.recommendations:
+        lines.append("## Improvement Recommendations (ranked by estimated impact)")
+        lines.append("")
+        for index, rec in enumerate(result.recommendations, start=1):
+            lines.append(f"**{index}. {rec.get('title', '')}** ({rec.get('impact', '')})")
+            lines.append(f"   - {rec.get('explanation', '')}")
+        lines.append("")
 
     if result.improvements:
         lines.append("## Top Improvements (in priority order)")

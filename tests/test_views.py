@@ -1086,5 +1086,134 @@ class TestSidebarSettingsGuards(unittest.TestCase):
         st_mock.caption.assert_not_called()
 
 
+# ------------------------------------------------ effectiveness score (F4.S2)
+class TestRenderEffectivenessScore(unittest.TestCase):
+    def _result(self, score: int = 80, recommendations=None, claims=None):
+        from app.evaluate import EvaluationResult
+
+        return EvaluationResult(
+            effectiveness_score=score,
+            recommendations=recommendations
+            if recommendations is not None
+            else [
+                {"title": "Add supporting evidence", "impact": "+8 points", "explanation": "x", "claim_id": 1},
+                {"title": "Clarify frequency", "impact": "+5 points", "explanation": "y", "claim_id": None},
+                {"title": "Add functional impact", "impact": "+3 points", "explanation": "z", "claim_id": None},
+            ],
+            claims=claims if claims is not None else [{"id": 1, "text": "Injured knee lifting."}],
+        )
+
+    def test_green_band_uses_success_banner(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+
+        st_mock, _session = _fake_streamlit()
+        st_mock.columns.return_value = (MagicMock(), MagicMock())
+        st_mock.button.return_value = False
+        result = self._result(score=90)
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "track_impression"
+        ):
+            evaluate_view._render_effectiveness_score(result)
+        st_mock.success.assert_called_once()
+        st_mock.error.assert_not_called()
+        st_mock.warning.assert_not_called()
+
+    def test_red_band_uses_error_banner_and_shows_all_recommendations(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+
+        st_mock, _session = _fake_streamlit()
+        st_mock.columns.return_value = (MagicMock(), MagicMock())
+        st_mock.button.return_value = False
+        result = self._result(score=20)
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "track_impression"
+        ):
+            evaluate_view._render_effectiveness_score(result)
+        st_mock.error.assert_called_once()
+        # All 3 recommendations rendered (one markdown title line each).
+        title_calls = [
+            c for c in st_mock.markdown.call_args_list if "1." in str(c) or "2." in str(c) or "3." in str(c)
+        ]
+        self.assertGreaterEqual(len(title_calls), 3)
+
+    def test_yellow_band_uses_warning_banner(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+
+        st_mock, _session = _fake_streamlit()
+        st_mock.columns.return_value = (MagicMock(), MagicMock())
+        st_mock.button.return_value = False
+        result = self._result(score=60)
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "track_impression"
+        ):
+            evaluate_view._render_effectiveness_score(result)
+        st_mock.warning.assert_called_once()
+
+    def test_impression_fires_once_per_reference(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+
+        st_mock, _session = _fake_streamlit()
+        st_mock.columns.return_value = (MagicMock(), MagicMock())
+        st_mock.button.return_value = False
+        result = self._result()
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "track_impression"
+        ) as mock_impression:
+            evaluate_view._render_effectiveness_score(result)
+            evaluate_view._render_effectiveness_score(result)
+        mock_impression.assert_called_once()
+        self.assertEqual(
+            mock_impression.call_args.args[0], evaluate_view.EFFECTIVENESS_SCORE_FEATURE_ID
+        )
+
+    def test_click_on_claim_linked_recommendation_fires_interaction_and_jumps(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+
+        st_mock, _session = _fake_streamlit()
+        st_mock.columns.return_value = (MagicMock(), MagicMock())
+        # First recommendation's button click returns True, others False.
+        st_mock.button.side_effect = [True, False, False]
+        result = self._result()
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "track_impression"
+        ), patch.object(evaluate_view, "track_interaction") as mock_interaction:
+            evaluate_view._render_effectiveness_score(result)
+        mock_interaction.assert_called_once_with(
+            evaluate_view.EFFECTIVENESS_SCORE_FEATURE_ID,
+            recommendationIndex=1,
+            action="jump_to_claim",
+        )
+
+    def test_click_on_generic_recommendation_triggers_rewrite(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+
+        st_mock, _session = _fake_streamlit()
+        st_mock.columns.return_value = (MagicMock(), MagicMock())
+        # Second recommendation (claim_id=None) clicked.
+        st_mock.button.side_effect = [False, True, False]
+        result = self._result()
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "track_impression"
+        ), patch.object(evaluate_view, "track_interaction") as mock_interaction:
+            evaluate_view._render_effectiveness_score(result)
+        mock_interaction.assert_called_once_with(
+            evaluate_view.EFFECTIVENESS_SCORE_FEATURE_ID,
+            recommendationIndex=2,
+            action="trigger_rewrite",
+        )
+
+    def test_no_recommendations_still_renders_score(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+
+        st_mock, _session = _fake_streamlit()
+        st_mock.columns.return_value = (MagicMock(), MagicMock())
+        result = self._result(recommendations=[])
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "track_impression"
+        ):
+            evaluate_view._render_effectiveness_score(result)
+        st_mock.button.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
