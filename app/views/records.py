@@ -15,7 +15,13 @@ from .. import telemetry
 from .. import va_gov_client
 from .. import va_gov_export
 from ..agiloop_telemetry import track_feature_error, track_impression, track_interaction
-from ..documents import ExtractionError, SearchResult, records_from_local_path, search_records
+from ..documents import (
+    ExtractionError,
+    SearchResult,
+    export_citation_index,
+    records_from_local_path,
+    search_records,
+)
 from ..fetch_client import FetchClient, FetchSandboxError
 from ..logging_config import get_logger
 from .uploads import check_upload_limits, extract_uploads
@@ -397,6 +403,8 @@ def render_record_search(slot: str, documents: list[Any]) -> None:
         else:
             _render_search_results(slot, results_list)
 
+        _render_citation_index_export(slot)
+
 
 def _render_search_results(slot: str, results: list[SearchResult]) -> None:
     for i, result in enumerate(results):
@@ -420,6 +428,43 @@ def _render_search_results(slot: str, results: list[SearchResult]) -> None:
                 pass
             st.success("Added to citation index.")
         st.divider()
+
+
+def _render_citation_index_export(slot: str) -> None:
+    """CSV/JSON download buttons for the accumulated ``citation_index`` (F2.S2)."""
+    index_any: Any = st.session_state.get(CITATION_INDEX_KEY, [])
+    citations: list[dict[str, str]] = index_any if isinstance(index_any, list) else []
+    if not citations:
+        return
+
+    st.caption(f"📌 Citation index: {len(citations)} excerpt(s) collected this session.")
+    col_csv, col_json = st.columns(2)
+    for fmt, col, mime in (("csv", col_csv, "text/csv"), ("json", col_json, "application/json")):
+        try:
+            data = export_citation_index(citations, fmt)
+        except ValueError as exc:  # noqa: BLE001 - defensive; fmt is hard-coded above
+            try:
+                track_feature_error(SEARCH_FEATURE_ID, exc, stage="citation_export")
+            except Exception:  # noqa: BLE001 - telemetry must never break the UI
+                pass
+            continue
+        clicked = col.download_button(
+            f"⬇️ Export citations (.{fmt})",
+            data=data,
+            file_name=f"citation_index.{fmt}",
+            mime=mime,
+            key=f"citation_export_{fmt}_{slot}",
+        )
+        if clicked:
+            try:
+                track_interaction(
+                    SEARCH_FEATURE_ID,
+                    action="export_citation_index",
+                    format=fmt,
+                    citation_count=len(citations),
+                )
+            except Exception:  # noqa: BLE001 - telemetry must never break the UI
+                pass
 
 
 __all__ = [

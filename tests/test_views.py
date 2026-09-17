@@ -441,6 +441,49 @@ class TestRenderRecordSearch(unittest.TestCase):
         st_mock.expander.assert_not_called()
 
 
+class TestRenderCitationIndexExport(unittest.TestCase):
+    """F2.S2 — CSV/JSON download buttons for the accumulated citation index."""
+
+    def _run(self, citations, clicked_fmt: str | None):
+        import app.views.records as records
+
+        st_mock, session = _fake_streamlit()
+        session["citation_index"] = citations
+        col_csv, col_json = MagicMock(), MagicMock()
+        col_csv.download_button.return_value = clicked_fmt == "csv"
+        col_json.download_button.return_value = clicked_fmt == "json"
+        st_mock.columns.return_value = (col_csv, col_json)
+        with _patch_st(records, st_mock), patch.object(
+            records, "track_interaction"
+        ) as mock_interaction, patch.object(records, "track_feature_error") as mock_error:
+            records._render_citation_index_export("eval")
+        return st_mock, session, col_csv, col_json, mock_interaction, mock_error
+
+    def test_no_export_buttons_when_index_empty(self) -> None:
+        st_mock, *_ = self._run([], None)
+        st_mock.columns.assert_not_called()
+
+    def test_renders_both_download_buttons_when_citations_present(self) -> None:
+        citations = [{"excerpt": "e", "source": "s"}]
+        st_mock, session, col_csv, col_json, mock_interaction, mock_error = self._run(
+            citations, None
+        )
+        col_csv.download_button.assert_called_once()
+        col_json.download_button.assert_called_once()
+        mock_interaction.assert_not_called()
+        mock_error.assert_not_called()
+
+    def test_csv_click_fires_interaction_telemetry(self) -> None:
+        citations = [{"excerpt": "e", "source": "s"}]
+        _st_mock, _session, _col_csv, _col_json, mock_interaction, _mock_error = self._run(
+            citations, "csv"
+        )
+        mock_interaction.assert_called_once()
+        self.assertEqual(mock_interaction.call_args.kwargs.get("action"), "export_citation_index")
+        self.assertEqual(mock_interaction.call_args.kwargs.get("format"), "csv")
+        self.assertEqual(mock_interaction.call_args.kwargs.get("citation_count"), 1)
+
+
 class TestRememberSourceRecords(unittest.TestCase):
     def test_stores_docs_per_source_label(self) -> None:
         import app.views.records as records

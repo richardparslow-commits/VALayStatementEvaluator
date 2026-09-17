@@ -298,6 +298,25 @@ streamlit run run_app.py --server.port $PORT --server.address 0.0.0.0
    the revised statement with `[Confirm: ...]` placeholders, and downloads for both the
    report and the revised statement.
 
+### Medical record search & citation index
+
+Once at least one medical record is loaded in **Evaluate**, a **🔎 Search medical records**
+panel appears below the record list:
+
+1. Enter a search query; optionally narrow by **From/To date** (matches any date mentioned
+   in a passage) and/or **Provider** (case-insensitive text match). Results are ranked with
+   an in-memory TF-IDF scorer over the record paragraphs (top 20 shown), with the matched
+   terms **highlighted** and a source label (`filename p.N`) per result.
+2. Click **➕ Export excerpt** on any result to add its excerpt + source to the session's
+   `citation_index`.
+3. Once the citation index has entries, **⬇️ Export citations (.csv)** / **(.json)** buttons
+   appear, producing a downloadable file with `excerpt` and `source` fields.
+4. Running **Run exhaustive evaluation** afterward appends a **Sources** section to the
+   generated report listing every collected citation.
+
+No new configuration is required — search and the citation index are entirely in-memory
+for the session (no new endpoints, no new env vars).
+
 ### Draft a statement
 
 1. Choose the veteran's medical-record source: upload files, import from Fetch Sandbox, or

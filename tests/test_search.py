@@ -16,6 +16,7 @@ from app.documents import (  # noqa: E402
     ExtractedDocument,
     Paragraph,
     build_inverted_index,
+    export_citation_index,
     search_records,
 )
 
@@ -124,6 +125,47 @@ class TestSearchRecords(unittest.TestCase):
         documents = [_doc("f.pdf", pages)]
         results = search_records(documents, "asthma", limit=5)
         self.assertEqual(len(results), 5)
+
+
+class TestExportCitationIndex(unittest.TestCase):
+    _CITATIONS = [
+        {"excerpt": "chronic knee pain noted", "source": "clinic.pdf p.2"},
+        {"excerpt": "asthma flare-up, prescribed inhaler", "source": "hospital.pdf p.5"},
+    ]
+
+    def test_json_export_round_trips(self) -> None:
+        import json
+
+        data = export_citation_index(self._CITATIONS, "json")
+        self.assertEqual(json.loads(data.decode("utf-8")), self._CITATIONS)
+
+    def test_csv_export_has_excerpt_and_source_columns(self) -> None:
+        import csv
+        import io
+
+        data = export_citation_index(self._CITATIONS, "csv")
+        rows = list(csv.DictReader(io.StringIO(data.decode("utf-8"))))
+        self.assertEqual(rows[0]["excerpt"], "chronic knee pain noted")
+        self.assertEqual(rows[0]["source"], "clinic.pdf p.2")
+        self.assertEqual(rows[1]["source"], "hospital.pdf p.5")
+
+    def test_format_is_case_insensitive(self) -> None:
+        self.assertEqual(
+            export_citation_index(self._CITATIONS, "CSV"),
+            export_citation_index(self._CITATIONS, "csv"),
+        )
+
+    def test_unsupported_format_raises_value_error(self) -> None:
+        with self.assertRaises(ValueError):
+            export_citation_index(self._CITATIONS, "xml")
+
+    def test_empty_citation_index_exports_empty_list_or_header_only(self) -> None:
+        import json
+
+        self.assertEqual(json.loads(export_citation_index([], "json").decode("utf-8")), [])
+        csv_bytes = export_citation_index([], "csv").decode("utf-8")
+        self.assertIn("excerpt", csv_bytes)
+        self.assertIn("source", csv_bytes)
 
 
 if __name__ == "__main__":

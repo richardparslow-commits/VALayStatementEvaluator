@@ -1,7 +1,9 @@
 """Document text extraction and chunking utilities."""
 from __future__ import annotations
 
+import csv
 import io
+import json
 import math
 import re
 import zipfile
@@ -549,3 +551,33 @@ def search_records(
         if len(results) >= limit:
             break
     return results
+
+
+# ------------------------------------------------------------ citation index
+# Feature: Medical Record Search & Citation Index (F2.S2)
+_CITATION_EXPORT_FIELDS = ("excerpt", "source")
+
+
+def export_citation_index(citations: list[dict[str, str]], fmt: str) -> bytes:
+    """Serialize the citation index (excerpt + source per entry) to bytes.
+
+    ``fmt`` is ``"csv"`` or ``"json"`` (case-insensitive); raises
+    :class:`ValueError` for anything else so a caller-facing error message
+    can be shown instead of silently exporting the wrong format.
+    """
+    normalized = (fmt or "").strip().lower()
+    if normalized == "json":
+        return json.dumps(citations, indent=2, ensure_ascii=False).encode("utf-8")
+    if normalized == "csv":
+        buffer = io.StringIO()
+        writer = csv.DictWriter(buffer, fieldnames=list(_CITATION_EXPORT_FIELDS))
+        writer.writeheader()
+        for citation in citations:
+            writer.writerow(
+                {
+                    "excerpt": citation.get("excerpt", ""),
+                    "source": citation.get("source", ""),
+                }
+            )
+        return buffer.getvalue().encode("utf-8")
+    raise ValueError(f"Unsupported citation export format: {fmt!r} (expected 'csv' or 'json')")

@@ -7,7 +7,9 @@ from dataclasses import dataclass, field
 import logging
 import time
 
-from .agiloop_telemetry import track_feature_error
+import streamlit as st
+
+from .agiloop_telemetry import track_feature_error, track_goal
 from .config import load_knowledge
 from .documents import (
     EVALUATE_INTERNAL_MAX_CHARS,
@@ -29,6 +31,9 @@ from .medical_review import (
 
 # Feature: Condition-Specific Templates
 FEATURE_ID = "02f0935a-ee5e-4083-88a2-10e11753ccc9"  # condition-specific-templates
+
+# Feature: Medical Record Search & Citation Index
+SEARCH_FEATURE_ID = "22bc7e10-dcda-431e-b3fb-4e8ff9b532cb"  # medical-record-search-citation-index
 
 CLAIMS_SYSTEM = """You are a VA claims evidence analyst. Decompose a lay/witness statement \
 into atomic factual assertions so each can be checked against medical records. Distinguish \
@@ -519,9 +524,25 @@ def _run_evaluation(
     with PhaseTimer(logger, "report", request_id=rid):
         with phase_timer("report"):
             report(0.96, "Step 7/7 — Building the report…")
-            result.report_markdown = build_report(result, statement_text)
+            result.report_markdown = build_report(
+                result, statement_text, citations=_citation_index_snapshot()
+            )
     report(1.0, "Evaluation complete.")
     return result
+
+
+def _citation_index_snapshot() -> list[dict[str, str]]:
+    """Best-effort read of ``citation_index`` from session state.
+
+    Guarded because this pipeline can run outside an active Streamlit script
+    context (e.g. offline tests, CLI usage) where ``st.session_state`` raises
+    instead of returning a default.
+    """
+    try:
+        citations = st.session_state.get("citation_index", [])
+    except Exception:  # noqa: BLE001 - session state may be unavailable
+        return []
+    return citations if isinstance(citations, list) else []
 
 
 def _analyze_topics(
@@ -681,8 +702,17 @@ _VERDICT_EMOJI = {
 }
 
 
-def build_report(result: EvaluationResult, statement_text: str) -> str:
-    """Render the full markdown evaluation report."""
+def build_report(
+    result: EvaluationResult,
+    statement_text: str,
+    citations: list[dict[str, str]] | None = None,
+) -> str:
+    """Render the full markdown evaluation report.
+
+    ``citations`` (F2.S2) is the ``citation_index`` collected via the medical
+    record search widget (excerpt + source per entry); when non-empty, a
+    "Sources" section listing every citation is appended to the report.
+    """
     lines: list[str] = []
     lines.append("# Lay Statement Evaluation Report")
     lines.append("")
@@ -830,6 +860,23 @@ def build_report(result: EvaluationResult, statement_text: str) -> str:
         lines.append("")
         lines.append(result.digest.summary)
         lines.append("")
+
+    if citations:
+        lines.append("## Sources")
+        lines.append("")
+        for citation in citations:
+            source = str(citation.get("source", "")).strip() or "(unknown source)"
+            excerpt = str(citation.get("excerpt", "")).strip()
+            lines.append(f"- **{source}**: {excerpt}")
+        lines.append("")
+        try:
+            track_goal(
+                SEARCH_FEATURE_ID,
+                "report_sources_appended",
+                citation_count=len(citations),
+            )
+        except Exception:  # noqa: BLE001 - telemetry must never break report generation
+            pass
 
     lines.append("---")
     lines.append(

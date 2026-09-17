@@ -24,6 +24,7 @@ from app.documents import (  # noqa: E402
 from app.evaluate import (  # noqa: E402
     DIMENSION_LABELS,
     EvaluationResult,
+    _citation_index_snapshot,
     _truncate_for_prompt,
     _verifications_text,
     _verify_claims,
@@ -288,6 +289,44 @@ class TestBuildReport(unittest.TestCase):
     def test_overall_rating_in_report(self):
         r = EvaluationResult(scores={k: 9 for k in DIMENSION_LABELS})
         self.assertIn("Excellent", build_report(r, "s"))
+
+    def test_sources_section_appended_when_citations_present(self):
+        r = EvaluationResult(scores={k: 5 for k in DIMENSION_LABELS})
+        citations = [
+            {"excerpt": "chronic knee pain noted", "source": "clinic.pdf p.2"},
+            {"excerpt": "asthma flare-up", "source": "hospital.pdf p.5"},
+        ]
+        with patch("app.evaluate.track_goal") as mock_goal:
+            report = build_report(r, "s", citations=citations)
+        self.assertIn("## Sources", report)
+        self.assertIn("clinic.pdf p.2", report)
+        self.assertIn("chronic knee pain noted", report)
+        self.assertIn("hospital.pdf p.5", report)
+        mock_goal.assert_called_once()
+        self.assertEqual(mock_goal.call_args.kwargs.get("citation_count"), 2)
+
+    def test_no_sources_section_when_citations_empty_or_none(self):
+        r = EvaluationResult(scores={k: 5 for k in DIMENSION_LABELS})
+        self.assertNotIn("## Sources", build_report(r, "s"))
+        self.assertNotIn("## Sources", build_report(r, "s", citations=[]))
+
+
+class TestCitationIndexSnapshot(unittest.TestCase):
+    def test_returns_list_from_session_state(self):
+        citations = [{"excerpt": "e", "source": "s"}]
+        with patch("app.evaluate.st") as mock_st:
+            mock_st.session_state.get.return_value = citations
+            self.assertEqual(_citation_index_snapshot(), citations)
+
+    def test_returns_empty_list_when_session_state_unavailable(self):
+        with patch("app.evaluate.st") as mock_st:
+            mock_st.session_state.get.side_effect = RuntimeError("no script run context")
+            self.assertEqual(_citation_index_snapshot(), [])
+
+    def test_returns_empty_list_when_value_is_not_a_list(self):
+        with patch("app.evaluate.st") as mock_st:
+            mock_st.session_state.get.return_value = "not-a-list"
+            self.assertEqual(_citation_index_snapshot(), [])
 
 
 class TestVerifyClaims(unittest.TestCase):
