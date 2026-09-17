@@ -107,7 +107,7 @@ class TestFollowUpStateAndRendering(unittest.TestCase):
 
         st_mock, session = _fake_streamlit()
         st_mock.text_area.side_effect = ["Edited question?", "Edited answer."]
-        st_mock.button.side_effect = [True, False]
+        st_mock.form_submit_button.side_effect = [True, False]
         with patch.object(follow_up, "st", st_mock):
             follow_up.render_follow_up_questions(
                 slot="eval",
@@ -131,9 +131,8 @@ class TestFollowUpStateAndRendering(unittest.TestCase):
 
         st_mock, session = _fake_streamlit()
         session["draft_follow_up_source_id"] = "req_1"
-        session["draft_follow_up_signature"] = (("A. Hazards", "Question one?"),)
         st_mock.text_area.side_effect = ["Question one?", ""]
-        st_mock.button.side_effect = [False, True]
+        st_mock.form_submit_button.side_effect = [False, True]
         with patch.object(follow_up, "st", st_mock):
             follow_up.render_follow_up_questions(
                 slot="draft",
@@ -163,6 +162,47 @@ class TestFollowUpStateAndRendering(unittest.TestCase):
                 next_run_label="evaluation",
             )
         st_mock.info.assert_called_once_with("No follow-up questions needed.")
+
+    def test_new_source_clears_consumed_answers(self) -> None:
+        import app.views.follow_up as follow_up
+
+        st_mock, session = _fake_streamlit()
+        session["eval_follow_up_source_id"] = "req_old"
+        session["eval_follow_up_saved"] = [
+            {"topic": "A. Hazards", "question": "Q?", "answer": "A."}
+        ]
+        session["eval_follow_up_pending_apply"] = False
+        with patch.object(follow_up, "st", st_mock):
+            follow_up.render_follow_up_questions(
+                slot="eval",
+                source_id="req_new",
+                questions=[],
+                empty_message="No follow-up questions needed.",
+                next_run_label="evaluation",
+            )
+        self.assertEqual(session["eval_follow_up_saved"], [])
+
+    def test_successful_consumption_clears_saved_follow_up_state(self) -> None:
+        import app.views.follow_up as follow_up
+
+        st_mock, session = _fake_streamlit()
+        session["eval_follow_up_saved"] = [
+            {"topic": "A. Hazards", "question": "Q?", "answer": "A."}
+        ]
+        session["eval_follow_up_skipped"] = [
+            {"topic": "B. Caregiver Burden", "question": "Skipped?"}
+        ]
+        with patch.object(follow_up, "st", st_mock):
+            follow_up.mark_follow_up_answers_consumed("eval")
+        self.assertEqual(session["eval_follow_up_saved"], [])
+        self.assertEqual(
+            session["eval_follow_up_applied_saved"],
+            [{"topic": "A. Hazards", "question": "Q?", "answer": "A."}],
+        )
+        self.assertEqual(
+            session["eval_follow_up_applied_skipped"],
+            [{"topic": "B. Caregiver Burden", "question": "Skipped?"}],
+        )
 
 
 class TestFollowUpRunIntegration(unittest.TestCase):
@@ -204,6 +244,17 @@ class TestFollowUpRunIntegration(unittest.TestCase):
         self.assertIn("Original statement.", appended_statement)
         self.assertIn("Additional follow-up details confirmed after the last run:", appended_statement)
         self.assertIn("He left the burner on twice last month.", appended_statement)
+        self.assertEqual(session["eval_follow_up_saved"], [])
+        self.assertEqual(
+            session["eval_follow_up_applied_saved"],
+            [
+                {
+                    "topic": "A. Hazards",
+                    "question": "What happened near the stove?",
+                    "answer": "He left the burner on twice last month.",
+                }
+            ],
+        )
 
     def test_draft_flow_appends_saved_answers(self) -> None:
         import app.views.draft_view as draft_view
@@ -250,6 +301,17 @@ class TestFollowUpRunIntegration(unittest.TestCase):
         self.assertIn("Original observations.", appended_observations)
         self.assertIn("Additional follow-up details confirmed after the last run:", appended_observations)
         self.assertIn("I help him shower every morning.", appended_observations)
+        self.assertEqual(session["draft_follow_up_saved"], [])
+        self.assertEqual(
+            session["draft_follow_up_applied_saved"],
+            [
+                {
+                    "topic": "B. Caregiver Burden",
+                    "question": "Who helps him bathe?",
+                    "answer": "I help him shower every morning.",
+                }
+            ],
+        )
 
 
 if __name__ == "__main__":

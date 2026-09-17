@@ -51,6 +51,20 @@ def append_follow_up_answers(text: str, *, slot: str) -> str:
     return f"{base}\n\n{appendix}"
 
 
+def mark_follow_up_answers_consumed(slot: str) -> None:
+    """Mark saved answers as consumed by a successful rerun."""
+    saved = _saved_answers(slot)
+    skipped = _saved_skips(slot)
+    if saved:
+        st.session_state[_key(slot, "applied_saved")] = saved
+    if skipped:
+        st.session_state[_key(slot, "applied_skipped")] = skipped
+    st.session_state[_key(slot, "saved")] = []
+    st.session_state[_key(slot, "skipped")] = []
+    st.session_state[_key(slot, "index")] = 0
+    st.session_state[_key(slot, "notice")] = ""
+
+
 def render_follow_up_questions(
     *,
     slot: str,
@@ -60,10 +74,16 @@ def render_follow_up_questions(
     next_run_label: str,
 ) -> None:
     """Render one follow-up question at a time with accept/skip controls."""
-    _ensure_state(slot, source_id, questions)
+    _ensure_state(slot, source_id)
+    questions = _filter_handled_questions(slot, questions)
     saved = _saved_answers(slot)
     skipped = _saved_skips(slot)
+    applied_saved = _applied_saved_answers(slot)
+    applied_skipped = _applied_skips(slot)
     index = int(st.session_state.get(_key(slot, "index"), 0) or 0)
+    if index > len(questions):
+        index = len(questions)
+        st.session_state[_key(slot, "index")] = index
 
     with st.expander("🤖 Automated follow-up question generator", expanded=bool(questions)):
         notice = _clean_text(st.session_state.get(_key(slot, "notice"), ""))
@@ -83,6 +103,29 @@ def render_follow_up_questions(
                 topic = _clean_text(item.get("topic")) or "Follow-up"
                 answer = _clean_text(item.get("answer"))
                 st.write(f"- **{topic}** — {answer}")
+        elif applied_saved:
+            st.caption(
+                f"{len(applied_saved)} accepted answer(s) were already included in the most recent "
+                f"{next_run_label} run."
+            )
+            for item in applied_saved:
+                topic = _clean_text(item.get("topic")) or "Follow-up"
+                answer = _clean_text(item.get("answer"))
+                st.write(f"- **{topic}** — {answer}")
+        if applied_skipped and not skipped:
+            st.caption(f"Previously skipped questions in the last cycle: {len(applied_skipped)}")
+        if saved or skipped or applied_saved or applied_skipped:
+            if st.button(
+                "Clear saved follow-up answers and skipped questions",
+                key=_key(slot, "clear"),
+            ):
+                st.session_state[_key(slot, "saved")] = []
+                st.session_state[_key(slot, "skipped")] = []
+                st.session_state[_key(slot, "applied_saved")] = []
+                st.session_state[_key(slot, "applied_skipped")] = []
+                st.session_state[_key(slot, "index")] = 0
+                st.session_state[_key(slot, "notice")] = "Cleared the saved follow-up state for this tab."
+                st.rerun()
 
         if index >= len(questions):
             if skipped:
@@ -92,20 +135,23 @@ def render_follow_up_questions(
 
         current = questions[index]
         st.caption(f"Question {index + 1} of {len(questions)} — {current.get('topic', 'Checklist topic')}")
-        question_text = st.text_area(
-            "Follow-up question (editable before asking)",
-            value=current.get("question", ""),
-            height=110,
-            key=_key(slot, f"question_{index}"),
-        )
-        answer_text = st.text_area(
-            "Witness answer",
-            value="",
-            height=160,
-            key=_key(slot, f"answer_{index}"),
-        )
-        accept = st.button("Save answer and continue", key=_key(slot, f"accept_{index}"))
-        skip = st.button("Skip this question", key=_key(slot, f"skip_{index}"))
+        with st.form(key=_key(slot, f"form_{index}")):
+            question_text = st.text_area(
+                "Follow-up question (editable before asking)",
+                value=current.get("question", ""),
+                height=110,
+                key=_key(slot, f"question_{index}"),
+            )
+            answer_text = st.text_area(
+                "Witness answer",
+                value="",
+                height=160,
+                key=_key(slot, f"answer_{index}"),
+            )
+            accept = st.form_submit_button(
+                "Save answer and continue", type="primary"
+            )
+            skip = st.form_submit_button("Skip this question")
 
         if accept:
             cleaned_answer = _clean_text(answer_text)
@@ -200,20 +246,51 @@ def _saved_skips(slot: str) -> list[dict[str, str]]:
     return list(raw) if isinstance(raw, list) else []
 
 
-def _ensure_state(slot: str, source_id: str, questions: list[dict[str, str]]) -> None:
-    normalized = [
-        {"topic": _clean_text(item.get("topic")), "question": _clean_text(item.get("question"))}
-        for item in questions
+def _applied_saved_answers(slot: str) -> list[dict[str, str]]:
+    raw = st.session_state.get(_key(slot, "applied_saved"), [])
+    return list(raw) if isinstance(raw, list) else []
+
+
+def _applied_skips(slot: str) -> list[dict[str, str]]:
+    raw = st.session_state.get(_key(slot, "applied_skipped"), [])
+    return list(raw) if isinstance(raw, list) else []
+
+
+def _filter_handled_questions(slot: str, questions: list[dict[str, str]]) -> list[dict[str, str]]:
+    handled = {
+        (_clean_text(item.get("topic")), _clean_text(item.get("question")))
+        for item in [*_saved_answers(slot), *_saved_skips(slot)]
         if isinstance(item, dict)
-    ]
-    signature = tuple((item["topic"], item["question"]) for item in normalized)
-    signature_key = _key(slot, "signature")
-    if (
-        st.session_state.get(_key(slot, "source_id")) != source_id
-        or st.session_state.get(signature_key) != signature
-    ):
+    }
+    filtered: list[dict[str, str]] = []
+    for item in questions:
+        if not isinstance(item, dict):
+            continue
+        normalized = {
+            "topic": _clean_text(item.get("topic")) or "Checklist topic",
+            "question": _clean_text(item.get("question")),
+        }
+        if not normalized["question"]:
+            continue
+        if (normalized["topic"], normalized["question"]) in handled:
+            continue
+        filtered.append(normalized)
+    return filtered
+
+
+def _ensure_state(slot: str, source_id: str) -> None:
+    source_key = _key(slot, "source_id")
+    if source_key not in st.session_state:
         st.session_state[_key(slot, "source_id")] = source_id
-        st.session_state[signature_key] = signature
+        st.session_state[_key(slot, "index")] = 0
+        st.session_state[_key(slot, "saved")] = []
+        st.session_state[_key(slot, "skipped")] = []
+        st.session_state[_key(slot, "applied_saved")] = []
+        st.session_state[_key(slot, "applied_skipped")] = []
+        st.session_state[_key(slot, "notice")] = ""
+        return
+    if st.session_state.get(source_key) != source_id:
+        st.session_state[source_key] = source_id
         st.session_state[_key(slot, "index")] = 0
         st.session_state[_key(slot, "saved")] = []
         st.session_state[_key(slot, "skipped")] = []

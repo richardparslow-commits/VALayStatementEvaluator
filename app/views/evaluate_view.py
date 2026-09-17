@@ -33,6 +33,7 @@ from ..shutdown import enter_run, exit_run
 from .follow_up import (
     append_follow_up_answers,
     evaluate_follow_up_questions,
+    mark_follow_up_answers_consumed,
     render_follow_up_questions,
 )
 from .shared import (
@@ -427,6 +428,7 @@ def _run_evaluation_flow(statement_text: str, records: list) -> None:
     st.session_state.eval_result = result
     st.session_state.eval_usage = llm.usage
     st.session_state.eval_request_id = rid
+    mark_follow_up_answers_consumed("eval")
     record_watchdog_run(llm.usage)
 
 
