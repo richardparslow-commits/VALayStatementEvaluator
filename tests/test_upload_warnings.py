@@ -3,6 +3,11 @@
 Uses Streamlit's AppTest harness to run the real app and drive the file
 uploader, so the warning behavior is locked in end-to-end (not just in the
 pure extraction helper).
+
+Runs wherever the runtime dependencies are installed (CI pip-installs
+requirements.lock first). The old gate here read `(PROJECT_ROOT / ".venv").exists()
+or True` — always true, and only ever looked like a check; a missing AppTest
+harness must surface as a failure rather than a silently skipped test.
 """
 import sys
 import unittest
@@ -16,10 +21,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 from log_isolation import isolate_app_logs  # noqa: E402
 
 
-@unittest.skipUnless(
-    (PROJECT_ROOT / ".venv").exists() or True,  # venv optional; deps needed either way
-    "requires streamlit AppTest",
-)
 class TestUploadWarnings(unittest.TestCase):
     def setUp(self) -> None:
         # AppTest runs the real app in-process — keep its run-log/audit-log writes

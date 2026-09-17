@@ -3,6 +3,13 @@
 Drives the real app with Streamlit's AppTest, stubbing the LLM so no network or
 key is needed, and asserts that a run surfaces (a) a live caption line and
 (b) the per-phase "Estimated API usage" expander.
+
+These run wherever the runtime dependencies are installed — including CI, which
+pip-installs requirements.lock before `unittest discover`. There is deliberately
+no skip gate here: a `PROJECT_ROOT/.venv` check used to sit on the helper class
+below (where it did nothing at all), and gating AppTest tests on a venv path
+would silently drop this coverage in CI. If Streamlit's AppTest harness is
+unavailable the test must error loudly, not skip.
 """
 import sys
 import unittest
@@ -70,7 +77,6 @@ class _FakeLLM:
         return content
 
 
-@unittest.skipUnless((PROJECT_ROOT / ".venv").exists(), "requires the project venv")
 class _FailoverLLM(_FakeLLM):
     """Same stub, recording every call against the backup endpoint."""
 
@@ -182,6 +188,47 @@ class TestUsageUi(unittest.TestCase):
         at = self._run_evaluation(_FakeLLM())
         messages = [w.value for w in at.warning]
         self.assertFalse(any("backup LLM endpoint" in m for m in messages), msg=str(messages))
+
+    def test_watchdog_widget_renders_with_a_fit_and_no_env_rates(self):
+        """Regression: once a watchdog fit exists the sidebar must render even
+        with no `.env` rates set.
+
+        The guard this replaced used `all(<bool>)` and raised TypeError on
+        exactly this branch, which killed the whole app render. The assertion
+        was lost when the AppTest suite was reorganised; it is restored here
+        because nothing else exercises the widget's fit branch end to end (the
+        unit tests below only cover `effective_credit_rates()` in isolation).
+        """
+        import app.config as config
+        import unittest.mock as mock
+
+        history = watchdog.UsageHistory()
+        watchdog.record_run(history, prompt_tokens=1000, completion_tokens=0, calls=1)
+        watchdog.record_calibration(history, credits=0.0, ts=1.0)
+        watchdog.record_run(history, prompt_tokens=1000, completion_tokens=0, calls=1)
+        watchdog.record_calibration(history, credits=0.1, ts=2.0)  # 100 credits/1M
+        # Save where the app will read it: isolate_app_logs() points
+        # VA_LSE_WATCHDOG_PATH at this test's temp dir.
+        watchdog.save_history(history, watchdog.history_path())
+
+        with mock.patch.object(config, "CREDITS_PER_1M_MAIN", None), mock.patch.object(
+            config, "CREDITS_PER_1M_FAST", None
+        ):
+            at = self._app()
+            at.run()
+
+        self.assertEqual(
+            list(at.exception), [], msg=f"app raised during render: {list(at.exception)}"
+        )
+        # The fit branch rendered the fallback guidance — the branch that used
+        # to raise. Markdown lives inside the sidebar expander, so search both.
+        rendered = [m.value for m in at.markdown] + [
+            m.value for expander in at.expander for m in expander.markdown
+        ]
+        self.assertTrue(
+            any("The estimator will now use" in value for value in rendered),
+            msg=f"fallback guidance not found: {rendered}",
+        )
 
     def test_explicit_env_rate_not_overwritten_by_watchdog(self):
         """A .env rate set for ONE model must not be clobbered by the watchdog
