@@ -766,6 +766,26 @@ class TestRubricAndPositiveSources(unittest.TestCase):
         self.assertEqual(cited, {"records.pdf p.5"})
         self.assertEqual(positive, set())
 
+    def test_later_supportive_match_marks_source_positive(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        fact = self._fact(source="records.pdf p.7")
+        result = EvaluationResult(
+            digest=self._digest([fact]),
+            verifications=[
+                {"id": 1, "verdict": "CONTRADICTED", "record_reference": "records.pdf p.7"},
+                {
+                    "id": 2,
+                    "verdict": "PARTIALLY SUPPORTED",
+                    "record_reference": "records.pdf p.7, 2020-01-01",
+                },
+            ],
+        )
+        cited, positive = evaluate_view._rubric_and_positive_sources(result)
+        self.assertEqual(cited, {"records.pdf p.7"})
+        self.assertEqual(positive, {"records.pdf p.7"})
+
     def test_fact_not_referenced_anywhere_is_excluded(self) -> None:
         import app.views.evaluate_view as evaluate_view
         from app.evaluate import EvaluationResult

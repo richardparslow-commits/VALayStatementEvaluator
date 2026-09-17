@@ -11,11 +11,17 @@ import time
 import traceback
 from typing import Any
 
+import pandas as pd
 import streamlit as st
 
 from .. import audit as audit_log
-from ..agiloop_telemetry import track_goal, track_impression, track_interaction
-from ..evaluate import DIMENSION_LABELS, run_evaluation
+from ..agiloop_telemetry import (
+    track_feature_error,
+    track_goal,
+    track_impression,
+    track_interaction,
+)
+from ..evaluate import DIMENSION_LABELS, VERDICTS, build_evidence_dashboard, run_evaluation
 from ..exporter import export_facts, filter_facts
 from ..logging_config import get_logger, get_request_id
 from ..documents import (
@@ -59,6 +65,9 @@ logger = get_logger("app.views.evaluate")
 
 # Feature: Final Statement PDF Export
 PDF_EXPORT_FEATURE_ID = "0d76d70b-8dd6-4561-a874-f768d5929222"  # final-statement-pdf-export
+
+# Feature: Evidence Strength Dashboard
+EVIDENCE_DASHBOARD_FEATURE_ID = "b25a523d-b974-43e1-a554-374bbdebb01d"  # evidence-strength-dashboard
 
 # Feature: Fact Citation Exporter
 EXPORT_FACTS_FEATURE_ID = "051bb638-ac1c-40cf-95f5-164779b4382c"  # fact-citation-exporter
@@ -509,6 +518,108 @@ def _render_pdf_export(statement_text: str, *, entry_point: str) -> None:
             pass
 
 
+def _render_evidence_dashboard(eval_result: Any) -> None:
+    """Render the Evidence Strength Dashboard below the verification table.
+
+    Groups verified claims by inferred record type (Diagnosis, Medication,
+    Symptom, Other) and shows verdict counts as a horizontal stacked bar
+    chart (``st.bar_chart`` renders native hover tooltips with the exact
+    per-segment count and, via the percentage caption below, the share of
+    each verdict), plus a concise text summary of overall evidence
+    strength. A dashboard build failure must never break the rest of the
+    Evaluate results panel — it is caught, tracked, and skipped.
+    """
+    try:
+        dashboard = build_evidence_dashboard(
+            eval_result.verifications, eval_result.claims
+        )
+    except Exception as exc:  # noqa: BLE001 - dashboard is best-effort, never fatal
+        logger.warning("evidence dashboard build failed error=%s", exc, exc_info=True)
+        try:
+            track_feature_error(EVIDENCE_DASHBOARD_FEATURE_ID, exc, phase="dashboard_build")
+        except Exception:  # noqa: BLE001 - telemetry must never break the UI
+            pass
+        return
+
+    if not dashboard:
+        return
+
+    impression_key = "evidence_dashboard_impression_sent"
+    if not st.session_state.get(impression_key):
+        try:
+            track_impression(
+                EVIDENCE_DASHBOARD_FEATURE_ID,
+                entry_point="evaluate_report",
+                recordTypeCount=len(dashboard),
+            )
+        except Exception:  # noqa: BLE001 - telemetry must never break the UI
+            pass
+        st.session_state[impression_key] = True
+
+    with st.expander("📊 Evidence strength dashboard", expanded=True):
+        st.caption(
+            "Claims grouped by the type of medical record most likely to confirm them, "
+            "with verdict counts from the verification step above. Hover a bar segment "
+            "for the exact count and percentage of that record type."
+        )
+        chart_df = pd.DataFrame(dashboard).T.reindex(columns=list(VERDICTS)).fillna(0).astype(int)
+        st.bar_chart(chart_df, horizontal=True)
+
+        total_claims = sum(sum(counts.values()) for counts in dashboard.values())
+        verdict_totals = {
+            verdict: sum(counts.get(verdict, 0) for counts in dashboard.values())
+            for verdict in VERDICTS
+        }
+        supported = verdict_totals["SUPPORTED"] + verdict_totals["PARTIALLY SUPPORTED"]
+        supported_pct = (supported / total_claims * 100) if total_claims else 0.0
+        contradicted_pct = (
+            (verdict_totals["CONTRADICTED"] / total_claims * 100) if total_claims else 0.0
+        )
+
+        percentage_rows = [
+            {
+                "Record type": record_type,
+                **{
+                    verdict: f"{counts.get(verdict, 0)} ({counts.get(verdict, 0) / max(sum(counts.values()), 1) * 100:.0f}%)"
+                    for verdict in VERDICTS
+                },
+            }
+            for record_type, counts in sorted(dashboard.items())
+        ]
+        st.dataframe(percentage_rows, width="stretch", hide_index=True)
+
+        weakest_type = min(
+            dashboard.items(),
+            key=lambda item: (
+                item[1].get("SUPPORTED", 0) + item[1].get("PARTIALLY SUPPORTED", 0)
+            )
+            / max(sum(item[1].values()), 1),
+        )[0]
+        summary = (
+            f"Of {total_claims} verified claim(s) across {len(dashboard)} record type(s), "
+            f"{supported} ({supported_pct:.0f}%) are supported or partially supported by the "
+            f"medical records"
+            + (f", while {contradicted_pct:.0f}% are contradicted" if verdict_totals["CONTRADICTED"] else "")
+            + f". **{weakest_type}** evidence is the weakest category — consider requesting "
+            "or reviewing additional records in that area."
+        )
+        st.write(summary)
+
+        try:
+            track_interaction(
+                EVIDENCE_DASHBOARD_FEATURE_ID,
+                action="dashboard_viewed",
+                claimCount=total_claims,
+            )
+            track_goal(
+                EVIDENCE_DASHBOARD_FEATURE_ID,
+                "evidence_strength_dashboard_rendered",
+                supportedPct=round(supported_pct, 1),
+            )
+        except Exception:  # noqa: BLE001 - telemetry must never break the UI
+            pass
+
+
 # --------------------------------------------------------- fact citation export
 _SUPPORTIVE_VERDICTS = ("SUPPORTED", "PARTIALLY SUPPORTED")
 
@@ -555,7 +666,7 @@ def _rubric_and_positive_sources(eval_result: Any) -> tuple[set[str], set[str]]:
                 cited.add(fact.source)
                 if verdict in _SUPPORTIVE_VERDICTS:
                     positive.add(fact.source)
-                break
+                    break
     return cited, positive
 
 
@@ -578,7 +689,11 @@ def _render_fact_export_section(eval_result: Any) -> None:
     impression_key = "export_facts_impression_sent"
     if not st.session_state.get(impression_key):
         try:
-            track_impression(EXPORT_FACTS_FEATURE_ID, entry_point="evaluate", fact_count=len(digest.facts))
+            track_impression(
+                EXPORT_FACTS_FEATURE_ID,
+                entry_point="evaluate",
+                fact_count=len(digest.facts),
+            )
         except Exception:  # noqa: BLE001 - telemetry must never break the UI
             pass
         st.session_state[impression_key] = True
@@ -755,6 +870,8 @@ def _render_evaluation_results(eval_result: Any) -> None:
                 }
             )
         st.dataframe(rows, width="stretch", hide_index=True)
+
+    _render_evidence_dashboard(eval_result)
 
     with st.expander("Rubric scores", expanded=True):
         score_rows = [

@@ -294,6 +294,11 @@ streamlit run run_app.py --server.port $PORT --server.address 0.0.0.0
    rubric scoring, improvement drafting, and report generation progress.
 5. Review the verdict table (✅ supported / 🟡 partial / ❌ contradicted / ⚪ not found),
    scores, and the prioritized improvement plan.
+5a. Below the verdict table, the **📊 Evidence strength dashboard** groups claims by
+    inferred record type (Diagnosis, Medication, Symptom, Other) and shows verdict counts
+    per type as a horizontal stacked bar chart (hover a segment for the exact count and
+    percentage), plus a concise text summary flagging the weakest evidence category.
+    Entirely in-memory — no new configuration, endpoints, or env vars.
 6. Review the **proposed rewrite**: a change-by-change table (original → suggested → why),
    the revised statement with `[Confirm: ...]` placeholders, and downloads for both the
    report and the revised statement.
