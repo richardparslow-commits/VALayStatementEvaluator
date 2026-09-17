@@ -26,12 +26,16 @@ from app.evaluate import (  # noqa: E402
     VERDICTS,
     EvaluationResult,
     _citation_index_snapshot,
+    _fallback_recommendations,
     _infer_record_type,
     _truncate_for_prompt,
     _verifications_text,
     _verify_claims,
     build_evidence_dashboard,
     build_report,
+    compute_effectiveness_score,
+    compute_score_band,
+    generate_improvement_recommendations,
     run_evaluation,
 )
 from app.llm import LLMError  # noqa: E402
@@ -132,6 +136,14 @@ class _FakeLLM:
                 ],
                 "revised_statement": "I confirm he has daily knee pain. [Confirm: brace use]",
                 "added_facts_to_verify": ["Brace prescribed 2021-06"],
+            }
+        if phase == "recommendations":
+            return {
+                "recommendations": [
+                    {"title": "Add supporting evidence for onset claim", "impact": "+8 points", "explanation": "Cite the intake note.", "claim_id": 1},
+                    {"title": "Clarify frequency of symptoms", "impact": "+5 points", "explanation": "State how often pain occurs.", "claim_id": 2},
+                    {"title": "Add a functional-impact example", "impact": "+4 points", "explanation": "Describe a specific limited activity.", "claim_id": None},
+                ]
             }
         if phase == "records:digest":
             return {"facts": [{"date": "2020-01", "type": "symptom", "description": "Knee pain after lifting.", "source": "a.txt p.1", "quote": "knee pain"}], "conditions_mentioned": ["knee pain"], "providers_and_facilities": ["Dr. Smith"], "notes": ""}
@@ -653,6 +665,188 @@ class TestBuildEvidenceDashboard(unittest.TestCase):
         verifications = [{"id": 99, "verdict": "SUPPORTED"}]
         dashboard = build_evidence_dashboard(verifications, [])
         self.assertEqual(dashboard["Other"]["SUPPORTED"], 1)
+class TestComputeEffectivenessScore(unittest.TestCase):
+    """F4.S1 — compute_effectiveness_score."""
+
+    def test_returns_int_in_range(self):
+        result = EvaluationResult(
+            claims=[{"id": 1, "text": "c1"}, {"id": 2, "text": "c2"}],
+            verifications=[
+                {"id": 1, "verdict": "SUPPORTED", "record_reference": "a.txt p.1"},
+                {"id": 2, "verdict": "NOT FOUND", "record_reference": ""},
+            ],
+            scores={k: 8.0 for k in DIMENSION_LABELS},
+            input_chars=2000,
+        )
+        score = compute_effectiveness_score(result)
+        self.assertIsInstance(score, int)
+        self.assertGreaterEqual(score, 0)
+        self.assertLessEqual(score, 100)
+
+    def test_high_quality_statement_scores_high(self):
+        result = EvaluationResult(
+            claims=[{"id": i, "text": f"c{i}"} for i in range(1, 5)],
+            verifications=[
+                {"id": i, "verdict": "SUPPORTED", "record_reference": "a.txt p.1"}
+                for i in range(1, 5)
+            ],
+            scores={k: 9.5 for k in DIMENSION_LABELS},
+            input_chars=5000,
+        )
+        self.assertGreater(compute_effectiveness_score(result), 75)
+
+    def test_low_quality_statement_scores_low(self):
+        result = EvaluationResult(
+            claims=[{"id": i, "text": f"c{i}"} for i in range(1, 5)],
+            verifications=[
+                {"id": i, "verdict": "CONTRADICTED", "record_reference": "a.txt p.1"}
+                for i in range(1, 5)
+            ],
+            scores={k: 1.0 for k in DIMENSION_LABELS},
+            input_chars=50,
+        )
+        self.assertLess(compute_effectiveness_score(result), 50)
+
+    def test_zero_claims_does_not_raise_and_returns_int(self):
+        result = EvaluationResult(claims=[], verifications=[], scores={}, input_chars=0)
+        score = compute_effectiveness_score(result)
+        self.assertIsInstance(score, int)
+        self.assertGreaterEqual(score, 0)
+        self.assertLessEqual(score, 100)
+
+    def test_exact_weights_applied(self):
+        # rubric=100 (all 10s), verdicts empty -> 50, density=0 (no claims yet
+        # but claims present with no cited refs -> 0), length=100 (2000 chars)
+        result = EvaluationResult(
+            claims=[{"id": 1, "text": "c1"}],
+            verifications=[],
+            scores={k: 10.0 for k in DIMENSION_LABELS},
+            input_chars=2000,
+        )
+        expected = round(100 * 0.40 + 50 * 0.30 + 0 * 0.20 + 100 * 0.10)
+        self.assertEqual(compute_effectiveness_score(result), expected)
+
+
+class TestComputeScoreBand(unittest.TestCase):
+    def test_green_above_75(self):
+        self.assertEqual(compute_score_band(76), "green")
+        self.assertEqual(compute_score_band(100), "green")
+
+    def test_yellow_50_to_75_inclusive(self):
+        self.assertEqual(compute_score_band(50), "yellow")
+        self.assertEqual(compute_score_band(75), "yellow")
+        self.assertEqual(compute_score_band(60), "yellow")
+
+    def test_red_below_50(self):
+        self.assertEqual(compute_score_band(49), "red")
+        self.assertEqual(compute_score_band(0), "red")
+
+
+class TestGenerateImprovementRecommendations(unittest.TestCase):
+    """F4.S1 — generate_improvement_recommendations."""
+
+    def test_returns_3_to_5_items_with_required_keys(self):
+        llm = _FakeLLM()
+        result = EvaluationResult(
+            claims=[{"id": 1, "text": "c1"}, {"id": 2, "text": "c2"}],
+            verifications=[
+                {"id": 1, "verdict": "SUPPORTED", "record_reference": "a.txt p.1"},
+                {"id": 2, "verdict": "NOT FOUND", "record_reference": ""},
+            ],
+            scores={k: 6.0 for k in DIMENSION_LABELS},
+            input_chars=2000,
+        )
+        recs = generate_improvement_recommendations(result, llm)
+        self.assertGreaterEqual(len(recs), 3)
+        self.assertLessEqual(len(recs), 5)
+        for rec in recs:
+            self.assertIn("title", rec)
+            self.assertIn("impact", rec)
+            self.assertIn("explanation", rec)
+        # exactly one LLM call made
+        self.assertEqual([p for _, p in llm.calls if p == "recommendations"], ["recommendations"])
+
+    def test_pads_when_model_returns_too_few(self):
+        llm = _FakeLLM(overrides={"recommendations": {"recommendations": [
+            {"title": "Only one", "impact": "+2 points", "explanation": "x"}
+        ]}})
+        result = EvaluationResult(claims=[{"id": 1, "text": "c1"}], verifications=[], scores={})
+        recs = generate_improvement_recommendations(result, llm)
+        self.assertGreaterEqual(len(recs), 3)
+
+    def test_caps_at_5_when_model_returns_more(self):
+        many = {"recommendations": [
+            {"title": f"Rec {i}", "impact": "+1 point", "explanation": "x"} for i in range(8)
+        ]}
+        llm = _FakeLLM(overrides={"recommendations": many})
+        result = EvaluationResult(claims=[{"id": 1, "text": "c1"}], verifications=[], scores={})
+        recs = generate_improvement_recommendations(result, llm)
+        self.assertEqual(len(recs), 5)
+
+    def test_zero_claims_reflects_missing_evidence(self):
+        llm = _FakeLLM(overrides={"recommendations": {"recommendations": []}})
+        result = EvaluationResult(claims=[], verifications=[], scores={}, input_chars=0)
+        recs = generate_improvement_recommendations(result, llm)
+        self.assertGreaterEqual(len(recs), 3)
+        self.assertLessEqual(len(recs), 5)
+        titles = " ".join(r["title"].lower() for r in recs)
+        self.assertIn("claim", titles)
+
+    def test_llm_failure_propagates_to_caller(self):
+        llm = _FakeLLM(overrides={"recommendations": LLMError("model down")})
+        result = EvaluationResult(claims=[{"id": 1, "text": "c1"}], verifications=[], scores={})
+        with self.assertRaises(LLMError):
+            generate_improvement_recommendations(result, llm)
+
+
+class TestFallbackRecommendations(unittest.TestCase):
+    def test_minimum_satisfied(self):
+        result = EvaluationResult(claims=[], verifications=[], scores={})
+        recs = _fallback_recommendations(result, 3)
+        self.assertGreaterEqual(len(recs), 3)
+        for rec in recs:
+            self.assertTrue(rec["title"])
+
+
+class TestRunEvaluationScoreIntegration(unittest.TestCase):
+    """F4.S1 — score/recommendations wired into the full evaluate pipeline."""
+
+    @patch("app.evaluate.review_medical_records")
+    @patch("app.evaluate.load_knowledge", return_value="k")
+    def test_full_pipeline_includes_score_and_recommendations(self, _mk, mock_review):
+        mock_review.return_value = _fake_digest()
+        llm = _FakeLLM()
+        result = run_evaluation(llm, "I saw knee injury during lifting. Daily pain observed.", [_doc()])
+        self.assertIsInstance(result.effectiveness_score, int)
+        self.assertGreaterEqual(result.effectiveness_score, 0)
+        self.assertLessEqual(result.effectiveness_score, 100)
+        self.assertIn(result.score_band, ("green", "yellow", "red"))
+        self.assertGreaterEqual(len(result.recommendations), 3)
+        self.assertLessEqual(len(result.recommendations), 5)
+        self.assertIn("Effectiveness score", result.report_markdown)
+
+    @patch("app.evaluate.review_medical_records")
+    @patch("app.evaluate.load_knowledge", return_value="k")
+    def test_recommendation_failure_is_swallowed(self, _mk, mock_review):
+        mock_review.return_value = _fake_digest()
+        llm = _FakeLLM(overrides={"recommendations": LLMError("model down")})
+        result = run_evaluation(llm, "stmt", [_doc()])
+        # pipeline still completes with fallback recommendations, never raises
+        self.assertGreaterEqual(len(result.recommendations), 3)
+        self.assertTrue(result.report_markdown)
+
+    @patch("app.evaluate.review_medical_records")
+    @patch("app.evaluate.load_knowledge", return_value="k")
+    def test_zero_claims_full_pipeline_succeeds(self, _mk, mock_review):
+        mock_review.return_value = _fake_digest()
+        llm = _FakeLLM(overrides={
+            "claims": {"claimed_condition": "", "writer_role": "veteran", "claims": []},
+            "verify": {"verifications": []},
+        })
+        result = run_evaluation(llm, "No factual assertions, just opinion.", [_doc()])
+        self.assertEqual(result.claims, [])
+        self.assertIsInstance(result.effectiveness_score, int)
+        self.assertGreaterEqual(len(result.recommendations), 3)
 
 
 if __name__ == "__main__":

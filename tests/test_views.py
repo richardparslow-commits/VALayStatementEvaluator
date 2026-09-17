@@ -684,9 +684,16 @@ class TestEmptyAnalysisResults(unittest.TestCase):
         with _patch_st(evaluate_view, st_mock):
             evaluate_view._render_evaluation_results(EvaluationResult())
 
-        st_mock.error.assert_called_once()
-        message = str(st_mock.error.call_args[0][0])
-        self.assertIn("no usable analysis", message)
+        # The results panel also renders the effectiveness-score band banner,
+        # which uses st.error for the RED band, so scope this assertion to the
+        # empty-analysis message instead of counting every st.error call.
+        empty_analysis_errors = [
+            str(call.args[0])
+            for call in st_mock.error.call_args_list
+            if "no usable analysis" in str(call.args[0])
+        ]
+        self.assertEqual(len(empty_analysis_errors), 1)
+        message = empty_analysis_errors[0]
         self.assertIn("req_84ab42a65e24", message)
         # Which run the panel belongs to is stated, so a cached re-render cannot
         # pass for a fresh run.
@@ -708,7 +715,34 @@ class TestEmptyAnalysisResults(unittest.TestCase):
         with _patch_st(evaluate_view, st_mock):
             evaluate_view._render_evaluation_results(result)
 
-        st_mock.error.assert_not_called()
+        # Only the effectiveness-score band banner may use st.error here; the
+        # empty-analysis guard must stay silent for a populated result.
+        error_messages = [str(call.args[0]) for call in st_mock.error.call_args_list]
+        self.assertFalse([m for m in error_messages if "no usable analysis" in m])
+
+    def test_blank_result_renders_the_score_band_banner_alongside_the_guard(self) -> None:
+        """The empty-analysis guard and the RED score band both use st.error.
+
+        Merge regression guard: the effectiveness-score panel renders its RED
+        band through ``st.error`` as well, so on a blank run the panel must
+        emit both messages — the guard exactly once and still naming the
+        reference — instead of one crowding the other out.
+        """
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        st_mock, _ = self._st()
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "track_impression"
+        ):
+            evaluate_view._render_evaluation_results(EvaluationResult())
+
+        error_messages = [str(call.args[0]) for call in st_mock.error.call_args_list]
+        guards = [m for m in error_messages if "no usable analysis" in m]
+        band_banners = [m for m in error_messages if "(RED band)" in m]
+        self.assertEqual(len(guards), 1)
+        self.assertIn("req_84ab42a65e24", guards[0])
+        self.assertEqual(len(band_banners), 1)
 
 
 # ------------------------------------------------- fact citation exporter (F7.S1)
@@ -1104,6 +1138,135 @@ class TestSidebarSettingsGuards(unittest.TestCase):
         with _patch_st(sidebar, st_mock):
             sidebar._secrets_source_note(self._settings())
         st_mock.caption.assert_not_called()
+
+
+# ------------------------------------------------ effectiveness score (F4.S2)
+class TestRenderEffectivenessScore(unittest.TestCase):
+    def _result(self, score: int = 80, recommendations=None, claims=None):
+        from app.evaluate import EvaluationResult
+
+        return EvaluationResult(
+            effectiveness_score=score,
+            recommendations=recommendations
+            if recommendations is not None
+            else [
+                {"title": "Add supporting evidence", "impact": "+8 points", "explanation": "x", "claim_id": 1},
+                {"title": "Clarify frequency", "impact": "+5 points", "explanation": "y", "claim_id": None},
+                {"title": "Add functional impact", "impact": "+3 points", "explanation": "z", "claim_id": None},
+            ],
+            claims=claims if claims is not None else [{"id": 1, "text": "Injured knee lifting."}],
+        )
+
+    def test_green_band_uses_success_banner(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+
+        st_mock, _session = _fake_streamlit()
+        st_mock.columns.return_value = (MagicMock(), MagicMock())
+        st_mock.button.return_value = False
+        result = self._result(score=90)
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "track_impression"
+        ):
+            evaluate_view._render_effectiveness_score(result)
+        st_mock.success.assert_called_once()
+        st_mock.error.assert_not_called()
+        st_mock.warning.assert_not_called()
+
+    def test_red_band_uses_error_banner_and_shows_all_recommendations(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+
+        st_mock, _session = _fake_streamlit()
+        st_mock.columns.return_value = (MagicMock(), MagicMock())
+        st_mock.button.return_value = False
+        result = self._result(score=20)
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "track_impression"
+        ):
+            evaluate_view._render_effectiveness_score(result)
+        st_mock.error.assert_called_once()
+        # All 3 recommendations rendered (one markdown title line each).
+        title_calls = [
+            c for c in st_mock.markdown.call_args_list if "1." in str(c) or "2." in str(c) or "3." in str(c)
+        ]
+        self.assertGreaterEqual(len(title_calls), 3)
+
+    def test_yellow_band_uses_warning_banner(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+
+        st_mock, _session = _fake_streamlit()
+        st_mock.columns.return_value = (MagicMock(), MagicMock())
+        st_mock.button.return_value = False
+        result = self._result(score=60)
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "track_impression"
+        ):
+            evaluate_view._render_effectiveness_score(result)
+        st_mock.warning.assert_called_once()
+
+    def test_impression_fires_once_per_reference(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+
+        st_mock, _session = _fake_streamlit()
+        st_mock.columns.return_value = (MagicMock(), MagicMock())
+        st_mock.button.return_value = False
+        result = self._result()
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "track_impression"
+        ) as mock_impression:
+            evaluate_view._render_effectiveness_score(result)
+            evaluate_view._render_effectiveness_score(result)
+        mock_impression.assert_called_once()
+        self.assertEqual(
+            mock_impression.call_args.args[0], evaluate_view.EFFECTIVENESS_SCORE_FEATURE_ID
+        )
+
+    def test_click_on_claim_linked_recommendation_fires_interaction_and_jumps(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+
+        st_mock, _session = _fake_streamlit()
+        st_mock.columns.return_value = (MagicMock(), MagicMock())
+        # First recommendation's button click returns True, others False.
+        st_mock.button.side_effect = [True, False, False]
+        result = self._result()
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "track_impression"
+        ), patch.object(evaluate_view, "track_interaction") as mock_interaction:
+            evaluate_view._render_effectiveness_score(result)
+        mock_interaction.assert_called_once_with(
+            evaluate_view.EFFECTIVENESS_SCORE_FEATURE_ID,
+            recommendationIndex=1,
+            action="jump_to_claim",
+        )
+
+    def test_click_on_generic_recommendation_triggers_rewrite(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+
+        st_mock, _session = _fake_streamlit()
+        st_mock.columns.return_value = (MagicMock(), MagicMock())
+        # Second recommendation (claim_id=None) clicked.
+        st_mock.button.side_effect = [False, True, False]
+        result = self._result()
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "track_impression"
+        ), patch.object(evaluate_view, "track_interaction") as mock_interaction:
+            evaluate_view._render_effectiveness_score(result)
+        mock_interaction.assert_called_once_with(
+            evaluate_view.EFFECTIVENESS_SCORE_FEATURE_ID,
+            recommendationIndex=2,
+            action="trigger_rewrite",
+        )
+
+    def test_no_recommendations_still_renders_score(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+
+        st_mock, _session = _fake_streamlit()
+        st_mock.columns.return_value = (MagicMock(), MagicMock())
+        result = self._result(recommendations=[])
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "track_impression"
+        ):
+            evaluate_view._render_effectiveness_score(result)
+        st_mock.button.assert_not_called()
 
 
 if __name__ == "__main__":

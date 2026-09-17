@@ -21,7 +21,13 @@ from ..agiloop_telemetry import (
     track_impression,
     track_interaction,
 )
-from ..evaluate import DIMENSION_LABELS, VERDICTS, build_evidence_dashboard, run_evaluation
+from ..evaluate import (
+    DIMENSION_LABELS,
+    VERDICTS,
+    build_evidence_dashboard,
+    compute_score_band,
+    run_evaluation,
+)
 from ..exporter import export_facts, filter_facts
 from ..logging_config import get_logger, get_request_id
 from ..documents import (
@@ -71,6 +77,15 @@ EVIDENCE_DASHBOARD_FEATURE_ID = "b25a523d-b974-43e1-a554-374bbdebb01d"  # eviden
 
 # Feature: Fact Citation Exporter
 EXPORT_FACTS_FEATURE_ID = "051bb638-ac1c-40cf-95f5-164779b4382c"  # fact-citation-exporter
+
+# Feature: Statement Effectiveness Score & Improvement Recommendations
+EFFECTIVENESS_SCORE_FEATURE_ID = "94104045-aa12-4018-95c6-e6912e659803"  # statement-effectiveness-score-improvement-recommendations
+
+_SCORE_BAND_DISPLAY = {
+    "green": ("🟢", "Strong statement"),
+    "yellow": ("🟡", "Needs improvement"),
+    "red": ("🔴", "Weak — act on recommendations below"),
+}
 
 
 def render_evaluate_tab() -> None:
@@ -813,6 +828,76 @@ def _render_fact_export_section(eval_result: Any) -> None:
                         pass
 
 
+def _render_effectiveness_score(eval_result: Any) -> None:
+    """Render the effectiveness score badge and ranked recommendations (F4.S2).
+
+    Fires `impression` once per rendered run (`entryPoint` attribute) when
+    the score becomes visible, and `interaction` on each recommendation
+    button click (`recommendationIndex` + `action`). The `goal` event for the
+    computed score itself is fired at the compute boundary in
+    `app/evaluate.py::_score_and_recommend` — not here — since it must fire
+    exactly once per computation, not once per render.
+    """
+    score = int(getattr(eval_result, "effectiveness_score", 0) or 0)
+    band = getattr(eval_result, "score_band", "") or compute_score_band(score)
+    rid = _result_reference() or "no-ref"
+
+    impression_key = f"effectiveness_score_impression_sent_{rid}"
+    if not st.session_state.get(impression_key):
+        try:
+            track_impression(EFFECTIVENESS_SCORE_FEATURE_ID, entry_point="evaluate_report_tab")
+        except Exception:  # noqa: BLE001 - telemetry must never break the UI
+            pass
+        st.session_state[impression_key] = True
+
+    st.subheader("🎯 Statement Effectiveness Score")
+    emoji, label = _SCORE_BAND_DISPLAY.get(band, _SCORE_BAND_DISPLAY["red"])
+    st.metric("Effectiveness score", f"{score}/100")
+    banner = {"green": st.success, "yellow": st.warning, "red": st.error}.get(band, st.error)
+    banner(f"{emoji} {label} ({band.upper()} band)")
+
+    recommendations = getattr(eval_result, "recommendations", None) or []
+    if not recommendations:
+        return
+
+    st.markdown("**Top improvement recommendations (ranked by estimated impact):**")
+    claims = getattr(eval_result, "claims", None) or []
+    claim_text = {c.get("id"): c.get("text", "") for c in claims}
+    for index, rec in enumerate(recommendations, start=1):
+        title = str(rec.get("title", ""))
+        impact = str(rec.get("impact", ""))
+        explanation = str(rec.get("explanation", ""))
+        claim_id = rec.get("claim_id")
+        st.markdown(f"**{index}. {title}** _{impact}_")
+        st.caption(explanation)
+        has_matching_claim = claim_id is not None and claim_id in claim_text
+        action_label = (
+            f"🔍 Jump to claim #{claim_id}" if has_matching_claim else "✏️ Apply to rewrite"
+        )
+        clicked = st.button(action_label, key=f"eval_rec_action_{rid}_{index}")
+        if clicked:
+            action = "jump_to_claim" if has_matching_claim else "trigger_rewrite"
+            st.session_state["eval_recommendation_target"] = {
+                "claim_id": claim_id,
+                "recommendation_index": index,
+                "action": action,
+            }
+            try:
+                track_interaction(
+                    EFFECTIVENESS_SCORE_FEATURE_ID,
+                    recommendationIndex=index,
+                    action=action,
+                )
+            except Exception:  # noqa: BLE001 - telemetry must never break the UI
+                pass
+            if has_matching_claim:
+                st.info(f"📍 Claim #{claim_id}: {claim_text.get(claim_id, '')}")
+            else:
+                st.info(
+                    "✏️ Marked for rewrite — see 'Suggested improvements — proposed rewrite' below."
+                )
+
+
 def _render_evaluation_results(eval_result: Any) -> None:
     render_usage_summary(st.session_state.get("eval_usage"))
 
@@ -840,6 +925,9 @@ def _render_evaluation_results(eval_result: Any) -> None:
             f"⚠️ {eval_result.truncation_warning} (input was {eval_result.input_chars:,} chars; "
             f"{eval_result.truncated_chars:,} truncated). Review the report header for details."
         )
+
+    st.divider()
+    _render_effectiveness_score(eval_result)
 
     st.divider()
     st.subheader("📋 Evaluation Results")
