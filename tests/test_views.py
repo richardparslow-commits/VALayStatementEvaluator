@@ -342,7 +342,14 @@ class TestRenderRecordSearch(unittest.TestCase):
         col_from.date_input.return_value = None
         col_to.date_input.return_value = None
         col_provider.text_input.return_value = ""
-        st_mock.columns.return_value = (col_from, col_to, col_provider)
+
+        def columns_side_effect(spec, *args, **kwargs):
+            n = spec if isinstance(spec, int) else len(spec)
+            if n == 3:
+                return (col_from, col_to, col_provider)
+            return tuple(MagicMock() for _ in range(n))
+
+        st_mock.columns.side_effect = columns_side_effect
         st_mock.text_input.return_value = query_value
 
         def button_side_effect(label, key=None, **kwargs):
