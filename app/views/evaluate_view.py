@@ -666,7 +666,7 @@ def _rubric_and_positive_sources(eval_result: Any) -> tuple[set[str], set[str]]:
                 cited.add(fact.source)
                 if verdict in _SUPPORTIVE_VERDICTS:
                     positive.add(fact.source)
-                break
+                    break
     return cited, positive
 
 
