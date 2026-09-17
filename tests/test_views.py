@@ -217,8 +217,8 @@ class TestExtractUploadsCaching(unittest.TestCase):
 
         st_mock, session = _fake_streamlit()
         cached_doc = MagicMock(filename="a.txt")
-        session["slot:a.txt:10"] = cached_doc
         uploaded = _UploadedFile("a.txt", 10)
+        session[uploads._upload_cache_key("slot", uploaded)] = cached_doc
 
         with _patch_st(uploads, st_mock), patch.object(
             uploads, "extract_uploaded_documents"
@@ -239,7 +239,41 @@ class TestExtractUploadsCaching(unittest.TestCase):
         ):
             docs = uploads.extract_uploads([uploaded], "slot")
         self.assertEqual(docs, [doc])
-        self.assertEqual(session["slot:b.txt:20"], doc)
+        self.assertEqual(session[uploads._upload_cache_key("slot", uploaded)], doc)
+
+    def test_a_replaced_file_is_not_served_from_cache(self) -> None:
+        """Same name and byte length, different content: must not reuse the old text.
+
+        A user who fixes a file locally and re-uploads it gets a corrected copy with
+        the same name and size; keying the cache on name+size alone would hand back
+        the previous extraction for the rest of the session.
+        """
+        import app.views.uploads as uploads
+
+        st_mock, session = _fake_streamlit()
+        stale_doc = MagicMock(filename="a.txt")
+
+        class _WithBytes(_UploadedFile):
+            def __init__(self, name: str, size: int, payload: bytes) -> None:
+                super().__init__(name, size)
+                self._payload = payload
+
+            def getvalue(self) -> bytes:
+                return self._payload
+
+        original = _WithBytes("a.txt", 10, b"old text")
+        session[uploads._upload_cache_key("slot", original)] = stale_doc
+        corrected = _WithBytes("a.txt", 10, b"new body")
+        fresh_doc = MagicMock(filename="a.txt")
+
+        with _patch_st(uploads, st_mock), patch.object(
+            uploads, "extract_uploaded_documents", return_value=([fresh_doc], [])
+        ) as extract_mock:
+            docs = uploads.extract_uploads([corrected], "slot")
+        self.assertEqual(docs, [fresh_doc])
+        extract_mock.assert_called_once()
+        # The stale entry is dropped, so a later rerun cannot resurrect it.
+        self.assertNotIn(uploads._upload_cache_key("slot", original), session)
 
     def test_failed_extraction_warns_and_summarizes(self) -> None:
         import app.views.uploads as uploads

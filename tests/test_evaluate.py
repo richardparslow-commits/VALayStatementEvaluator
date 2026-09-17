@@ -352,9 +352,10 @@ class TestVerifyClaims(unittest.TestCase):
         claims = [{"id": 1, "text": "Knee pain."}]
         digest = _fake_digest()
         docs = [_doc()]
-        result = _verify_claims(llm, claims, digest, docs, report=lambda f, m: None)
+        result, gaps = _verify_claims(llm, claims, digest, docs, report=lambda f, m: None)
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["verdict"], "SUPPORTED")
+        self.assertEqual(gaps, [])
 
     def test_batches_of_eight(self):
         # 10 claims -> should trigger 2 LLM calls (8 + 2)
@@ -370,7 +371,7 @@ class TestVerifyClaims(unittest.TestCase):
         llm = _FakeLLM(overrides={"verify": _verify})
         claims = [{"id": i, "text": f"claim {i}"} for i in range(1, 11)]
         digest = _fake_digest()
-        result = _verify_claims(llm, claims, digest, [_doc()], report=lambda f, m: None)
+        result, _gaps = _verify_claims(llm, claims, digest, [_doc()], report=lambda f, m: None)
         self.assertEqual(call_count["n"], 2)
         self.assertEqual(len(result), 10)
         self.assertEqual({r["id"] for r in result}, set(range(1, 11)))
@@ -378,7 +379,9 @@ class TestVerifyClaims(unittest.TestCase):
     def test_missing_verdict_defaults_to_not_found(self):
         llm = _FakeLLM(overrides={"verify": {"verifications": []}})
         claims = [{"id": 1, "text": "Missing."}, {"id": 2, "text": "Also missing."}]
-        result = _verify_claims(llm, claims, _fake_digest(), [_doc()], report=lambda f, m: None)
+        result, _gaps = _verify_claims(
+            llm, claims, _fake_digest(), [_doc()], report=lambda f, m: None
+        )
         self.assertEqual(result[0]["verdict"], "NOT FOUND")
         self.assertIn("Not returned", result[0]["note"])
 
@@ -390,14 +393,50 @@ class TestVerifyClaims(unittest.TestCase):
             ]}
         })
         claims = [{"id": 1, "text": "c1"}, {"id": 2, "text": "c2"}]
-        result = _verify_claims(llm, claims, _fake_digest(), [_doc()], report=lambda f, m: None)
+        result, gaps = _verify_claims(llm, claims, _fake_digest(), [_doc()], report=lambda f, m: None)
         self.assertEqual(result[0]["verdict"], "CONTRADICTED")
         self.assertEqual(result[1]["verdict"], "NOT FOUND")
+        self.assertEqual(gaps, [])
 
     def test_empty_claims(self):
         llm = _FakeLLM()
-        result = _verify_claims(llm, [], _fake_digest(), [_doc()], report=lambda f, m: None)
+        result, gaps = _verify_claims(llm, [], _fake_digest(), [_doc()], report=lambda f, m: None)
         self.assertEqual(result, [])
+        self.assertEqual(gaps, [])
+
+    def test_a_claim_no_record_text_covers_is_a_gap_not_a_contradiction(self):
+        """An absent record must not be reported to the veteran as a conflict."""
+        llm = _FakeLLM(overrides={
+            "verify": {"verifications": [
+                {"id": 1, "verdict": "CONTRADICTED", "record_reference": "", "note": "No record of this."},
+            ]}
+        })
+        claims = [{"id": 1, "text": "Torn rotator cuff from the 2003 deployment."}]
+        # The record set is about knee pain only, and the digest has nothing about
+        # a shoulder, so there is no evidence either way.
+        result, gaps = _verify_claims(
+            llm, claims, _fake_digest(), [_doc()], report=lambda f, m: None
+        )
+        self.assertEqual(result[0]["verdict"], "NOT FOUND")
+        self.assertIn("Downgraded from CONTRADICTED", result[0]["note"])
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("rotator", gaps[0]["claim"])
+
+    def test_a_contradiction_stands_when_the_digest_covers_the_claim(self):
+        """Only an *absent* record is downgraded; real conflicts are reported."""
+        llm = _FakeLLM(overrides={
+            "verify": {"verifications": [
+                {"id": 1, "verdict": "CONTRADICTED", "record_reference": "a.txt p.1", "note": "Wrong side."},
+            ]}
+        })
+        # Worded differently from the claim, but plainly about the same thing: the
+        # digest documents it, so the verifier had evidence and its verdict stands.
+        claims = [{"id": 1, "text": "Knee pain began in service."}]
+        result, gaps = _verify_claims(
+            llm, claims, _fake_digest(), [_doc()], report=lambda f, m: None
+        )
+        self.assertEqual(result[0]["verdict"], "CONTRADICTED")
+        self.assertEqual(gaps, [])
 
 
 class TestRunEvaluationHappyPath(unittest.TestCase):

@@ -67,22 +67,28 @@ def _csv_formula_guard(value: str) -> str:
 # --------------------------------------------------------------- source parsing
 _SOURCE_PATTERNS = (
     # "[filename — page 3]" / "filename — page 3" / "filename - pages 3-4"
-    re.compile(r"^\[?(?P<doc>.+?)\s*[—-]\s*pages?\s*(?P<pages>[\d,\-\s]+)\]?$", re.IGNORECASE),
-    # "filename p.3" (app.documents.DocumentPage.label convention)
-    re.compile(r"^(?P<doc>.+?)\s+p\.(?P<pages>[\d,\-]+)$", re.IGNORECASE),
+    # and the block-addressed form for .txt/.md/.docx ("filename — block 2").
+    re.compile(
+        r"^\[?(?P<doc>.+?)\s*[—-]\s*(?:pages?|blocks?)\s*(?P<pages>[\d,\-\s]+)\]?$",
+        re.IGNORECASE,
+    ),
+    # "filename p.3" / "filename b.2" (app.documents.DocumentPage.label), plus
+    # the chunk-span form the digest now emits: "clinic.pdf p.3-p.9".
+    re.compile(r"^(?P<doc>.+?)\s+[pb]\.(?P<pages>[\d,\-]+)$", re.IGNORECASE),
 )
 
 
 def parse_source(source: str) -> tuple[str, str]:
     """Best-effort split of a `MedicalFact.source` string into (document, page(s)).
 
-    `MedicalFact.source` is free text produced by the digest LLM — usually a
-    page citation such as ``"records.pdf — page 3"`` when a single page backs
-    the fact, but sometimes a coarser fallback like ``"chunk 2/9"`` when the
-    model could not resolve a precise page. There is no separate page/document
-    field on the dataclass (no schema changes per the technical spec), so this
-    parses the common citation shapes and otherwise reports the raw string as
-    the document name with an empty page — it never guesses/invents a page.
+    ``MedicalFact`` now carries ``document``/``page`` fields set from the chunk's
+    page span (see ``app.medical_review``), so a fact whose citation could be
+    resolved needs no parsing; callers should prefer those fields when present.
+    This remains for the unresolved case, where ``source`` is free text: usually a
+    page citation such as ``"records.pdf — page 3"``, sometimes a coarser
+    fallback like ``"chunk 2/9"`` when the model could not resolve a page. It
+    parses the common citation shapes and otherwise reports the raw string as the
+    document name with an empty page — it never guesses/invents a page.
     """
     text = (source or "").strip()
     if not text:

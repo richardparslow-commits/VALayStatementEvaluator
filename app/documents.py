@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 
-from typing import Protocol
+from typing import Any, Protocol, Sequence
 
 from pypdf import PdfReader
 
@@ -29,6 +29,50 @@ class UploadedFile(Protocol):
     def getvalue(self) -> bytes: ...
 
 SUPPORTED_EXTENSIONS = (".pdf", ".txt", ".md", ".docx")
+
+# How a document's text is addressed in citations. "page" is a real PDF page
+# (or a single-page file); "block" means the source has no page numbers at all
+# (a long .txt/.md/.docx) and the number is a synthesized block. Chunks and facts
+# cite whichever applies, so a 200-page DOCX no longer reports every fact as
+# "p.1" while the file genuinely has no pages to point at.
+PAGE = "page"
+BLOCK = "block"
+
+# Marker emitted by ``ExtractedDocument.page_labelled_text`` and parsed back out
+# of a chunk to recover which pages a chunk covers. Defined once: the digest's
+# fact citations are derived from these markers, so a format change must not be
+# able to drift between the writer and the reader.
+_PAGE_MARKER_RE = re.compile(
+    r"\[(?P<file>[^\[\]]+?) — (?P<kind>page|block) (?P<num>\d+)\]"
+)
+
+
+def page_marker(filename: str, kind: str, number: int) -> str:
+    """Return the in-text marker that identifies one page/block of a document."""
+    return f"[{filename} — {kind} {number}]"
+
+
+def chunk_source_hint(pages: Sequence[tuple[str, str, int]]) -> str:
+    """Compress ``(filename, kind, number)`` occurrences into a citation range.
+
+    A chunk is a contiguous slice of the concatenated record text, so the pages
+    it covers form runs: ``clinic.pdf p.3–p.9`` (one file) or
+    ``clinic.pdf p.9; labs.pdf p.1–p.2`` (straddling a file boundary). Returns
+    an empty string when the chunk carries no markers (e.g. hand-built text).
+    """
+    runs: list[tuple[str, str, int, int]] = []
+    for filename, kind, number in pages:
+        if runs and runs[-1][0] == filename and runs[-1][1] == kind and runs[-1][3] + 1 == number:
+            previous = runs[-1]
+            runs[-1] = (previous[0], previous[1], previous[2], number)
+        else:
+            runs.append((filename, kind, number, number))
+    labels: list[str] = []
+    for filename, kind, first, last in runs:
+        prefix = "p." if kind == PAGE else "b."
+        span = f"{prefix}{first}" if first == last else f"{prefix}{first}-{prefix}{last}"
+        labels.append(f"{filename} {span}")
+    return "; ".join(labels)
 
 # Chunk size chosen so a digest prompt (system + knowledge + chunk) stays well under
 # typical context windows while small enough that dense pages are never truncated
@@ -55,12 +99,18 @@ class DocumentPage:
     """One page (or one text block) from an uploaded document."""
 
     filename: str
-    page: int  # 1-based; text files use page 1
+    page: int  # 1-based; "block" documents number synthesized blocks instead
     text: str
+    kind: str = PAGE  # PAGE for a real page, BLOCK when the source has none
 
     @property
     def label(self) -> str:
-        return f"{self.filename} p.{self.page}"
+        prefix = "p." if self.kind == PAGE else "b."
+        return f"{self.filename} {prefix}{self.page}"
+
+    @property
+    def marker(self) -> str:
+        return page_marker(self.filename, self.kind, self.page)
 
 
 @dataclass
@@ -69,6 +119,24 @@ class ExtractedDocument:
 
     filename: str
     pages: list[DocumentPage] = field(default_factory=list)
+    # Pages present in the *source file*, including pages whose text could not be
+    # extracted. A 400-page scan bundle with 30 text pages must not report itself
+    # as a 30-page record set, so the two counts are tracked separately.
+    total_pages: int = 0
+    # Source page numbers that yielded no text (image-only scans, unreadable
+    # pages). Named rather than counted: the user needs to know *which* pages of
+    # their records were never read.
+    unreadable_pages: list[int] = field(default_factory=list)
+    pagination: str = PAGE
+
+    @property
+    def source_page_count(self) -> int:
+        """Pages in the source file (falls back to extracted pages when unknown)."""
+        return self.total_pages or len(self.pages)
+
+    @property
+    def unreadable_count(self) -> int:
+        return len(self.unreadable_pages)
 
     @property
     def full_text(self) -> str:
@@ -80,20 +148,38 @@ class ExtractedDocument:
 
     def page_labelled_text(self) -> str:
         """Full text with page markers so LLM citations can reference pages."""
-        parts = [
-            f"[{p.filename} — page {p.page}]\n{p.text}" for p in self.pages if p.text.strip()
-        ]
+        parts = [f"{p.marker}\n{p.text}" for p in self.pages if p.text.strip()]
         return "\n\n".join(parts)
+
+    def page_records(self) -> list[tuple[str, str, int]]:
+        """``(filename, kind, page)`` for every page, for chunk-span recovery."""
+        return [(p.filename, p.kind, p.page) for p in self.pages]
 
 
 # ---------------------------------------------------------------- extraction
+def _decode_text(data: bytes) -> str:
+    """Decode a text file, preferring the encodings real exports actually use.
+
+    ``utf-8`` with ``errors="replace"`` alone silently turns a Windows/cp1252
+    export (common for clinic notes and Word's "save as text") into mojibake, and
+    that mojibake then flows into extracted quotes and citations. Try the likely
+    encodings in order before falling back to a lossy replace.
+    """
+    for encoding in ("utf-8", "cp1252", "latin-1"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
 def extract_document(filename: str, data: bytes) -> ExtractedDocument:
     """Extract text from an uploaded file based on its extension."""
     lower = filename.lower()
     if lower.endswith(".pdf"):
         return _extract_pdf(filename, data)
     if lower.endswith((".txt", ".md")):
-        return document_from_text(filename, data.decode("utf-8", errors="replace"))
+        return document_from_text(filename, _decode_text(data))
     if lower.endswith(".docx"):
         return _extract_docx(filename, data)
     raise ExtractionError(
@@ -101,34 +187,201 @@ def extract_document(filename: str, data: bytes) -> ExtractedDocument:
     )
 
 
+def _blocks_from_text(
+    filename: str, text: str, block_chars: int | None = None
+) -> list[DocumentPage]:
+    """Split paged-less text (.txt/.md/.docx) into addressable blocks.
+
+    A .txt/.docx has no page numbers, so every fact extracted from one used to be
+    cited "p.1" — provenance that is false for a 200-page document. Long text is
+    split at paragraph boundaries into blocks of roughly
+    ``config.DOCUMENT_BLOCK_CHARS`` and labelled ``b.1``, ``b.2``… (see
+    ``DocumentPage.label``); short text stays a single page so the common case is
+    unchanged.
+    """
+    limit = config.DOCUMENT_BLOCK_CHARS if block_chars is None else block_chars
+    text = clean_text(text)
+    if len(text) <= limit:
+        return [DocumentPage(filename, 1, text, PAGE)]
+
+    paragraphs = [part.strip() for part in re.split(r"\n{2,}", text) if part.strip()]
+    blocks: list[str] = []
+    current = ""
+    for paragraph in paragraphs:
+        if current and len(current) + len(paragraph) + 2 > limit:
+            blocks.append(current)
+            current = paragraph
+        else:
+            current = f"{current}\n\n{paragraph}" if current else paragraph
+        # A single oversized paragraph (a table dump, a pasted export) still has to
+        # be cut, or one block would hold the whole file and defeat the point.
+        while len(current) > limit:
+            blocks.append(current[:limit])
+            current = current[limit:]
+    if current:
+        blocks.append(current)
+    return [DocumentPage(filename, i, block, BLOCK) for i, block in enumerate(blocks, start=1)]
+
+
 def document_from_text(filename: str, text: str) -> ExtractedDocument:
-    """Create a single-page extracted document from plain text."""
+    """Create an extracted document from plain text, blocked when it is long."""
     text = clean_text(text)
     if not text:
         raise ExtractionError(f"{filename}: file is empty.")
-    return ExtractedDocument(filename=filename, pages=[DocumentPage(filename, 1, text)])
+    pages = _blocks_from_text(filename, text)
+    return ExtractedDocument(
+        filename=filename,
+        pages=pages,
+        total_pages=len(pages),
+        pagination=pages[0].kind if pages else PAGE,
+    )
+
+
+_DATE_TOKEN_RE = re.compile(
+    r"\b(\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4})\b"
+)
+# A page this short is either a mostly-blank page or a layout the extractor only
+# half-recovered; it is worth trying the other extraction mode on it.
+_WEAK_PAGE_CHARS = 400
+
+
+def _extraction_score(text: str) -> tuple[int, int]:
+    """Rank an extraction of the same page: dates first, then completeness.
+
+    Print-to-PDF clinical pages are multi-column (date | provider | value), and
+    pypdf's default reader interleaves those columns while ``layout`` mode keeps
+    rows intact. The columns are what the LLM needs to attach the right date to
+    the right result, so the extraction that preserves the most date tokens wins;\n    text length only breaks ties.
+    """
+    return (len(_DATE_TOKEN_RE.findall(text)), len(text))
+
+
+def _page_text(page: Any) -> str:
+    """Best-effort text for one PDF page, preferring the layout-preserving read.
+
+    Tries the default extraction and, when the page looks weak or the default
+    read has no dates, also ``extraction_mode="layout"``; keeps whichever scores
+    higher. Layout mode is unavailable on older pypdf releases, so a ``TypeError``
+    from the unexpected keyword simply leaves the default read in place.
+    """
+    default = ""
+    try:
+        default = (page.extract_text() or "").strip()
+    except Exception:  # noqa: BLE001 - unreadable page, keep going
+        default = ""
+    if not config.PDF_LAYOUT_EXTRACTION:
+        return _dehyphenate(default)
+    if default and len(default) >= _WEAK_PAGE_CHARS and _extraction_score(default)[0] > 0:
+        return _dehyphenate(default)
+    try:
+        layout = (page.extract_text(extraction_mode="layout") or "").strip()
+    except TypeError:  # pypdf too old for layout mode
+        return _dehyphenate(default)
+    except Exception:  # noqa: BLE001 - layout pass failed, keep the default read
+        return _dehyphenate(default)
+    best = layout if _extraction_score(layout) > _extraction_score(default) else default
+    return _dehyphenate(best)
+
+
+def _page_lines(text: str) -> list[str]:
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+# A word broken across a line by the PDF's own wrapping: "hyper-\ntension".
+_HYPHEN_BREAK_RE = re.compile(r"(?<=[A-Za-z])-\n(?=[a-z])")
+
+
+def _dehyphenate(text: str) -> str:
+    """Rejoin words the PDF split at a line break.
+
+    Without this, ``hyper-\ntension`` is two tokens and never matches a claim
+    about hypertension — the wrap, not the content, decides whether evidence is
+    found. The trade-off is a genuinely hyphenated compound split at a line break
+    (``well-\nbeing``) being joined; for retrieval purposes a joined compound
+    still matches on the shared tokens, while a split one matches neither.
+    """
+    return _HYPHEN_BREAK_RE.sub("", text)
+
+
+def strip_running_headers(pages: list[DocumentPage]) -> list[DocumentPage]:
+    """Drop boilerplate lines that repeat on most pages (headers/footers).
+
+    A VA.gov export stamps the same running header and page-number footer on
+    every page. Left in, they consume digest prompt budget, repeat on every fact
+    the model extracts, and skew the IDF weighting both retrieval paths use (a
+    token that appears on every page looks like boilerplate rather than signal).
+
+    Only lines that appear on more than ``config.RUNNING_LINE_RATIO`` of pages are
+    removed, and only when at least ``config.RUNNING_LINE_MIN_PAGES`` pages are
+    present — on a three-page document every line already repeats, so stripping
+    would delete real content.
+    """
+    if len(pages) < config.RUNNING_LINE_MIN_PAGES:
+        return pages
+    counts: Counter[str] = Counter()
+    for page in pages:
+        counts.update({line for line in _page_lines(page.text) if len(line) <= 200})
+    threshold = len(pages) * config.RUNNING_LINE_RATIO
+    boilerplate = {
+        line
+        for line, seen in counts.items()
+        # A short numeric line is the page number itself; longer repeats are the
+        # header/footer text. Both are safe to drop, but never drop a line that
+        # carries a date — that is genuinely part of the record.
+        if seen > threshold and not _DATE_TOKEN_RE.search(line)
+    }
+    if not boilerplate:
+        return pages
+    stripped: list[DocumentPage] = []
+    for page in pages:
+        kept = [line for line in page.text.splitlines() if line.strip() not in boilerplate]
+        text = "\n".join(kept).strip()
+        if text:
+            stripped.append(DocumentPage(page.filename, page.page, text, page.kind))
+        else:
+            # Every line was boilerplate: keep the page as unreadable rather than
+            # silently deleting it, so coverage reporting stays honest.
+            stripped.append(page)
+    return stripped
 
 
 def _extract_pdf(filename: str, data: bytes) -> ExtractedDocument:
     try:
         reader = PdfReader(io.BytesIO(data))
+        encrypted = bool(getattr(reader, "is_encrypted", False))
     except Exception as exc:  # noqa: BLE001
         raise ExtractionError(f"{filename}: could not read PDF ({exc})") from exc
 
-    doc = ExtractedDocument(filename=filename)
-    for index, page in enumerate(reader.pages, start=1):
-        try:
-            text = (page.extract_text() or "").strip()
-        except Exception:  # noqa: BLE001 - skip unreadable page, keep going
-            text = ""
+    # A password-protected export (My HealtheVet offers one) parses fine and then
+    # raises FileNotDecryptedError the moment its pages are touched. Left uncaught
+    # that escapes the caller's ``except ExtractionError`` and takes down the whole
+    # upload with a pypdf traceback, so name it instead.
+    if encrypted:
+        raise ExtractionError(
+            f"{filename}: this PDF is password-protected, so its text cannot be read. "
+            "Open it with the password and re-save (or print to PDF) without one, then "
+            "upload that copy."
+        )
+    try:
+        source_pages = list(reader.pages)
+    except Exception as exc:  # noqa: BLE001 - damaged or unsupported structure
+        raise ExtractionError(f"{filename}: could not read PDF pages ({exc})") from exc
+
+    doc = ExtractedDocument(filename=filename, total_pages=len(source_pages))
+    for index, page in enumerate(source_pages, start=1):
+        text = _page_text(page)
         if text:
             doc.pages.append(DocumentPage(filename, index, text))
+        else:
+            doc.unreadable_pages.append(index)
 
     if not doc.pages or doc.char_count < 20:
         raise ExtractionError(
-            f"{filename}: no extractable text. The PDF may be scanned/image-only; "
-            "please upload a text-based PDF or OCR it first."
+            f"{filename}: no extractable text in {doc.total_pages:,} page(s). The PDF "
+            "may be scanned/image-only; run scripts/ocr_records.py on it (or OCR it "
+            "another way) and upload the result."
         )
+    doc.pages = strip_running_headers(doc.pages)
     return doc
 
 
@@ -171,7 +424,13 @@ def _extract_docx(filename: str, data: bytes) -> ExtractedDocument:
     text = "\n".join(paragraphs).strip()
     if not text:
         raise ExtractionError(f"{filename}: DOCX contains no readable text.")
-    return ExtractedDocument(filename=filename, pages=[DocumentPage(filename, 1, text)])
+    pages = _blocks_from_text(filename, text)
+    return ExtractedDocument(
+        filename=filename,
+        pages=pages,
+        total_pages=len(pages),
+        pagination=pages[0].kind if pages else PAGE,
+    )
 
 
 def _validate_docx_uncompressed_sizes(
@@ -327,17 +586,38 @@ class Chunk:
     index: int  # 1-based chunk number
     total: int  # total chunks
     text: str
+    # (filename, kind, page) for every page marker found inside ``text``. This is
+    # what turns a chunk into a citation: without it the digest could only say
+    # "chunk 7/40", which resolves to no page of any file, because chunks are cut
+    # from the concatenation of every uploaded document.
+    pages: tuple[tuple[str, str, int], ...] = ()
 
     @property
     def label(self) -> str:
         return f"chunk {self.index}/{self.total}"
+
+    @property
+    def source_hint(self) -> str:
+        """Citation range for this chunk, e.g. ``clinic.pdf p.3-p.9``."""
+        return chunk_source_hint(list(self.pages)) or self.label
+
+    @property
+    def page_numbers(self) -> tuple[int, ...]:
+        return tuple(sorted({page for _, _, page in self.pages}))
+
+
+def _chunk_pages(text: str) -> tuple[tuple[str, str, int], ...]:
+    return tuple(
+        (match.group("file"), match.group("kind"), int(match.group("num")))
+        for match in _PAGE_MARKER_RE.finditer(text)
+    )
 
 
 def chunk_page_labelled_text(text: str, max_chars: int = DEFAULT_CHUNK_CHARS) -> list[Chunk]:
     """Split page-labelled text into overlapping chunks at paragraph boundaries."""
     text = clean_text(text)
     if len(text) <= max_chars:
-        return [Chunk(1, 1, text)]
+        return [Chunk(1, 1, text, _chunk_pages(text))]
 
     chunks: list[str] = []
     start = 0
@@ -358,7 +638,9 @@ def chunk_page_labelled_text(text: str, max_chars: int = DEFAULT_CHUNK_CHARS) ->
         start = max(end - CHUNK_OVERLAP_CHARS, start + 1)
 
     total = len(chunks)
-    return [Chunk(i, total, c) for i, c in enumerate(chunks, start=1)]
+    return [
+        Chunk(i, total, c, _chunk_pages(c)) for i, c in enumerate(chunks, start=1)
+    ]
 
 
 # ------------------------------------------------------- paragraph retrieval
@@ -368,6 +650,37 @@ class Paragraph:
 
     label: str
     text: str
+
+
+# A retrieved block longer than this is split further, on single newlines.
+PARAGRAPH_MAX_CHARS = config.PARAGRAPH_MAX_CHARS
+
+
+def _split_oversized(block: str, limit: int = PARAGRAPH_MAX_CHARS) -> list[str]:
+    """Break a block that has no blank lines inside it into line-grouped pieces.
+
+    PDF text extraction often returns a whole page with no blank line, which would
+    otherwise become a single retrieval unit for that page: one query score for
+    hundreds of lines, so a paragraph buried in the middle can never outrank the
+    page as a whole.
+    """
+    if len(block) <= limit:
+        return [block]
+    pieces: list[str] = []
+    current: list[str] = []
+    used = 0
+    for line in block.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if current and used + len(stripped) > limit:
+            pieces.append("\n".join(current))
+            current, used = [], 0
+        current.append(stripped)
+        used += len(stripped) + 1
+    if current:
+        pieces.append("\n".join(current))
+    return pieces
 
 
 _PARAGRAPH_CACHE: dict[tuple[str, int, int], list[Paragraph]] = {}
@@ -387,8 +700,10 @@ def paragraph_index(doc: ExtractedDocument, min_chars: int = 40) -> list[Paragra
     for page in doc.pages:
         for block in re.split(r"\n{2,}", page.text):
             block = block.strip()
-            if len(block) >= min_chars:
-                paragraphs.append(Paragraph(page.label, block))
+            if len(block) < min_chars:
+                continue
+            for piece in _split_oversized(block):
+                paragraphs.append(Paragraph(page.label, piece))
     if len(_PARAGRAPH_CACHE) > 64:  # keep the cache bounded
         _PARAGRAPH_CACHE.clear()
     _PARAGRAPH_CACHE[key] = paragraphs
@@ -397,7 +712,9 @@ def paragraph_index(doc: ExtractedDocument, min_chars: int = 40) -> list[Paragra
 
 # ------------------------------------------------------------ TF-IDF search
 # Feature: Medical Record Search & Citation Index
-_LABEL_PAGE_RE = re.compile(r"^(?P<filename>.*) p\.(?P<page>\d+)$")
+_LABEL_PAGE_RE = re.compile(
+    r"^(?P<filename>.*) (?P<prefix>[pb])\.(?P<page>\d+)$"
+)
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 _SEARCH_DATE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4})\b")
 SEARCH_RESULT_LIMIT = 20

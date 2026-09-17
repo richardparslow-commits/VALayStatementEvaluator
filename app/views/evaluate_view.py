@@ -34,6 +34,7 @@ from ..evaluate import (
     VERDICTS,
     build_evidence_dashboard,
     compute_score_band,
+    coverage_lines,
     run_evaluation,
 )
 from ..exporter import export_facts, filter_facts
@@ -1192,6 +1193,57 @@ def _render_effectiveness_score(eval_result: Any) -> None:
                 )
 
 
+def _render_record_coverage(eval_result: Any) -> None:
+    """Show what the record set contained, what was read, and how citations held up.
+
+    Rendered only when there is something to say (files with known page counts, an
+    unreadable-page count, chunks that yielded no facts, a citation check, or
+    coverage-gap claims), so an ordinary small run is not buried in caveats. The
+    panel opens automatically when something is missing, because a partial review
+    that arrives silently is the failure this exists to prevent.
+    """
+    digest = getattr(eval_result, "digest", None)
+    if digest is None:
+        return
+    check = getattr(digest, "citation_check", None) or {}
+    gaps = getattr(eval_result, "evidence_gaps", None) or []
+    if not (
+        digest.pages_in_files
+        or digest.unreadable_pages
+        or digest.chunks_without_facts
+        or check.get("checked")
+        or gaps
+    ):
+        return
+
+    with st.expander(
+        "🧾 Record coverage & citation check",
+        expanded=bool(digest.unreadable_pages or gaps),
+    ):
+        st.caption(
+            "What the uploaded files contained, what the review actually read, and whether "
+            "each citation's quote was found on the page it names."
+        )
+        for line in coverage_lines(digest):
+            st.markdown(line)
+        if digest.files:
+            st.dataframe(digest.files, width="stretch", hide_index=True)
+        if digest.duplicate_pages:
+            shown = ", ".join(
+                f"{row.get('document')} p.{row.get('page')} = {row.get('duplicate_of')}"
+                for row in digest.duplicate_pages[:8]
+            )
+            more = " …" if len(digest.duplicate_pages) > 8 else ""
+            st.caption(f"Pages skipped as duplicates: {shown}{more}")
+        if gaps:
+            st.warning(
+                "These claims had no matching text in the uploaded records, so nothing could "
+                "be checked against them. That is a record-coverage gap, not a contradiction:"
+            )
+            for gap in gaps:
+                st.write(f"- {gap.get('claim', '')}")
+
+
 def _render_evaluation_results(eval_result: Any) -> None:
     render_usage_summary(st.session_state.get("eval_usage"))
 
@@ -1219,6 +1271,9 @@ def _render_evaluation_results(eval_result: Any) -> None:
             f"⚠️ {eval_result.truncation_warning} (input was {eval_result.input_chars:,} chars; "
             f"{eval_result.truncated_chars:,} truncated). Review the report header for details."
         )
+
+    st.divider()
+    _render_record_coverage(eval_result)
 
     st.divider()
     _render_effectiveness_score(eval_result)

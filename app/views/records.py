@@ -24,7 +24,7 @@ from ..documents import (
 )
 from ..fetch_client import FetchClient, FetchSandboxError
 from ..logging_config import get_logger
-from .uploads import check_upload_limits, extract_uploads
+from .uploads import check_upload_limits, extract_uploads, render_record_volume_warning
 
 logger = get_logger("app.views.records")
 
@@ -117,7 +117,9 @@ def records_uploader(slot: str) -> list:
             st.warning(msg)
         files = accepted if rejections else files
     documents = extract_uploads(files, slot)
-    total_pages = sum(len(d.pages) for d in documents)
+    # Pages the files contain, not pages that yielded text: a scan-only bundle has
+    # very few readable pages and must not look like a small record set.
+    total_pages = sum(d.source_page_count for d in documents)
     if documents and total_pages > config.MAX_RECORD_PAGES:
         st.error(
             f"Record set is {total_pages:,} pages, which exceeds the configured limit of "
@@ -125,6 +127,7 @@ def records_uploader(slot: str) -> list:
             "VA_LSE_MAX_RECORD_PAGES."
         )
         return []
+    render_record_volume_warning(documents, slot=slot)
     remember_source_records(slot, "Upload", documents)
     _label_detected_va_gov_exports(slot, documents)
     return documents

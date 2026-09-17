@@ -149,6 +149,9 @@ def digest_to_json(digest: MedicalDigest | None) -> dict[str, Any] | None:
                 "description": f.description,
                 "source": f.source,
                 "quote": f.quote,
+                "document": f.document,
+                "page": f.page,
+                "section": f.section,
             }
             for f in digest.facts
         ],
@@ -158,6 +161,12 @@ def digest_to_json(digest: MedicalDigest | None) -> dict[str, Any] | None:
         "pages_reviewed": digest.pages_reviewed,
         "chunks_reviewed": digest.chunks_reviewed,
         "duplicates_skipped": digest.duplicates_skipped,
+        "pages_in_files": digest.pages_in_files,
+        "unreadable_pages": digest.unreadable_pages,
+        "chunks_without_facts": digest.chunks_without_facts,
+        "duplicate_pages": list(digest.duplicate_pages),
+        "files": list(digest.files),
+        "citation_check": dict(digest.citation_check),
     }
 
 
@@ -171,6 +180,9 @@ def digest_from_json(raw: Any) -> MedicalDigest | None:
             description=_as_str(item.get("description")),
             source=_as_str(item.get("source")),
             quote=_as_str(item.get("quote")),
+            document=_as_str(item.get("document")),
+            page=_as_int(item.get("page")),
+            section=_as_str(item.get("section")),
         )
         for item in _dict_items(raw.get("facts"))
     ]
@@ -182,6 +194,12 @@ def digest_from_json(raw: Any) -> MedicalDigest | None:
         pages_reviewed=_as_int(raw.get("pages_reviewed")),
         chunks_reviewed=_as_int(raw.get("chunks_reviewed")),
         duplicates_skipped=_as_int(raw.get("duplicates_skipped")),
+        pages_in_files=_as_int(raw.get("pages_in_files")),
+        unreadable_pages=_as_int(raw.get("unreadable_pages")),
+        chunks_without_facts=_as_int(raw.get("chunks_without_facts")),
+        duplicate_pages=_dict_items(raw.get("duplicate_pages")),
+        files=_dict_items(raw.get("files")),
+        citation_check=_as_dict(raw.get("citation_check")),
     )
 
 
@@ -196,6 +214,7 @@ def evaluation_to_json(result: EvaluationResult) -> dict[str, Any]:
         "rationales": dict(result.rationales),
         "improvements": list(result.improvements),
         "omitted_record_facts": list(result.omitted_record_facts),
+        "evidence_gaps": list(result.evidence_gaps),
         "executive_summary": result.executive_summary,
         "topic_focus": result.topic_focus,
         "topic_rows": list(result.topic_rows),
@@ -224,6 +243,7 @@ def evaluation_from_json(raw: Any) -> EvaluationResult:
         rationales=_str_map(data.get("rationales")),
         improvements=_dict_items(data.get("improvements")),
         omitted_record_facts=_dict_items(data.get("omitted_record_facts")),
+        evidence_gaps=_dict_items(data.get("evidence_gaps")),
         executive_summary=_as_str(data.get("executive_summary")),
         topic_focus=_as_str(data.get("topic_focus")),
         topic_rows=_dict_items(data.get("topic_rows")),

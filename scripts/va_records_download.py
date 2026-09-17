@@ -53,11 +53,15 @@ IF A STEP FAILS (VA.gov changed its markup)
 from __future__ import annotations
 
 import argparse
+import datetime
+import hashlib
+import json
 import re
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -235,6 +239,25 @@ def safe_pdf_name(suggested: str) -> str:
     return base
 
 
+# A wizard run that asked for "All time" + "Select all VA records" and produced
+# fewer pages than this did not deliver what was requested; the download is kept
+# (it may be genuinely small) but the operator is told before using it.
+MIN_EXPECTED_PAGES = 5
+# Below this share of text-bearing pages the export is mostly scans: the app will
+# report the image-only pages as uncovered, and OCR is needed first.
+MIN_TEXT_RATIO = 0.5
+
+# What the wizard was asked for this run. Recorded in the manifest so a report
+# built from the file can be traced back to the selection it came from.
+PLANNED_SELECTIONS: dict[str, str] = {
+    "date_range": "All time",
+    "record_type": "Select all VA records",
+    "file_type": "PDF",
+}
+
+MANIFEST_SCHEMA = 1
+
+
 def looks_like_pdf(path: Path) -> bool:
     """True when the file exists and starts with the ``%PDF`` magic bytes.
 
@@ -249,6 +272,105 @@ def looks_like_pdf(path: Path) -> bool:
             return handle.read(5).startswith(b"%PDF")
     except OSError:
         return False
+
+
+def pdf_summary(path: Path) -> dict[str, Any]:
+    """Page counts and text-vs-image balance of a downloaded export.
+
+    ``%PDF`` magic bytes prove the file is a PDF, not that it is *the* record set:
+    a wizard that silently kept a narrower date range, or an export that is mostly
+    scanned images, both produce a plausible-looking file. This is the cheapest
+    way to notice either before the file is used.
+    """
+    try:
+        from pypdf import PdfReader
+    except ImportError:  # pragma: no cover - pypdf ships with the app's deps
+        return {"error": "pypdf is not installed (pip install -r requirements.txt)"}
+    try:
+        reader = PdfReader(str(path))
+        if getattr(reader, "is_encrypted", False):
+            return {"error": "the downloaded PDF is password-protected"}
+        pages = list(reader.pages)
+    except Exception as exc:  # noqa: BLE001 - reported to the operator
+        return {"error": f"could not read the PDF ({type(exc).__name__}: {exc})"}
+    text_pages = 0
+    for page in pages:
+        try:
+            if (page.extract_text() or "").strip():
+                text_pages += 1
+        except Exception:  # noqa: BLE001 - one unreadable page must not stop the count
+            continue
+    total = len(pages)
+    return {
+        "pages": total,
+        "text_pages": text_pages,
+        "image_only_pages": total - text_pages,
+        "text_ratio": round(text_pages / total, 3) if total else 0.0,
+        "bytes": path.stat().st_size,
+    }
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def download_manifest(path: Path, summary: dict[str, Any]) -> dict[str, Any]:
+    """The provenance record written beside a downloaded export."""
+    return {
+        "schema": MANIFEST_SCHEMA,
+        "source": "va.gov medical-records download wizard",
+        "downloaded_at": datetime.datetime.now(datetime.UTC).isoformat(),
+        "filename": path.name,
+        "sha256": _sha256(path) if path.is_file() else "",
+        "selections": dict(PLANNED_SELECTIONS),
+        "selections_source": "clicked by scripts/va_records_download.py",
+        "content": summary,
+    }
+
+
+def report_download(path: Path, *, manifest_path: Path | None = None) -> list[str]:
+    """Summarize a downloaded export, write its manifest, and return any warnings.
+
+    Warnings are returned (not just printed) so the caller and tests can assert on
+    them; the operator sees them on stderr because acting on them is optional but
+    ignoring them silently is how a partial record set becomes a partial statement.
+    """
+    summary = pdf_summary(path)
+    manifest = download_manifest(path, summary)
+    destination = manifest_path or path.with_suffix(path.suffix + ".manifest.json")
+    try:
+        destination.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    except OSError as exc:  # pragma: no cover - manifest is a convenience
+        print(f"  (could not write the manifest: {exc})", file=sys.stderr)
+        destination = None  # type: ignore[assignment]
+
+    if "error" in summary:
+        print(f"✖ Could not inspect the downloaded file: {summary['error']}", file=sys.stderr)
+        return [str(summary["error"])]
+
+    warnings: list[str] = []
+    pages = int(summary["pages"])
+    ratio = float(summary["text_ratio"])
+    print(f"  {pages:,} page(s): {summary['text_pages']:,} with text, "
+          f"{summary['image_only_pages']:,} image-only.")
+    if pages < MIN_EXPECTED_PAGES:
+        warnings.append(
+            f"only {pages} page(s) for 'All time' + 'Select all VA records' — the report "
+            "may be incomplete. Re-check the wizard's date range before using it."
+        )
+    if ratio < MIN_TEXT_RATIO:
+        warnings.append(
+            f"{summary['image_only_pages']:,} of {pages:,} pages are image-only, so the app "
+            "cannot read them. OCR the file first: python scripts/ocr_records.py "
+            f"{path.name}"
+        )
+    if destination is not None:
+        print(f"  Manifest (provenance, page counts, sha256): {destination}")
+    return warnings
 
 
 def _load_playwright() -> Any:
@@ -718,6 +840,8 @@ def main(argv: list[str] | None = None) -> int:
         print("✔ Dry run finished: the wizard was walked but nothing was downloaded.")
         return 0
     print(f"✔ Saved {saved} ({saved.stat().st_size:,} bytes)")
+    for warning in report_download(saved):
+        print(f"✖ {warning}", file=sys.stderr)
     print(f"  Upload it in the app (record source 'Upload files') or pass it to the pipeline.")
     return 0
 

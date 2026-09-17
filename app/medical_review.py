@@ -32,6 +32,7 @@ from .llm import LLMClient, LLMError
 from .logging_config import PhaseTimer, get_request_id
 from .profiler import get_current_run_profiler, worker_timer
 from .prompt_sanitize import GUARD_NOTE, sanitize_for_prompt
+from .va_gov_export import section_map
 
 logger = logging.getLogger("app.medical_review")
 
@@ -61,8 +62,9 @@ Return JSON with this exact shape:
       "date": "YYYY-MM or YYYY-MM-DD or approximate (e.g., 'circa 2019', 'unknown')",
       "type": "diagnosis | symptom | treatment | medication | test_result | hospitalization | provider_visit | in_service_event | functional_limitation | observable_behavior | administrative | other",
       "description": "concise factual description",
-      "source": "{source_hint}",
-      "quote": "short verbatim quote from the chunk supporting this fact"
+      "source": "the file and page you took this from, exactly as the [file — page N] markers spell it, e.g. 'clinic.pdf p.7'",
+      "quote": "short verbatim quote from the chunk supporting this fact",
+      "section": "the record section this fact came from (e.g. Problem list, Medications, Lab results) or 'unknown'"
     }}
   ],
   "conditions_mentioned": ["condition 1", "condition 2"],
@@ -74,7 +76,16 @@ Rules:
 - Capture every distinct fact; do NOT summarize multiple events into one unless identical.
 - Preserve exact dates, dosages, pain scores, and proper nouns.
 - 'quote' must be a real excerpt from the chunk, <= 40 words.
+- 'source' must name the file and page the quoted text sits under, copied from the
+  nearest [file — page N] marker above it. Never answer 'chunk', 'records' or a
+  bare page number: a citation that cannot be checked is useless downstream.
+- Prefer the exact date printed next to the quote over an inferred one. If a date is
+  ambiguous, prefer the dates listed for this chunk below.
 - Prefer many precise facts over few broad ones; when in doubt about relevance, include the fact.
+
+This chunk covers: {source_hint}
+Record sections present in this chunk: {section_hint}
+Dates printed on these pages: {page_dates}
 
 CHUNK TEXT:
 <<<
@@ -85,8 +96,63 @@ CHUNK TEXT:
 
 MERGE_SYSTEM = """You are consolidating extracted medical facts from multiple chunks of the \
 same record set into one authoritative digest. Deduplicate identical facts, keep every \
-distinct fact, resolve trivially different phrasings, and keep all source citations. \
+distinct fact, resolve trivially different phrasings, and keep all source citations \
+(the file and page each fact came from — never replace them with a chunk number). \
 Do not add facts that were not provided. Output JSON only."""
+
+# The elements a VA lay/witness statement has to establish, in the order a rating
+# decision reads them. A digest fact is only useful to the drafting pass if it can
+# be attached to one of these, so the mapping is explicit rather than left to the
+# prose of a prompt.
+STATEMENT_ELEMENTS: tuple[str, ...] = (
+    "in_service_event",
+    "current_diagnosis",
+    "nexus",
+    "functional_impact",
+    "severity_frequency",
+    "treatment_history",
+    "buddy_observable",
+    "other",
+)
+
+# Digest ``type`` -> statement element. Types the digest prompt asks for are the
+# keys; anything unknown falls through to the nexus text check below, then "other".
+_TYPE_TO_ELEMENT: dict[str, str] = {
+    "in_service_event": "in_service_event",
+    "diagnosis": "current_diagnosis",
+    "symptom": "severity_frequency",
+    "test_result": "severity_frequency",
+    "treatment": "treatment_history",
+    "medication": "treatment_history",
+    "hospitalization": "treatment_history",
+    "provider_visit": "treatment_history",
+    "functional_limitation": "functional_impact",
+    "observable_behavior": "buddy_observable",
+    "administrative": "other",
+    "other": "other",
+}
+
+# A medical opinion on causation is the nexus evidence itself, whatever ``type``
+# the model labelled it with — a diagnosis line that quotes "at least as likely as
+# not ... caused by service" is worth more to the statement than the diagnosis.
+_NEXUS_TEXT_RE = re.compile(
+    r"\b(as likely as not|at least as likely|more likely than not|less likely than not|"
+    r"secondary to|caused by|causally related|aggravat\w*|service[- ]connected|"
+    r"nexus|incurred in service|arose during service)\b",
+    re.IGNORECASE,
+)
+
+
+def statement_element_for(fact: "MedicalFact") -> str:
+    """Map one digest fact onto the lay-statement element it can support.
+
+    Deterministic and dependency-free, so the drafting/verification prompts and
+    the coverage panel all agree on what the record set does and does not
+    support (see ``MedicalDigest.element_coverage``).
+    """
+    if _NEXUS_TEXT_RE.search(f"{fact.description} {fact.quote}"):
+        return "nexus"
+    return _TYPE_TO_ELEMENT.get(_norm_key(fact.type), "other")
 
 
 @dataclass
@@ -96,6 +162,13 @@ class MedicalFact:
     description: str
     source: str
     quote: str = ""
+    # Resolved citation. ``source`` stays the human-readable string the model
+    # produced (and is what the export shows); these two are the machine-checkable
+    # version, filled from the chunk's own page markers when the model's answer
+    # could not be resolved to a page.
+    document: str = ""
+    page: int = 0
+    section: str = ""
 
 
 @dataclass
@@ -109,6 +182,48 @@ class MedicalDigest:
     pages_reviewed: int = 0
     chunks_reviewed: int = 0
     duplicates_skipped: int = 0
+    # Coverage: what the source files contained versus what was actually read.
+    # Real record bundles are routinely part scan, so a report that claims
+    # "reviewed 3,000 pages" while 1,200 of them were image-only is worse than one
+    # that says so — the user can then OCR those pages and re-run.
+    pages_in_files: int = 0
+    unreadable_pages: int = 0
+    chunks_without_facts: int = 0
+    duplicate_pages: list[dict[str, Any]] = field(default_factory=list)
+    files: list[dict[str, Any]] = field(default_factory=list)
+    # Result of checking each fact's quote against the page it cites (see
+    # ``verify_citations``): the one measurement that turns "the report cites
+    # page 7" into "page 7 really says this".
+    citation_check: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def coverage_ratio(self) -> float:
+        """Share of source pages whose text was actually extracted (1.0 = all)."""
+        if not self.pages_in_files:
+            return 1.0
+        return max(0.0, min(1.0, (self.pages_in_files - self.unreadable_pages)
+                             / self.pages_in_files))
+
+    def keyword_overlap(self, query: str) -> float:
+        """Share of the query's content words that appear anywhere in the digest.
+
+        A cheap, non-IDF signal used to decide whether "no raw record text matched"
+        really means the record set is silent about a claim, or only that the claim
+        and the record word the same thing differently — the digest paraphrases the
+        records, so it is the wider net for that case.
+        """
+        query_tokens = set(_tokens(query))
+        if not query_tokens or not self.facts:
+            return 0.0
+        fact_tokens = _tokens(
+            " ".join(f"{fact.description} {fact.quote}" for fact in self.facts)
+        )
+        return len(query_tokens & set(fact_tokens)) / len(query_tokens)
+
+    def element_coverage(self) -> dict[str, int]:
+        """Count facts per lay-statement element (see ``statement_element_for``)."""
+        counts: Counter[str] = Counter(statement_element_for(fact) for fact in self.facts)
+        return {element: counts.get(element, 0) for element in STATEMENT_ELEMENTS}
 
     def as_json_text(self, max_facts: int | None = None) -> str:
         limit = config.MAX_DIGEST_FACTS if max_facts is None else max_facts
@@ -214,21 +329,295 @@ class MedicalDigest:
         return header + "\n" + "\n".join(lines)
 
 
-def _fact_from_raw(raw: dict, fallback_source: str) -> MedicalFact | None:
+# "[clinic.pdf — page 7]" / "[clinic.pdf — block 3]" as a whole citation.
+_MARKER_CITATION_RE = re.compile(
+    r"^\[?(?P<doc>[^\[\]]+?)\s*—\s*(?:page|block)\s*(?P<num>\d+)\]?$", re.IGNORECASE
+)
+# "clinic.pdf p.7" / "notes.docx b.3" / the chunk-span form "clinic.pdf p.7-p.9".
+_LABEL_CITATION_RE = re.compile(
+    r"^(?P<doc>.+?)\s+[pb]\.(?P<num>\d+)(?:\s*[-–]\s*[pb]\.\d+)?$", re.IGNORECASE
+)
+
+
+def _parse_citation(source: str) -> tuple[str, int]:
+    """Split a citation string into ``(document, first_page)``; ``("", 0)`` if none.
+
+    Deliberately strict: a free-text source like ``"chunk 2/9"`` or a multi-file
+    span (``"a.pdf p.3; b.pdf p.1"``) returns no page rather than a guessed one,
+    and the caller then falls back to the chunk's own page span.
+    """
+    text = (source or "").strip()
+    if not text:
+        return "", 0
+    match = _MARKER_CITATION_RE.match(text) or _LABEL_CITATION_RE.match(text)
+    if not match:
+        return "", 0
+    document = match.group("doc").strip()
+    if not document or ";" in document:
+        return "", 0
+    return document, int(match.group("num"))
+
+
+def _fact_from_raw(
+    raw: dict,
+    fallback_source: str,
+    *,
+    document: str = "",
+    page: int = 0,
+    section: str = "",
+) -> MedicalFact | None:
+    """Build a fact, resolving its citation against the chunk it came from.
+
+    ``document``/``page``/``section`` are the chunk's own page markers: used when
+    the model's ``source`` cannot be resolved to a page, so a fact still points at
+    the pages it was read from instead of at a chunk number that maps to nothing.
+    """
     description = str(raw.get("description", "") or "").strip()
     if not description:
         return None
+    model_source = str(raw.get("source", "") or "").strip()
+    cited_document, cited_page = _parse_citation(model_source)
+    raw_section = str(raw.get("section", "") or "").strip()
+    if _norm_key(raw_section) in ("", "unknown", "n/a", "none"):
+        raw_section = ""
+    # The merge pass is handed ``vars(fact)`` and often echoes the structured
+    # citation back; accept it, so a merged fact does not lose the page the
+    # extraction pass worked to resolve.
+    raw_document = str(raw.get("document", "") or "").strip()
+    raw_page = raw.get("page")
+    model_page = raw_page if isinstance(raw_page, int) else 0
+    if not model_page and isinstance(raw_page, str) and raw_page.isdigit():
+        model_page = int(raw_page)
     return MedicalFact(
         date=str(raw.get("date", "unknown") or "unknown").strip(),
         type=str(raw.get("type", "other") or "other").strip().lower(),
         description=description,
-        source=str(raw.get("source", "") or fallback_source).strip() or fallback_source,
+        source=model_source or fallback_source,
         quote=str(raw.get("quote", "") or "").strip(),
+        document=cited_document or raw_document or document,
+        page=cited_page or model_page or page,
+        section=raw_section or section,
     )
+
+
+# How many leading words of a quote are matched against the page text. A whole
+# quote can straddle a page break or contain the model's ellipsis; a long prefix
+# is enough to prove the fact came from the page it cites.
+_CITATION_PROBE_WORDS = 12
+# Quotes shorter than this cannot be checked meaningfully — four words appear on
+# hundreds of pages, so "not found on this page" would be noise.
+_CITATION_MIN_PROBE_WORDS = 4
+
+
+def _citation_probe(quote: str) -> str:
+    """Normalized leading words of a quote, or "" when too short to check."""
+    words = re.findall(r"[a-z0-9]+", quote.lower())
+    if len(words) < _CITATION_MIN_PROBE_WORDS:
+        return ""
+    return " ".join(words[:_CITATION_PROBE_WORDS])
+
+
+def verify_citations(
+    facts: list[MedicalFact], documents: list[ExtractedDocument]
+) -> dict[str, Any]:
+    """Check that each fact's quote actually occurs on the page the fact cites.
+
+    The digest is produced by an LLM reading overlapping chunks, so a fact can
+    cite a page it does not appear on — the quote came from the neighbouring
+    chunk, or the model reached for a plausible page number. The check is cheap
+    because both sides are already in memory, and it is the only thing standing
+    between a citation and an assertion: a report a veteran signs should say how
+    many of its citations were actually verified.
+
+    Facts without a resolved page, or with a quote too short to be meaningful,
+    are counted as ``skipped`` rather than guessed at.
+    """
+    page_texts: dict[tuple[str, int], str] = {}
+    for doc in documents:
+        for page in doc.pages:
+            page_texts[(doc.filename, page.page)] = re.sub(
+                r"\s+", " ", page.text.lower()
+            )
+    checked = 0
+    skipped = 0
+    missing: list[dict[str, Any]] = []
+    for fact in facts:
+        probe = _citation_probe(fact.quote)
+        text = page_texts.get((fact.document, fact.page)) if fact.document else None
+        if not probe or text is None:
+            skipped += 1
+            continue
+        checked += 1
+        if probe not in text:
+            missing.append(
+                {
+                    "document": fact.document,
+                    "page": fact.page,
+                    "description": fact.description[:160],
+                    "quote": fact.quote[:160],
+                }
+            )
+    result: dict[str, Any] = {
+        "checked": checked,
+        "missing": len(missing),
+        "skipped": skipped,
+        "examples": missing[:5],
+    }
+    if checked:
+        result["verified_ratio"] = round((checked - len(missing)) / checked, 3)
+    logger.info(
+        "citation check checked=%d missing=%d skipped=%d",
+        checked,
+        len(missing),
+        skipped,
+        extra={
+            "request_id": get_request_id() or "-",
+            "phase": "records:citations",
+            "status": "ok" if not missing else "mismatch",
+            "checked": checked,
+            "missing": len(missing),
+        },
+    )
+    return result
+
+
+def _restore_citations(
+    merged: list[MedicalFact], sources: list[MedicalFact]
+) -> list[MedicalFact]:
+    """Re-attach the citation the merge model dropped when it reworded a fact.
+
+    The merge pass rewrites descriptions, so a fact that comes back without a
+    document/page is matched back to the pre-merge fact it consolidated. Without
+    this, every merged fact loses its page and the report's citations degrade to
+    "records" — exactly the property the extraction pass establishes.
+    """
+    if not merged:
+        return merged
+    by_description: dict[str, MedicalFact] = {}
+    for fact in sources:
+        by_description.setdefault(_norm_key(fact.description), fact)
+        by_description.setdefault(f"{_norm_key(fact.date)}|{_norm_key(fact.description)}", fact)
+    for fact in merged:
+        if fact.document and fact.page:
+            continue
+        original = by_description.get(_norm_key(fact.description)) or by_description.get(
+            f"{_norm_key(fact.date)}|{_norm_key(fact.description)}"
+        )
+        if original is None:
+            continue
+        fact.document = fact.document or original.document
+        fact.page = fact.page or original.page
+        fact.section = fact.section or original.section
+    return merged
 
 
 def _norm_key(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip().lower()
+
+
+# Matches a source string that is a citation rather than an entity name. Used to
+# keep page citations out of anything that lists providers/facilities.
+_CITATION_SOURCE_RE = re.compile(r"\b[pb]\.\d|\b(?:page|block)\s*\d", re.IGNORECASE)
+
+
+# ------------------------------------------------------- duplicate page detection
+# A line that is only digits/punctuation is a page number or a footer rule, not
+# content: ignoring such lines is what lets a re-printed page match its original.
+_NUMBER_ONLY_LINE_RE = re.compile(r"^[\W\d_]+$")
+
+
+def _page_fingerprint(text: str) -> str:
+    """Hash a page's content with page-number-only lines removed."""
+    kept = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not _NUMBER_ONLY_LINE_RE.match(line.strip())
+    ]
+    return hashlib.sha1(_norm_key(" ".join(kept)).encode("utf-8")).hexdigest()
+
+
+def _page_shingles(text: str, size: int = 5, limit: int = 4_000) -> frozenset[str]:
+    """Word n-grams of a page, for near-duplicate comparison (bounded work).
+
+    Bounded at ``limit`` words: comparison cost must not grow with the longest
+    page in a 5,000-page bundle.
+    """
+    words = re.findall(r"[a-z0-9]+", text.lower())[:limit]
+    if len(words) < size:
+        return frozenset(words)
+    return frozenset(" ".join(words[i : i + size]) for i in range(len(words) - size + 1))
+
+
+def _shingle_similarity(left: frozenset[str], right: frozenset[str]) -> float:
+    if not left or not right:
+        return 0.0
+    union = len(left | right)
+    return len(left & right) / union if union else 0.0
+
+
+# Bound on how many same-size candidates a page is compared against, so near-dup
+# detection stays linear-ish on large bundles.
+_NEAR_DUP_CANDIDATES = 8
+
+
+def _dedupe_pages(
+    documents: list[ExtractedDocument],
+) -> tuple[list[ExtractedDocument], list[dict[str, Any]]]:
+    """Drop repeated pages, exactly and nearly, naming every page that was dropped.
+
+    Record bundles routinely repeat pages, and the repeats are rarely byte-equal:
+    the same page re-printed with a different footer, or scanned twice. Exact
+    hashing catches neither. Pages are compared by content fingerprint (exact) and
+    by word n-gram overlap within a similar-length bucket (near), and each skip is
+    recorded with the page it duplicated so the coverage report can name it — a
+    silently dropped page is indistinguishable from a page that was never read.
+    """
+    fingerprints: dict[str, str] = {}
+    signatures: dict[int, list[tuple[frozenset[str], str]]] = {}
+    unique_docs: list[ExtractedDocument] = []
+    duplicates: list[dict[str, Any]] = []
+
+    for doc in documents:
+        kept = ExtractedDocument(
+            filename=doc.filename,
+            total_pages=doc.total_pages,
+            unreadable_pages=list(doc.unreadable_pages),
+            pagination=doc.pagination,
+        )
+        for page in doc.pages:
+            fingerprint = _page_fingerprint(page.text)
+            origin = fingerprints.get(fingerprint)
+            if origin is None:
+                shingles = _page_shingles(page.text)
+                bucket = len(page.text) // 200
+                for candidate_bucket in (bucket - 1, bucket, bucket + 1):
+                    for candidate_shingles, candidate_origin in signatures.get(
+                        candidate_bucket, []
+                    )[:_NEAR_DUP_CANDIDATES]:
+                        if (
+                            _shingle_similarity(shingles, candidate_shingles)
+                            >= config.DUPLICATE_PAGE_SIMILARITY
+                        ):
+                            origin = candidate_origin
+                            break
+                    if origin is not None:
+                        break
+                if origin is None:
+                    fingerprints[fingerprint] = page.label
+                    signatures.setdefault(bucket, []).append((shingles, page.label))
+            if origin is not None:
+                duplicates.append(
+                    {
+                        "document": doc.filename,
+                        "page": page.page,
+                        "duplicate_of": origin,
+                    }
+                )
+                continue
+            kept.pages.append(page)
+        if kept.pages:
+            unique_docs.append(kept)
+    return unique_docs, duplicates
 
 
 def _dedupe_facts(facts: list[MedicalFact]) -> list[MedicalFact]:
@@ -259,45 +648,59 @@ def review_medical_records(
         raise ValueError("No medical records provided.")
 
     pages = sum(len(doc.pages) for doc in documents)
-    if pages > config.MAX_RECORD_PAGES:
+    # The cap is measured on the pages the *files* contain, not the pages that
+    # yielded text: a bundle of scans has few readable pages and would otherwise
+    # slip past the limit and spend hours of LLM calls on it.
+    pages_in_files = sum(doc.source_page_count for doc in documents)
+    if pages_in_files > config.MAX_RECORD_PAGES:
         raise ValueError(
-            f"Record set is {pages:,} pages, over the configured limit of "
+            f"Record set is {pages_in_files:,} pages, over the configured limit of "
             f"{config.MAX_RECORD_PAGES:,}. Split the records into smaller sets or raise "
             "VA_LSE_MAX_RECORD_PAGES."
         )
 
     # Drop duplicate pages (across and within files) BEFORE chunking: record
     # bundles frequently repeat the same pages, and re-digesting them wastes
-    # hours on very large sets without adding evidence.
-    seen_page_hashes: set[str] = set()
-    unique_docs: list[ExtractedDocument] = []
-    duplicates_skipped = 0
-    for doc in documents:
-        kept = ExtractedDocument(filename=doc.filename)
-        for page in doc.pages:
-            page_hash = hashlib.sha1(_norm_key(page.text).encode("utf-8")).hexdigest()
-            if page_hash in seen_page_hashes:
-                duplicates_skipped += 1
-                continue
-            seen_page_hashes.add(page_hash)
-            kept.pages.append(page)
-        if kept.pages:
-            unique_docs.append(kept)
+    # hours on very large sets without adding evidence. Every skip is recorded
+    # with the page it duplicated, so the coverage report can name them.
+    unique_docs, duplicate_pages = _dedupe_pages(documents)
+    duplicates_skipped = len(duplicate_pages)
     if not unique_docs:
         raise ValueError("Records contain no extractable unique text.")
+
+    unreadable_pages = sum(doc.unreadable_count for doc in documents)
 
     full_text = "\n\n".join(doc.page_labelled_text() for doc in unique_docs)
     chunks = chunk_page_labelled_text(full_text)
     total_units = len(chunks)
+    # Deterministic per-page context for the digest prompt: the dates actually
+    # printed on the page (an anchor for the fact's own date) and the VA.gov
+    # section the page belongs to. Both beat asking the model to remember them.
+    page_dates: dict[str, str] = {}
+    page_sections: dict[str, str] = {}
+    for doc in unique_docs:
+        sections = section_map(doc)
+        for doc_page in doc.pages:
+            dates = _dates_in_text(doc_page.text)
+            if dates:
+                page_dates[doc_page.label] = ", ".join(dates)
+            section = sections.get(doc_page.page, "")
+            if section:
+                page_sections[doc_page.label] = section
 
     if progress:
         dup_note = (
             f" ({duplicates_skipped} duplicate page(s) skipped)" if duplicates_skipped else ""
         )
+        unreadable_note = (
+            f" {unreadable_pages:,} page(s) have no extractable text"
+            if unreadable_pages
+            else ""
+        )
         progress(
             0.05,
-            f"Reviewing {pages:,} pages in {len(chunks)} chunk(s){dup_note} using "
-            f"{config.RECORDS_CONCURRENCY} parallel worker(s)…",
+            f"Reviewing {pages:,} pages in {len(chunks)} chunk(s){dup_note}{unreadable_note} "
+            f"using {config.RECORDS_CONCURRENCY} parallel worker(s)…",
         )
 
     _ctx_request_id = get_request_id()  # capture for worker threads
@@ -333,7 +736,13 @@ def review_medical_records(
                     DIGEST_SYSTEM,
                     DIGEST_USER_TEMPLATE.format(
                         label=sanitize_for_prompt(chunk.label, max_chars=200),
-                        source_hint=sanitize_for_prompt(chunk.label, max_chars=200),
+                        source_hint=sanitize_for_prompt(chunk.source_hint, max_chars=200),
+                        section_hint=sanitize_for_prompt(
+                            _chunk_sections(chunk, page_sections), max_chars=300
+                        ),
+                        page_dates=sanitize_for_prompt(
+                            _chunk_dates(chunk, page_dates), max_chars=400
+                        ),
                         chunk_text=sanitize_for_prompt(chunk.text, max_chars=1_000_000),
                         guard_note=GUARD_NOTE,
                     ),
@@ -467,15 +876,29 @@ def review_medical_records(
     all_facts: list[MedicalFact] = []
     conditions: Counter[str] = Counter()
     providers: Counter[str] = Counter()
+    chunks_without_facts = 0
+    chunks_by_index = {chunk.index: chunk for chunk in chunks}
     for index in sorted(results):
         data = results[index]
-        fallback = f"chunk {index}/{len(chunks)}"
+        chunk = chunks_by_index.get(index)
+        fallback = chunk.source_hint if chunk is not None else f"chunk {index}/{len(chunks)}"
+        document = chunk.pages[0][0] if chunk is not None and chunk.pages else ""
+        page = chunk.pages[0][2] if chunk is not None and chunk.pages else 0
+        section = _chunk_sections(chunk, page_sections, default="") if chunk is not None else ""
+        facts_in_chunk = 0
         for raw in data.get("facts", []) or []:
             if not isinstance(raw, dict):
                 continue
-            fact = _fact_from_raw(raw, fallback)
+            fact = _fact_from_raw(
+                raw, fallback, document=document, page=page, section=section
+            )
             if fact:
                 all_facts.append(fact)
+                facts_in_chunk += 1
+        if facts_in_chunk == 0:
+            # A chunk that yielded nothing is indistinguishable from a chunk the
+            # model skimmed; counted so the report can say how many there were.
+            chunks_without_facts += 1
         for name in data.get("conditions_mentioned", []) or []:
             conditions[str(name).strip()] += 1
         for name in data.get("providers_and_facilities", []) or []:
@@ -501,6 +924,11 @@ def review_medical_records(
         pages_reviewed=pages,
         chunks_reviewed=len(chunks),
         duplicates_skipped=duplicates_skipped,
+        pages_in_files=pages_in_files,
+        unreadable_pages=unreadable_pages,
+        chunks_without_facts=chunks_without_facts,
+        duplicate_pages=duplicate_pages,
+        files=[_file_coverage(doc) for doc in documents],
     )
 
     with (
@@ -513,13 +941,18 @@ def review_medical_records(
         _mem_cp("records:post_merge")
     except Exception:  # noqa: BLE001
         pass
+    digest.citation_check = verify_citations(digest.facts, documents)
     with tracing.phase_span("records:summary"), PhaseTimer(logger, "records:summary", request_id=rid):
         digest.summary = _summarize(llm, digest)
     duration_ms = int((time.perf_counter() - _review_t0) * 1000)
     logger.info(
-        "records review done pages=%d chunks=%d facts=%d duplicates_skipped=%d duration_ms=%d",
+        "records review done pages=%d pages_in_files=%d unreadable_pages=%d chunks=%d "
+        "chunks_without_facts=%d facts=%d duplicates_skipped=%d duration_ms=%d",
         pages,
+        pages_in_files,
+        unreadable_pages,
         len(chunks),
+        chunks_without_facts,
         len(digest.facts),
         duplicates_skipped,
         duration_ms,
@@ -529,17 +962,62 @@ def review_medical_records(
             "status": "ok",
             "duration_ms": duration_ms,
             "pages": pages,
+            "pages_in_files": pages_in_files,
+            "unreadable_pages": unreadable_pages,
             "chunks": len(chunks),
+            "chunks_without_facts": chunks_without_facts,
             "facts": len(digest.facts),
         },
     )
     if progress:
+        unreadable_note = (
+            f" {unreadable_pages:,} page(s) could not be read (image-only) and are not "
+            "covered — OCR them and re-run for a complete review."
+            if unreadable_pages
+            else ""
+        )
         progress(
             0.8,
             f"Record review complete: {len(digest.facts):,} facts extracted from "
-            f"{pages:,} pages ({digest.chunks_reviewed} chunks).",
+            f"{pages:,} pages ({digest.chunks_reviewed} chunks).{unreadable_note}",
         )
     return digest
+
+
+def _file_coverage(doc: ExtractedDocument) -> dict[str, Any]:
+    """Per-file coverage row for the digest's coverage report."""
+    return {
+        "filename": doc.filename,
+        "pages_in_file": doc.source_page_count,
+        "pages_read": len(doc.pages),
+        "unreadable_pages": doc.unreadable_count,
+        "pagination": doc.pagination,
+        "characters": doc.char_count,
+    }
+
+
+def _chunk_dates(chunk: Chunk, page_dates: dict[str, str]) -> str:
+    """Dates printed on this chunk's pages, as an anchor for the fact dates."""
+    found: list[str] = []
+    for filename, kind, number in chunk.pages:
+        label = f"{filename} {'p.' if kind == 'page' else 'b.'}{number}"
+        for date in page_dates.get(label, "").split(", "):
+            if date and date not in found:
+                found.append(date)
+    return ", ".join(found[:12]) if found else "none detected on these pages"
+
+
+def _chunk_sections(
+    chunk: Chunk, page_sections: dict[str, str], *, default: str = "unknown"
+) -> str:
+    """Record sections this chunk touches (VA.gov exports are section-structured)."""
+    found: list[str] = []
+    for filename, kind, number in chunk.pages:
+        label = f"{filename} {'p.' if kind == 'page' else 'b.'}{number}"
+        section = page_sections.get(label, "")
+        if section and section not in found:
+            found.append(section)
+    return ", ".join(found[:6]) if found else default
 
 
 MERGE_BATCH_SIZE = 200
@@ -561,7 +1039,7 @@ def _merge_facts(
     facts = _dedupe_facts(digest.facts)
     if len(facts) <= MERGE_SINGLE_LIMIT:
         try:
-            return _merge_once(llm, facts) or facts
+            return _restore_citations(_merge_once(llm, facts), facts) or facts
         except LLMError:
             return facts
 
@@ -599,7 +1077,7 @@ def _merge_facts(
 
             tok = _rid_var.set(_merge_ctx)
             try:
-                return _merge_once(llm, batch)
+                return _restore_citations(_merge_once(llm, batch), batch)
             finally:
                 try:
                     _rid_var.reset(tok)
@@ -683,17 +1161,128 @@ _STOPWORDS = {
 }
 
 
+# Two-letter clinical abbreviations that matter (GI bleed, CT scan, IV
+# antibiotics, EKG) even though the general rule ignores tokens this short.
+_SHORT_CLINICAL_TOKENS = frozenset(
+    {"ct", "gi", "iv", "er", "pt", "mi", "tb", "ekg", "ecg", "bp", "hr", "ent", "rbc"}
+)
+
+# Lay term -> the word the record set is likely to use. A veteran writes "my neck
+# and lower back"; the record writes "cervical and lumbar strain". Without a
+# bridge those two share no token, and a verification against those records
+# reports no evidence for a claim the records plainly document. The mapping is
+# additive (the original token is kept), symmetric in effect (both sides expand),
+# and deliberately small: it covers the lay/clinical pairs that recur in VA
+# claims, not a general medical ontology.
+_CLINICAL_SYNONYMS: dict[str, str] = {
+    "neck": "cervical",
+    "cervical": "cervical",
+    "back": "lumbar",
+    "lumbar": "lumbar",
+    "dorsal": "lumbar",
+    "thoracic": "thoracic",
+    "sob": "dyspnea",
+    "breath": "dyspnea",
+    "breathing": "dyspnea",
+    "breathless": "dyspnea",
+    "shortness": "dyspnea",
+    "dyspnea": "dyspnea",
+    "dyspneic": "dyspnea",
+    "ringing": "tinnitus",
+    "tinnitus": "tinnitus",
+    "hearing": "audiology",
+    "audiology": "audiology",
+    "audiogram": "audiology",
+    "numb": "paresthesia",
+    "numbness": "paresthesia",
+    "tingling": "paresthesia",
+    "paresthesia": "paresthesia",
+    "paresthesias": "paresthesia",
+    "dizzy": "vertigo",
+    "dizziness": "vertigo",
+    "lightheaded": "vertigo",
+    "vertigo": "vertigo",
+    "depressed": "depressive",
+    "depression": "depressive",
+    "depressive": "depressive",
+    "anxiety": "anxious",
+    "anxious": "anxious",
+    "stomach": "gastric",
+    "gastric": "gastric",
+    "abdomen": "abdominal",
+    "abdominal": "abdominal",
+    "kidney": "renal",
+    "renal": "renal",
+    "heart": "cardiac",
+    "cardiac": "cardiac",
+    "sleep": "insomnia",
+    "sleeping": "insomnia",
+    "insomnia": "insomnia",
+    "swelling": "edema",
+    "swollen": "edema",
+    "edema": "edema",
+    "migraine": "headache",
+    "migraines": "headache",
+    "headaches": "headache",
+}
+
+# Suffix stripping, longest first so "ies"/"ing" win over a bare "s". Only used
+# to add an extra token (never to replace one), so an over-eager stem can widen a
+# match but can never lose one.
+_STEM_SUFFIXES: tuple[tuple[str, str], ...] = (
+    ("ingly", ""),
+    ("edly", ""),
+    ("ing", ""),
+    ("ied", "y"),
+    ("ies", "y"),
+    ("ed", ""),
+    ("es", ""),
+    ("s", ""),
+)
+
+
+def _stem(token: str) -> str:
+    """Crude suffix stem: reports/reported/reporting -> report."""
+    if len(token) <= 4:
+        return token
+    for suffix, replacement in _STEM_SUFFIXES:
+        if not token.endswith(suffix):
+            continue
+        stem = token[: -len(suffix)]
+        if len(stem) < 3:
+            continue
+        stem += replacement
+        if suffix in ("ing", "ed") and len(stem) > 3 and stem[-1] == stem[-2]:
+            stem = stem[:-1]  # running -> run, stopped -> stop
+        return stem
+    return token
+
+
 @lru_cache(maxsize=10_000)
 def _tokens(text: str) -> frozenset[str]:
     """Tokenize text into content words; LRU-cached (bounded at 10k entries)
     because facts and paragraphs are scored repeatedly during verification of
     many claims. Bounded LRU prevents unbounded memory growth on large record
-    sets while retaining high hit rates for repeated phrases."""
-    return frozenset(
-        token
-        for token in re.findall(r"[a-z0-9]{3,}", text.lower())
-        if token not in _STOPWORDS
-    )
+    sets while retaining high hit rates for repeated phrases.
+
+    Each token is emitted alongside its stem and its clinical synonym, so
+    "reports neck pain" and "cervical pain reported" share tokens. Expansion is
+    additive: scoring only ever gains overlap, never loses a literal match.
+    """
+    tokens: set[str] = set()
+    for token in re.findall(r"[a-z0-9]+", text.lower()):
+        if token in _STOPWORDS or len(token) < 2:
+            continue
+        if len(token) == 2 and token not in _SHORT_CLINICAL_TOKENS:
+            continue
+        tokens.add(token)
+        stem = _stem(token)
+        if stem != token:
+            tokens.add(stem)
+        synonym = _CLINICAL_SYNONYMS.get(token) or _CLINICAL_SYNONYMS.get(stem)
+        if synonym:
+            tokens.add(synonym)
+    return frozenset(tokens)
 
 
 # Backwards-compat alias: some tooling/tests may import _TOKEN_CACHE.
@@ -872,14 +1461,16 @@ def get_timeline_providers(events: list[TimelineEvent]) -> list[str]:
     """Extract unique provider/facility names from event sources.
 
     Parses provider names from source strings like "VCU Medical Center (provider)" or
-    "VA Hospital Richmond (facility)".
+    "VA Hospital Richmond (facility)". A source that is a page citation
+    ("clinic.pdf p.3-p.9") is not a provider and is skipped — otherwise the
+    timeline's provider filter fills up with file names now that every fact
+    carries a page citation instead of the old free-text source.
     """
     providers: set[str] = set()
     for event in events:
         source = event.source
-        # Extract provider name from parenthetical if present
-        import re
-
+        if _CITATION_SOURCE_RE.search(source):
+            continue
         match = re.match(r"^(.+?)\s*\((?:provider|facility|role).*?\)$", source)
         if match:
             providers.add(match.group(1).strip())
@@ -996,27 +1587,46 @@ def render_timeline_markdown(events: list[TimelineEvent]) -> str:
     return "\n".join(lines)
 
 
-def find_relevant_excerpts(
-    documents: list[ExtractedDocument],
-    query: str,
-    *,
-    top_k: int = 5,
-    excerpt_chars: int = 700,
-) -> str:
-    """Cheap keyword-overlap retrieval of raw record excerpts relevant to a claim.
+def query_has_content_words(text: str) -> bool:
+    """True when a query carries words worth matching (not only labels/stopwords).
 
-    Returns labelled excerpts for inclusion in verification prompts. Deterministic and
-    dependency-free, so verification always has raw-source context, not just the digest.
-    Paragraph splitting is cached per document so very large record sets are only
-    parsed once across all claim batches.
+    A claim with no content words ("c1", "item 2") gives retrieval nothing to
+    judge, and an empty-evidence verdict must not be inferred from it.
     """
-    query_tokens = set(_tokens(query))
-    if not query_tokens:
-        return ""
+    return bool(_tokens(text))
 
-    # Build the paragraph corpus first so token weights reflect how common each
-    # term is across ALL records (IDF). Distinctive terms then dominate the
-    # ranking instead of boilerplate repeated on every page.
+
+@dataclass
+class RetrievedEvidence:
+    """Raw record excerpts for one query, with the signal needed to judge them.
+
+    ``best_overlap`` is the honest half of the result: when nothing in the record
+    set overlaps the query above the relevance floor, an absent record is a
+    *coverage gap*, not a contradiction, and the caller must be able to tell
+    which of the two it is holding before it reports a verdict to the user.
+    """
+
+    text: str = ""
+    excerpts: int = 0
+    best_overlap: float = 0.0
+    corpus_size: int = 0
+
+    @property
+    def weak(self) -> bool:
+        """True when nothing retrieved cleared ``config.EVIDENCE_WEAK_OVERLAP``."""
+        return self.best_overlap < config.EVIDENCE_WEAK_OVERLAP
+
+
+def _rank_paragraphs(
+    documents: list[ExtractedDocument], query_tokens: set[str]
+) -> tuple[list[tuple[float, str, str]], int]:
+    """Rank paragraphs against query tokens; returns ``(ranked, corpus_size)``.
+
+    Every paragraph is ranked, not just the ones clearing a threshold: ranking
+    without gating guarantees the verification prompt receives the best raw
+    context the record set can offer, and the threshold becomes a *signal* about
+    that context (``RetrievedEvidence.weak``) rather than a silent filter.
+    """
     corpus: list[tuple[str, str, frozenset[str]]] = []
     df: Counter[str] = Counter()
     for doc in documents:
@@ -1028,30 +1638,71 @@ def find_relevant_excerpts(
                     df[token] += 1
     total = len(corpus)
     if not total:
-        return ""
+        return [], 0
 
     def weight(token: str) -> float:
         return math.log((total + 1) / (df.get(token, 0) + 1)) + 1.0
 
     query_weight = sum(weight(t) for t in query_tokens) or 1.0
-
-    scored: list[tuple[float, str]] = []
-    for label, text, tokens in corpus:
-        overlap = sum(weight(t) for t in query_tokens & tokens) / query_weight
-        if overlap >= 0.15:
-            scored.append((overlap, f"[{label}]\n{text[:excerpt_chars]}"))
-
+    scored = [
+        (sum(weight(t) for t in query_tokens & tokens) / query_weight, label, text)
+        for label, text, tokens in corpus
+    ]
     scored.sort(key=lambda item: item[0], reverse=True)
+    return scored, total
+
+
+def retrieve_evidence(
+    documents: list[ExtractedDocument],
+    query: str,
+    *,
+    top_k: int = 8,
+    excerpt_chars: int = 700,
+) -> RetrievedEvidence:
+    """Retrieve the raw record excerpts most relevant to a claim, ranked.
+
+    Deterministic and dependency-free, so verification always has raw-source
+    context rather than only the digest. Paragraph splitting is cached per
+    document, so a very large record set is parsed once across all claim batches.
+    """
+    query_tokens = set(_tokens(query))
+    if not query_tokens:
+        return RetrievedEvidence()
+    ranked, corpus_size = _rank_paragraphs(documents, query_tokens)
     seen: set[str] = set()
     unique: list[str] = []
-    for _, excerpt in scored:
+    for _, label, text in ranked:
+        excerpt = f"[{label}]\n{text[:excerpt_chars]}"
         key = excerpt[:120]
-        if key not in seen:
-            seen.add(key)
-            unique.append(excerpt)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(excerpt)
         if len(unique) >= top_k:
             break
-    return "\n\n---\n\n".join(unique)
+    return RetrievedEvidence(
+        text="\n\n---\n\n".join(unique),
+        excerpts=len(unique),
+        best_overlap=ranked[0][0] if ranked else 0.0,
+        corpus_size=corpus_size,
+    )
+
+
+def find_relevant_excerpts(
+    documents: list[ExtractedDocument],
+    query: str,
+    *,
+    top_k: int = 5,
+    excerpt_chars: int = 700,
+) -> str:
+    """Ranked raw record excerpts as text (thin wrapper over ``retrieve_evidence``).
+
+    Kept because existing callers and tests expect a plain string; new callers
+    should use ``retrieve_evidence`` so they also see ``weak``/``best_overlap``.
+    """
+    return retrieve_evidence(
+        documents, query, top_k=top_k, excerpt_chars=excerpt_chars
+    ).text
 
 
 # --------------------------------------------------------- timeline extraction
@@ -1093,6 +1744,34 @@ _UNDATED_LLM_SYSTEM = (
     "('YYYY') or year-month ('YYYY-MM'). If there is truly no inferable date, return null for "
     "that fact. Output JSON only."
 )
+
+
+# One pass, longest alternative first, so "2019-04-17" is taken as a day rather
+# than also yielding a truncated "2019-04" month entry (the precision-specific
+# patterns below each match a prefix of a longer date).
+_ANY_DATE_RE = re.compile(
+    rf"\b(?:\d{{4}}-\d{{1,2}}-\d{{1,2}}|\d{{4}}-\d{{1,2}}|(?:{_MONTH_ALTERNATION})\.?\s+\d{{4}}|"
+    rf"\d{{1,2}}/\d{{1,2}}/\d{{2,4}}|(?:circa|approx\.?|approximately)\s*['’]?\d{{4}})\b",
+    re.IGNORECASE,
+)
+
+
+def _dates_in_text(text: str, limit: int = 6) -> list[str]:
+    """Distinct ISO dates printed in a page of text (at most ``limit``).
+
+    Fed to the digest prompt as the dates that actually appear on this chunk's
+    pages, so a fact's date is anchored to what the record prints rather than
+    inferred from prose — the difference between "circa 2019" and 2019-04-17 in
+    the timeline the statement is built from.
+    """
+    found: list[str] = []
+    for match in _ANY_DATE_RE.finditer(text):
+        parsed = _regex_extract_date(match.group(0))
+        if parsed and parsed[0] not in found:
+            found.append(parsed[0])
+            if len(found) >= limit:
+                return found
+    return found
 
 
 def _regex_extract_date(text: str) -> tuple[str, str] | None:
@@ -1167,21 +1846,13 @@ def _event_from_fact(fact: MedicalFact, *, iso_date: str | None, precision: str)
     }
 
 
-def _llm_infer_undated(
-    llm: LLMClient, facts: list[MedicalFact]
-) -> dict[int, tuple[str, str] | None]:
-    """Best-effort LLM date inference for facts regex could not date.
-
-    Returns a mapping of the input list's index to a parsed (iso_date,
-    precision) tuple, or ``None`` when the model also could not infer a date.
-    Never raises — a failed/malformed LLM call simply yields no inferences and
-    those facts remain in the 'undated' bucket.
-    """
-    if not facts:
-        return {}
+def _infer_dates_once(
+    llm: LLMClient, batch: list[MedicalFact]
+) -> list[Any] | None:
+    """One inference call for a batch; ``None`` when the call itself failed."""
     items = [
         {"index": i, "description": f.description[:300], "quote": f.quote[:200]}
-        for i, f in enumerate(facts)
+        for i, f in enumerate(batch)
     ]
     try:
         data = llm.chat_json(
@@ -1190,20 +1861,75 @@ def _llm_infer_undated(
             '{"dates": [{"index": <int>, "date": "YYYY" | "YYYY-MM" | null}]}\n\n'
             + json.dumps(items),
             model=llm._settings.model_fast,
-            max_tokens=2000,
+            # Budget per fact, not a flat cap: a fixed 2000-token ceiling over a
+            # few hundred undated facts truncates the JSON mid-array and loses the
+            # entire batch.
+            max_tokens=max(2000, 60 * len(batch)),
             phase="timeline:llm_date_extraction",
         )
-    except Exception:  # noqa: BLE001 - fallback pass must never break extraction
+    except Exception as exc:  # noqa: BLE001 - fallback pass must never break extraction
+        logger.warning(
+            "timeline date inference call failed error=%s",
+            f"{type(exc).__name__}: {exc}",
+            extra={
+                "request_id": get_request_id() or "-",
+                "phase": "timeline:llm_date_extraction",
+                "status": "error",
+                "error_class": type(exc).__name__,
+            },
+        )
+        return None
+    rows = data.get("dates") if isinstance(data, dict) else None
+    return rows if isinstance(rows, list) else None
+
+
+def _llm_infer_undated(
+    llm: LLMClient, facts: list[MedicalFact]
+) -> dict[int, tuple[str, str] | None]:
+    """Best-effort LLM date inference for facts regex could not date.
+
+    Returns a mapping of the input list's index to a parsed (iso_date,
+    precision) tuple, or ``None`` when the model also could not infer a date.
+    Never raises — a failed call simply yields no inferences for that batch and
+    those facts stay in the 'undated' bucket.
+
+    Batched, and tolerant per row: one call over every undated fact in a large
+    bundle both overflows the output budget (losing the whole batch, and with it
+    the chronology the statement depends on) and lets a single malformed row cost
+    every other date. Each batch is retried once; rows are parsed individually.
+    """
+    if not facts:
         return {}
+    batch_size = max(1, config.UNDATED_FACT_BATCH_SIZE)
     inferred: dict[int, tuple[str, str] | None] = {}
-    for row in data.get("dates", []) or []:
-        if not isinstance(row, dict):
-            continue
-        index = row.get("index")
-        if not isinstance(index, int):
-            continue
-        raw_date = row.get("date")
-        inferred[index] = _regex_extract_date(str(raw_date)) if raw_date else None
+    for start in range(0, len(facts), batch_size):
+        batch = facts[start : start + batch_size]
+        for _attempt in (1, 2):
+            rows = _infer_dates_once(llm, batch)
+            if rows is not None:
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    index = row.get("index")
+                    if not isinstance(index, int) or not 0 <= index < len(batch):
+                        continue
+                    raw_date = row.get("date")
+                    inferred[start + index] = (
+                        _regex_extract_date(str(raw_date)) if raw_date else None
+                    )
+                break
+        else:
+            logger.warning(
+                "timeline date inference lost a batch facts=%d start=%d",
+                len(batch),
+                start,
+                extra={
+                    "request_id": get_request_id() or "-",
+                    "phase": "timeline:llm_date_extraction",
+                    "status": "dropped",
+                    "facts": len(batch),
+                },
+            )
     return inferred
 
 

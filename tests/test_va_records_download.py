@@ -8,6 +8,7 @@ maintainer will see when VA.gov changes its markup.
 """
 from __future__ import annotations
 
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -293,6 +294,73 @@ class TestPdfValidation(unittest.TestCase):
             self.assertFalse(vrd.looks_like_pdf(html))
             self.assertFalse(vrd.looks_like_pdf(empty))
             self.assertFalse(vrd.looks_like_pdf(Path(tmp) / "missing.pdf"))
+
+
+class TestDownloadInspection(unittest.TestCase):
+    """A downloaded PDF is checked for being *the* record set, not just a PDF."""
+
+    def _pdf(self, path: Path, pages: list[str]) -> None:
+        import io
+
+        from reportlab.pdfgen import canvas
+
+        buffer = io.BytesIO()
+        pdf = canvas.Canvas(buffer)
+        for text in pages:
+            y = 760
+            for line in (text.split("\n") if text else []):
+                pdf.drawString(72, y, line)
+                y -= 14
+            pdf.showPage()
+        pdf.save()
+        path.write_bytes(buffer.getvalue())
+
+    def test_summary_counts_text_and_image_pages(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "records.pdf"
+            self._pdf(path, ["Knee pain noted.", "", "Tinnitus noted."])
+            summary = vrd.pdf_summary(path)
+        self.assertEqual(summary["pages"], 3)
+        self.assertEqual(summary["text_pages"], 2)
+        self.assertEqual(summary["image_only_pages"], 1)
+        self.assertAlmostEqual(summary["text_ratio"], 0.667, places=3)
+        self.assertGreater(summary["bytes"], 0)
+
+    def test_a_tiny_export_is_flagged_as_possibly_incomplete(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "records.pdf"
+            self._pdf(path, ["One page."])
+            warnings = vrd.report_download(path)
+            manifest = json.loads(
+                (Path(tmp) / "records.pdf.manifest.json").read_text(encoding="utf-8")
+            )
+        self.assertTrue(any("incomplete" in w for w in warnings))
+        self.assertEqual(manifest["selections"]["date_range"], "All time")
+        self.assertEqual(manifest["selections"]["record_type"], "Select all VA records")
+        self.assertEqual(manifest["content"]["pages"], 1)
+        self.assertEqual(len(manifest["sha256"]), 64)
+
+    def test_a_mostly_scanned_export_points_at_the_ocr_script(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "records.pdf"
+            self._pdf(path, ["Text.", "", "", ""])
+            warnings = vrd.report_download(path)
+        self.assertTrue(any("ocr_records.py" in w for w in warnings))
+
+    def test_a_healthy_export_produces_no_warnings(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "records.pdf"
+            self._pdf(path, [f"Encounter note {i}." for i in range(1, 9)])
+            warnings = vrd.report_download(path)
+        self.assertEqual(warnings, [])
+
+    def test_an_unreadable_download_is_reported_not_crashed(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "records.pdf"
+            path.write_bytes(b"%PDF-1.4 not really a pdf")
+            warnings = vrd.report_download(path)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("could not read", warnings[0])
 
 
 class TestWizardFlow(unittest.TestCase):
