@@ -23,11 +23,14 @@ from app.documents import (  # noqa: E402
 )
 from app.evaluate import (  # noqa: E402
     DIMENSION_LABELS,
+    VERDICTS,
     EvaluationResult,
     _citation_index_snapshot,
+    _infer_record_type,
     _truncate_for_prompt,
     _verifications_text,
     _verify_claims,
+    build_evidence_dashboard,
     build_report,
     run_evaluation,
 )
@@ -579,6 +582,77 @@ class TestRunEvaluationWithRealDigest(unittest.TestCase):
         result = run_evaluation(llm, "Knee injury statement.", docs, progress=None)
         self.assertTrue(result.digest.pages_reviewed >= 1)
         self.assertGreater(len(result.claims), 0)
+
+
+class TestInferRecordType(unittest.TestCase):
+    def test_diagnostic_keywords(self):
+        self.assertEqual(_infer_record_type("MRI showed a torn meniscus."), "Diagnosis")
+        self.assertEqual(_infer_record_type("Diagnosed with PTSD in 2015."), "Diagnosis")
+
+    def test_medication_keywords(self):
+        self.assertEqual(_infer_record_type("Prescribed 50mg sertraline daily."), "Medication")
+        self.assertEqual(_infer_record_type("Needed a refill of his medication."), "Medication")
+
+    def test_symptom_keywords(self):
+        self.assertEqual(_infer_record_type("Constant knee pain since the incident."), "Symptom")
+        self.assertEqual(_infer_record_type("Reports daily anxiety and insomnia."), "Symptom")
+
+    def test_default_other(self):
+        self.assertEqual(_infer_record_type("He was present at the ceremony in June."), "Other")
+
+
+class TestBuildEvidenceDashboard(unittest.TestCase):
+    def test_groups_by_record_type_with_all_verdict_keys(self):
+        claims = [
+            {"id": 1, "text": "MRI confirmed a torn meniscus."},
+            {"id": 2, "text": "Prescribed a daily 20mg dose."},
+            {"id": 3, "text": "Constant knee pain since 2014."},
+            {"id": 4, "text": "He attended the unit reunion."},
+        ]
+        verifications = [
+            {"id": 1, "verdict": "SUPPORTED"},
+            {"id": 2, "verdict": "PARTIALLY SUPPORTED"},
+            {"id": 3, "verdict": "CONTRADICTED"},
+            {"id": 4, "verdict": "NOT FOUND"},
+        ]
+        dashboard = build_evidence_dashboard(verifications, claims)
+        self.assertEqual(set(dashboard.keys()), {"Diagnosis", "Medication", "Symptom", "Other"})
+        for counts in dashboard.values():
+            self.assertEqual(set(counts.keys()), set(VERDICTS))
+        self.assertEqual(dashboard["Diagnosis"]["SUPPORTED"], 1)
+        self.assertEqual(dashboard["Medication"]["PARTIALLY SUPPORTED"], 1)
+        self.assertEqual(dashboard["Symptom"]["CONTRADICTED"], 1)
+        self.assertEqual(dashboard["Other"]["NOT FOUND"], 1)
+
+    def test_multiple_claims_same_record_type_are_tallied(self):
+        claims = [
+            {"id": 1, "text": "Daily headache since deployment."},
+            {"id": 2, "text": "Severe pain in lower back."},
+            {"id": 3, "text": "Reports nausea most mornings."},
+        ]
+        verifications = [
+            {"id": 1, "verdict": "SUPPORTED"},
+            {"id": 2, "verdict": "SUPPORTED"},
+            {"id": 3, "verdict": "NOT FOUND"},
+        ]
+        dashboard = build_evidence_dashboard(verifications, claims)
+        self.assertEqual(dashboard["Symptom"]["SUPPORTED"], 2)
+        self.assertEqual(dashboard["Symptom"]["NOT FOUND"], 1)
+        self.assertEqual(sum(dashboard["Symptom"].values()), 3)
+
+    def test_unknown_verdict_falls_back_to_not_found(self):
+        claims = [{"id": 1, "text": "Unusual verdict claim about pain."}]
+        verifications = [{"id": 1, "verdict": "UNKNOWN_VERDICT"}]
+        dashboard = build_evidence_dashboard(verifications, claims)
+        self.assertEqual(dashboard["Symptom"]["NOT FOUND"], 1)
+
+    def test_empty_inputs_return_empty_dashboard(self):
+        self.assertEqual(build_evidence_dashboard([], []), {})
+
+    def test_verification_with_missing_claim_falls_back_to_other(self):
+        verifications = [{"id": 99, "verdict": "SUPPORTED"}]
+        dashboard = build_evidence_dashboard(verifications, [])
+        self.assertEqual(dashboard["Other"]["SUPPORTED"], 1)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import logging
+import re
 import time
+from typing import Any
 
 import streamlit as st
 
@@ -681,6 +683,87 @@ def _verify_claims(
                 continue
     return [verdict_by_id.get(c["id"], {"id": c["id"], "verdict": "NOT FOUND",
             "record_reference": "", "note": "Not returned by verifier."}) for c in claims]
+
+
+# Feature: Evidence Strength Dashboard (F3.S1)
+VERDICTS: tuple[str, ...] = ("SUPPORTED", "PARTIALLY SUPPORTED", "CONTRADICTED", "NOT FOUND")
+
+DEFAULT_RECORD_TYPE = "Other"
+
+# Simple keyword/regex inference of the "record type" a claim most likely
+# relates to. Order matters — the first matching pattern wins, so more
+# specific categories (diagnosis, medication) are checked before the
+# broader "symptom" bucket.
+_RECORD_TYPE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "Diagnosis",
+        re.compile(
+            r"\b(diagnos\w*|scan|x-ray|mri|ct\s*scan|biopsy|lab\s*(test|result)s?|"
+            r"bloodwork|imaging)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "Medication",
+        re.compile(
+            r"\b(medication\w*|prescri\w*|dosage|dose|milligram\w*|\bmg\b|pill\w*|"
+            r"tablet\w*|\bdrug\w*|refill\w*)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "Symptom",
+        re.compile(
+            r"\b(pain|ache\w*|symptom\w*|nause\w*|dizz\w*|fatigue\w*|numbness|"
+            r"anxiety|depress\w*|insomnia|tremor\w*|swelling|headache\w*)\b",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+
+def _infer_record_type(claim_text: str) -> str:
+    """Infer the medical record type a claim most plausibly relates to.
+
+    Uses simple keyword regexes over the claim text (per the story's
+    implementation notes) — diagnostic/imaging language, medication
+    language, and symptom language are checked in that order; anything
+    that matches none of them falls back to :data:`DEFAULT_RECORD_TYPE`.
+    """
+    for record_type, pattern in _RECORD_TYPE_PATTERNS:
+        if pattern.search(claim_text):
+            return record_type
+    return DEFAULT_RECORD_TYPE
+
+
+def build_evidence_dashboard(
+    verifications: list[dict[str, Any]],
+    claims: list[dict[str, Any]],
+) -> dict[str, dict[str, int]]:
+    """Aggregate claim verdicts by inferred record type for the dashboard.
+
+    Groups every verified claim under an inferred record type (Diagnosis,
+    Medication, Symptom, or Other — see :func:`_infer_record_type`) and
+    tallies verdict counts within each group. Every record type present is
+    given a full ``{verdict: count}`` mapping across all four verdicts
+    (zero-filled where absent) so chart-building code never has to guard
+    against missing keys.
+
+    Returns an empty dict when there are no verifications (e.g. a run that
+    produced zero extracted claims) — callers must treat that as "nothing
+    to render" rather than an error.
+    """
+    claim_text_by_id: dict[Any, str] = {c.get("id"): str(c.get("text", "")) for c in claims}
+    dashboard: dict[str, dict[str, int]] = {}
+    for verification in verifications:
+        claim_text = claim_text_by_id.get(verification.get("id"), "")
+        record_type = _infer_record_type(claim_text)
+        verdict = str(verification.get("verdict") or "NOT FOUND")
+        if verdict not in VERDICTS:
+            verdict = "NOT FOUND"
+        counts = dashboard.setdefault(record_type, {v: 0 for v in VERDICTS})
+        counts[verdict] += 1
+    return dashboard
 
 
 def _verifications_text(result: EvaluationResult) -> str:
