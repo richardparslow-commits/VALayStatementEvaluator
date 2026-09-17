@@ -4,3 +4,15 @@
 -r requirements.txt
 mypy>=1.18
 types-requests
+# Optional tracing backend, installed here so the tracing tests exercise a real
+# TracerProvider and in-memory span exporter instead of skipping (the app itself
+# no-ops without these — see requirements-otel.txt).
+opentelemetry-sdk>=1.44
+opentelemetry-exporter-otlp-proto-http>=1.44
+# S3 client for the backup tests only. tests/test_audit_backup_s3.py drives the
+# real boto3 backend against a loopback S3 server, so installing this makes those
+# assertions run rather than skip — a skipped backup test would mean "unverified"
+# for the code path that has to survive a pod failure.
+# The GCS and Azure backends are optional too; they are covered by interface tests
+# only (see tests/test_audit_backup.py), not against a live account.
+boto3>=1.34

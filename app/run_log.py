@@ -17,6 +17,11 @@ Design:
 - stdlib only; append+flush per event; never raises (best-effort like audit).
 - The UI-facing error text and the run log are written through the same
   helper so a user-shown reference always has a matching log line.
+- Size-bounded (``VA_LSE_RUN_LOG_MAX_BYTES`` x ``VA_LSE_RUN_LOG_BACKUPS``). Until
+  this was added this file was the *only* unbounded writer in the app — the audit
+  log has always rotated — so it, not ``audit.log``, was what could fill the log
+  volume on a long-lived pod. Rotation happens under the same lock as the append,
+  so it cannot lose a line or interleave with a concurrent writer.
 """
 from __future__ import annotations
 
@@ -27,12 +32,39 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from . import config
 from .logging_config import get_logger
 
 logger = get_logger("app.run_log")
 
 _LOCK = threading.Lock()
 _FILENAME = "runs.jsonl"
+
+
+def _rotated_names(path: Path) -> list[Path]:
+    """Rotated siblings, newest first (``runs.jsonl.1`` … ``runs.jsonl.N``)."""
+    return [path.with_name(f"{path.name}.{i}") for i in range(1, config.RUN_LOG_BACKUPS + 1)]
+
+
+def _rotate_if_needed(path: Path) -> None:
+    """Shift ``runs.jsonl`` to ``.1`` once it reaches the size limit.
+
+    Called with ``_LOCK`` held. Rotation failures are swallowed by the caller's
+    best-effort contract — a run log that stops rotating is bad, but a run log
+    that breaks a run is worse.
+    """
+    try:
+        if not path.exists() or path.stat().st_size < config.RUN_LOG_MAX_BYTES:
+            return
+        backups = max(1, config.RUN_LOG_BACKUPS)
+        path.with_name(f"{path.name}.{backups}").unlink(missing_ok=True)
+        for index in range(backups - 1, 0, -1):
+            source = path.with_name(f"{path.name}.{index}")
+            if source.exists():
+                source.replace(path.with_name(f"{path.name}.{index + 1}"))
+        path.replace(path.with_name(f"{path.name}.1"))
+    except OSError as exc:
+        logger.debug("could not rotate the run log: %s", exc)
 
 
 def _resolve_log_path() -> Path:
@@ -87,25 +119,43 @@ def run_log_event(
     try:
         line = json.dumps(payload, ensure_ascii=False)
         with _LOCK:
-            with open(_resolve_log_path(), "a", encoding="utf-8") as fh:
+            path = _resolve_log_path()
+            _rotate_if_needed(path)
+            with open(path, "a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
     except Exception:  # noqa: BLE001 - run log must never break a run
         pass
 
 
 def read_recent_events(limit: int = 200) -> list[dict[str, Any]]:
-    """Best-effort read of the last ``limit`` events (for the ops UI/tests)."""
+    """Best-effort read of the last ``limit`` events (for the ops UI/tests).
+
+    Reads newest file first and stops as soon as ``limit`` events are parsed, so
+    the common case touches one file rather than the whole retained history.
+    """
     try:
         path = _resolve_log_path()
-        if not path.exists() or path.name == "runs.jsonl" and not path.exists():
+        if not path.exists():
             return []
-        lines = path.read_text(encoding="utf-8").splitlines()
-        out: list[dict[str, Any]] = []
-        for line in lines[-limit:]:
+        newest_first: list[dict[str, Any]] = []
+        for candidate in [path, *_rotated_names(path)]:
             try:
-                out.append(json.loads(line))
-            except json.JSONDecodeError:
+                if not candidate.exists():
+                    continue
+                for line in reversed(candidate.read_text(encoding="utf-8").splitlines()):
+                    if not line.strip():
+                        continue
+                    try:
+                        newest_first.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+                    if len(newest_first) >= limit:
+                        break
+            except OSError:
                 continue
-        return out
+            if len(newest_first) >= limit:
+                break
+        newest_first.reverse()
+        return newest_first[-limit:]
     except Exception:  # noqa: BLE001
         return []

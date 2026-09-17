@@ -13,6 +13,8 @@ from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
 
+from .config import FALLBACK_ENDPOINT, PRIMARY_ENDPOINT
+
 # Phases that always run on the cheap (fast) model: the bulk record digest and
 # the mechanical fact dedup/merge. Every other phase runs on the main model.
 FAST_MODEL_PHASES = frozenset({"records:digest", "records:merge"})
@@ -31,6 +33,10 @@ class UsageEntry:
     phase: str
     prompt_tokens: int
     completion_tokens: int
+    # Which endpoint served this call. Defaulted rather than required so a queued
+    # job submitted by an older pod (whose payload has no such field) still
+    # deserializes, and so a single-endpoint deployment reads as "primary".
+    endpoint: str = PRIMARY_ENDPOINT
 
 
 @dataclass
@@ -61,11 +67,13 @@ class UsageTracker:
         content: str,
         prompt_tokens: int | None = None,
         completion_tokens: int | None = None,
+        endpoint: str = PRIMARY_ENDPOINT,
     ) -> None:
         """Record one completed call. Prefer real metadata when available."""
         self.entries.append(
             UsageEntry(
                 model=model,
+                endpoint=endpoint or PRIMARY_ENDPOINT,
                 phase=phase,
                 prompt_tokens=(
                     prompt_tokens
@@ -103,6 +111,22 @@ class UsageTracker:
             role = "fast" if entry.phase in FAST_MODEL_PHASES else "main"
             roles[role] += entry.prompt_tokens + entry.completion_tokens
         return roles
+
+    # ------------------------------------------------------------ endpoints
+    def endpoints_used(self) -> list[str]:
+        """Endpoints that actually served a call in this run, in a stable order.
+
+        A run served entirely by the primary returns ``["primary"]``, not an empty
+        list, so a stored run record always answers "which endpoint produced this?"
+        rather than leaving it silent.
+        """
+        seen = {entry.endpoint for entry in self.entries if entry.endpoint}
+        return [name for name in (PRIMARY_ENDPOINT, FALLBACK_ENDPOINT) if name in seen]
+
+    @property
+    def used_fallback(self) -> bool:
+        """Whether any call in this run was served by the backup endpoint."""
+        return any(entry.endpoint == FALLBACK_ENDPOINT for entry in self.entries)
 
     def totals(self) -> PhaseStats:
         total = PhaseStats()
@@ -147,11 +171,15 @@ class UsageTracker:
         )
 
     def summary(self) -> dict[str, Any]:
-        """Structured totals for post-run display."""
+        """Structured totals for post-run display, including the endpoints used."""
         total = self.totals()
         return {
             "calls": total.calls,
             "prompt_tokens": total.prompt_tokens,
             "completion_tokens": total.completion_tokens,
             "total_tokens": total.total_tokens,
+            "endpoints": self.endpoints_used(),
+            "fallback_calls": sum(
+                1 for entry in self.entries if entry.endpoint == FALLBACK_ENDPOINT
+            ),
         }

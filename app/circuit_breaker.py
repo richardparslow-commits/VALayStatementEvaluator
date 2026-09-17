@@ -19,9 +19,18 @@ Stdlib-only implementation that mirrors the behaviour the spec asks for
   rejected immediately with ``QueueFullError``. Waiting callers block up to
   ``VA_LSE_LLM_QUEUE_TIMEOUT_SECONDS`` (default 30 s) before timing out.
 
-Both primitives are singletons per process (one breaker + one limiter for the
-LLM path). Test helpers ``reset_llm_breaker`` / ``reset_llm_limiter`` allow
-tests to reconfigure them without restarting the process.
+The breaker is **per endpoint** (``get_llm_breaker``), because a breaker is a
+statement about one endpoint's health: a shared one would let a healthy fallback's
+successes close the primary's breaker and hide an ongoing outage, and let the
+primary's failures refuse calls the fallback could have served. The concurrency
+limiter stays global — it bounds *this process's* egress, not one provider's.
+
+Each breaker also tracks how long its endpoint has been *continuously*
+unhealthy (``unhealthy_for_seconds``), which is the failover trigger. That is a
+different clock from the probe countdown: ``_opened_at`` is reset by every failed
+probe, so it never ages past one ``recovery_timeout`` while traffic keeps probing.
+Test helpers ``reset_llm_breaker`` / ``reset_llm_limiter`` allow tests to
+reconfigure them without restarting the process.
 """
 
 from __future__ import annotations
@@ -73,6 +82,7 @@ class CircuitBreaker:
         self._state: CircuitState = "CLOSED"
         self._failure_count: int = 0
         self._opened_at: float | None = None
+        self._unhealthy_since: float | None = None
         self._lock = threading.Lock()
 
     # ---------------------------------------------------------------- state
@@ -87,11 +97,43 @@ class CircuitBreaker:
         with self._lock:
             return self._failure_count
 
+    def unhealthy_for_seconds(self) -> float | None:
+        """How long this endpoint has been continuously unhealthy, else ``None``.
+
+        Set when the breaker first opens and cleared only by a genuine recovery
+        (a transition back to CLOSED) — *not* by a failed probe. This is the
+        failover trigger, and it is deliberately not ``_opened_at``: a failed
+        probe resets that one, so with a 60 s recovery timeout and continuous
+        traffic it never ages past 60 s, and a failover rule built on it would
+        never fire under exactly the load it exists to handle.
+        """
+        with self._lock:
+            if self._unhealthy_since is None:
+                return None
+            return max(0.0, time.monotonic() - self._unhealthy_since)
+
     def _transition(self, new_state: CircuitState, *, reason: str) -> None:
         old = self._state
         if old == new_state:
             return
         self._state = new_state
+        if new_state == "OPEN":
+            # First open wins: HALF_OPEN -> OPEN (a failed probe) must not restart
+            # the clock, or a long outage would look like it began a minute ago.
+            if self._unhealthy_since is None:
+                self._unhealthy_since = time.monotonic()
+        elif new_state == "CLOSED":
+            self._unhealthy_since = None
+        # Imported here rather than at module scope: the breaker is created during
+        # `get_llm_breaker()` from inside a call path, and a metrics import that
+        # pulled in config (or anything else) at module load would add a startup
+        # dependency to a primitive that must stay stdlib-only.
+        try:
+            from .metrics import observe_breaker_transition
+
+            observe_breaker_transition(self.name, old, new_state)
+        except Exception:  # noqa: BLE001 - instrumentation is best-effort by design
+            pass
         logger.warning(
             "circuit breaker '%s' %s -> %s (%s)",
             self.name,
@@ -182,6 +224,7 @@ class CircuitBreaker:
             self._state = "CLOSED"
             self._failure_count = 0
             self._opened_at = None
+            self._unhealthy_since = None
 
 
 # ------------------------------------------------------------------ limiter
@@ -330,35 +373,62 @@ class ConcurrencyLimiter:
 
 # ---------------------------------------------------------- singletons
 
-_llm_breaker: CircuitBreaker | None = None
+# Breaker names. The name is also the `breaker` label on the circuit-breaker
+# metrics, so an operator can tell a primary outage from a fallback one.
+LLM_BREAKER_NAME = "llm"
+LLM_FALLBACK_BREAKER_NAME = "llm-fallback"
+
+_llm_breakers: dict[str, CircuitBreaker] = {}
 _llm_breaker_lock = threading.RLock()
 
 _llm_limiter: ConcurrencyLimiter | None = None
 _llm_limiter_lock = threading.RLock()
 
 
-def get_llm_breaker() -> CircuitBreaker:
-    """Return the process-wide LLM circuit breaker (lazy, env-configured)."""
-    global _llm_breaker
-    if _llm_breaker is not None:
-        return _llm_breaker
-    with _llm_breaker_lock:
-        if _llm_breaker is not None:
-            return _llm_breaker
-        try:
-            from . import config as _cfg  # pylint: disable=import-outside-toplevel
+def _breaker_config() -> tuple[int, float]:
+    """Threshold/recovery from config, with safe fallbacks if config is absent."""
+    try:
+        from . import config as _cfg  # pylint: disable=import-outside-toplevel
 
-            threshold = int(getattr(_cfg, "LLM_CB_FAILURE_THRESHOLD", 3))
-            recovery = float(getattr(_cfg, "LLM_CB_RECOVERY_SECONDS", 60))
-        except Exception:  # noqa: BLE001
-            threshold = 3
-            recovery = 60.0
-        _llm_breaker = CircuitBreaker(
+        return (
+            int(getattr(_cfg, "LLM_CB_FAILURE_THRESHOLD", 3)),
+            float(getattr(_cfg, "LLM_CB_RECOVERY_SECONDS", 60)),
+        )
+    except Exception:  # noqa: BLE001
+        return 3, 60.0
+
+
+def get_llm_breaker(name: str = LLM_BREAKER_NAME) -> CircuitBreaker:
+    """Return the process-wide breaker for one LLM endpoint (lazy, env-configured).
+
+    Keyed by endpoint name rather than one global instance — see the module
+    docstring for why a shared breaker is wrong once there is a fallback.
+    """
+    existing = _llm_breakers.get(name)
+    if existing is not None:
+        return existing
+    with _llm_breaker_lock:
+        existing = _llm_breakers.get(name)
+        if existing is not None:
+            return existing
+        threshold, recovery = _breaker_config()
+        breaker = CircuitBreaker(
             failure_threshold=threshold,
             recovery_timeout=recovery,
-            name="llm",
+            name=name,
         )
-        return _llm_breaker
+        _llm_breakers[name] = breaker
+        return breaker
+
+
+def iter_llm_breakers() -> tuple[CircuitBreaker, ...]:
+    """Breakers that already exist, in name order — does not create any.
+
+    Used by ``/metrics``: instantiating a breaker for an endpoint that was never
+    called would report a state for something that has never been tested.
+    """
+    with _llm_breaker_lock:
+        return tuple(_llm_breakers[name] for name in sorted(_llm_breakers))
 
 
 def get_llm_limiter() -> ConcurrencyLimiter:
@@ -390,22 +460,19 @@ def get_llm_limiter() -> ConcurrencyLimiter:
 
 def reset_llm_breaker(
     *,
+    name: str = LLM_BREAKER_NAME,
     failure_threshold: int | None = None,
     recovery_timeout: float | None = None,
 ) -> CircuitBreaker:
-    """Reset (or reconfigure) the global LLM breaker — intended for tests."""
-    global _llm_breaker
+    """Reset (or reconfigure) one endpoint's LLM breaker — intended for tests."""
     with _llm_breaker_lock:
-        if _llm_breaker is None:
-            breaker = get_llm_breaker()
-            _llm_breaker = breaker
-        assert _llm_breaker is not None
+        breaker = get_llm_breaker(name)
         if failure_threshold is not None:
-            _llm_breaker.failure_threshold = max(1, int(failure_threshold))
+            breaker.failure_threshold = max(1, int(failure_threshold))
         if recovery_timeout is not None:
-            _llm_breaker.recovery_timeout = max(0.0, float(recovery_timeout))
-        _llm_breaker.reset()
-        return _llm_breaker
+            breaker.recovery_timeout = max(0.0, float(recovery_timeout))
+        breaker.reset()
+        return breaker
 
 
 def reset_llm_limiter(
@@ -439,8 +506,22 @@ def reset_all_for_tests(
     limiter_queue_depth: int = 50,
     limiter_timeout: float = 30.0,
 ) -> tuple[CircuitBreaker, ConcurrencyLimiter]:
-    """Convenience: reset both singletons to known test defaults."""
-    breaker = reset_llm_breaker(failure_threshold=breaker_threshold, recovery_timeout=breaker_recovery)
+    """Convenience: reset every breaker plus the limiter to known test defaults."""
+    # Every *existing* breaker, not just the primary: a test that armed failover
+    # must not leak an OPEN fallback into the next test.
+    with _llm_breaker_lock:
+        names = set(_llm_breakers) | {LLM_BREAKER_NAME}
+    breaker = reset_llm_breaker(
+        name=LLM_BREAKER_NAME,
+        failure_threshold=breaker_threshold,
+        recovery_timeout=breaker_recovery,
+    )
+    for name in sorted(names - {LLM_BREAKER_NAME}):
+        reset_llm_breaker(
+            name=name,
+            failure_threshold=breaker_threshold,
+            recovery_timeout=breaker_recovery,
+        )
     limiter = reset_llm_limiter(
         max_concurrent=limiter_concurrent,
         max_queue_depth=limiter_queue_depth,

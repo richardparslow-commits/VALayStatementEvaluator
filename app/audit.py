@@ -22,6 +22,14 @@ Privacy contract — audit entries **never** contain: statement / observations /
 record text / veteran or witness names / file content. Only counts,
 classifications and source labels are recorded.
 
+One field sits outside that guarantee and is called out deliberately:
+``error_message`` is arbitrary ``str(exc)`` from an upstream library, and a
+library can put anything in an exception message. It is scrubbed of
+PII-shaped tokens and whitespace-collapsed, and it can be omitted entirely with
+``VA_LSE_AUDIT_ERROR_MESSAGES=0`` — which is what a deployment shipping audit
+logs to third-party storage should do (see DEPLOYMENT.md → Audit log backup).
+``error_class`` is always recorded and is always safe.
+
 Configuration via env (see ``.env.example``):
 
 * ``VA_LSE_AUDIT_LOG_DIR``       — directory for ``audit.log`` (default ``logs``,
@@ -42,7 +50,9 @@ import json
 import logging
 import logging.handlers
 import os
+import re
 import sys
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -56,6 +66,41 @@ _CONFIGURED_KEY = "_va_lse_audit_configured"
 
 # Fallback in-memory session id when Streamlit is unavailable (tests / CLI).
 _process_session_id: str | None = None
+
+# ---------------------------------------------------------------------------
+# Write-failure visibility.
+#
+# ``logging`` swallows handler-level exceptions (``Handler.handleError`` prints
+# to stderr at most, and only when ``raiseExceptions`` is on), and every call
+# here is wrapped in a blanket ``except``. So when the log volume filled, the app
+# kept serving and *silently stopped auditing* — the worst possible outcome for a
+# compliance stream. Counting handler failures turns that into something
+# ``/health`` can report.
+# ---------------------------------------------------------------------------
+_write_lock = threading.Lock()
+_write_failures = 0
+_last_write_error = ""
+
+# PII-shaped tokens that can turn up inside an arbitrary exception message.
+_SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
+_LONG_DIGITS_RE = re.compile(r"\b\d{7,}\b")
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
+_NEWLINE_RE = re.compile(r"\s+")
+
+
+def _note_write_failure(exc: BaseException) -> None:
+    global _write_failures, _last_write_error  # noqa: PLW0603
+    with _write_lock:
+        _write_failures += 1
+        _last_write_error = f"{type(exc).__name__}: {exc}"[:300]
+
+
+def _scrub_error_message(text: str) -> str:
+    """Collapse whitespace and redact PII-shaped tokens from free-text errors."""
+    scrubbed = _NEWLINE_RE.sub(" ", text or "").strip()
+    for pattern in (_SSN_RE, _EMAIL_RE, _LONG_DIGITS_RE):
+        scrubbed = pattern.sub("[redacted]", scrubbed)
+    return _safe_truncate(scrubbed, 300)
 
 Action = Literal["evaluate", "draft"]
 Status = Literal["start", "ok", "error"]
@@ -140,6 +185,20 @@ def configure_audit_logging(
         raw_backups = backups
 
     # JSON formatter — single line per audit entry, no diagnostic extras.
+    class _FailureCountingHandler(logging.Handler):
+        """Mixin that records handler-level failures (full disk, read-only mount)."""
+
+        def handleError(self, record: logging.LogRecord) -> None:  # noqa: N802 - logging API
+            exc = sys.exc_info()[1]
+            _note_write_failure(exc if exc is not None else RuntimeError("unknown logging failure"))
+            super().handleError(record)
+
+    class _CountingRotatingFileHandler(_FailureCountingHandler, logging.handlers.RotatingFileHandler):
+        pass
+
+    class _CountingStreamHandler(_FailureCountingHandler, logging.StreamHandler):
+        pass
+
     class _AuditJsonFormatter(logging.Formatter):
         def format(self, record: logging.LogRecord) -> str:  # noqa: A003
             # Prefer a pre-serialized ``audit_payload`` when set; else fall back
@@ -158,7 +217,7 @@ def configure_audit_logging(
 
     # Stdout handler — always present (separate from ``app`` stdout so a log
     # aggregator can filter on logger name ``audit``).
-    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler = _CountingStreamHandler(sys.stdout)
     stream_handler.setFormatter(formatter)
     stream_handler.setLevel(logging.INFO)
     # Mark so we can cleanly replace on reconfigure.
@@ -171,7 +230,7 @@ def configure_audit_logging(
             log_path = Path(raw_dir).expanduser().resolve()
             log_path.mkdir(parents=True, exist_ok=True)
             file_path = log_path / raw_file
-            file_handler = logging.handlers.RotatingFileHandler(
+            file_handler = _CountingRotatingFileHandler(
                 str(file_path), maxBytes=raw_max, backupCount=raw_backups, encoding="utf-8"
             )
             file_handler.setFormatter(formatter)
@@ -243,12 +302,52 @@ def get_audit_session_id() -> str:
     return _process_session_id
 
 
+def audit_health() -> dict[str, Any]:
+    """Health payload for ``GET /health`` — is the audit stream actually writing?
+
+    ``write_failures`` is the number of failed handler emits in this process. A
+    non-zero value means audit records were lost; the usual cause is a full or
+    read-only log volume, and it is reported rather than raised because the app
+    is designed to keep serving when audit logging breaks.
+    """
+    with _write_lock:
+        failures = _write_failures
+        last_error = _last_write_error
+    payload: dict[str, Any] = {
+        "configured": _CONFIGURED,
+        "dir": os.getenv("VA_LSE_AUDIT_LOG_DIR", "").strip()
+        or os.getenv("VA_LSE_LOG_DIR", "").strip()
+        or "logs",
+        "file": _env_str("VA_LSE_AUDIT_LOG_FILE", "audit.log"),
+        "max_bytes": _config.AUDIT_LOG_MAX_BYTES,
+        "backups": _config.AUDIT_LOG_BACKUPS,
+        "retention_days": _config.AUDIT_RETENTION_DAYS,
+        "error_messages_enabled": _config.AUDIT_ERROR_MESSAGES,
+        "write_failures": failures,
+        "last_write_error": last_error or None,
+    }
+    if not _CONFIGURED:
+        payload["status"] = "not_configured"
+    elif failures:
+        payload["status"] = "degraded"
+        payload["reason"] = (
+            f"{failures} audit write(s) failed; records were lost. "
+            "Check free space and permissions on the audit log directory."
+        )
+    else:
+        payload["status"] = "ok"
+    return payload
+
+
 def _reset_for_tests() -> None:
-    """Reset process-global session id (tests only)."""
-    global _process_session_id, _CONFIGURED  # noqa: PLW0603
+    """Reset process-global session id and write counters (tests only)."""
+    global _process_session_id, _CONFIGURED, _write_failures, _last_write_error  # noqa: PLW0603
 
     _process_session_id = None
     _CONFIGURED = False
+    with _write_lock:
+        _write_failures = 0
+        _last_write_error = ""
     # Remove handlers so tmp-path tests do not leak.
     audit_logger = logging.getLogger(_AUDIT_LOGGER_NAME)
     for h in list(audit_logger.handlers):
@@ -277,12 +376,19 @@ def audit_event(
     outcome: dict[str, Any] | None = None,
     error_class: str | None = None,
     error_message: str | None = None,
+    llm_endpoints: list[str] | None = None,
 ) -> None:
     """Emit one audit log entry (best-effort, never raises).
 
     Only metadata and classifications are recorded — no statement text,
     observations, or record content. ``condition`` is truncated to 120 chars;
     ``error_message`` to 300 chars.
+
+    ``llm_endpoints`` names the endpoints that served the run (``primary`` when a
+    single endpoint was used). It is here because a failover silently changes
+    which model wrote the document: this is a legal work product, and "the backup
+    provider generated this one" belongs in the audit record next to the rest of
+    the run's metadata, not only in a log line.
     """
     try:
         audit_logger = get_audit_logger()
@@ -315,6 +421,14 @@ def audit_event(
             payload["record_pages"] = int(record_pages)
         if duration_ms is not None:
             payload["duration_ms"] = int(duration_ms)
+        if llm_endpoints:
+            # Bounded and truncated like every other field here: these come from
+            # the caller, and an audit record must not grow without limit.
+            safe_endpoints = [
+                _safe_truncate(str(name), 32) for name in llm_endpoints[:4] if str(name).strip()
+            ]
+            if safe_endpoints:
+                payload["llm_endpoints"] = safe_endpoints
         if outcome is not None and isinstance(outcome, dict) and outcome:
             # Shallow-copy and ensure JSON-serializable primitives only.
             safe_outcome: dict[str, Any] = {}
@@ -332,8 +446,10 @@ def audit_event(
             payload["outcome"] = safe_outcome
         if error_class:
             payload["error_class"] = _safe_truncate(error_class, 80)
-        if error_message:
-            payload["error_message"] = _safe_truncate(error_message, 300)
+        # Free-text upstream error text is the one field outside the module's
+        # "counts and classifications only" contract; see the module docstring.
+        if error_message and _config.AUDIT_ERROR_MESSAGES:
+            payload["error_message"] = _scrub_error_message(error_message)
 
         # Emit as structured JSON — the formatter serializes ``audit_payload``.
         audit_logger.info("", extra={"audit_payload": payload})
@@ -372,6 +488,7 @@ def audit_evaluate_ok(
     record_pages: int | None = None,
     outcome: dict[str, Any] | None = None,
     user_session_id: str | None = None,
+    llm_endpoints: list[str] | None = None,
 ) -> None:
     audit_event(
         "evaluate",
@@ -384,6 +501,7 @@ def audit_evaluate_ok(
         record_pages=record_pages,
         duration_ms=duration_ms,
         outcome=outcome,
+        llm_endpoints=llm_endpoints,
     )
 
 
@@ -444,6 +562,7 @@ def audit_draft_ok(
     record_pages: int | None = None,
     outcome: dict[str, Any] | None = None,
     user_session_id: str | None = None,
+    llm_endpoints: list[str] | None = None,
 ) -> None:
     audit_event(
         "draft",
@@ -456,6 +575,7 @@ def audit_draft_ok(
         record_pages=record_pages,
         duration_ms=duration_ms,
         outcome=outcome,
+        llm_endpoints=llm_endpoints,
     )
 
 

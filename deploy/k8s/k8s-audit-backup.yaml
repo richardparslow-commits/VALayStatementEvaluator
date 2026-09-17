@@ -1,0 +1,122 @@
+# k8s-audit-backup.yaml — CronJob that ships the audit log off-pod
+#
+# Runs scripts/backup_audit_logs.py in its own pod against the shared log volume.
+# A CronJob is preferred over a sidecar here:
+#
+#   * a sidecar shares its pod's lifecycle, so it dies with the pod whose logs it
+#     is supposed to rescue, and it cannot run while the pod is evicted or during
+#     a rolling update;
+#   * a CronJob's failures are visible (`kubectl get jobs`), which is the whole
+#     point of having a backup;
+#   * it needs no extra memory in the web pod.
+#
+# Apply order:
+#
+#   kubectl apply -f k8s-logs.yaml            # the RWX PVC — required first
+#   kubectl apply -f k8s-audit-backup.yaml
+#
+# Then confirm it actually works (do this, do not assume):
+#
+#   kubectl create job --from=cronjob/va-lse-audit-backup audit-backup-manual -n va-lse
+#   kubectl logs -n va-lse job/audit-backup-manual
+#   # and check the web tier sees it:
+#   kubectl exec -n va-lse deploy/va-lse -- python -c \
+#     "import json,urllib.request;print(urllib.request.urlopen('http://127.0.0.1:8001/health').read().decode())"
+#
+# Credentials: prefer workload identity (AWS IRSA, GCP Workload Identity, Azure
+# Workload Identity) over static keys. If you must use keys, put them in a secret
+# and reference it below — never in this file:
+#
+#   kubectl create secret generic va-lse-backup-creds -n va-lse \
+#     --from-literal=AWS_ACCESS_KEY_ID=... \
+#     --from-literal=AWS_SECRET_ACCESS_KEY=...
+#
+# The image needs the destination SDK: build it from requirements-backup.txt, or
+# set VA_LSE_AUDIT_BACKUP_DESTINATION=filesystem to write to a second mount.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: va-lse-audit-backup
+  namespace: va-lse
+  labels:
+    app.kubernetes.io/name: va-lse-audit-backup
+    app.kubernetes.io/part-of: va-lay-statement-evaluator
+spec:
+  # Every 6 hours, matching VA_LSE_AUDIT_BACKUP_INTERVAL_HOURS. The schedule is
+  # what bounds the exposure window: whatever the live audit.log has gained since
+  # the last pass is what a pod death would lose. At this app's audit volume
+  # (a handful of lines per run) that is a handful of records, not days of them.
+  schedule: "0 */6 * * *"
+  # Never overlap passes: two processes sharing one watermark is a state-file race
+  # (the code also takes a lock, but not scheduling the collision is better).
+  concurrencyPolicy: Forbid
+  # If a pass has not started within 10 minutes of its slot, skip it rather than
+  # pile up. Combined with Forbid this keeps a stuck run from blocking the schedule.
+  startingDeadlineSeconds: 600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # A hung upload must not hold the lock until the next slot.
+      activeDeadlineSeconds: 900
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            app: va-lse-audit-backup
+        spec:
+          restartPolicy: OnFailure
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534           # nobody — must be able to read /app/logs
+            runAsGroup: 65534
+            fsGroup: 65534             # makes a CSI volume writable by 65534
+          containers:
+            - name: audit-backup
+              image: va-lse:latest
+              imagePullPolicy: IfNotPresent
+              command:
+                - python
+                - scripts/backup_audit_logs.py
+                - --once
+                - --prune                      # enforce cloud retention too
+                - --require-destination        # fail loudly if unconfigured
+              envFrom:
+                - secretRef:
+                    name: va-lse-env           # carries the destination + creds
+              env:
+                - name: VA_LSE_AUDIT_LOG_DIR
+                  value: "/app/logs"
+                - name: VA_LSE_LOG_DIR
+                  value: "/app/logs"
+                # Set these (or in the secret) for this job specifically. Example:
+                #   VA_LSE_AUDIT_BACKUP_DESTINATION=s3
+                #   VA_LSE_AUDIT_BACKUP_S3_BUCKET=my-audit-bucket
+                #   VA_LSE_AUDIT_BACKUP_S3_PREFIX=va-lse
+                #   AWS_REGION=us-east-1
+                - name: VA_LSE_AUDIT_BACKUP_REQUIRED
+                  value: "1"
+              resources:
+                requests:
+                  cpu: "50m"
+                  memory: "128Mi"
+                limits:
+                  cpu: "500m"
+                  memory: "512Mi"
+              securityContext:
+                readOnlyRootFilesystem: true
+                allowPrivilegeEscalation: false
+              volumeMounts:
+                - name: app-logs
+                  mountPath: /app/logs
+                # A backup that cannot write its state file still ships objects
+                # (keys are content-addressed, so a re-upload overwrites rather
+                # than duplicates) — but it re-uploads, so give it scratch space.
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: app-logs
+              persistentVolumeClaim:
+                claimName: va-lse-logs     # RWX — see k8s-logs.yaml
+            - name: tmp
+              emptyDir: {}

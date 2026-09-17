@@ -10,6 +10,7 @@ from __future__ import annotations
 import sys
 import types
 import unittest
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -1138,6 +1139,569 @@ class TestSidebarSettingsGuards(unittest.TestCase):
         with _patch_st(sidebar, st_mock):
             sidebar._secrets_source_note(self._settings())
         st_mock.caption.assert_not_called()
+
+
+class _FakeBlobStore:
+    """Minimal blob-store stand-in for the sidebar panel (name + is_shared)."""
+
+    def __init__(self, name: str = "filesystem", is_shared: bool = True) -> None:
+        self.name = name
+        self.is_shared = is_shared
+
+
+def _backup_health(**overrides) -> dict:  # noqa: ANN003 - test payload builder
+    """An ``audit_backup_health()`` payload, healthy unless overridden."""
+    payload = {
+        "configured": True,
+        "destination": "s3",
+        "off_pod": True,
+        "interval_hours": 6.0,
+        "local_retention_days": 7,
+        "cloud_retention_days": 90,
+        "uploaded_objects": 4,
+        "uploaded_bytes": 4096,
+        "runs": 5,
+        "last_success_utc": "2026-09-16T12:00:00+00:00",
+        "last_error": None,
+        "pending_bytes": 0,
+        "age_seconds": 600,
+        "stale": False,
+        "status": "ok",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _disk_status(**overrides) -> dict:  # noqa: ANN003 - test payload builder
+    """A ``disk_status()`` payload, comfortably above the floor by default."""
+    payload = {
+        "checked": True,
+        "path": "/app/logs",
+        "free_bytes": 10 * 1024**3,
+        "total_bytes": 40 * 1024**3,
+        "used_percent": 75.0,
+        "min_free_bytes": 256 * 1024**2,
+        "below_floor": False,
+    }
+    payload.update(overrides)
+    return payload
+
+
+class TestJobQueuePanel(unittest.TestCase):
+    """Sidebar ops panel: tells the truth about where runs execute.
+
+    The panel renders on every sidebar paint, so these tests also pin the rule
+    that rendering performs no queue I/O — the backlog is fetched only when the
+    operator asks, because the Upstash tier's ``depth()`` is two HTTP requests.
+    """
+
+    class _Queue:
+        def __init__(
+            self,
+            *,
+            name: str = "redis",
+            distributed: bool = True,
+            depth: int = 0,
+            reachable: bool = True,
+            boom: bool = False,
+        ) -> None:
+            self.name = name
+            self.is_distributed = distributed
+            self._depth = depth
+            self._reachable = reachable
+            self._boom = boom
+            self.probes = 0
+
+        def depth(self) -> int:
+            self.probes += 1
+            if self._boom:
+                raise RuntimeError("connection refused")
+            return self._depth
+
+        def ping(self) -> bool:
+            if self._boom:
+                raise RuntimeError("connection refused")
+            return self._reachable
+
+    @contextmanager
+    def _panel(
+        self,
+        st_mock: MagicMock,
+        *,
+        enabled: bool = True,
+        queue=None,  # noqa: ANN001 - _Queue or a raising side effect
+        blob=None,  # noqa: ANN001 - _FakeBlobStore or a raising side effect
+    ):
+        import app.blob_store as blob_store
+        import app.job_queue as job_queue
+        import app.views.sidebar as sidebar
+
+        queue = queue if queue is not None else self._Queue()
+        blob = blob if blob is not None else _FakeBlobStore()
+        backend_patch = (
+            patch.object(job_queue, "get_job_backend", side_effect=queue)
+            if isinstance(queue, BaseException)
+            else patch.object(job_queue, "get_job_backend", return_value=queue)
+        )
+        blob_patch = (
+            patch.object(blob_store, "get_blob_store", side_effect=blob)
+            if isinstance(blob, BaseException)
+            else patch.object(blob_store, "get_blob_store", return_value=blob)
+        )
+        with ExitStack() as stack:
+            stack.enter_context(_patch_st(sidebar, st_mock))
+            stack.enter_context(
+                patch.object(sidebar.config, "JOB_QUEUE_ENABLED", enabled, create=True)
+            )
+            stack.enter_context(backend_patch)
+            stack.enter_context(blob_patch)
+            yield queue
+
+    @staticmethod
+    def _rows(st_mock: MagicMock) -> dict:
+        rows = st_mock.dataframe.call_args[0][0]
+        return {row["Setting"]: row["Value"] for row in rows}
+
+    def test_disabled_explains_in_process_execution(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        with self._panel(st_mock, enabled=False) as queue:
+            sidebar._job_queue_panel()
+        self.assertGreaterEqual(st_mock.caption.call_count, 2)
+        self.assertIn("worker pool", str(st_mock.caption.call_args_list[-1][0][0]))
+        st_mock.dataframe.assert_not_called()
+
+    def test_disabled_does_not_touch_the_queue(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        with self._panel(st_mock, enabled=False) as queue:
+            sidebar._job_queue_panel()
+        self.assertEqual(queue.probes, 0)
+        st_mock.warning.assert_not_called()
+        st_mock.error.assert_not_called()
+
+    def test_enabled_names_backend_and_shared_blob_store(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        st_mock.button.return_value = False
+        with self._panel(st_mock) as queue:
+            sidebar._job_queue_panel()
+        self.assertIn(queue.name, str(st_mock.caption.call_args_list[0][0][0]))
+        rows = self._rows(st_mock)
+        self.assertEqual(rows["Backend"], "redis")
+        self.assertEqual(rows["Distributed"], "yes")
+        self.assertEqual(rows["Job documents"], "filesystem (shared)")
+        st_mock.warning.assert_not_called()
+
+    def test_local_only_blob_store_is_not_called_shared(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        st_mock.button.return_value = False
+        with self._panel(st_mock, blob=_FakeBlobStore(name="s3", is_shared=False)):
+            sidebar._job_queue_panel()
+        self.assertEqual(self._rows(st_mock)["Job documents"], "s3")
+
+    def test_single_process_backend_warns_workers_cannot_claim(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        st_mock.button.return_value = False
+        with self._panel(st_mock, queue=self._Queue(name="inprocess", distributed=False)):
+            sidebar._job_queue_panel()
+        st_mock.warning.assert_called_once()
+        msg = str(st_mock.warning.call_args[0][0])
+        self.assertIn("inprocess", msg)
+        self.assertIn("VA_LSE_REDIS_URL", msg)
+        self.assertEqual(self._rows(st_mock)["Distributed"], "no")
+
+    def test_backend_failure_is_reported_not_raised(self) -> None:
+        import app.views.sidebar as sidebar
+        from app.job_queue import JobQueueUnavailable
+
+        st_mock, _ = _fake_streamlit()
+        with self._panel(st_mock, queue=JobQueueUnavailable("redis package missing")):
+            sidebar._job_queue_panel()
+        st_mock.error.assert_called_once()
+        msg = str(st_mock.error.call_args[0][0])
+        self.assertIn("Job queue unavailable", msg)
+        self.assertIn("redis package missing", msg)
+        st_mock.dataframe.assert_not_called()
+
+    def test_blob_failure_degrades_the_row(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        st_mock.button.return_value = False
+        with self._panel(st_mock, blob=RuntimeError("no boto3")):
+            sidebar._job_queue_panel()
+        self.assertEqual(self._rows(st_mock)["Job documents"], "unavailable")
+
+    def test_render_does_not_probe_the_queue(self) -> None:
+        """Every sidebar paint must stay offline; the probe is button-driven."""
+        import app.views.sidebar as sidebar
+
+        st_mock, session = _fake_streamlit()
+        st_mock.button.return_value = False
+        with self._panel(st_mock, queue=self._Queue(depth=7)) as queue:
+            sidebar._job_queue_panel()
+        self.assertEqual(queue.probes, 0)
+        self.assertNotIn("job_queue_probe_at", session)
+        st_mock.info.assert_not_called()
+
+    def test_backlog_probe_reports_waiting_jobs(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, session = _fake_streamlit()
+        st_mock.button.return_value = True
+        with self._panel(st_mock, queue=self._Queue(depth=3)) as queue:
+            sidebar._job_queue_panel()
+        self.assertEqual(queue.probes, 1)
+        self.assertEqual(session["job_queue_depth"], 3)
+        self.assertTrue(session["job_queue_reachable"])
+        st_mock.info.assert_called_once()
+        self.assertIn("3 job(s)", str(st_mock.info.call_args[0][0]))
+
+    def test_backlog_probe_reports_empty_queue(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        st_mock.button.return_value = True
+        with self._panel(st_mock, queue=self._Queue(depth=0)):
+            sidebar._job_queue_panel()
+        st_mock.info.assert_not_called()
+        self.assertIn("No jobs waiting", str(st_mock.caption.call_args_list[-2][0][0]))
+
+    def test_backlog_probe_flags_unreachable_queue(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, session = _fake_streamlit()
+        st_mock.button.return_value = True
+        with self._panel(st_mock, queue=self._Queue(reachable=False)):
+            sidebar._job_queue_panel()
+        self.assertFalse(session["job_queue_reachable"])
+        self.assertIn("unreachable", str(st_mock.error.call_args[0][0]))
+
+    def test_backlog_probe_failure_is_reported(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, session = _fake_streamlit()
+        st_mock.button.return_value = True
+        with self._panel(st_mock, queue=self._Queue(boom=True)):
+            sidebar._job_queue_panel()
+        self.assertIsNone(session["job_queue_depth"])
+        self.assertFalse(session["job_queue_reachable"])
+        self.assertIn("Queue probe failed", str(st_mock.error.call_args[0][0]))
+        self.assertIn("connection refused", str(st_mock.error.call_args[0][0]))
+
+
+class TestAuditBackupPanel(unittest.TestCase):
+    """Sidebar compliance panel: is the audit log backed up, and is it surviving?
+
+    The panel renders on every sidebar paint, so these tests also pin the rule that
+    it performs no network I/O — everything it shows comes from the state file the
+    backup process writes plus one ``statvfs``.
+    """
+
+    @contextmanager
+    def _panel(self, st_mock: MagicMock, *, health=None, disk=None):  # noqa: ANN001
+        """Patch the two functions the panel reads; capture what it renders."""
+        import app.audit_backup as audit_backup
+        import app.views.sidebar as sidebar
+
+        health = health if health is not None else _backup_health()
+        disk = disk if disk is not None else _disk_status()
+        health_patch = (
+            patch.object(audit_backup, "audit_backup_health", side_effect=health)
+            if isinstance(health, BaseException)
+            else patch.object(audit_backup, "audit_backup_health", return_value=health)
+        )
+        disk_patch = (
+            patch.object(audit_backup, "disk_status", side_effect=disk)
+            if isinstance(disk, BaseException)
+            else patch.object(audit_backup, "disk_status", return_value=disk)
+        )
+        with ExitStack() as stack:
+            stack.enter_context(_patch_st(sidebar, st_mock))
+            stack.enter_context(health_patch)
+            stack.enter_context(disk_patch)
+            yield
+
+    @staticmethod
+    def _rows(st_mock: MagicMock) -> dict:
+        rows = st_mock.dataframe.call_args[0][0]
+        return {row["Setting"]: row["Value"] for row in rows}
+
+    def test_unconfigured_warns_the_record_lives_only_here(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        with self._panel(st_mock, health=_backup_health(configured=False, status="disabled",
+                                                        destination="none")):
+            sidebar._audit_backup_panel()
+        msg = str(st_mock.warning.call_args[0][0])
+        self.assertIn("only on this volume", msg)
+        self.assertEqual(self._rows(st_mock)["Status"], "disabled")
+
+    def test_same_volume_destination_is_called_out(self) -> None:
+        """A 'backup' on the volume it should survive is the dangerous config."""
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        with self._panel(st_mock, health=_backup_health(off_pod=False)):
+            sidebar._audit_backup_panel()
+        self.assertIn("does **not** survive", str(st_mock.warning.call_args[0][0]))
+
+    def test_stale_backup_warns(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        stale = _backup_health(status="stale", reason="last successful backup was 72h ago")
+        with self._panel(st_mock, health=stale):
+            sidebar._audit_backup_panel()
+        self.assertIn("Backups have stopped", str(st_mock.warning.call_args[0][0]))
+
+    def test_failed_pass_shows_the_error_not_a_stale_timestamp(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        failed = _backup_health(status="error", reason="AccessDenied")
+        with self._panel(st_mock, health=failed):
+            sidebar._audit_backup_panel()
+        self.assertIn("AccessDenied", str(st_mock.error.call_args[0][0]))
+
+    def test_never_ran_warns_about_a_dead_cronjob(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        with self._panel(st_mock, health=_backup_health(status="never_ran")):
+            sidebar._audit_backup_panel()
+        self.assertIn("CronJob or sidecar", str(st_mock.warning.call_args[0][0]))
+
+    def test_healthy_backup_reports_age_and_pending_bytes(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        healthy = _backup_health(age_seconds=1800, pending_bytes=2048)
+        with self._panel(st_mock, health=healthy):
+            sidebar._audit_backup_panel()
+        st_mock.success.assert_called_once()
+        self.assertIn("0.5h ago", str(st_mock.success.call_args[0][0]))
+        self.assertIn("2 KB would be lost", self._rows(st_mock)["Not yet shipped"])
+
+    def test_disk_below_floor_is_an_error(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        low = _disk_status(free_bytes=1024, below_floor=True)
+        with self._panel(st_mock, disk=low):
+            sidebar._audit_backup_panel()
+        self.assertIn("VA_LSE_DISK_MIN_FREE_BYTES", str(st_mock.error.call_args[0][0]))
+
+    def test_retention_and_volume_are_visible(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        with self._panel(st_mock):
+            sidebar._audit_backup_panel()
+        rows = self._rows(st_mock)
+        self.assertEqual(rows["Retention"], "7d local / 90d cloud")
+        self.assertIn("GB", rows["Log volume free"])
+
+    def test_a_failing_health_call_is_reported_not_raised(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        with self._panel(st_mock, health=RuntimeError("state file unreadable")):
+            sidebar._audit_backup_panel()
+        st_mock.error.assert_called_once()
+        self.assertIn("state file unreadable", str(st_mock.error.call_args[0][0]))
+        st_mock.dataframe.assert_not_called()
+
+    def test_panel_does_not_build_a_destination_client(self) -> None:
+        """Rendering must not construct an S3/GCS client (no I/O, no credentials)."""
+        import app.audit_backup as audit_backup
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        with self._panel(st_mock):
+            with patch.object(audit_backup, "build_destination") as builder:
+                sidebar._audit_backup_panel()
+        builder.assert_not_called()
+
+
+def _failover_status(**overrides):  # noqa: ANN003 - test payload builder
+    base = {
+        "configured": False,
+        "active": False,
+        "after_seconds": 300.0,
+        "primary_unhealthy_seconds": None,
+    }
+    base.update(overrides)
+    return base
+
+
+class TestLlmFailoverPanel(unittest.TestCase):
+    """Sidebar failover panel: which endpoint is serving, and what happens next.
+
+    The countdown is the reason this panel exists. A failing primary inside the
+    grace period produces fast-fail errors *by design*, and without a visible wait
+    a user cannot tell a two-minute provider hiccup from a broken key.
+    """
+
+    @contextmanager
+    def _panel(self, st_mock: MagicMock, status):  # noqa: ANN001
+        import app.llm as llm_module
+        import app.views.sidebar as sidebar
+
+        status_patch = (
+            patch.object(llm_module, "failover_status", side_effect=status)
+            if isinstance(status, BaseException)
+            else patch.object(llm_module, "failover_status", return_value=status)
+        )
+        with ExitStack() as stack:
+            stack.enter_context(_patch_st(sidebar, st_mock))
+            stack.enter_context(status_patch)
+            yield
+
+    @staticmethod
+    def _rows(st_mock: MagicMock) -> dict:
+        rows = st_mock.dataframe.call_args[0][0]
+        return {row["Setting"]: row["Value"] for row in rows}
+
+    def test_a_single_endpoint_deployment_explains_how_to_arm_one(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        with self._panel(st_mock, _failover_status()):
+            sidebar._llm_failover_panel()
+        caption = " ".join(str(c[0][0]) for c in st_mock.caption.call_args_list)
+        self.assertIn("single endpoint", caption)
+        self.assertIn("OPENAI_BASE_URL_FALLBACK", caption)
+        self.assertEqual(self._rows(st_mock)["Backup configured"], "no")
+        st_mock.warning.assert_not_called()
+
+    def test_an_armed_but_unused_backup_reports_healthy(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        status = _failover_status(configured=True, primary_unhealthy_seconds=None)
+        with self._panel(st_mock, status):
+            sidebar._llm_failover_panel()
+        st_mock.success.assert_called_once()
+        rows = self._rows(st_mock)
+        self.assertEqual(rows["Backup configured"], "yes")
+        self.assertEqual(rows["Serving from backup"], "no")
+        self.assertEqual(rows["Primary unhealthy for"], "healthy")
+
+    def test_a_zero_unhealthy_time_reads_as_zero_not_healthy(self) -> None:
+        """0.0 means "the clock just started" — which is not the same as healthy."""
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        status = _failover_status(configured=True, primary_unhealthy_seconds=0.0)
+        with self._panel(st_mock, status):
+            sidebar._llm_failover_panel()
+        self.assertEqual(self._rows(st_mock)["Primary unhealthy for"], "0s")
+
+    def test_being_served_by_the_backup_is_stated_plainly(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        status = _failover_status(configured=True, active=True, primary_unhealthy_seconds=900.0)
+        with self._panel(st_mock, status):
+            sidebar._llm_failover_panel()
+        message = str(st_mock.warning.call_args[0][0])
+        self.assertIn("backup endpoint", message)
+        self.assertIn("llm_endpoints", message, "the stamp is how it is recovered later")
+        self.assertEqual(self._rows(st_mock)["Serving from backup"], "yes")
+
+    def test_the_grace_window_shows_a_countdown(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        status = _failover_status(configured=True, primary_unhealthy_seconds=120.0)
+        with self._panel(st_mock, status):
+            sidebar._llm_failover_panel()
+        message = str(st_mock.warning.call_args[0][0])
+        self.assertIn("about 180s", message, "300s threshold - 120s unhealthy")
+        self.assertIn("120s", message)
+
+    def test_the_countdown_window_names_the_escape_hatch(self) -> None:
+        """The one setting that removes the wait must be where the wait is felt."""
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        status = _failover_status(configured=True, primary_unhealthy_seconds=120.0)
+        with self._panel(st_mock, status):
+            sidebar._llm_failover_panel()
+        caption = " ".join(str(c[0][0]) for c in st_mock.caption.call_args_list)
+        self.assertIn("LLM_ENDPOINT_FALLBACK_TIMEOUT_SECONDS=0", caption)
+
+    def test_the_countdown_does_not_claim_every_call_is_failing(self) -> None:
+        """The breaker still lets a retry through each recovery window, and a
+        successful retry ends this state — saying otherwise sends an operator
+        hunting for a problem that does not exist."""
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        status = _failover_status(configured=True, primary_unhealthy_seconds=120.0)
+        with self._panel(st_mock, status):
+            sidebar._llm_failover_panel()
+        message = str(st_mock.warning.call_args[0][0])
+        self.assertIn("re-tried every", message)
+
+    def test_the_breaker_state_is_reported(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        status = _failover_status(configured=True, primary_unhealthy_seconds=5.0)
+        with self._panel(st_mock, status):
+            sidebar._llm_failover_panel()
+        self.assertIn(self._rows(st_mock)["Primary breaker"], {"CLOSED", "OPEN", "HALF_OPEN"})
+
+    def test_an_unknown_threshold_does_not_render_a_bogus_countdown(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        status = _failover_status(configured=True, after_seconds=None, primary_unhealthy_seconds=None)
+        with self._panel(st_mock, status):
+            sidebar._llm_failover_panel()
+        self.assertEqual(self._rows(st_mock)["Failover after"], "unknown")
+
+    def test_a_failing_status_call_is_reported_not_raised(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        with self._panel(st_mock, RuntimeError("breaker unavailable")):
+            sidebar._llm_failover_panel()
+        st_mock.error.assert_called_once()
+        self.assertIn("breaker unavailable", str(st_mock.error.call_args[0][0]))
+        st_mock.dataframe.assert_not_called()
+
+    def test_rendering_never_constructs_an_llm_client(self) -> None:
+        """The sidebar paints on every rerun, so this must stay off the network."""
+        import app.llm as llm_module
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        with self._panel(st_mock, _failover_status(configured=True)):
+            with patch.object(llm_module, "LLMClient") as client:
+                sidebar._llm_failover_panel()
+        client.assert_not_called()
+
+    def test_the_panel_says_why_the_backup_is_not_a_sidebar_setting(self) -> None:
+        """Otherwise "why can't I set this here?" has no answer in the UI."""
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        with self._panel(st_mock, _failover_status(configured=True)):
+            sidebar._llm_failover_panel()
+        caption = " ".join(str(c[0][0]) for c in st_mock.caption.call_args_list)
+        self.assertIn("worker", caption)
 
 
 # ------------------------------------------------ effectiveness score (F4.S2)

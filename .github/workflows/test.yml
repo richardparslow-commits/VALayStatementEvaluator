@@ -53,11 +53,70 @@ jobs:
           python -m pip install --upgrade pip
           pip install --require-hashes -r requirements.lock
 
+      # The runtime lock deliberately omits the optional SDKs the suite asserts
+      # against (requirements-otel.txt / requirements-backup.txt are opt-in), and
+      # the tests exercising them fail rather than skip when the package is
+      # absent — so without this the tracing tests only ever assert the
+      # "SDK not installed" branch. Installing after the lock adds only what the
+      # lock is missing; the lock still pins the runtime itself.
+      - name: Install test extras
+        run: pip install -r requirements-dev.txt
+
       - name: Run offline unit tests
         run: python -m unittest discover -s tests -v
 
       - name: Run 2,000-page scale simulation (no API calls)
         run: python scripts/scale_sim.py
+
+  # The rest of the suite fakes the queue transport, which cannot catch a
+  # redis-py API mismatch (a renamed method or changed kwarg would pass the fakes
+  # and fail in production). This job runs the queue against a real server.
+  # tests/test_job_queue_redis_live.py skips itself when the URL is unset, so
+  # local runs without Redis stay green.
+  queue-integration:
+    name: Job queue against real Redis
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    env:
+      VA_LSE_TEST_REDIS_URL: redis://localhost:6379/0
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements.lock
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --require-hashes -r requirements.lock
+
+      - name: Job queue integration tests (real Redis)
+        run: python -m unittest tests.test_job_queue_redis_live -v
+
+      - name: Worker CLI smoke check against the queue
+        env:
+          VA_LSE_JOB_QUEUE: "1"
+          VA_LSE_REDIS_URL: redis://localhost:6379/0
+          VA_LSE_BLOB_DIR: /tmp/va-lse-blobs
+        run: |
+          # No workers → nothing to claim; this asserts the CLI wires up the
+          # Redis backend and exits cleanly rather than crashing on startup.
+          python -m app.worker --once
+          python -m app.worker --drain-stale
 
   # Gate for the live job below. A job-level `if` may only use the github, needs,
   # vars and inputs contexts — `secrets` is NOT available there. Reading it in a

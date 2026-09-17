@@ -6,6 +6,7 @@ in place exactly as before — only the rendering moved here.
 """
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import streamlit as st
@@ -102,6 +103,11 @@ def render_sidebar_settings() -> None:
         st.divider()
         _credit_calibration_widget()
         st.divider()
+        _job_queue_panel()
+        st.divider()
+        _audit_backup_panel()
+        _llm_failover_panel()
+        st.divider()
         st.caption(
             "⚠️ Uploaded documents are sent to the configured LLM endpoint for analysis. "
             "Review privacy before uploading sensitive records."
@@ -109,6 +115,331 @@ def render_sidebar_settings() -> None:
         st.caption(
             "This tool is an aid for drafting and reviewing lay statements. It is not "
             "legal, medical, or claims advice."
+        )
+
+
+def _job_queue_panel() -> None:
+    """Read-only view of how runs execute and whether the queue is healthy.
+
+    Deliberately does no I/O on render: this runs on every sidebar paint, and the
+    Upstash tier's ``depth()`` is two HTTP requests, so probing it here would add
+    network latency to every widget interaction. The backlog is fetched only when
+    asked for, and cached with the time it was taken.
+    """
+    from ..blob_store import get_blob_store
+    from ..job_queue import get_job_backend
+
+    with st.expander("🛠️ Job queue — how runs execute", expanded=False):
+        if not config.JOB_QUEUE_ENABLED:
+            st.caption(
+                "Runs execute inside this Streamlit process. For large record sets that "
+                "means the pod serving your browser also carries the digest (a 2,000-page "
+                "bundle peaks near 1.8 GB) and a pod restart loses the run."
+            )
+            st.caption(
+                "Set `VA_LSE_JOB_QUEUE=1` and configure Redis or the shared cache to hand "
+                "runs to a worker pool — see DEPLOYMENT.md → Pattern C."
+            )
+            return
+        try:
+            backend = get_job_backend()
+        except Exception as exc:  # noqa: BLE001 - this panel must never break the app
+            st.error(f"Job queue unavailable: {type(exc).__name__}: {exc}")
+            return
+
+        distributed = backend.is_distributed
+        st.caption(
+            f"Enabled. Runs are submitted to a **{backend.name}** queue for a worker to "
+            "execute."
+        )
+        if not distributed:
+            st.warning(
+                f"The active backend (**{backend.name}**) only works inside one process, so "
+                "a separate worker can never claim these jobs. Set `VA_LSE_REDIS_URL` or "
+                "`VA_LSE_SHARED_CACHE_URL`/`_TOKEN`."
+            )
+
+        try:
+            blob = get_blob_store()
+            blob_label = f"{blob.name} (shared)" if blob.is_shared else blob.name
+        except Exception:  # noqa: BLE001
+            blob_label = "unavailable"
+        st.dataframe(
+            [
+                {"Setting": "Backend", "Value": backend.name},
+                {"Setting": "Distributed", "Value": "yes" if distributed else "no"},
+                {"Setting": "Job documents", "Value": blob_label},
+                {
+                    "Setting": "Inline payload limit",
+                    "Value": f"{config.JOB_QUEUE_INLINE_MAX_BYTES / 1024:.0f} KB",
+                },
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+
+        # Backlog is the one value that needs the queue, so it is on demand.
+        if st.button("Check backlog", key="job_queue_probe"):
+            try:
+                with st.spinner("Asking the queue…"):
+                    st.session_state["job_queue_depth"] = backend.depth()
+                    st.session_state["job_queue_reachable"] = backend.ping()
+                    st.session_state["job_queue_probe_at"] = time.time()
+            except Exception as exc:  # noqa: BLE001
+                st.session_state["job_queue_depth"] = None
+                st.session_state["job_queue_reachable"] = False
+                st.session_state["job_queue_probe_at"] = time.time()
+                st.error(f"Queue probe failed: {type(exc).__name__}: {exc}")
+        depth = st.session_state.get("job_queue_depth")
+        if st.session_state.get("job_queue_probe_at") and depth is not None:
+            # A probe that threw already reported its own cause above; reporting a
+            # backlog we never managed to read would only add a vaguer error.
+            reachable = st.session_state.get("job_queue_reachable")
+            age = time.time() - float(st.session_state["job_queue_probe_at"])
+            if reachable is False:
+                st.error("Queue unreachable — check Redis/Upstash and the worker pods.")
+            elif depth:
+                st.info(f"{depth} job(s) waiting for a worker ({age:.0f}s ago).")
+            else:
+                st.caption(f"No jobs waiting ({age:.0f}s ago).")
+
+        st.caption(
+            "Full status (backend, backlog, reachability) is on `GET /health` → "
+            "`job_queue`. Workers expose the same on their own health port."
+        )
+
+
+def _audit_backup_panel() -> None:
+    """Read-only view of the compliance stream: is it backed up and is it surviving?
+
+    Unlike the job-queue panel this does **not** defer its values behind a button,
+    because nothing here touches the network: ``audit_backup_health`` reads the
+    state file the backup process writes and stats the log files, and
+    ``disk_status`` is one ``statvfs``. Those are the questions an operator has to
+    be able to answer without shelling into a pod — ``last_success`` staleness is
+    the whole difference between "we are backing up" and "we stopped three weeks
+    ago and nobody noticed".
+    """
+    from ..audit_backup import audit_backup_health, disk_status
+
+    with st.expander("🗄️ Audit log backup — retention and off-pod copies", expanded=False):
+        try:
+            payload = audit_backup_health()
+            disk = disk_status()
+        except Exception as exc:  # noqa: BLE001 - the panel must never break the app
+            st.error(f"Audit backup status unavailable: {type(exc).__name__}: {exc}")
+            return
+
+        status = str(payload.get("status") or "unknown")
+        if not payload.get("configured"):
+            st.warning(
+                "No backup destination is configured, so the audit log exists only on "
+                "this volume — a pod restart or volume loss takes the record with it."
+            )
+            st.caption(
+                "Set `VA_LSE_AUDIT_BACKUP_DESTINATION` (filesystem, s3, gcs, or azure) and "
+                "run `scripts/backup_audit_logs.py`. See DEPLOYMENT.md → Audit log "
+                "retention and backup."
+            )
+        elif status == "error":
+            st.error(f"Last backup pass failed: {payload.get('reason') or payload.get('last_error')}")
+        elif status == "never_ran":
+            st.warning(
+                "Configured, but no successful pass has been recorded against this "
+                "volume — check that the CronJob or sidecar is actually running."
+            )
+        elif status == "stale":
+            st.warning(f"Backups have stopped: {payload.get('reason')}")
+        else:
+            age = payload.get("age_seconds")
+            st.success(
+                "Last pass succeeded"
+                + (f" {age / 3600:.1f}h ago." if isinstance(age, int) else ".")
+            )
+
+        # The single most misleading configuration: a "backup" that shares the
+        # volume it is supposed to survive.
+        if payload.get("configured") and payload.get("off_pod") is False:
+            st.warning(
+                "The destination is on this pod's own volume, so it does **not** survive "
+                "the failure a backup exists for. Point it at object storage or a "
+                "separate mount."
+            )
+
+        pending = payload.get("pending_bytes")
+        st.dataframe(
+            [
+                {"Setting": "Status", "Value": status},
+                {
+                    "Setting": "Destination",
+                    "Value": f"{payload.get('destination')}"
+                    + (" (off-pod)" if payload.get("off_pod") else ""),
+                },
+                {
+                    "Setting": "Last success",
+                    "Value": payload.get("last_success_utc") or "never",
+                },
+                {
+                    "Setting": "Not yet shipped",
+                    "Value": (
+                        f"{pending / 1024:.0f} KB would be lost with this pod"
+                        if isinstance(pending, int)
+                        else "unknown"
+                    ),
+                },
+                {
+                    "Setting": "Uploaded",
+                    "Value": f"{payload.get('uploaded_objects', 0)} object(s), "
+                    f"{payload.get('uploaded_bytes', 0) / 1024:.0f} KB",
+                },
+                {
+                    "Setting": "Retention",
+                    "Value": f"{payload.get('local_retention_days')}d local / "
+                    f"{payload.get('cloud_retention_days')}d cloud",
+                },
+                {
+                    "Setting": "Log volume free",
+                    "Value": (
+                        f"{disk['free_bytes'] / 1024 ** 3:.1f} GB "
+                        f"({disk['used_percent']}% used)"
+                        if disk.get("checked")
+                        else "unknown"
+                    ),
+                },
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+
+        if disk.get("checked") and disk.get("below_floor"):
+            st.error(
+                "Free space is below `VA_LSE_DISK_MIN_FREE_BYTES`. Rotation is by count "
+                "and can delete a file that is younger than the retention window — back "
+                "up or prune before records are lost."
+            )
+
+        st.caption(
+            "Full status is on `GET /health` → `audit`, `audit_backup`, `disk`, and as "
+            "Prometheus metrics on `GET /metrics`. Verify or restore the backup with "
+            "`scripts/restore_audit_logs.py`."
+        )
+
+
+def _primary_breaker_state() -> str:
+    """The primary endpoint's circuit-breaker state, or "unavailable".
+
+    Guarded because this panel also renders on the Streamlit-Cloud pattern, where
+    the breaker module may not be importable in the same process as the render.
+    """
+    try:
+        from ..circuit_breaker import get_llm_breaker
+
+        return str(get_llm_breaker().state)
+    except Exception:  # noqa: BLE001 - display only, never raise
+        return "unavailable"
+
+
+def _primary_breaker_recovery_seconds() -> float:
+    """How often a failing primary gets another chance, in seconds."""
+    try:
+        from ..circuit_breaker import get_llm_breaker
+
+        return float(get_llm_breaker().recovery_timeout)
+    except Exception:  # noqa: BLE001 - display only, never raise
+        return 60.0
+
+
+def _llm_failover_panel() -> None:
+    """Show which LLM endpoint is serving this session, and what happens next.
+
+    Network-free, so it is not deferred behind a button: ``failover_status`` reads
+    the environment and the process-wide breaker, and ``circuit_breaker_state`` is
+    the same object the call path consults.
+
+    The countdown is the point of this panel. When the primary is unhealthy but the
+    grace period has not elapsed, calls fail fast *by design* (failover is not
+    rushed for a blip) — and a user staring at an error has no way to tell a
+    two-minute provider hiccup from a broken key. Naming the remaining wait, and
+    the one setting that removes it, is what makes that window legible without
+    changing the behaviour.
+    """
+    from ..llm import failover_status
+
+    with st.expander("🔀 LLM endpoint failover", expanded=False):
+        try:
+            status = failover_status()
+        except Exception as exc:  # noqa: BLE001 - the panel must never break the app
+            st.error(f"Failover status unavailable: {type(exc).__name__}: {exc}")
+            return
+
+        configured = bool(status.get("configured"))
+        active = bool(status.get("active"))
+        threshold = status.get("after_seconds")
+        unhealthy = status.get("primary_unhealthy_seconds")
+
+        if not configured:
+            st.caption(
+                "Running on a **single endpoint**, so an extended outage means waiting "
+                "for it to recover (or pointing the app at another one). Set "
+                "`OPENAI_BASE_URL_FALLBACK` to arm a backup endpoint — see "
+                "DEPLOYMENT.md → LLM endpoint failover."
+            )
+        elif active:
+            st.warning(
+                "Calls are being served by the **backup endpoint** because the primary "
+                "has been failing. Output may differ slightly from a normal run, and "
+                "the audit record for these runs records both endpoints "
+                "(`llm_endpoints`). Traffic returns to the primary automatically."
+            )
+        elif isinstance(unhealthy, (int, float)) and unhealthy > 0:
+            remaining = max(0.0, float(threshold or 0) - float(unhealthy))
+            recovery = _primary_breaker_recovery_seconds()
+            # Precise on purpose: the breaker still lets a retry through every
+            # recovery window, so calls are not *uniformly* failing here — and a
+            # successful retry ends this state. Saying "everything is down" would
+            # send someone hunting for a problem that does not exist.
+            st.warning(
+                f"The primary endpoint has been failing for {unhealthy:.0f}s, so most "
+                f"calls are failing fast. It is re-tried every {recovery:.0f}s, and one "
+                f"successful retry puts everything back on it. Failover to the backup "
+                f"engages after {float(threshold or 0):.0f}s of continuous failure — in "
+                f"about {remaining:.0f}s."
+            )
+            st.caption(
+                "The wait is deliberate: it stops a short provider blip from moving the "
+                "work onto another provider. To fail over immediately instead, set "
+                "`LLM_ENDPOINT_FALLBACK_TIMEOUT_SECONDS=0`."
+            )
+        else:
+            st.success("Primary endpoint healthy; the backup is configured and unused.")
+
+        rows = [
+            {"Setting": "Backup configured", "Value": "yes" if configured else "no"},
+            {"Setting": "Serving from backup", "Value": "yes" if active else "no"},
+            {"Setting": "Primary breaker", "Value": _primary_breaker_state()},
+            {
+                "Setting": "Failover after",
+                "Value": (
+                    f"{float(threshold):.0f}s of continuous failure"
+                    if threshold is not None
+                    else "unknown"
+                ),
+            },
+            {
+                "Setting": "Primary unhealthy for",
+                "Value": (
+                    f"{float(unhealthy):.0f}s"
+                    if isinstance(unhealthy, (int, float))
+                    else "healthy"
+                ),
+            },
+        ]
+        st.dataframe(rows, width="stretch", hide_index=True)
+        st.caption(
+            "The backup is configured through the environment, not this sidebar: a "
+            "worker builds its own client from its environment, so a web-only setting "
+            "would silently not apply to queued runs. Live state is on `GET /health` "
+            "→ `llm_failover` and as `va_lse_llm_failover_active` on `GET /metrics`."
         )
 
 

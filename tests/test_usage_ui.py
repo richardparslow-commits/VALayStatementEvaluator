@@ -71,6 +71,17 @@ class _FakeLLM:
 
 
 @unittest.skipUnless((PROJECT_ROOT / ".venv").exists(), "requires the project venv")
+class _FailoverLLM(_FakeLLM):
+    """Same stub, recording every call against the backup endpoint."""
+
+    def _record(self, model, phase, system, user, content):
+        self.usage.record(
+            model=model, phase=phase, system=system, user=user,
+            content=content, prompt_tokens=None, completion_tokens=None,
+            endpoint="fallback",
+        )
+
+
 class TestUsageUi(unittest.TestCase):
     def setUp(self) -> None:
         # Keep run-log, audit-log, and watchdog side effects out of the
@@ -137,6 +148,40 @@ class TestUsageUi(unittest.TestCase):
         self.assertIn("claims", phases)
         self.assertGreater(fake.usage.totals().calls, 0)
 
+
+    def _run_evaluation(self, fake):
+        """Drive one end-to-end Evaluate run in the real app with a stubbed LLM."""
+        import app.views.evaluate_view as evaluate_view
+
+        evaluate_view.get_llm = lambda: fake  # type: ignore[assignment]
+        at = self._app()
+        at.run()
+        at.radio(key="eval_mode").set_value("Paste text")
+        at.run()
+        at.text_area(key="eval_paste").set_value("I watched the veteran limp after duty.")
+        at.run()
+        at.file_uploader(key="files_eval").set_value(
+            [("good.txt", b"Knee pain noted during visit.", "text/plain")]
+        )
+        at.run()
+        at.button(key="eval_run").click().run()
+        return at
+
+    def test_a_failed_over_run_tells_the_user_it_used_the_backup(self):
+        """A different model wrote this document — the reader must not have to
+        open a details panel, or read the audit log, to find that out."""
+        at = self._run_evaluation(_FailoverLLM())
+        messages = [w.value for w in at.warning]
+        self.assertTrue(
+            any("backup LLM endpoint" in m for m in messages),
+            msg=f"no failover warning rendered: {messages}",
+        )
+
+    def test_a_normal_run_does_not_warn_about_failover(self):
+        """Silence in the ordinary case is what makes the warning meaningful."""
+        at = self._run_evaluation(_FakeLLM())
+        messages = [w.value for w in at.warning]
+        self.assertFalse(any("backup LLM endpoint" in m for m in messages), msg=str(messages))
 
     def test_explicit_env_rate_not_overwritten_by_watchdog(self):
         """A .env rate set for ONE model must not be clobbered by the watchdog

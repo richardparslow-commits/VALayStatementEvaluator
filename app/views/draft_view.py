@@ -19,6 +19,7 @@ from ..documents import (
     MAX_OBSERVATIONS_CHARS,
 )
 from ..draft import DraftResult, grounding_markdown, run_draft
+from ..job_payload import DraftJob
 from ..logging_config import get_logger
 from ..pdf_export import detect_unconfirmed_placeholders, generate_statement_pdf
 from ..pipeline_guard import (
@@ -35,6 +36,8 @@ from .follow_up import (
     mark_follow_up_answers_consumed,
     render_follow_up_questions,
 )
+
+from . import job_runner
 from .shared import (
     audit_condition_for_slot,
     audit_record_meta,
@@ -127,6 +130,12 @@ def render_draft_tab() -> None:
     if observations:
         _render_observations_length_guidance(observations)
 
+    if job_runner.queue_mode_active():
+        st.caption(
+            f"⚙️ This run is processed by a background worker ({job_runner.queue_status_line()}). "
+            "You can close this tab — the results will be waiting when you come back."
+        )
+
     run = st.button("✍️ Draft the statement", type="primary", key="draft_run")
     if run:
         # Mint the correlation id BEFORE validation so every rejection carries a
@@ -148,6 +157,10 @@ def render_draft_tab() -> None:
             observations=observations,
         )
 
+    # A queued run outlives this browser session, so re-attach to one started
+    # earlier (a reload mid-digest would otherwise look like nothing happened).
+    job_runner.resume_pending_job("draft", action_label="Drafting")
+
     cached_draft: Any = st.session_state.get("draft_result")
     if cached_draft is None:
         return
@@ -157,6 +170,69 @@ def render_draft_tab() -> None:
 
 
 # ------------------------------------------------------------------ input UI
+def _run_draft_queued(
+    *,
+    rid: str,
+    records: list,
+    condition: str,
+    claim_type: str,
+    relationship: str,
+    witness_name: str,
+    veteran_name: str,
+    known_since: str,
+    contact_frequency: str,
+    witnessed_event: str,
+    observations: str,
+) -> None:
+    """Submit the drafting run to a worker and wait for its result (Pattern C).
+
+    The worker writes the audit start/ok/error pair, so this path emits none —
+    one audit record per run regardless of where it executed.
+    """
+    if not check_shutdown_gate("draft"):
+        run_log_event(
+            "draft", "rejected", request_id=rid,
+            error="app shutting down", reason="draining",
+        )
+        return
+    config_error = job_runner.worker_config_error()
+    if config_error:
+        run_log_event(
+            "draft", "rejected", request_id=rid,
+            error=config_error, reason="worker_key_missing",
+        )
+        st.error(config_error)
+        return
+    _sources, _files, _pages = audit_record_meta("draft", records)
+    outcome = job_runner.submit_job(
+        slot="draft",
+        job=DraftJob(
+            records=records,
+            witness={
+                "name": witness_name.strip(),
+                "relationship": relationship,
+                "known_since": known_since.strip(),
+                "contact_frequency": contact_frequency.strip(),
+                "veteran_name": veteran_name.strip(),
+                "witnessed_event": witnessed_event,
+            },
+            observations=observations.strip(),
+            condition=condition.strip(),
+            claim_type=claim_type,
+            request_id=rid,
+            record_sources=_sources,
+        ),
+        request_id=rid,
+        condition=(condition.strip()[:120] if condition.strip() else None),
+        sources=_sources,
+        files=_files,
+        pages=_pages,
+        action_label="Drafting",
+    )
+    if outcome is not None and outcome.ok:
+        st.success(f"Draft complete — reference `{rid}`.")
+
+
 def _render_observations_length_guidance(observations: str) -> None:
     n = len(observations)
     st.caption(
@@ -250,6 +326,21 @@ def _run_draft_flow(
     observations: str,
 ) -> None:
     """Run the pipeline with the pre-minted run id; persist the result."""
+    if job_runner.queue_mode_active():
+        _run_draft_queued(
+            rid=rid,
+            records=records,
+            condition=condition,
+            claim_type=claim_type,
+            relationship=relationship,
+            witness_name=witness_name,
+            veteran_name=veteran_name,
+            known_since=known_since,
+            contact_frequency=contact_frequency,
+            witnessed_event=witnessed_event,
+            observations=observations,
+        )
+        return
     llm = get_llm()
     if llm is None:
         run_log_event("draft", "rejected", request_id=rid, error="LLM client unavailable", reason="llm_unavailable")
@@ -431,6 +522,8 @@ def _finish_draft_run(
     """Log/audit success and stash the result for the results renderer."""
     duration_ms = int((time.perf_counter() - t0) * 1000)
     total = llm.usage.totals()
+    # Which endpoint(s) actually served this run (see evaluate_view).
+    _draft_endpoints = llm.usage.endpoints_used()
     logger.info(
         "draft run done duration_ms=%d calls=%d tokens_in=%d tokens_out=%d",
         duration_ms,
@@ -465,8 +558,16 @@ def _finish_draft_run(
         record_files=files,
         record_pages=pages,
         outcome=_outcome_d or None,
+        llm_endpoints=_draft_endpoints,
     )
-    run_log_event("draft", "ok", request_id=rid, duration_ms=duration_ms, **_outcome_d)
+    run_log_event(
+        "draft",
+        "ok",
+        request_id=rid,
+        duration_ms=duration_ms,
+        endpoints=",".join(_draft_endpoints),
+        **_outcome_d,
+    )
     # Profiler: emit per-run timing breakdown.
     if profiler_run is not None:
         profiler_run.run_end_mono = time.monotonic()
@@ -592,3 +693,23 @@ def _render_draft_results(draft_result: Any) -> None:
             )
             st.write(draft_result.digest.summary)
             st.code(draft_result.digest.timeline_text()[:20000], language=None)
+
+        # Timeline view
+        st.divider()
+        st.subheader("📅 Medical Record Timeline")
+        st.caption(
+            "View all medical events extracted from your records, sorted chronologically. "
+            "Use filters to focus on specific time periods or event types."
+        )
+
+        # Add timeline tab
+        timeline_tab, _ = st.columns([1, 3])
+        with timeline_tab:
+            if st.button("🗓️ Open Full Timeline", type="secondary"):
+                # Store digest in session state for the timeline tab
+                st.session_state.timeline_digest = draft_result.digest
+                st.switch_page("/timeline")
+
+        # Compact inline timeline preview
+        from .timeline import render_timeline_in_results
+        render_timeline_in_results(draft_result.digest)

@@ -1,0 +1,54 @@
+# AlertManager configuration.
+#
+# The routing below is deliberately a working default rather than an empty one: it
+# splits by severity, which is the only decision this file has to get right. Wire
+# one real receiver (Slack or email is enough for a small business) and the
+# `critical` route is what wakes someone up.
+route:
+  receiver: default
+  group_by: ["alertname", "job", "tier"]
+  # If a first alert arrives and more follow, wait briefly so one incident is one
+  # notification rather than fifteen.
+  group_wait: 30s
+  group_interval: 5m
+  # How often an unresolved alert re-notifies. An hour is a compromise: frequent
+  # enough that a critical is not forgotten, quiet enough to be tolerable at 3am.
+  repeat_interval: 1h
+  routes:
+    - matchers:
+        - severity = "critical"
+      receiver: critical
+      group_wait: 10s
+      repeat_interval: 30m
+      continue: false
+    - matchers:
+        - severity = "warning"
+      receiver: default
+      repeat_interval: 12h
+
+receivers:
+  # Prints to the AlertManager log. Replace or extend before relying on this:
+  # an alert nobody sees is the same as no alert at all.
+  - name: default
+
+  - name: critical
+    # --- Slack (uncomment and set the webhook) ---------------------------
+    # slack_configs:
+    #   - api_url: "https://hooks.slack.com/services/REPLACE/ME"
+    #     channel: "#va-lse-alerts"
+    #     title: "{{ .CommonLabels.alertname }}"
+    #     text: "{{ range .Alerts }}{{ .Annotations.summary }}\n{{ .Annotations.description }}\n{{ end }}"
+    # --- Email -----------------------------------------------------------
+    # email_configs:
+    #   - to: "oncall@example.com"
+    #     from: "alertmanager@example.com"
+    #     smarthost: "smtp.example.com:587"
+
+# Silence an alert while working on it, so the on-call rotation is not re-paged
+# for something already being handled: create it in the AlertManager UI.
+inhibit_rules:
+  # A dead instance makes every downstream alert meaningless — do not page twice
+  # for one outage.
+  - source_matchers: [severity = "critical", alertname = "VaElseInstanceDown"]
+    target_matchers: [severity = "warning"]
+    equal: ["job", "tier"]

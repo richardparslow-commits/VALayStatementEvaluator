@@ -19,6 +19,21 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies from the hash-pinned lockfile
+#
+# Optional extras are deliberately NOT installed here, so the default image carries
+# no cloud SDKs. Add the ones this deployment actually uses, or the corresponding
+# feature reports a clear configuration error at runtime rather than failing at
+# import:
+#
+#   requirements-backup.txt  audit log backup to s3/gcs/azure
+#                            (filesystem destination needs nothing)
+#   requirements-s3.txt      S3 blob store for large queued job payloads
+#   requirements-otel.txt    OpenTelemetry tracing (VA_LSE_TRACING=1)
+#
+# The audit-backup CronJob runs from this same image, so an s3/gcs/azure
+# destination needs the backup extras present *here*:
+#
+#   RUN pip install --no-cache-dir -r requirements-backup.txt
 COPY requirements.lock ./
 RUN pip install --no-cache-dir --require-hashes -r requirements.lock
 
@@ -27,8 +42,13 @@ COPY .streamlit/config.toml ./.streamlit/config.toml
 COPY app/ ./app/
 COPY run_app.py ./
 
-# Create logs directory for audit + diagnostic logs
-RUN mkdir -p /app/logs && chown -R nobody:nogroup /app/logs
+# Create the logs directory (audit + diagnostic logs) and the blob directory
+# (large job payloads shared with the workers — see app/blob_store.py).
+#
+# Both must exist and be owned by the runtime user in the *image*: a named volume
+# or PVC mounted over a path that does not exist here is created root-owned, and
+# the non-root process below would then be unable to write to it.
+RUN mkdir -p /app/logs /app/blobs && chown -R nobody:nogroup /app/logs /app/blobs
 
 # Run as non-root for security
 USER nobody

@@ -1,0 +1,19 @@
+# Grafana datasource, provisioned on first boot so the dashboard works with no
+# clicking. `uid: prometheus` is what grafana-dashboard.json references — changing
+# it here breaks every panel, because the JSON pins the uid rather than relying on
+# the default datasource.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      # The dashboard uses $__rate_interval, which needs to know the scrape
+      # interval to keep rate() windows sane.
+      timeInterval: 15s
+      httpMethod: POST
+    editable: true

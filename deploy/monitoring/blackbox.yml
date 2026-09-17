@@ -1,0 +1,19 @@
+# blackbox_exporter probe modules.
+#
+# Used only for /ready, which reports readiness as an HTTP status code (503 when
+# the LLM gateway or a configured model is unreachable) rather than as a metric.
+# Probing is the right tool for that: the app's own /metrics must not perform
+# network I/O (ADR-011), so readiness is checked from outside it.
+modules:
+  http_2xx:
+    prober: http
+    timeout: 5s
+    http:
+      # GET, not HEAD: the readiness handler caches its verdict per request and
+      # some proxies treat HEAD differently.
+      method: GET
+      preferred_ip_protocol: ip4
+      # Any 2xx is ready. A 503 is the app deliberately removing itself from the
+      # load-balancer pool, which is exactly what this alert should catch.
+      valid_http_versions: ["HTTP/1.1", "HTTP/2.0"]
+      valid_status_codes: [200]

@@ -31,6 +31,7 @@ only exception the guard raises.
 from __future__ import annotations
 
 import concurrent.futures
+import contextvars
 import logging
 import os
 import threading
@@ -269,6 +270,14 @@ def _propagate_streamlit_ctx(fn: Callable[..., T], *args: Any, **kwargs: Any) ->
     there) and self-attached inside the worker via the documented
     ``add_script_run_ctx`` pattern. Best-effort: no-op when no context
     exists (bare scripts/tests).
+
+    The worker also runs inside a copy of the caller's ``contextvars``, because
+    those do not cross threads by themselves. Everything the pipeline attaches to
+    them — the request id (``app/logging_config``), the run profiler
+    (``app/profiler``), and the active trace span (``app/tracing``) — would
+    otherwise silently vanish at this boundary: logs from the pipeline would lose
+    their correlation id, and (worse) every run would start a second, unrelated
+    trace inside this thread.
     """
     try:
         from streamlit.runtime.scriptrunner_utils.script_run_context import (
@@ -278,18 +287,22 @@ def _propagate_streamlit_ctx(fn: Callable[..., T], *args: Any, **kwargs: Any) ->
         ctx = get_script_run_ctx(suppress_warning=True)
     except Exception:  # noqa: BLE001 - context propagation is best-effort
         ctx = None
+    ctx_vars = contextvars.copy_context()
 
     def _wrapped() -> T:
-        if ctx is not None:
-            try:
-                from streamlit.runtime.scriptrunner_utils.script_run_context import (
-                    add_script_run_ctx,
-                )
+        def _in_context() -> T:
+            if ctx is not None:
+                try:
+                    from streamlit.runtime.scriptrunner_utils.script_run_context import (
+                        add_script_run_ctx,
+                    )
 
-                add_script_run_ctx(ctx=ctx)
-            except Exception:  # noqa: BLE001 - context propagation is best-effort
-                pass
-        return fn(*args, **kwargs)
+                    add_script_run_ctx(ctx=ctx)
+                except Exception:  # noqa: BLE001 - context propagation is best-effort
+                    pass
+            return fn(*args, **kwargs)
+
+        return ctx_vars.run(_in_context)
 
     return _wrapped
 
@@ -309,9 +322,10 @@ def run_with_timeout(
     graceful-shutdown model where the orchestrator's SIGKILL handles stuck
     processes.
 
-    The worker inherits the caller's Streamlit ``ScriptRunContext`` (see
-    :func:`_propagate_streamlit_ctx`) so pipeline progress callbacks using
-    ``st.*`` keep working from the pool thread.
+    The worker inherits the caller's Streamlit ``ScriptRunContext`` and
+    ``contextvars`` (see :func:`_propagate_streamlit_ctx`) so pipeline progress
+    callbacks using ``st.*`` keep working from the pool thread and the run's
+    request id, profiler, and trace span stay attached to it.
 
     The timeout defaults to ``VA_LSE_PIPELINE_TIMEOUT_SECONDS`` (30 min).
     """

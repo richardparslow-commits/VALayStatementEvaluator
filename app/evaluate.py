@@ -19,6 +19,7 @@ from .documents import (
     MAX_STATEMENT_CHARS,
 )
 from .llm import LLMClient, LLMError
+from . import tracing
 from .logging_config import PhaseTimer, get_request_id
 from .profiler import phase_timer
 from .prompt_sanitize import GUARD_NOTE, sanitize_digest_text, sanitize_for_prompt
@@ -384,46 +385,52 @@ def run_evaluation(
     """Execute the full evaluation pipeline."""
     rid = get_request_id() or "-"
     t0 = time.perf_counter()
+    pages = sum(len(d.pages) for d in records)
     logger.info(
         "evaluate start pages=%d statement_chars=%d",
-        sum(len(d.pages) for d in records),
+        pages,
         len(statement_text),
         extra={"request_id": rid, "phase": "evaluate", "status": "start"},
     )
-    try:
-        result = _run_evaluation(llm, statement_text, records, progress)
-        duration_ms = int((time.perf_counter() - t0) * 1000)
-        logger.info(
-            "evaluate done duration_ms=%d claims=%d verifications=%d contradictions=%d",
-            duration_ms,
-            len(result.claims),
-            len(result.verifications),
-            result.contradiction_count,
-            extra={
-                "request_id": rid,
-                "phase": "evaluate",
-                "status": "ok",
-                "duration_ms": duration_ms,
-            },
-        )
-        return result
-    except Exception as exc:  # noqa: BLE001 - feature-error boundary
-        duration_ms = int((time.perf_counter() - t0) * 1000)
-        logger.error(
-            "evaluate error duration_ms=%d error=%s",
-            duration_ms,
-            f"{type(exc).__name__}: {exc}",
-            exc_info=exc,
-            extra={
-                "request_id": rid,
-                "phase": "evaluate",
-                "status": "error",
-                "duration_ms": duration_ms,
-                "error_class": type(exc).__name__,
-            },
-        )
-        track_feature_error(FEATURE_ID, exc)
-        raise
+    # Root span for the run (no-op unless tracing is enabled). Phase spans nest
+    # under it, and in Pattern C the worker continues this same trace.
+    with tracing.run_span(
+        "evaluate", files=len(records), pages=pages, chars=len(statement_text)
+    ):
+        try:
+            result = _run_evaluation(llm, statement_text, records, progress)
+            duration_ms = int((time.perf_counter() - t0) * 1000)
+            logger.info(
+                "evaluate done duration_ms=%d claims=%d verifications=%d contradictions=%d",
+                duration_ms,
+                len(result.claims),
+                len(result.verifications),
+                result.contradiction_count,
+                extra={
+                    "request_id": rid,
+                    "phase": "evaluate",
+                    "status": "ok",
+                    "duration_ms": duration_ms,
+                },
+            )
+            return result
+        except Exception as exc:  # noqa: BLE001 - feature-error boundary
+            duration_ms = int((time.perf_counter() - t0) * 1000)
+            logger.error(
+                "evaluate error duration_ms=%d error=%s",
+                duration_ms,
+                f"{type(exc).__name__}: {exc}",
+                exc_info=exc,
+                extra={
+                    "request_id": rid,
+                    "phase": "evaluate",
+                    "status": "error",
+                    "duration_ms": duration_ms,
+                    "error_class": type(exc).__name__,
+                },
+            )
+            track_feature_error(FEATURE_ID, exc)
+            raise
 
 
 def _truncate_for_prompt(text: str, limit: int = EVALUATE_INTERNAL_MAX_CHARS) -> tuple[str, int]:
@@ -468,14 +475,17 @@ def _run_evaluation(
             progress(frac, msg)
 
     rid = get_request_id() or "-"
-    with PhaseTimer(logger, "records:review", request_id=rid, chunks=len(records)):
+    with (
+        tracing.phase_span("records:review", files=len(records)),
+        PhaseTimer(logger, "records:review", request_id=rid, chunks=len(records)),
+    ):
         with phase_timer("records:review"):
             report(0.02, "Step 1/7 — Exhaustive review of medical records…")
             result.digest = review_medical_records(
                 llm, records, progress=lambda f, m: progress((0.02 + f * 0.48), m) if progress else None
             )
 
-    with PhaseTimer(logger, "claims", request_id=rid):
+    with tracing.phase_span("claims"), PhaseTimer(logger, "claims", request_id=rid):
         with phase_timer("claims"):
             report(0.52, "Step 2/7 — Extracting factual claims from the statement…")
             claims_data = llm.chat_json(
@@ -496,13 +506,16 @@ def _run_evaluation(
                 extra={"request_id": rid, "phase": "claims", "status": "ok"},
             )
 
-    with PhaseTimer(logger, "verify", request_id=rid, claims=len(result.claims)):
+    with (
+        tracing.phase_span("verify", claims=len(result.claims)),
+        PhaseTimer(logger, "verify", request_id=rid, claims=len(result.claims)),
+    ):
         with phase_timer("verify"):
             report(0.60, "Step 3/7 — Verifying each claim against the records…")
             assert result.digest is not None  # set by records:review above
             result.verifications = _verify_claims(llm, result.claims, result.digest, records, report)
 
-    with PhaseTimer(logger, "rubric", request_id=rid):
+    with tracing.phase_span("rubric"), PhaseTimer(logger, "rubric", request_id=rid):
         with phase_timer("rubric"):
             report(0.78, "Step 4/7 — Scoring against the lay-evidence rubric…")
             rubric_data = llm.chat_json(
@@ -524,22 +537,24 @@ def _run_evaluation(
             result.omitted_record_facts = rubric_data.get("omitted_record_facts", [])
             result.executive_summary = rubric_data.get("executive_summary", "")
 
-    with PhaseTimer(logger, "topic", request_id=rid):
+    with tracing.phase_span("topic"), PhaseTimer(logger, "topic", request_id=rid):
         with phase_timer("topic"):
             report(0.79, "Step 5/7 — Auditing topic coverage (hazards, care, family, progression)…")
             _analyze_topics(llm, result, statement_text, report)
 
-    with PhaseTimer(logger, "revision", request_id=rid):
+    with tracing.phase_span("revision"), PhaseTimer(logger, "revision", request_id=rid):
         with phase_timer("revision"):
             report(0.86, "Step 6/8 — Drafting improvement suggestions and a revised statement…")
             _draft_revision(llm, result, statement_text, report)
 
-    with PhaseTimer(logger, "score", request_id=rid):
+    # The score/recommendations pass is LLM-backed like every other phase, so it
+    # gets the same phase span treatment as its neighbours.
+    with tracing.phase_span("score"), PhaseTimer(logger, "score", request_id=rid):
         with phase_timer("score"):
             report(0.92, "Step 7/8 — Computing effectiveness score and recommendations…")
             _score_and_recommend(llm, result, report)
 
-    with PhaseTimer(logger, "report", request_id=rid):
+    with tracing.phase_span("report"), PhaseTimer(logger, "report", request_id=rid):
         with phase_timer("report"):
             report(0.96, "Step 8/8 — Building the report…")
             result.report_markdown = build_report(

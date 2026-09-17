@@ -1,0 +1,18 @@
+# Optional dependency for distributed tracing (VA_LSE_TRACING=1).
+#
+# Not part of requirements.txt / requirements.lock on purpose: tracing is opt-in
+# and every tracing code path degrades to a no-op when these packages are
+# missing, so the default install stays lean.
+#
+#   pip install -r requirements-otel.txt
+#
+# Then point the OTLP exporter at whatever ingests traces (Jaeger, Grafana
+# Tempo, Datadog, New Relic, Honeycomb) with the standard OTEL_* variables:
+#
+#   VA_LSE_TRACING=1
+#   OTEL_EXPORTER_OTLP_ENDPOINT=https://otlp.example.com   # or http://localhost:4318
+#   OTEL_EXPORTER_OTLP_HEADERS=api-key=...                 # when the backend needs one
+#
+# See TRACING.md for backend recipes, span names, sampling, and the PHI note.
+opentelemetry-sdk>=1.44
+opentelemetry-exporter-otlp-proto-http>=1.44

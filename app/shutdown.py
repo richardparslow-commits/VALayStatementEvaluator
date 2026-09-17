@@ -143,6 +143,10 @@ def request_shutdown(
 
     drained = _wait_for_drain(grace_seconds)
     remaining = inflight_count()
+    # Flush traces only after the drain: buffered spans belong to the runs that
+    # just finished, and losing them would lose the trace of the very run an
+    # operator is trying to explain. No-op when tracing is off.
+    _flush_traces()
     if drained:
         logger.warning(
             "shutdown drained cleanly (inflight=0) after %s",
@@ -158,6 +162,16 @@ def request_shutdown(
             extra={"phase": "shutdown", "status": "force_exit", "inflight": remaining},
         )
     return drained
+
+
+def _flush_traces() -> None:
+    """Flush buffered spans during shutdown. Never raises, never blocks for long."""
+    try:
+        from .tracing import shutdown_tracing
+
+        shutdown_tracing()
+    except Exception as exc:  # noqa: BLE001 - telemetry must not break shutdown
+        logger.debug("could not flush traces during shutdown: %s", exc)
 
 
 def _signal_handler(signum: int, _frame: FrameType | None) -> None:

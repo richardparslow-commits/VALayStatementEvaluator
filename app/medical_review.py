@@ -24,7 +24,7 @@ import contextvars
 import logging
 import time
 
-from . import config
+from . import config, tracing
 from .documents import Chunk, ExtractedDocument, chunk_page_labelled_text, paragraph_index
 from .llm import LLMClient, LLMError
 from .logging_config import PhaseTimer, get_request_id
@@ -300,6 +300,10 @@ def review_medical_records(
 
     _ctx_request_id = get_request_id()  # capture for worker threads
     _ctx_profiler_run = get_current_run_profiler()
+    # Spans do not follow contextvars into a thread pool either, so the digest
+    # thread re-attaches this parent context — otherwise every chunk span would
+    # start a trace of its own instead of nesting under the run.
+    _ctx_span = tracing.current_span_context()
 
     def digest_chunk(chunk: Chunk) -> dict[str, object]:
         # Propagate the run's correlation id into the worker thread.
@@ -310,7 +314,19 @@ def review_medical_records(
         profiler_token = _current_run_var.set(_ctx_profiler_run)
         t0 = time.perf_counter()
         try:
-            with worker_timer("digest", index=chunk.index):
+            # Adopt the run's span for this thread, then (optionally) open a chunk
+            # span nested under it. Per-chunk spans are opt-in
+            # (VA_LSE_TRACE_CHUNK_SPANS): a 5,000-page bundle is hundreds of
+            # chunks, which would swamp every other span in the trace.
+            with (
+                tracing.use_parent(_ctx_span),
+                tracing.phase_span(
+                    "records:digest.chunk",
+                    enabled=config.TRACING_CHUNK_SPANS,
+                    chunk=chunk.index,
+                ),
+                worker_timer("digest", index=chunk.index),
+            ):
                 data = llm.chat_json(
                     DIGEST_SYSTEM,
                     DIGEST_USER_TEMPLATE.format(
@@ -399,7 +415,10 @@ def review_medical_records(
                         f"Extracting facts — {completed}/{total_units} chunks done…",
                     )
 
-    run_round(chunks)
+    with tracing.phase_span(
+        "records:digest", chunks=total_units, concurrency=config.RECORDS_CONCURRENCY, pages=pages
+    ):
+        run_round(chunks)
 
     # Retry failed chunks once; parallel bursts can hit transient rate limits.
     if failed:
@@ -418,7 +437,8 @@ def review_medical_records(
         failed.clear()
         if progress:
             progress(0.62, f"Retrying {len(retry_targets)} failed chunk(s)…")
-        run_round(retry_targets)
+        with tracing.phase_span("records:digest", chunks=len(retry_targets), retry=True):
+            run_round(retry_targets)
 
     if failed:
         labels = ", ".join(f"chunk {i}" for i in sorted(failed))
@@ -481,14 +501,17 @@ def review_medical_records(
         duplicates_skipped=duplicates_skipped,
     )
 
-    with PhaseTimer(logger, "records:merge", request_id=rid, facts=len(all_facts)):
+    with (
+        tracing.phase_span("records:merge", facts=len(all_facts)),
+        PhaseTimer(logger, "records:merge", request_id=rid, facts=len(all_facts)),
+    ):
         digest.facts = _merge_facts(llm, digest, progress)
     # Memory checkpoint: after merge (fact list may have shrunk)
     try:
         _mem_cp("records:post_merge")
     except Exception:  # noqa: BLE001
         pass
-    with PhaseTimer(logger, "records:summary", request_id=rid):
+    with tracing.phase_span("records:summary"), PhaseTimer(logger, "records:summary", request_id=rid):
         digest.summary = _summarize(llm, digest)
     duration_ms = int((time.perf_counter() - _review_t0) * 1000)
     logger.info(
@@ -674,6 +697,301 @@ def _tokens(text: str) -> frozenset[str]:
 # Backwards-compat alias: some tooling/tests may import _TOKEN_CACHE.
 # Expose the underlying cache mapping via the LRU wrapper's cache_info.
 _TOKEN_CACHE: dict[str, frozenset[str]] = {}  # deprecated; _tokens is now LRU-bounded
+
+
+# ------------------------------------------------------------------- timeline
+
+
+@dataclass
+class TimelineEvent:
+    """A single event on the medical timeline, derived from a MedicalFact.
+
+    Used by the timeline UI to render events with their date, type, description,
+    and source citation. Events are sorted by date for chronological display.
+    """
+
+    date: str  # ISO date (YYYY-MM-DD) or partial (YYYY-MM) or qualifier (e.g., "unknown")
+    date_sortable: str  # Normalized date string for sorting (YYYY-MM-DD or YYYY-MM or "9999-99")
+    type: str  # fact type: diagnosis, symptom, treatment, medication, etc.
+    description: str  # Short description (<=100 chars for display)
+    full_description: str  # Full fact description (for expandable details)
+    source: str  # Source citation (e.g., "records p.5" or "chunk 3/50")
+    quote: str  # Supporting quote from the record
+    index: int  # Position in the original facts list (for stable ordering)
+
+
+@dataclass
+class TimelineGap:
+    """A detected gap in the medical record timeline.
+
+    Represents a date range with no recorded medical events, which may indicate
+    missing records or periods the user should address in their statement.
+    """
+
+    start_date: str  # End of previous event (exclusive)
+    end_date: str  # Start of next event (exclusive)
+    duration_months: int  # Approximate duration of the gap in months
+    note: str  # Suggested note for the user
+
+
+def build_timeline_events(digest: MedicalDigest) -> list[TimelineEvent]:
+    """Convert a MedicalDigest into a sorted list of TimelineEvents.
+
+    Events are sorted chronologically by their date_sortable value. Facts with
+    the same date maintain their original order from the digest.
+    """
+    events: list[TimelineEvent] = []
+    for index, fact in enumerate(digest.facts):
+        event = TimelineEvent(
+            date=fact.date,
+            date_sortable=_normalize_date_for_sort(fact.date),
+            type=fact.type,
+            description=_truncate_description(fact.description, 100),
+            full_description=fact.description,
+            source=fact.source,
+            quote=fact.quote,
+            index=index,
+        )
+        events.append(event)
+
+    # Sort by date_sortable, then by original index for stable ordering
+    events.sort(key=lambda e: (e.date_sortable, e.index))
+    return events
+
+
+def _normalize_date_for_sort(date_str: str) -> str:
+    """Normalize a date string for sorting.
+
+    Handles various date formats extracted by the LLM:
+    - Full dates: "2023-05-15" -> "2023-05-15"
+    - Month/year: "2023-05" -> "2023-05"
+    - Year only: "2023" -> "2023"
+    - Qualifiers: "unknown", "circa 2019" -> "9999" (sort last)
+    """
+    if not date_str or date_str.lower() in ("unknown", "n/a", "none", ""):
+        return "9999-99-99"
+
+    date_lower = date_str.lower().strip()
+
+    # Handle qualifiers like "circa 2019", "approx 2020"
+    import re
+
+    circa_match = re.match(r"(circa|approx(?:imately)?)\s*(\d{4})", date_lower)
+    if circa_match:
+        year = circa_match.group(2)
+        return f"{year}-06-15"  # Mid-year for approximate dates
+
+    # Try to extract a 4-digit year
+    year_match = re.search(r"\b(\d{4})\b", date_str)
+    if not year_match:
+        return "9999-99-99"
+
+    year = year_match.group(1)
+
+    # Look for month
+    month_match = re.search(r"\b(0?\d|1[0-2])\b", date_str)
+    month = month_match.group(1).zfill(2) if month_match else "06"  # Default to June
+
+    # Look for day
+    day_match = re.search(r"\b(0?[1-9]|[12]\d|3[01])\b", date_str)
+    day = day_match.group(1).zfill(2) if day_match else "15"  # Default to mid-month
+
+    return f"{year}-{month}-{day}"
+
+
+def _truncate_description(text: str, max_length: int) -> str:
+    """Truncate a description to max_length characters, adding ellipsis if needed."""
+    text = text.strip()
+    if len(text) <= max_length:
+        return text
+    truncated = text[: max_length - 3].rsplit(" ", 1)[0]
+    return f"{truncated}..."
+
+
+def detect_timeline_gaps(
+    events: list[TimelineEvent],
+    *,
+    min_gap_months: int = 6,
+) -> list[TimelineGap]:
+    """Detect significant gaps in the timeline where no medical events are recorded.
+
+    A gap is flagged when there are at least `min_gap_months` between consecutive
+    events. This helps users identify periods that may need additional documentation
+    or explanation in their statement.
+    """
+    if len(events) < 2:
+        return []
+
+    gaps: list[TimelineGap] = []
+    for i in range(len(events) - 1):
+        current = events[i]
+        next_event = events[i + 1]
+
+        # Skip events without sortable dates
+        if current.date_sortable == "9999-99-99" or next_event.date_sortable == "9999-99-99":
+            continue
+
+        try:
+            from datetime import datetime
+
+            current_date = datetime.strptime(current.date_sortable, "%Y-%m-%d")
+            next_date = datetime.strptime(next_event.date_sortable, "%Y-%m-%d")
+            gap_days = (next_date - current_date).days
+            gap_months = gap_days // 30  # Approximate
+
+            if gap_months >= min_gap_months:
+                gaps.append(
+                    TimelineGap(
+                        start_date=current.date,
+                        end_date=next_event.date,
+                        duration_months=gap_months,
+                        note=(f"No recorded medical events for approximately {gap_months} months "
+                        f"({current.date} to {next_event.date}). "
+                        f"Consider whether treatment continued during this period or if records "
+                        f"are missing."
+                        ),
+                    )
+                )
+        except ValueError:
+            continue
+
+    return gaps
+
+
+def get_timeline_type_counts(events: list[TimelineEvent]) -> dict[str, int]:
+    """Count events by type for the filter UI."""
+    counts: dict[str, int] = {}
+    for event in events:
+        counts[event.type] = counts.get(event.type, 0) + 1
+    return counts
+
+
+def get_timeline_providers(events: list[TimelineEvent]) -> list[str]:
+    """Extract unique provider/facility names from event sources.
+
+    Parses provider names from source strings like "VCU Medical Center (provider)" or
+    "VA Hospital Richmond (facility)".
+    """
+    providers: set[str] = set()
+    for event in events:
+        source = event.source
+        # Extract provider name from parenthetical if present
+        import re
+
+        match = re.match(r"^(.+?)\s*\((?:provider|facility|role).*?\)$", source)
+        if match:
+            providers.add(match.group(1).strip())
+        else:
+            # Use the source as-is if no parenthetical
+            if source and source != "records":
+                providers.add(source)
+
+    return sorted(providers)
+
+
+def filter_timeline_events(
+    events: list[TimelineEvent],
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    fact_types: set[str] | None = None,
+    providers: set[str] | None = None,
+) -> list[TimelineEvent]:
+    """Filter timeline events by date range, fact type, and/or provider.
+
+    Args:
+        events: The full list of timeline events.
+        date_from: Filter events on or after this date (YYYY-MM-DD format).
+        date_to: Filter events on or before this date (YYYY-MM-DD format).
+        fact_types: Set of fact types to include (None = all types).
+        providers: Set of provider names to include (None = all providers).
+
+    Returns:
+        Filtered list of events.
+    """
+    if not events:
+        return []
+
+    filtered: list[TimelineEvent] = []
+    for event in events:
+        # Date range filter
+        if date_from and event.date_sortable != "9999-99-99":
+            if event.date_sortable < date_from:
+                continue
+        if date_to and event.date_sortable != "9999-99-99":
+            if event.date_sortable > date_to:
+                continue
+
+        # Fact type filter
+        if fact_types and event.type not in fact_types:
+            continue
+
+        # Provider filter
+        if providers:
+            event_provider = _extract_provider_from_source(event.source)
+            if event_provider and event_provider not in providers:
+                continue
+
+        filtered.append(event)
+
+    return filtered
+
+
+def _extract_provider_from_source(source: str) -> str | None:
+    """Extract provider/facility name from a source string.
+
+    Returns the provider name if found, None otherwise.
+    """
+    import re
+
+    # Match patterns like "VCU Medical Center (provider)" or "Dr. Smith (provider)"
+    match = re.match(r"^(.+?)\s*\((?:provider|facility|role).*?\)$", source)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+def render_timeline_markdown(events: list[TimelineEvent]) -> str:
+    """Render timeline events as markdown for PDF export or text display.
+
+    Produces a clean, chronological timeline suitable for printing or inclusion
+    in VA form attachments.
+    """
+    if not events:
+        return "No medical events recorded in the timeline.\n"
+
+    lines: list[str] = []
+    lines.append("# Medical Record Timeline")
+    lines.append("")
+    lines.append(f"**Total events:** {len(events)}")
+    lines.append("")
+
+    current_year = None
+    for event in events:
+        # Group by year for readability
+        year = event.date_sortable[:4] if event.date_sortable != "9999-99-99" else "Unknown"
+        if year != current_year:
+            current_year = year
+            lines.append(f"## {year}")
+            lines.append("")
+
+        # Format the date for display
+        date_display = event.date if event.date else "Unknown date"
+        type_label = event.type.replace("_", " ").title()
+
+        lines.append(f"### {date_display} — {type_label}")
+        lines.append("")
+        lines.append(f"{event.full_description}")
+        if event.quote:
+            lines.append("")
+            lines.append(f"> \"{event.quote}\"")
+        lines.append("")
+        lines.append(f"*Source: {event.source}*")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 def find_relevant_excerpts(
