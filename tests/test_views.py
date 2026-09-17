@@ -329,6 +329,118 @@ class TestIsLocalRun(unittest.TestCase):
             self.assertFalse(records.is_local_run())
 
 
+class TestRenderRecordSearch(unittest.TestCase):
+    """F2.S1 — search widget: query+filters -> ranked/highlighted results;
+    export adds to ``citation_index`` in session state."""
+
+    def _widget_mock(self, query_value: str, button_hits: dict) -> tuple:
+        import app.views.records as records
+        from app.documents import SearchResult
+
+        st_mock, session = _fake_streamlit()
+        col_from, col_to, col_provider = MagicMock(), MagicMock(), MagicMock()
+        col_from.date_input.return_value = None
+        col_to.date_input.return_value = None
+        col_provider.text_input.return_value = ""
+        st_mock.columns.return_value = (col_from, col_to, col_provider)
+        st_mock.text_input.return_value = query_value
+
+        def button_side_effect(label, key=None, **kwargs):
+            return button_hits.get(key, False)
+
+        st_mock.button.side_effect = button_side_effect
+        return records, st_mock, session, SearchResult
+
+    def test_search_click_stores_results_and_fires_telemetry(self) -> None:
+        records, st_mock, session, SearchResult = self._widget_mock(
+            "asthma", {"search_submit_eval": True}
+        )
+        fake_result = SearchResult(
+            label="clinic.pdf p.1", excerpt="**asthma** flare", score=1.0,
+            filename="clinic.pdf", page=1,
+        )
+        with _patch_st(records, st_mock), patch.object(
+            records, "search_records", return_value=[fake_result]
+        ) as mock_search, patch.object(
+            records, "track_impression"
+        ) as mock_impression, patch.object(
+            records, "track_interaction"
+        ) as mock_interaction:
+            records.render_record_search("eval", [MagicMock()])
+
+        mock_search.assert_called_once()
+        self.assertEqual(session["search_results_eval"], [fake_result])
+        mock_impression.assert_called_once()
+        self.assertEqual(mock_impression.call_args.kwargs.get("entry_point"), "eval")
+        # one interaction for the search action
+        actions = [c.kwargs.get("action") for c in mock_interaction.call_args_list]
+        self.assertIn("search", actions)
+
+    def test_search_failure_fires_error_telemetry_and_shows_message(self) -> None:
+        records, st_mock, session, _SearchResult = self._widget_mock(
+            "asthma", {"search_submit_eval": True}
+        )
+        with _patch_st(records, st_mock), patch.object(
+            records, "search_records", side_effect=RuntimeError("boom")
+        ), patch.object(records, "track_feature_error") as mock_error, patch.object(
+            records, "track_impression"
+        ), patch.object(records, "track_interaction"):
+            records.render_record_search("eval", [MagicMock()])
+
+        mock_error.assert_called_once()
+        self.assertEqual(mock_error.call_args.kwargs.get("stage"), "search")
+        self.assertEqual(session["search_results_eval"], [])
+        st_mock.error.assert_called()
+
+    def test_export_excerpt_adds_to_citation_index(self) -> None:
+        records, st_mock, session, SearchResult = self._widget_mock(
+            "", {"search_export_eval_0": True}
+        )
+        result = SearchResult(
+            label="clinic.pdf p.2", excerpt="**knee** pain noted", score=2.0,
+            filename="clinic.pdf", page=2,
+        )
+        session["search_results_eval"] = [result]
+        with _patch_st(records, st_mock), patch.object(
+            records, "track_impression"
+        ), patch.object(records, "track_interaction") as mock_interaction:
+            records.render_record_search("eval", [MagicMock()])
+
+        self.assertEqual(
+            session["citation_index"],
+            [{"excerpt": "**knee** pain noted", "source": "clinic.pdf p.2"}],
+        )
+        export_calls = [
+            c for c in mock_interaction.call_args_list
+            if c.kwargs.get("action") == "export_excerpt"
+        ]
+        self.assertEqual(len(export_calls), 1)
+        self.assertEqual(export_calls[0].kwargs.get("source"), "clinic.pdf p.2")
+
+    def test_export_excerpt_does_not_duplicate(self) -> None:
+        records, st_mock, session, SearchResult = self._widget_mock(
+            "", {"search_export_eval_0": True}
+        )
+        result = SearchResult(
+            label="clinic.pdf p.2", excerpt="**knee** pain noted", score=2.0,
+            filename="clinic.pdf", page=2,
+        )
+        session["search_results_eval"] = [result]
+        session["citation_index"] = [{"excerpt": "**knee** pain noted", "source": "clinic.pdf p.2"}]
+        with _patch_st(records, st_mock), patch.object(
+            records, "track_impression"
+        ), patch.object(records, "track_interaction"):
+            records.render_record_search("eval", [MagicMock()])
+
+        self.assertEqual(len(session["citation_index"]), 1)
+
+    def test_no_documents_renders_nothing(self) -> None:
+        records, st_mock, _session, _SearchResult = self._widget_mock("", {})
+        with _patch_st(records, st_mock):
+            records.render_record_search("eval", [])
+        st_mock.expander.assert_not_called()
+
+
 class TestRememberSourceRecords(unittest.TestCase):
     def test_stores_docs_per_source_label(self) -> None:
         import app.views.records as records

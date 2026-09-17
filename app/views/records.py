@@ -14,12 +14,17 @@ from .. import config
 from .. import telemetry
 from .. import va_gov_client
 from .. import va_gov_export
-from ..documents import ExtractionError, records_from_local_path
+from ..agiloop_telemetry import track_feature_error, track_impression, track_interaction
+from ..documents import ExtractionError, SearchResult, records_from_local_path, search_records
 from ..fetch_client import FetchClient, FetchSandboxError
 from ..logging_config import get_logger
 from .uploads import check_upload_limits, extract_uploads
 
 logger = get_logger("app.views.records")
+
+# Feature: Medical Record Search & Citation Index
+SEARCH_FEATURE_ID = "22bc7e10-dcda-431e-b3fb-4e8ff9b532cb"  # medical-record-search-citation-index
+CITATION_INDEX_KEY = "citation_index"
 
 
 def is_local_run() -> bool:
@@ -326,8 +331,100 @@ def _va_gov_records(slot: str) -> list[Any]:
     return merged.documents
 
 
+# ------------------------------------------------------- record search + citations
+def render_record_search(slot: str, documents: list[Any]) -> None:
+    """Search widget over loaded medical records with date/provider filters.
+
+    Renders once at least one record is loaded for the slot (F2.S1): a query
+    box plus optional date-range/provider filters returns TF-IDF-ranked
+    passages with highlighted matches and a source label. Clicking "Export"
+    on a result adds its excerpt + source to ``citation_index`` in
+    ``session_state`` (read by ``build_report``/CSV-JSON export in F2.S2).
+    """
+    if not documents:
+        return
+
+    impression_key = f"search_impression_sent_{slot}"
+    if not st.session_state.get(impression_key):
+        try:
+            track_impression(SEARCH_FEATURE_ID, entry_point=slot, records_loaded=len(documents))
+        except Exception:  # noqa: BLE001 - telemetry must never break the UI
+            pass
+        st.session_state[impression_key] = True
+
+    with st.expander("🔎 Search medical records", expanded=False):
+        query = st.text_input("Search query", key=f"search_query_{slot}")
+        col_from, col_to, col_provider = st.columns(3)
+        date_from = col_from.date_input("From date", value=None, key=f"search_date_from_{slot}")
+        date_to = col_to.date_input("To date", value=None, key=f"search_date_to_{slot}")
+        provider = col_provider.text_input("Provider (optional)", key=f"search_provider_{slot}")
+
+        results_key = f"search_results_{slot}"
+        if st.button("Search", key=f"search_submit_{slot}") and query.strip():
+            try:
+                results = search_records(
+                    documents,
+                    query,
+                    date_from=date_from or None,
+                    date_to=date_to or None,
+                    provider=provider or None,
+                )
+            except Exception as exc:  # noqa: BLE001 - search must never crash the UI
+                logger.error("record search failed: %s", exc, exc_info=exc)
+                try:
+                    track_feature_error(SEARCH_FEATURE_ID, exc, stage="search")
+                except Exception:  # noqa: BLE001
+                    pass
+                st.error(f"Search failed: {exc}")
+                results = []
+            st.session_state[results_key] = results
+            try:
+                track_interaction(
+                    SEARCH_FEATURE_ID,
+                    action="search",
+                    has_date_filter=bool(date_from or date_to),
+                    has_provider_filter=bool(provider),
+                    result_count=len(results),
+                )
+            except Exception:  # noqa: BLE001 - telemetry must never break the UI
+                pass
+
+        results_any: Any = st.session_state.get(results_key, [])
+        results_list: list[SearchResult] = results_any if isinstance(results_any, list) else []
+        if not results_list:
+            if query.strip():
+                st.caption("No matching passages found.")
+        else:
+            _render_search_results(slot, results_list)
+
+
+def _render_search_results(slot: str, results: list[SearchResult]) -> None:
+    for i, result in enumerate(results):
+        st.markdown(f"**{result.label}**")
+        st.markdown(result.excerpt)
+        if st.button("➕ Export excerpt", key=f"search_export_{slot}_{i}"):
+            citation = {"excerpt": result.excerpt, "source": result.label}
+            index_any: Any = st.session_state.setdefault(CITATION_INDEX_KEY, [])
+            index: list[dict[str, str]] = index_any if isinstance(index_any, list) else []
+            if citation not in index:
+                index.append(citation)
+            st.session_state[CITATION_INDEX_KEY] = index
+            try:
+                track_interaction(
+                    SEARCH_FEATURE_ID,
+                    action="export_excerpt",
+                    source=result.label,
+                    page=result.page,
+                )
+            except Exception:  # noqa: BLE001 - telemetry must never break the UI
+                pass
+            st.success("Added to citation index.")
+        st.divider()
+
+
 __all__ = [
     "is_local_run",
     "records_uploader",
     "remember_source_records",
+    "render_record_search",
 ]
