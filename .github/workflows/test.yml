@@ -62,6 +62,32 @@ jobs:
       - name: Install test extras
         run: pip install -r requirements-dev.txt
 
+      # A test that skips because a dev-only dependency is missing is an
+      # unverified code path, not a pass (this is how 24 deployment-asset
+      # assertions silently stopped running). Fail here instead of discovering
+      # the gap later. httpx is intentionally absent: the app treats it as
+      # optional and this mirror resolves `openai` against the httpx2 fork.
+      - name: Verify test prerequisites
+        run: |
+          python - <<'PY'
+          import importlib.util
+          import sys
+
+          required = {
+              "yaml": "PyYAML (requirements-dev.txt) — deploy/manifest asset tests",
+              "boto3": "boto3 (requirements-dev.txt) — S3 backup backend tests",
+              "opentelemetry.sdk": "opentelemetry-sdk (requirements-dev.txt) — tracing tests",
+          }
+          missing = [
+              f"{module}: {why}"
+              for module, why in required.items()
+              if importlib.util.find_spec(module) is None
+          ]
+          if missing:
+              sys.exit("missing test prerequisites:\n  " + "\n  ".join(missing))
+          print(f"all {len(required)} suite-required prerequisites present")
+          PY
+
       - name: Run offline unit tests
         run: python -m unittest discover -s tests -v
 
