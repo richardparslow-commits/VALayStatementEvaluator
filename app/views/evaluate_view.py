@@ -49,6 +49,7 @@ from .shared import (
     progress_widgets,
     records_uploader,
     render_condition_selector_for_slot,
+    render_record_search,
     render_usage_summary,
     record_watchdog_run,
 )
@@ -103,6 +104,7 @@ def render_evaluate_tab() -> None:
                 "Large record set: chunks are digested in parallel with duplicate pages "
                 "skipped, but expect a longer run for a meticulous review."
             )
+        render_record_search("eval", records)
 
     render_condition_selector_for_slot("eval")
 

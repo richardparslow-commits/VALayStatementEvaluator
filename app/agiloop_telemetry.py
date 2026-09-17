@@ -75,10 +75,12 @@ def _session_id() -> str:
     return str(st.session_state.get(_SESSION_ID_KEY, "unknown"))
 
 
-def track_impression(feature_id: str, entry_point: str | None = None) -> None:
+def track_impression(feature_id: str, entry_point: str | None = None, **attributes: Any) -> None:
     """Track a feature impression — call when the feature UI becomes visible."""
-    metadata = {"entryPoint": entry_point} if entry_point else None
-    _send_event("feature.impression", feature_id=feature_id, metadata=metadata)
+    metadata: dict[str, Any] = dict(attributes)
+    if entry_point:
+        metadata["entryPoint"] = entry_point
+    _send_event("feature.impression", feature_id=feature_id, metadata=metadata or None)
 
 
 def track_interaction(feature_id: str, **attributes: Any) -> None:
@@ -128,14 +130,20 @@ def _sanitize_error_stack(error: BaseException) -> str:
     return joined
 
 
-def track_feature_error(feature_id: str, error: BaseException) -> None:
-    """Track a feature-level error caught at a feature boundary."""
+def track_feature_error(feature_id: str, error: BaseException, **attributes: Any) -> None:
+    """Track a feature-level error caught at a feature boundary.
+
+    ``**attributes`` accepts additional non-PII context (e.g. ``stage``) that
+    callers want attached alongside the sanitized message/stack — merged in
+    without changing any existing 2-argument call site's behavior.
+    """
     _send_event(
         "feature.error",
         feature_id=feature_id,
         metadata={
             "errorMessage": _sanitize_error_message(error),
             "errorStack": _sanitize_error_stack(error),
+            **attributes,
         },
     )
 

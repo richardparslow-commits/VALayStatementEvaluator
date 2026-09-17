@@ -1,11 +1,16 @@
 """Document text extraction and chunking utilities."""
 from __future__ import annotations
 
+import csv
 import io
+import json
+import math
 import re
 import zipfile
 import xml.etree.ElementTree as ET
+from collections import Counter
 from dataclasses import dataclass, field
+from datetime import date, datetime
 from pathlib import Path
 
 from typing import Protocol
@@ -388,3 +393,208 @@ def paragraph_index(doc: ExtractedDocument, min_chars: int = 40) -> list[Paragra
         _PARAGRAPH_CACHE.clear()
     _PARAGRAPH_CACHE[key] = paragraphs
     return paragraphs
+
+
+# ------------------------------------------------------------ TF-IDF search
+# Feature: Medical Record Search & Citation Index
+_LABEL_PAGE_RE = re.compile(r"^(?P<filename>.*) p\.(?P<page>\d+)$")
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+_SEARCH_DATE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4})\b")
+SEARCH_RESULT_LIMIT = 20
+SEARCH_EXCERPT_MAX_CHARS = 400
+
+
+@dataclass
+class SearchResult:
+    """One ranked medical-record passage matching a search query."""
+
+    label: str
+    excerpt: str
+    score: float
+    filename: str
+    page: int
+
+
+def _tokenize(text: str) -> list[str]:
+    return _TOKEN_RE.findall(text.lower())
+
+
+def build_inverted_index(paragraphs: list[Paragraph]) -> dict[str, dict[int, int]]:
+    """Build a token -> {paragraph_index: term_frequency} inverted index.
+
+    Kept as a standalone step (rather than inlined in ``search_records``) so
+    the ranking step can be unit tested against a hand-built index.
+    """
+    index: dict[str, dict[int, int]] = {}
+    for i, paragraph in enumerate(paragraphs):
+        counts = Counter(_tokenize(paragraph.text))
+        for token, count in counts.items():
+            index.setdefault(token, {})[i] = count
+    return index
+
+
+def _parse_search_date(raw: str) -> date | None:
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y"):
+        try:
+            return datetime.strptime(raw, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _paragraph_dates(text: str) -> list[date]:
+    dates: list[date] = []
+    for match in _SEARCH_DATE_RE.finditer(text):
+        parsed = _parse_search_date(match.group(1))
+        if parsed:
+            dates.append(parsed)
+    return dates
+
+
+def _paragraph_in_date_range(text: str, date_from: date | None, date_to: date | None) -> bool:
+    """True when at least one date mentioned in the paragraph falls in range."""
+    dates = _paragraph_dates(text)
+    if not dates:
+        return False
+    for found in dates:
+        if date_from and found < date_from:
+            continue
+        if date_to and found > date_to:
+            continue
+        return True
+    return False
+
+
+def _highlight(text: str, tokens: list[str], max_chars: int = SEARCH_EXCERPT_MAX_CHARS) -> str:
+    """Bold every whole-word query-token match in a bounded excerpt (markdown)."""
+    excerpt = text if len(text) <= max_chars else text[:max_chars].rstrip() + "…"
+    unique_tokens = sorted({t for t in tokens if len(t) > 1}, key=len, reverse=True)
+    for token in unique_tokens:
+        excerpt = re.sub(rf"(?i)\b({re.escape(token)})\b", r"**\1**", excerpt)
+    return excerpt
+
+
+def _split_label(label: str) -> tuple[str, int]:
+    match = _LABEL_PAGE_RE.match(label)
+    if not match:
+        return label, 1
+    return match.group("filename"), int(match.group("page"))
+
+
+def search_records(
+    documents: list[ExtractedDocument],
+    query: str,
+    *,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    provider: str | None = None,
+    limit: int = SEARCH_RESULT_LIMIT,
+) -> list[SearchResult]:
+    """Rank paragraphs across ``documents`` against ``query`` via TF-IDF.
+
+    Supports an optional inclusive date-range filter (matched against any
+    date mentioned in the paragraph text) and an optional provider filter
+    (case-insensitive substring match against the paragraph text). Returns
+    the top ``limit`` results, highest score first.
+    """
+    query = (query or "").strip()
+    if not query:
+        return []
+
+    paragraphs: list[Paragraph] = []
+    for doc in documents:
+        paragraphs.extend(paragraph_index(doc))
+    if not paragraphs:
+        return []
+
+    query_tokens = _tokenize(query)
+    if not query_tokens:
+        return []
+
+    index = build_inverted_index(paragraphs)
+    n_paragraphs = len(paragraphs)
+    scores = [0.0] * n_paragraphs
+    for token in set(query_tokens):
+        postings = index.get(token)
+        if not postings:
+            continue
+        # Smoothed inverse-document-frequency: common across the record set
+        # weighs less than a term that appears in only a few paragraphs.
+        idf = math.log((n_paragraphs + 1) / (len(postings) + 1)) + 1.0
+        for paragraph_index_, term_frequency in postings.items():
+            scores[paragraph_index_] += term_frequency * idf
+
+    ranked_indices = sorted(
+        (i for i, s in enumerate(scores) if s > 0), key=lambda i: scores[i], reverse=True
+    )
+
+    provider_query = (provider or "").strip().lower()
+    results: list[SearchResult] = []
+    for i in ranked_indices:
+        paragraph = paragraphs[i]
+        if provider_query and provider_query not in paragraph.text.lower():
+            continue
+        if (date_from or date_to) and not _paragraph_in_date_range(
+            paragraph.text, date_from, date_to
+        ):
+            continue
+        filename, page = _split_label(paragraph.label)
+        results.append(
+            SearchResult(
+                label=paragraph.label,
+                excerpt=_highlight(paragraph.text, query_tokens),
+                score=scores[i],
+                filename=filename,
+                page=page,
+            )
+        )
+        if len(results) >= limit:
+            break
+    return results
+
+
+# ------------------------------------------------------------ citation index
+# Feature: Medical Record Search & Citation Index (F2.S2)
+_CITATION_EXPORT_FIELDS = ("excerpt", "source")
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_formula_guard(value: str) -> str:
+    """Neutralize CSV/spreadsheet formula injection (OWASP CSV Injection).
+
+    Excerpt/source text originates from uploaded medical-record content,
+    which is untrusted input. If a cell's value begins with ``=``, ``+``,
+    ``-``, or ``@`` (or a leading tab/CR), spreadsheet applications such as
+    Excel or Google Sheets may interpret it as a formula when the exported
+    file is opened, enabling formula-injection attacks against whoever opens
+    the download. Prefixing with a single quote forces the cell to be
+    treated as literal text while leaving the visible content unchanged.
+    """
+    if value.startswith(_CSV_FORMULA_PREFIXES):
+        return "'" + value
+    return value
+
+
+def export_citation_index(citations: list[dict[str, str]], fmt: str) -> bytes:
+    """Serialize the citation index (excerpt + source per entry) to bytes.
+
+    ``fmt`` is ``"csv"`` or ``"json"`` (case-insensitive); raises
+    :class:`ValueError` for anything else so a caller-facing error message
+    can be shown instead of silently exporting the wrong format.
+    """
+    normalized = (fmt or "").strip().lower()
+    if normalized == "json":
+        return json.dumps(citations, indent=2, ensure_ascii=False).encode("utf-8")
+    if normalized == "csv":
+        buffer = io.StringIO()
+        writer = csv.DictWriter(buffer, fieldnames=list(_CITATION_EXPORT_FIELDS))
+        writer.writeheader()
+        for citation in citations:
+            writer.writerow(
+                {
+                    "excerpt": _csv_formula_guard(str(citation.get("excerpt", ""))),
+                    "source": _csv_formula_guard(str(citation.get("source", ""))),
+                }
+            )
+        return buffer.getvalue().encode("utf-8")
+    raise ValueError(f"Unsupported citation export format: {fmt!r} (expected 'csv' or 'json')")

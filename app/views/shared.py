@@ -23,7 +23,12 @@ from ..logging_config import get_logger, get_request_id, new_request_id, set_req
 from ..llm import LLMClient, LLMError
 from ..run_log import run_log_event
 from ..shutdown import is_shutting_down
-from .records import is_local_run, records_uploader, remember_source_records  # noqa: F401
+from .records import (  # noqa: F401
+    is_local_run,
+    records_uploader,
+    remember_source_records,
+    render_record_search,
+)
 from .uploads import check_upload_limits, extract_uploads  # noqa: F401
 from .usage import (  # noqa: F401
     effective_credit_rates,
