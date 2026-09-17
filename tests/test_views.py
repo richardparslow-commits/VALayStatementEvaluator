@@ -684,9 +684,16 @@ class TestEmptyAnalysisResults(unittest.TestCase):
         with _patch_st(evaluate_view, st_mock):
             evaluate_view._render_evaluation_results(EvaluationResult())
 
-        st_mock.error.assert_called_once()
-        message = str(st_mock.error.call_args[0][0])
-        self.assertIn("no usable analysis", message)
+        # The results panel also renders the effectiveness-score band banner,
+        # which uses st.error for the RED band, so scope this assertion to the
+        # empty-analysis message instead of counting every st.error call.
+        empty_analysis_errors = [
+            str(call.args[0])
+            for call in st_mock.error.call_args_list
+            if "no usable analysis" in str(call.args[0])
+        ]
+        self.assertEqual(len(empty_analysis_errors), 1)
+        message = empty_analysis_errors[0]
         self.assertIn("req_84ab42a65e24", message)
         # Which run the panel belongs to is stated, so a cached re-render cannot
         # pass for a fresh run.
@@ -708,7 +715,10 @@ class TestEmptyAnalysisResults(unittest.TestCase):
         with _patch_st(evaluate_view, st_mock):
             evaluate_view._render_evaluation_results(result)
 
-        st_mock.error.assert_not_called()
+        # Only the effectiveness-score band banner may use st.error here; the
+        # empty-analysis guard must stay silent for a populated result.
+        error_messages = [str(call.args[0]) for call in st_mock.error.call_args_list]
+        self.assertFalse([m for m in error_messages if "no usable analysis" in m])
 
 
 # ------------------------------------------------- fact citation exporter (F7.S1)
@@ -765,6 +775,26 @@ class TestRubricAndPositiveSources(unittest.TestCase):
         cited, positive = evaluate_view._rubric_and_positive_sources(result)
         self.assertEqual(cited, {"records.pdf p.5"})
         self.assertEqual(positive, set())
+
+    def test_later_supportive_match_marks_source_positive(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        fact = self._fact(source="records.pdf p.7")
+        result = EvaluationResult(
+            digest=self._digest([fact]),
+            verifications=[
+                {"id": 1, "verdict": "CONTRADICTED", "record_reference": "records.pdf p.7"},
+                {
+                    "id": 2,
+                    "verdict": "PARTIALLY SUPPORTED",
+                    "record_reference": "records.pdf p.7, 2020-01-01",
+                },
+            ],
+        )
+        cited, positive = evaluate_view._rubric_and_positive_sources(result)
+        self.assertEqual(cited, {"records.pdf p.7"})
+        self.assertEqual(positive, {"records.pdf p.7"})
 
     def test_fact_not_referenced_anywhere_is_excluded(self) -> None:
         import app.views.evaluate_view as evaluate_view
