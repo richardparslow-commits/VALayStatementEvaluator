@@ -16,6 +16,7 @@ import streamlit as st
 from .. import audit as audit_log
 from ..agiloop_telemetry import track_goal, track_impression, track_interaction
 from ..evaluate import DIMENSION_LABELS, run_evaluation
+from ..exporter import export_facts, filter_facts
 from ..logging_config import get_logger, get_request_id
 from ..documents import (
     EVALUATE_INTERNAL_MAX_CHARS,
@@ -58,6 +59,9 @@ logger = get_logger("app.views.evaluate")
 
 # Feature: Final Statement PDF Export
 PDF_EXPORT_FEATURE_ID = "0d76d70b-8dd6-4561-a874-f768d5929222"  # final-statement-pdf-export
+
+# Feature: Fact Citation Exporter
+EXPORT_FACTS_FEATURE_ID = "051bb638-ac1c-40cf-95f5-164779b4382c"  # fact-citation-exporter
 
 
 def render_evaluate_tab() -> None:
@@ -505,6 +509,195 @@ def _render_pdf_export(statement_text: str, *, entry_point: str) -> None:
             pass
 
 
+# --------------------------------------------------------- fact citation export
+_SUPPORTIVE_VERDICTS = ("SUPPORTED", "PARTIALLY SUPPORTED")
+
+
+def _rubric_and_positive_sources(eval_result: Any) -> tuple[set[str], set[str]]:
+    """Cross-reference digest facts against rubric verification results.
+
+    `MedicalFact` carries no `rubric_verified`/`positive_outcome` flag (no
+    schema changes — see `.implement/technical-spec.md`), and
+    `EvaluationResult.verifications` carries no direct fact id either — each
+    verification's `record_reference` is free text ("source label + date of
+    the supporting/conflicting record fact", see `app/evaluate.py`). This
+    does a best-effort substring match of each fact's `source` label against
+    every verification's `record_reference` (case-insensitive) to recover the
+    link the acceptance criteria calls for:
+
+    - "cited in rubric verification": the fact's source appears in *any*
+      verification's `record_reference` (regardless of verdict).
+    - "supporting positive outcomes": the fact's source appears in a
+      verification whose verdict is SUPPORTED or PARTIALLY SUPPORTED — i.e.
+      the record corroborates the lay statement rather than contradicting it.
+    """
+    digest = getattr(eval_result, "digest", None)
+    verifications = getattr(eval_result, "verifications", None) or []
+    cited: set[str] = set()
+    positive: set[str] = set()
+    if not digest or not digest.facts:
+        return cited, positive
+
+    references = [
+        (str(v.get("record_reference", "") or "").lower(), str(v.get("verdict", "") or ""))
+        for v in verifications
+    ]
+    references = [(ref, verdict) for ref, verdict in references if ref]
+    if not references:
+        return cited, positive
+
+    for fact in digest.facts:
+        source_lower = fact.source.lower().strip()
+        if not source_lower:
+            continue
+        for ref, verdict in references:
+            if source_lower in ref:
+                cited.add(fact.source)
+                if verdict in _SUPPORTIVE_VERDICTS:
+                    positive.add(fact.source)
+                break
+    return cited, positive
+
+
+def _render_fact_export_section(eval_result: Any) -> None:
+    """Render the "Export Facts" panel: digest summary, filters, and downloads.
+
+    Implements F7.S1 (Fact Citation Exporter, feature id
+    `051bb638-ac1c-40cf-95f5-164779b4382c`) — placed immediately after the
+    medical-digest summary so the export controls sit next to the data they
+    export. Fires `impression` on first render, `interaction` on the Export
+    Facts click and each individual download, `error` at the export boundary,
+    and `goal` once files are generated. No fact content (descriptions,
+    quotes, document names) is ever attached to a telemetry payload — only
+    counts, format labels, and the two filter booleans.
+    """
+    digest = getattr(eval_result, "digest", None)
+    if not digest or not digest.facts:
+        return
+
+    impression_key = "export_facts_impression_sent"
+    if not st.session_state.get(impression_key):
+        try:
+            track_impression(EXPORT_FACTS_FEATURE_ID, entry_point="evaluate", fact_count=len(digest.facts))
+        except Exception:  # noqa: BLE001 - telemetry must never break the UI
+            pass
+        st.session_state[impression_key] = True
+
+    with st.expander("📑 Medical record digest — export fact citations", expanded=False):
+        st.caption(
+            f"{len(digest.facts):,} facts extracted from {digest.pages_reviewed:,} pages "
+            f"({digest.chunks_reviewed} chunk(s), {digest.duplicates_skipped} duplicate "
+            "page(s) skipped)."
+        )
+        if digest.summary:
+            st.write(digest.summary)
+
+        only_rubric = st.checkbox(
+            "Only show facts cited in rubric verification",
+            key="export_facts_only_rubric",
+        )
+        only_positive = st.checkbox(
+            "Only show facts supporting positive outcomes",
+            key="export_facts_only_positive",
+        )
+
+        rid = get_request_id() or "-"
+        if st.button("📤 Export Facts", key="export_facts_button"):
+            try:
+                track_interaction(
+                    EXPORT_FACTS_FEATURE_ID,
+                    action="export_click",
+                    filter_rubric=only_rubric,
+                    filter_positive=only_positive,
+                )
+            except Exception:  # noqa: BLE001 - telemetry must never break the UI
+                pass
+
+            cited_sources, positive_sources = _rubric_and_positive_sources(eval_result)
+            generated: dict[str, bytes] = {}
+            errors: list[str] = []
+            for fmt in ("csv", "pdf", "md"):
+                try:
+                    generated[fmt] = export_facts(
+                        digest,
+                        fmt,
+                        only_rubric_cited=only_rubric,
+                        only_positive_outcomes=only_positive,
+                        rubric_cited_sources=cited_sources,
+                        positive_outcome_sources=positive_sources,
+                    )
+                except Exception as exc:  # noqa: BLE001 - one format failing must not block the rest
+                    errors.append(f"{fmt}: {exc}")
+                    logger.error(
+                        "fact export generation failed format=%s error=%s",
+                        fmt,
+                        exc,
+                        exc_info=True,
+                        extra={
+                            "request_id": rid,
+                            "phase": "export_facts",
+                            "status": "error",
+                            "format": fmt,
+                        },
+                    )
+            st.session_state["export_facts_files"] = generated
+            filtered_count = len(
+                filter_facts(
+                    digest.facts,
+                    only_rubric_cited=only_rubric,
+                    only_positive_outcomes=only_positive,
+                    rubric_cited_sources=cited_sources,
+                    positive_outcome_sources=positive_sources,
+                )
+            )
+            if errors:
+                st.error("Some export formats could not be generated: " + "; ".join(errors))
+            if generated:
+                try:
+                    track_goal(
+                        EXPORT_FACTS_FEATURE_ID,
+                        "facts exported",
+                        fact_count=filtered_count,
+                        filtered=only_rubric or only_positive,
+                    )
+                except Exception:  # noqa: BLE001 - telemetry must never break the UI
+                    pass
+                st.success(f"Generated export files for {filtered_count} fact row(s).")
+
+        files_any: Any = st.session_state.get("export_facts_files")
+        files: dict[str, bytes] = files_any if isinstance(files_any, dict) else {}
+        if files:
+            labels = {
+                "csv": ("⬇️ Download CSV", "text/csv", "medical_digest_facts.csv"),
+                "pdf": ("⬇️ Download PDF", "application/pdf", "medical_digest_facts.pdf"),
+                "md": ("⬇️ Download Markdown", "text/markdown", "medical_digest_facts.md"),
+            }
+            columns = st.columns(3)
+            for col, fmt in zip(columns, ("csv", "pdf", "md")):
+                data = files.get(fmt)
+                if data is None:
+                    continue
+                label, mime, filename = labels[fmt]
+                clicked = col.download_button(
+                    label,
+                    data=data,
+                    file_name=filename,
+                    mime=mime,
+                    key=f"export_facts_download_{fmt}",
+                )
+                if clicked:
+                    try:
+                        track_interaction(
+                            EXPORT_FACTS_FEATURE_ID,
+                            action="download",
+                            format=fmt,
+                            filter_rubric=only_rubric,
+                            filter_positive=only_positive,
+                        )
+                    except Exception:  # noqa: BLE001 - telemetry must never break the UI
+                        pass
+
+
 def _render_evaluation_results(eval_result: Any) -> None:
     render_usage_summary(st.session_state.get("eval_usage"))
 
@@ -674,6 +867,8 @@ def _render_evaluation_results(eval_result: Any) -> None:
                 mime="text/markdown",
             )
             _render_pdf_export(revised, entry_point="evaluate")
+
+    _render_fact_export_section(eval_result)
 
     with st.expander("Full markdown report"):
         st.markdown(eval_result.report_markdown)
