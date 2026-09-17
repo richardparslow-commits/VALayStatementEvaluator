@@ -1219,11 +1219,6 @@ class TestRenderMedicalTimeline(unittest.TestCase):
         ]
         return MedicalDigest(facts=facts, conditions=["Knee"], pages_reviewed=10)
 
-    def _timeline_data(self, digest):
-        from app.medical_review import build_timeline_data
-
-        return build_timeline_data(digest)
-
     def _st(self):
         st_mock, session = _fake_streamlit()
         st_mock.radio.return_value = "All"
