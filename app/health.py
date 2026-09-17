@@ -1,8 +1,12 @@
 """Lightweight health sidecar for container orchestration.
 
-Exposes ``GET /health`` (liveness — always 200 once the process is up) and
+Exposes ``GET /health`` (liveness — always 200 once the process is up),
 ``GET /ready`` (readiness — 200 only when the LLM endpoint is reachable and
-the configured models are listed). Both respond in <2s.
+the configured models are listed), and ``GET /metrics`` (Prometheus text
+format, for alerting on trends rather than polling JSON). All three respond in
+<2s, and none of them performs network I/O unless explicitly asked to with
+``?probe=1`` — see :mod:`app.metrics` and
+:meth:`app.job_queue.JobBackend.health` for why that constraint is load-bearing.
 
 The server is stdlib-only (``http.server``) and runs on a daemon thread so it
 never blocks Streamlit. Readiness is cached (TTL 30s) and the upstream
@@ -21,13 +25,14 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 logger = logging.getLogger("app.health")
 
 # ------------------------------------------------------------------ constants
 HEALTH_PATH = "/health"
 READY_PATH = "/ready"
+METRICS_PATH = "/metrics"
 
 # Keep comfortably under the 2s SLO in the spec; leave headroom for JSON
 # serialisation and TCP.
@@ -70,11 +75,62 @@ def _health_port() -> int:
     return 8001
 
 
-def _probe_llm_readiness() -> tuple[bool, str]:
-    """Check the LLM endpoint and configured models; always returns quickly.
+def _probe_endpoint_models(
+    base_url: str,
+    api_key: str,
+    models: tuple[tuple[str, str], ...],
+    *,
+    timeout: float = MODELS_PROBE_TIMEOUT_SECONDS,
+) -> tuple[bool, str]:
+    """GET {base_url}/models and require every named model to be listed.
 
-    Returns ``(ready, detail)``. On any network/auth/parse failure the
-    endpoint is considered not ready (503) rather than raising.
+    Returns ``(ready, detail)``. Any network/auth/parse failure is "not ready"
+    rather than an exception, and the detail never contains the key.
+    """
+    if not api_key:
+        return False, "missing OPENAI_API_KEY"
+    if not base_url:
+        return False, "missing base_url"
+    url = base_url.rstrip("/") + "/models"
+    try:
+        import urllib.error  # noqa: F401  # imported for side-effect type completeness
+        import urllib.request
+
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_key}"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            raw = resp.read().decode("utf-8")
+        data: Any = json.loads(raw)
+        rows = data.get("data", []) if isinstance(data, dict) else []
+        ids: set[str] = set()
+        for row in rows:
+            if isinstance(row, dict):
+                mid = row.get("id")
+                if isinstance(mid, str) and mid.strip():
+                    ids.add(mid.strip())
+        # Every configured model must be listed for readiness.
+        missing: list[str] = []
+        for label, model in models:
+            if model and model not in ids:
+                missing.append(f"{label} `{model}` not listed at /models")
+        if missing:
+            return False, "; ".join(missing)
+        return True, "ready"
+    except Exception as exc:  # noqa: BLE001 - readiness is advisory, never raise
+        return False, f"llm probe failed: {type(exc).__name__}: {exc}"
+
+
+def _probe_llm_readiness() -> tuple[bool, str]:
+    """Check the LLM endpoint(s) and configured models; always returns quickly.
+
+    Ready means "this instance can serve a run", so a healthy *fallback* endpoint
+    counts as ready: during an outage that has failed over cleanly the pod is
+    serving users, and failing readiness would pull it out of the load balancer
+    and page on-call for a primary problem that is already handled. The primary's
+    outage is not hidden — it is in the detail here, in the ``llm_failover``
+    block of ``/health``, and in ``va_lse_llm_failover_active``.
+
+    The fallback is only probed when the primary fails, so the healthy path still
+    costs one round trip (and stays inside the probe's 5s budget when it costs two).
     """
     # Import lazily so this module can be imported before config/logging setup.
     try:
@@ -87,41 +143,27 @@ def _probe_llm_readiness() -> tuple[bool, str]:
     except Exception as exc:  # noqa: BLE001
         return False, f"settings unavailable: {exc}"
 
-    api_key = (settings.api_key or "").strip()
-    base_url = (settings.base_url or "").strip()
-    if not api_key:
-        return False, "missing OPENAI_API_KEY"
-    if not base_url:
-        return False, "missing base_url"
-
-    # Probe GET {base_url}/models with a short timeout so /ready keeps <2s.
-    url = base_url.rstrip("/") + "/models"
-    try:
-        import urllib.error  # noqa: F401  # imported for side-effect type completeness
-        import urllib.request
-
-        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_key}"})
-        with urllib.request.urlopen(req, timeout=MODELS_PROBE_TIMEOUT_SECONDS) as resp:  # noqa: S310
-            raw = resp.read().decode("utf-8")
-        data: Any = json.loads(raw)
-        rows = data.get("data", []) if isinstance(data, dict) else []
-        ids: set[str] = set()
-        for row in rows:
-            if isinstance(row, dict):
-                mid = row.get("id")
-                if isinstance(mid, str) and mid.strip():
-                    ids.add(mid.strip())
-        # Both configured models must be listed for readiness.
-        missing: list[str] = []
-        for label, model in (("Main model", settings.model_main), ("Fast model", settings.model_fast)):
-            if model and model not in ids:
-                missing.append(f"{label} `{model}` not listed at /models")
-        if missing:
-            return False, "; ".join(missing)
+    primary_ready, primary_detail = _probe_endpoint_models(
+        (settings.base_url or "").strip(),
+        (settings.api_key or "").strip(),
+        (("Main model", settings.model_main), ("Fast model", settings.model_fast)),
+    )
+    if primary_ready:
         return True, "ready"
-    except Exception as exc:  # noqa: BLE001 - readiness is advisory, never raise
-        # Short detail without leaking the key.
-        return False, f"llm probe failed: {type(exc).__name__}: {exc}"
+    if not settings.fallback_configured:
+        return False, primary_detail
+
+    fallback_ready, fallback_detail = _probe_endpoint_models(
+        settings.fallback_base_url.strip(),
+        settings.fallback_api_key_or_primary(),
+        (
+            ("Fallback main model", settings.fallback_model_main_or_primary()),
+            ("Fallback fast model", settings.fallback_model_fast_or_primary()),
+        ),
+    )
+    if fallback_ready:
+        return True, f"primary endpoint unavailable ({primary_detail}); fallback endpoint ready"
+    return False, f"primary: {primary_detail}; fallback: {fallback_detail}"
 
 
 def _cached_readiness(*, force: bool = False) -> tuple[bool, str]:
@@ -139,7 +181,23 @@ def _cached_readiness(*, force: bool = False) -> tuple[bool, str]:
     return ready, detail
 
 
-def _health_payload(*, probe_cache: bool = False) -> dict[str, Any]:
+def cached_readiness_state() -> bool | None:
+    """The last readiness verdict, or ``None`` if no check has been made yet.
+
+    Deliberately never triggers a probe of its own: readiness costs a round trip to
+    the LLM gateway, and ``/metrics`` is scraped every 15s and shares a port with
+    the liveness probe, so it must not perform network I/O (see
+    :mod:`app.metrics`). The orchestrator's readiness probe keeps this fresh; if
+    nothing has probed yet there is no verdict to report, and ``None`` propagates
+    to an absent series rather than an invented healthy one.
+    """
+    with _ready_lock:
+        if _cached_ready_at == 0.0:
+            return None
+        return _cached_ready
+
+
+def _health_payload(*, probe_cache: bool = False, probe_queue: bool = False) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "status": "ok",
         "service": "va-lay-statement-evaluator",
@@ -153,6 +211,69 @@ def _health_payload(*, probe_cache: bool = False) -> dict[str, Any]:
         payload["cache"] = cache.health(probe=probe_cache)
     except Exception:  # noqa: BLE001
         payload["cache"] = {"backend": "unavailable"}
+    # Include job-queue status: an operator needs to see, from the web pod, that
+    # runs are being handed to a worker (and how deep that backlog is). The
+    # backlog itself is only read for a local backend or when probe_queue is set,
+    # because reading it on a remote tier is a network round trip on the liveness
+    # path — see JobBackend.health.
+    try:
+        from .job_queue import get_job_backend as _gjb
+
+        payload["job_queue"] = _gjb().health(probe=probe_queue)
+    except Exception:  # noqa: BLE001
+        payload["job_queue"] = {"backend": "unavailable"}
+    # Include tracing status so "why are there no traces?" is answerable from the
+    # same endpoint operators already poll. Reports configuration only — no probe
+    # of the collector, because /health must not block on a network round trip.
+    try:
+        from .tracing import tracing_health as _th
+
+        payload["tracing"] = _th()
+    except Exception:  # noqa: BLE001
+        payload["tracing"] = {"enabled": False, "active": False, "reason": "unavailable"}
+    # Audit stream *and* its off-pod backup. Two separate blocks on purpose: the
+    # audit log is the compliance artifact and the backup is what makes it survive
+    # the pod, and either can be broken while the other looks fine.
+    try:
+        from .audit import audit_health as _ah
+
+        payload["audit"] = _ah()
+    except Exception:  # noqa: BLE001
+        payload["audit"] = {"status": "unavailable"}
+    try:
+        from .audit_backup import audit_backup_health as _abh
+
+        payload["audit_backup"] = _abh()
+    except Exception:  # noqa: BLE001
+        payload["audit_backup"] = {"status": "unavailable"}
+    # Free space on the log volume. "No protection against disk-space exhaustion"
+    # is answered by making it observable: below VA_LSE_DISK_MIN_FREE_BYTES this
+    # reports below_floor, and audit.write_failures says whether it is already
+    # costing us records. stdlib only, no I/O beyond a statvfs.
+    try:
+        from .audit_backup import disk_status as _ds
+
+        payload["disk"] = _ds()
+    except Exception:  # noqa: BLE001
+        payload["disk"] = {"checked": False}
+    # Whether a backup can be read back *with this configuration*. Config-only and
+    # network-free on purpose: restoring is on demand, but "could we restore from
+    # here?" is a question an operator should not have to shell into a pod to
+    # answer, and it is the one thing that makes a green backup job meaningful.
+    try:
+        from .audit_restore import audit_integrity_health as _aih
+
+        payload["restore"] = _aih()
+    except Exception:  # noqa: BLE001
+        payload["restore"] = {"restore_available": False, "error": "unavailable"}
+    # Failover state. Network-free (config + the primary breaker), because /health
+    # is polled every 10s by the kubelet and must never depend on a provider.
+    try:
+        from .llm import failover_status as _fs
+
+        payload["llm_failover"] = _fs()
+    except Exception:  # noqa: BLE001
+        payload["llm_failover"] = {"configured": False, "active": False}
     return payload
 
 
@@ -179,13 +300,28 @@ class _HealthHandler(BaseHTTPRequestHandler):
     def _handle(self, *, get_body: bool) -> None:
         parsed = urlparse(self.path)
         path = (parsed.path or "/").rstrip("/") or "/"
+        # ``?probe=1`` is the explicit opt-in to the one value that costs a
+        # network round trip (queue depth on a remote backend). It is off by
+        # default on every route so a scrape or a kubelet poll can never block on
+        # a slow Redis tier.
+        query = parse_qs(parsed.query)
+        probe = (query.get("probe") or [""])[0].strip().lower() in ("1", "true", "yes")
         started = time.monotonic()
         try:
             if path == HEALTH_PATH:
-                payload = _health_payload()
+                payload = _health_payload(probe_queue=probe)
                 body = json.dumps(payload).encode("utf-8")
                 self._send_json(200, body, get_body=get_body)
                 logger.debug("health probe path=%s status=200", path)
+                return
+            if path == METRICS_PATH:
+                from .metrics import CONTENT_TYPE as _metrics_ct
+                from .metrics import render_prometheus as _render
+
+                text = _render(_health_payload(probe_queue=probe))
+                body = text.encode("utf-8")
+                self._send(200, body, _metrics_ct, get_body=get_body)
+                logger.debug("metrics scrape path=%s status=200 probe=%s", path, probe)
                 return
             if path == READY_PATH:
                 # During graceful shutdown the instance must fall out of the
@@ -239,8 +375,11 @@ class _HealthHandler(BaseHTTPRequestHandler):
                 pass
 
     def _send_json(self, status: int, body: bytes, *, get_body: bool) -> None:
+        self._send(status, body, "application/json; charset=utf-8", get_body=get_body)
+
+    def _send(self, status: int, body: bytes, content_type: str, *, get_body: bool) -> None:
         self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
@@ -283,7 +422,11 @@ def start_health_server(port: int | None = None, *, host: str = "0.0.0.0") -> Th
     thread.start()
     _server = server
     _thread = thread
-    logger.info("health server listening on %s:%d (GET /health, GET /ready)", host, chosen_port)
+    logger.info(
+        "health server listening on %s:%d (GET /health, GET /ready, GET /metrics)",
+        host,
+        chosen_port,
+    )
     return server
 
 

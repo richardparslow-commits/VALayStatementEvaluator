@@ -97,17 +97,30 @@ spec:
           volumeMounts:
             - name: app-logs
               mountPath: /app/logs
+            # --- Pattern C only: uncomment BOTH this mount and the blobs volume
+            # --- below, and apply k8s-blobs.yaml first. Pattern A keeps every run
+            # --- inside this pod, so it needs no shared blob storage and is left
+            # --- working out of the box. Without this mount a Pattern C web pod
+            # --- cannot externalize a large job's records and the run fails.
+            # - name: blobs
+            #   mountPath: /app/blobs
           # Read-only root filesystem for security
           securityContext:
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false
             runAsNonRoot: true
             runAsUser: 65534       # nobody
+      securityContext:
+        fsGroup: 65534                 # so the RWX volume is writable by nobody
       volumes:
+        # Persistent + shared. An emptyDir here reclaimed the whole audit stream on
+        # every pod restart and split it from the worker's own emptyDir, so
+        # "the audit log" was really two ephemeral files on two pods. Apply
+        # k8s-logs.yaml first; a Pending PVC will hold this pod in ContainerCreating.
         - name: app-logs
-          emptyDir:
-            sizeLimit: 1Gi
-        # For persistent logs across pod restarts, replace emptyDir with a PVC:
-        # - name: app-logs
+          persistentVolumeClaim:
+            claimName: va-lse-logs       # ReadWriteMany — see k8s-logs.yaml
+        # --- Pattern C only (see the mount comment above):
+        # - name: blobs
         #   persistentVolumeClaim:
-        #     claimName: va-lse-logs
+        #     claimName: va-lse-blobs      # ReadWriteMany — see k8s-blobs.yaml

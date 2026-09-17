@@ -1,0 +1,121 @@
+# k8s-worker.yaml — worker Deployment for Pattern C.
+#
+# Workers are the pods that actually run the digest pipeline. They are
+# deliberately a separate Deployment from the Streamlit pods so the two tiers can
+# be sized and scaled independently:
+#
+#   * web pods  — thin. Hold the browser WebSocket (hence still sticky), enqueue
+#                 jobs, poll status, render results. ~512 Mi is plenty.
+#   * worker pods — fat. Peak ~1.8 GB on a 2,000-page bundle (PERFORMANCE.md), so
+#                 they get their own generous memory limit and no Ingress.
+#
+# Apply after Redis + the shared blob storage, and before flipping
+# VA_LSE_JOB_QUEUE=1 on the web tier, so jobs are never queued into a pool nothing
+# is consuming:
+#
+#   kubectl apply -f k8s-redis.yaml
+#   kubectl apply -f k8s-blobs.yaml        # RWX PVC (or use S3 and skip it)
+#   kubectl apply -f k8s-worker.yaml
+#   kubectl rollout status deployment/va-lse-worker
+#   # then uncomment the blob volume in k8s-deployment.yaml and:
+#   kubectl set env deployment/va-lse -n va-lse VA_LSE_JOB_QUEUE=1
+#
+# Rollback: set VA_LSE_JOB_QUEUE back to 0. Jobs already on the queue still
+# finish; new runs go back in-process.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: va-lse-worker
+  labels:
+    app: va-lse-worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: va-lse-worker
+  template:
+    metadata:
+      labels:
+        app: va-lse-worker
+    spec:
+      # Let the in-flight job finish before SIGKILL. The worker registers each
+      # job with app/shutdown, so SIGTERM drains instead of discarding 35 minutes
+      # of work. This MUST exceed the longest single job; the job's lease (15 min
+      # by default) covers the case where the pod is killed anyway.
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: va-lse-worker
+          image: va-lse:latest          # same image as the web tier
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "app.worker"]
+          envFrom:
+            - secretRef:
+                name: va-lse-env        # provides OPENAI_API_KEY + queue config
+          env:
+            # Stable, human-readable identity in logs and on the job record.
+            - name: VA_LSE_WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: VA_LSE_WORKER_HEALTH_PORT
+              value: "8002"
+          ports:
+            - name: health
+              containerPort: 8002
+          # Liveness only. An idle worker is healthy; readiness would gate on the
+          # LLM gateway and is not needed because nothing load-balances to a
+          # worker — they pull work off the queue themselves.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 4
+          resources:
+            # One job peaks ~1.8 GB at 2,000 pages. Keep
+            # VA_LSE_WORKER_CONCURRENCY at 1 unless you raise these limits —
+            # two concurrent large jobs in one 2 Gi container will OOM.
+            requests:
+              cpu: "250m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "3Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65534       # nobody (matches the web tier)
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: logs
+              mountPath: /app/logs      # run log + audit log
+            # Shared with the web tier: large jobs put their extracted record text
+            # here and the queue carries a reference (app/blob_store.py). Must be
+            # ReadWriteMany — see k8s-blobs.yaml.
+            - name: blobs
+              mountPath: /app/blobs
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: logs
+          # Must be the same volume the web tier mounts: a worker's audit entries
+          # belong to the run the user submitted, and a per-pod emptyDir put them
+          # on a different disk that vanished with the worker. See k8s-logs.yaml.
+          persistentVolumeClaim:
+            claimName: va-lse-logs       # ReadWriteMany
+        - name: blobs
+          persistentVolumeClaim:
+            claimName: va-lse-blobs
+        - name: tmp
+          emptyDir: {}
+---
+# Workers pull from Redis; nothing routes traffic to them. There is deliberately
+# no Service here — the queue is the interface.
+#
+# Scale with: kubectl scale deployment/va-lse-worker --replicas=N
+# Throughput is bounded by the LLM endpoint (VA_LSE_RECORDS_CONCURRENCY per job),
+# not by pod count, so watch LLM rate limits before scaling out.

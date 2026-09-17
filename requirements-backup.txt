@@ -1,0 +1,26 @@
+# Optional dependencies for off-pod audit log backup
+# (VA_LSE_AUDIT_BACKUP_DESTINATION=s3 | gcs | azure).
+#
+# Not part of requirements.txt / requirements.lock: the filesystem destination
+# needs no extra package, and nothing in the running app imports these. Install
+# only the one your destination needs — they are deliberately not a single
+# combined requirement in production images, because shipping three cloud SDKs to
+# run one of them is a lot of attack surface for a log shipper.
+#
+#   pip install -r requirements-backup.txt
+#
+# The backup runs as a separate process (scripts/backup_audit_logs.py), so these
+# packages belong in the *backup* job's image, not necessarily the web tier's.
+#
+# destination=s3    -> boto3 (AWS S3, Cloudflare R2, MinIO, DO Spaces, and GCS in
+#                      interoperability mode)
+# destination=gcs   -> google-cloud-storage
+# destination=azure -> azure-storage-blob (+ azure-identity for managed identity)
+#
+# All three are imported lazily: a missing package is reported as a clear
+# configuration error, never an ImportError traceback. See
+# DEPLOYMENT.md -> Audit log retention and backup.
+boto3>=1.34
+google-cloud-storage>=2.14
+azure-storage-blob>=12.19
+azure-identity>=1.16

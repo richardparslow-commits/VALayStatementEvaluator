@@ -1,16 +1,17 @@
 # Deployment Guide — VA Lay Statement Evaluator
 
 This document covers running the app in production at scale, including
-multi-instance deployment behind a load balancer, session persistence,
-and graceful failover. For single-user local setup, see `README.md → Setup`.
+multi-instance deployment behind a load balancer, running the pipeline on a
+worker pool, and graceful failover. For single-user local setup, see
+`README.md → Setup`.
 
 ## Table of contents
 
 1. [Deployment patterns at a glance](#1-deployment-patterns-at-a-glance)
 2. [Pattern A — Docker Compose + nginx (session affinity)](#2-pattern-a--docker-compose--nginx-session-affinity)
 3. [Pattern B — Kubernetes with session affinity](#3-pattern-b--kubernetes-with-session-affinity)
-4. [Pattern C — Kubernetes with Redis session store](#4-pattern-c--kubernetes-with-redis-session-store)
-5. [Session persistence tradeoffs](#5-session-persistence-tradeoffs)
+4. [Pattern C — Kubernetes with a worker pool and Redis](#4-pattern-c--kubernetes-with-a-worker-pool-and-redis)
+5. [Placement tradeoffs](#5-placement-tradeoffs)
 6. [Dockerfile](#6-dockerfile)
 7. [Health probe wiring](#7-health-probe-wiring)
 8. [Graceful shutdown at scale](#8-graceful-shutdown-at-scale)
@@ -20,22 +21,41 @@ and graceful failover. For single-user local setup, see `README.md → Setup`.
 12. [TLS and reverse proxy](#12-tls-and-reverse-proxy)
 13. [Distributed cache for VA reference data](#13-distributed-cache-for-va-reference-data)
 14. [Pattern D — Streamlit Community Cloud](#14-pattern-d--streamlit-community-cloud)
+15. [Distributed tracing (OpenTelemetry)](#15-distributed-tracing-opentelemetry)
+16. [Audit log retention and backup](#16-audit-log-retention-and-backup)
+17. [LLM endpoint failover (optional)](#17-llm-endpoint-failover-optional)
 
 ---
 
 ## 1. Deployment patterns at a glance
 
-| Pattern | Instances | Session persistence | Failover | Complexity |
+| Pattern | Instances | Where heavy runs execute | Failover | Complexity |
 |---|---|---|---|---|
-| **A. Docker Compose + nginx** | 3 (configurable) | Cookie-based affinity | Affinity preserves session; new instance loses state | Low — ideal for small teams |
-| **B. K8s + session affinity** | ≥ 2 via Deployment | Client-IP or cookie affinity | Same-node sessions survive pod restart; cross-node sessions lost | Medium |
-| **C. K8s + Redis session store** | ≥ 2 via Deployment | Redis-backed `st.session_state` | Full: any pod serves any session; pod kill is invisible to user | High — best for 100-user scale |
-| **D. Streamlit Community Cloud** | 1 (platform-managed) | Per-session process state | Platform restarts the app; in-memory state lost | None — no infrastructure (§14) |
+| **A. Docker Compose + nginx** | 3 (configurable) | In the pod serving the session | Affinity preserves session; new instance loses state | Low — ideal for small teams |
+| **B. K8s + session affinity** | ≥ 2 via Deployment | In the pod serving the session | Same-node sessions survive pod restart; cross-node sessions lost | Medium |
+| **C. K8s + worker pool + Redis** | ≥ 2 web + N workers | On a dedicated worker pool | Web pods are interchangeable; a killed worker's job is re-queued | High — best for 100-user scale |
+| **D. Streamlit Community Cloud** | 1 (platform-managed) | In the single process | Platform restarts the app; in-memory state lost | None — no infrastructure (§14) |
 
-**Recommendation for 100 concurrent users:** Pattern C (Kubernetes + Redis). Session
-affinity (Patterns A/B) creates hot spots — a user who uploads a large record set
-keeps hitting the same pod, preventing the load balancer from spreading work. Redis
-eliminates this constraint. Patterns A/B are suitable for <20 users or development/staging.
+**Recommendation for 100 concurrent users:** Pattern C (Kubernetes + worker pool).
+
+Two things are true at once here, and only the second is fixed by adding Redis:
+
+1. **Session affinity is still required.** A Streamlit session is a live WebSocket bound
+to one server process; every rerun, widget event, and upload travels over that socket.
+Replicating `st.session_state` to Redis does *not* let a different pod serve a user who is
+connected elsewhere — if the load balancer routes `POST /_stcore/stream` to a pod that does
+not hold the session, Streamlit answers "session not found → please reload". So Patterns
+A/B/C all keep sticky sessions.
+
+2. **But affinity must not decide where the work runs.** With the pipeline executing inside
+the script run, a user with a 2,000-page bundle pins the pod that owns their socket for
+~35 minutes and ~1.8 GB (`PERFORMANCE.md`), and a pod restart destroys all of it. Pattern C
+moves the *run* — not the session — onto a worker pool. Web pods become interchangeable
+and cheap; any pod can render a finished job's result; workers are scaled and sized
+independently of the browser tier.
+
+Patterns A/B are suitable for <20 users or development/staging. Redis is **required** in
+Pattern C — not as a session store, but as the job queue, status channel, and result store.
 
 **For a demo or single-user deployment with no infrastructure**, Pattern D (Streamlit
 Community Cloud) is enough — but note it has no `VA_LSE_LOG_DIR` volume, so audit logs are
@@ -61,6 +81,26 @@ docker compose up -d --scale streamlit-web=5
 docker compose logs -f nginx
 docker compose logs -f streamlit-web
 ```
+
+#### Pattern C from the same compose file
+
+The bundled compose file can also run the worker tier, so you can rehearse Pattern C
+(including a real Redis) on one machine before touching a cluster:
+
+```bash
+# Web tier + Redis + 1 worker, with the shared job-document volume
+VA_LSE_JOB_QUEUE=1 docker compose --profile pattern-c up --build -d
+
+docker compose up -d --scale worker=4          # scale the worker tier
+docker compose logs -f worker
+docker compose exec redis redis-cli llen va_lse:jobs:evaluate
+```
+
+The `redis` and `worker` services sit behind the `pattern-c` profile, so a plain
+`docker compose up` stays Pattern A. The worker reads the same `.env` as the web tier but has
+no browser session — `OPENAI_API_KEY` must be in `.env` (or the `environment:` block), not
+typed into the sidebar. Flip `VA_LSE_JOB_QUEUE=0` to go back to in-process runs; anything
+already queued still finishes.
 
 ### `docker-compose.yml`
 
@@ -333,198 +373,164 @@ kubectl get pods -l app=va-lse -w
 
 ---
 
-## 4. Pattern C — Kubernetes with Redis session store
+## 4. Pattern C — Kubernetes with a worker pool and Redis
 
-This is the recommended pattern for 100 concurrent users. It replaces
-in-memory session state with Redis, so any pod can serve any session.
+This is the recommended pattern for 100 concurrent users.
 
 ### How it works
 
-Streamlit stores per-session data in `st.session_state` (a Python dict).
-To externalize this:
+The app ships a distributed job queue (`app/job_queue.py` + `app/worker.py`). With
+`VA_LSE_JOB_QUEUE=1`, an Evaluate/Draft run is **submitted** instead of executed:
 
-1. **`streamlit-ext-session-state`** (or a custom wrapper around
-   `streamlit-javascript` + Redis) serializes session state to Redis on
-   every rerun and deserializes it at the start.
-2. **Alternative (simpler, recommended):** Keep the app stateless per-request
-   and reconstruct it on each Streamlit rerun from persistent storage. The
-   app already does this for most state:
-   - Uploaded documents are re-extracted from the uploaded files (cached
-     per `st.session_state` but re-extractable).
-   - Evaluation/Draft results are stored in `st.session_state` and lost on
-     pod migration — but the user can re-run.
-   - The `request_id` and audit trail are written to `logs/audit.log` (not
-     session state), so they survive pod restarts.
+1. The web pod extracts the uploaded files (as it always has), serializes the statement
+   or observations plus the extracted page text, and enqueues the job.
+2. A worker pod claims it, runs `run_evaluation` / `run_draft` under the same memory and
+   timeout guards as the in-process path, and writes the result back.
+3. The web pod polls a small status key — a few hundred bytes per tick — and renders the
+   report when the job finishes. Any web pod can render any job's result.
 
-3. **Pragmatic approach:** Use a **Redis-backed session store** that persists
-   `st.session_state` across pod restarts, so mid-run pod kills do not lose
-   the user's uploaded records and in-progress results.
+What this buys you over affinity alone:
 
-### Redis session store pattern
+| | Pattern A/B | Pattern C |
+|---|---|---|
+| Where a 2,000-page digest runs | the pod owning the user's WebSocket | a worker pod |
+| Web-pod memory during a large run | ~1.8 GB peak same-process | a few MB (polling) |
+| Pod killed mid-run | run lost, connection dropped | worker re-queues it; user reloads and re-attaches |
+| User closes the tab mid-run | run is torn down (`BaseException` unwinds the script run) | run completes; results wait for the user |
+| Scaling | web pods must be sized for the worst run | web and worker tiers scale independently |
 
-```yaml
-# k8s-redis.yaml
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: va-lse-redis
-spec:
-  serviceName: va-lse-redis
-  replicas: 1
-  selector:
-    matchLabels:
-      app: va-lse-redis
-  template:
-    metadata:
-      labels:
-        app: va-lse-redis
-    spec:
-      containers:
-        - name: redis
-          image: redis:7-alpine
-          ports:
-            - containerPort: 6379
-          command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
-          volumeMounts:
-            - name: redis-data
-              mountPath: /data
-  volumeClaimTemplates:
-    - metadata:
-        name: redis-data
-      spec:
-        accessModes: ["ReadWriteOnce"]
-        resources:
-          requests:
-            storage: 1Gi
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: va-lse-redis
-spec:
-  selector:
-    app: va-lse-redis
-  ports:
-    - port: 6379
-```
+**Sticky sessions stay on.** Affinity is not a workaround here — it is required by
+Streamlit's WebSocket, and it is now cheap: what a user is stuck to is a thin UI pod.
+Do **not** remove the Ingress affinity annotations unless you have replaced the
+Streamlit server itself; a session that lands on the wrong pod gets "session not found".
 
-The Streamlit app would need a session-state hook to persist to Redis:
+**The worker needs the API key in its own environment.** A worker has no browser session,
+so a key typed into the sidebar cannot reach it. Configure `OPENAI_API_KEY` (and the model
+names) in the worker's env or mounted secret. The app checks this before queueing and
+refuses the run with a clear message rather than failing on the worker.
 
-```python
-# In app/main.py or a new app/session_store.py:
-import json
-import os
+### Redis
 
-REDIS_URL = os.getenv("VA_LSE_REDIS_URL", "")
+Redis holds the queue, per-job status, and results — not session state. Keys are namespaced
+under `VA_LSE_JOB_QUEUE_PREFIX` (default `va_lse`):
 
-def _sync_session_to_redis() -> None:
-    """Persist st.session_state to Redis after every rerun (best-effort)."""
-    if not REDIS_URL:
-        return
-    try:
-        import redis
-        r = redis.from_url(REDIS_URL, decode_responses=True)
-        session_id = st.session_state.get("_va_lse_session_id", "")
-        if not session_id:
-            import uuid
-            session_id = f"sess_{uuid.uuid4().hex[:12]}"
-            st.session_state["_va_lse_session_id"] = session_id
-        # Serialize session state (exclude non-serializable items)
-        serializable = {}
-        for k, v in st.session_state.items():
-            try:
-                json.dumps(v)
-                serializable[k] = v
-            except (TypeError, ValueError):
-                pass  # Skip non-serializable items (e.g. UploadedFile objects)
-        r.setex(f"va_lse:session:{session_id}", 7200, json.dumps(serializable))  # 2h TTL
-    except Exception:
-        pass  # Redis failure must never break the app
+| Key | Purpose |
+|---|---|
+| `va_lse:jobs:evaluate`, `va_lse:jobs:draft` | job ids waiting for a worker (list) |
+| `va_lse:jobs:<kind>:leases` | heartbeat per running job (sorted set) — drives re-queue of abandoned jobs |
+| `va_lse:job:<id>:meta` | status, progress, message, worker id (small JSON) |
+| `va_lse:job:<id>:payload` | statement/observations + extracted record text — or a blob reference when large |
+| `va_lse:job:<id>:result` | the finished report, usage totals |
 
-def _load_session_from_redis() -> None:
-    """Load session state from Redis on app start (best-effort)."""
-    if not REDIS_URL:
-        return
-    try:
-        import redis
-        import uuid
-        r = redis.from_url(REDIS_URL, decode_responses=True)
-        session_id = st.session_state.get("_va_lse_session_id", "")
-        if not session_id:
-            session_id = f"sess_{uuid.uuid4().hex[:12]}"
-            st.session_state["_va_lse_session_id"] = session_id
-        data = r.get(f"va_lse:session:{session_id}")
-        if data:
-            for k, v in json.loads(data).items():
-                if k not in st.session_state:
-                    st.session_state[k] = v
-    except Exception:
-        pass
-```
+All three carry `VA_LSE_JOB_QUEUE_TTL_SECONDS` (24 h default), so completed jobs expire on
+their own.
 
-### Integration with the app
+Redis holds the *payload*, not the uploaded PDFs: extraction still happens on the web pod,
+so what crosses the queue is the page-labelled record text. That text is what makes a large
+job large, so above `VA_LSE_JOB_QUEUE_INLINE_MAX_BYTES` (256 KB default) the payload is
+externalized — see **Job documents** below. Sizing follows from that: with externalization
+on, Redis only needs room for small jobs, status, and results, and `--maxmemory` no longer
+has to be sized for `concurrency × peak batch text` (a 5,000-page bundle serializes to
+tens of megabytes, far past the 2 Gi the reference StatefulSet proposes).
+`deploy/k8s/k8s-redis.yaml` provisions that StatefulSet; note that
+`--maxmemory-policy allkeys-lru` will evict the largest keys first — which, once the big
+payloads are in blob storage, are the finished results rather than a running job. Use
+`noeviction` (or a larger `maxmemory`) if a lost job is worse than a failed write.
 
-Add to `app/config.py`:
+**Upstash instead of in-cluster Redis:** setting `VA_LSE_SHARED_CACHE_URL` +
+`VA_LSE_SHARED_CACHE_TOKEN` (the credentials the reference cache already uses) makes the
+same queue run over the Upstash REST API with no extra infrastructure and no `redis`
+package. See README → Distributed cache for the setup steps. Upstash has no blocking pop, so
+workers poll on `VA_LSE_JOB_QUEUE_POLL_SECONDS` (raise it to reduce request costs). Note that
+Upstash bills per request and per byte, which is the other reason large payloads belong in
+the blob store rather than in the queue.
 
-```python
-# Redis session store (optional). Set VA_LSE_REDIS_URL to enable
-# Redis-backed session persistence for multi-instance deployments.
-# Without it, sessions are in-memory per pod (Pattern A/B).
-REDIS_URL = os.getenv("VA_LSE_REDIS_URL", "")
-```
+### Job documents — inline or externalized
 
-Add to `.env.example`:
+A job's documents go to a blob store when they exceed `VA_LSE_JOB_QUEUE_INLINE_MAX_BYTES`
+(256 KB default); the queue then carries a small content-addressed reference instead. Small
+jobs stay inline, so the zero-configuration path is unchanged and no extra round trip is
+paid for a 40 KB statement.
 
-```bash
-# Redis-backed session store for multi-instance K8s deployments (Pattern C).
-# Leave empty for single-instance or affinity-based deployments (Patterns A/B).
-# VA_LSE_REDIS_URL=redis://va-lse-redis:6379/0
-```
+| `VA_LSE_BLOB_STORE` | Backing store | Notes |
+|---|---|---|
+| `auto` (default) | filesystem when the queue is on, otherwise none | no configuration needed |
+| `filesystem` | `VA_LSE_BLOB_DIR` (default `blobs`) | stdlib only; the directory **must be shared** with every worker |
+| `s3` | `VA_LSE_BLOB_S3_BUCKET` (+ `_PREFIX`, `_ENDPOINT_URL`) | needs `pip install -r requirements-s3.txt`; works with AWS S3, Cloudflare R2, MinIO, DO Spaces |
+| `none` | — | never externalize; every job must fit `VA_LSE_JOB_QUEUE_MAX_PAYLOAD_BYTES` |
+
+The filesystem backend is the right default for a cluster because it needs no extra
+service: `deploy/k8s/k8s-blobs.yaml` provisions a **ReadWriteMany** PVC mounted at
+`/app/blobs` in both the web and worker Deployments, and the compose file mounts the same
+`job-blobs` volume in both. A per-pod `emptyDir` (or a `ReadWriteOnce` PVC shared by
+accident) fails in a specific, confusing way: the web pod writes the blob happily, then the
+worker cannot resolve the reference and the job fails with `BlobNotFound`. The blob **must**
+be visible to every pod that might claim the job, so verify with
+`kubectl exec deploy/va-lse-worker -- ls /app/blobs` after a large run.
+
+Use S3 when the web and worker tiers cannot share a filesystem — multi-cluster, or worker
+nodes in another region. `deploy/k8s/k8s-deployment.yaml` / `k8s-worker.yaml` then need the
+`AWS_*` credentials in the env secret, and no PVC.
+
+Blobs are content-addressed (the key is derived from the bytes), so two users uploading the
+same bundle in one deployment share one object, and re-submitting a failed run re-uses it.
+They are deleted when the job reaches a terminal state, and the filesystem backend also
+sweeps anything older than `VA_LSE_JOB_QUEUE_TTL_SECONDS` on write, so a crashed worker
+cannot leak bytes forever. Storage needed is roughly `queue depth × average job text`;
+a handful of concurrent 2,000-page bundles is a few hundred MB.
+
+The sidebar's **🛠️ Job queue** panel and `GET /health → job_queue` report which blob
+backend is active, so a misconfigured tier is visible before a job fails.
 
 ### Deployment
 
 ```bash
-# Create secret
+# Redis (or point the app at Upstash instead and skip this)
+kubectl apply -f deploy/k8s/k8s-redis.yaml
+
+# Credentials + queue flags
 kubectl create secret generic va-lse-env --from-env-file=.env
-
-# Add VA_LSE_REDIS_URL to the secret
 kubectl patch secret va-lse-env -p \
-  '{"data":{"VA_LSE_REDIS_URL":"cmVkaXM6Ly92YS1sc2UtcmVkaXM6NjM3OS8w"}}'  # base64-encoded
+  '{"data":{"VA_LSE_REDIS_URL":"cmVkaXM6Ly92YS1sc2UtcmVkaXM6NjM3OS8w","VA_LSE_JOB_QUEUE":"MQ=="}}'
 
-# Apply all manifests
+# Web tier, then the worker tier
 kubectl apply -f deploy/k8s/
+kubectl rollout status deployment/va-lse-worker
+
+# Confirm the queue is live and see the backlog
+curl -s localhost:8001/health | jq .job_queue      # web pod
+curl -s localhost:8002/health | jq .job_queue      # worker pod
 ```
+
+Start workers **before** flipping `VA_LSE_JOB_QUEUE=1` on the web tier, otherwise users
+queue jobs nothing is consuming. To roll back, unset it — in-flight jobs already on the
+queue finish, and new runs go back in-process.
 
 ---
 
-## 5. Session persistence tradeoffs
+## 5. Placement tradeoffs
 
-| Factor | Pattern A/B (affinity) | Pattern C (Redis) |
+| Factor | Pattern A/B (run in the web pod) | Pattern C (worker pool) |
 |---|---|---|
-| **Setup complexity** | Low — just nginx cookie or k8s affinity annotation | Medium — Redis StatefulSet + session hook code |
-| **Failover behavior** | User loses session if their pod dies; must re-upload records and re-run | Session survives pod restart; user sees a brief pause |
-| **Load distribution** | Hot spots — large record sets keep one pod busy while others idle | Even — any pod can pick up any session |
-| **Memory per pod** | Higher (session state accumulates) | Lower (state offloaded to Redis) |
-| **Operational cost** | Zero additional infra | Redis pod + 1 GB PVC + monitoring |
+| **Setup complexity** | Low — just nginx cookie or k8s affinity annotation | High — Redis + worker Deployment + queue flags |
+| **Where heavy work runs** | The pod serving the user's session | Dedicated worker pods |
+| **Run survives pod restart** | No — the user re-uploads and re-runs | Yes — the job is re-queued and any web pod renders it |
+| **Run survives a closed tab** | No | Yes |
+| **Web pod memory** | Sized for the worst run (2,000 pages ≈ 1.8 GB) | Flat; workers carry the peak |
+| **Scaling** | Vertical, or more identically-sized pods | Web and worker tiers scale independently |
+| **Operational cost** | Zero additional infra | Redis + worker pods + monitoring |
 | **When to use** | < 20 users, dev/staging, quick demos | 20–100+ concurrent users, production |
 
-**Key insight:** The app's heaviest state — uploaded medical records and
-`MedicalDigest` — is already re-extractable from the source files. The only
-truly volatile state is in-progress pipeline results and the `request_id`.
-For many deployments, **Pattern B with session affinity is sufficient** because:
-
-1. Pod restarts are rare in healthy clusters (kubectl drain + rolling updates
-   are the main causes).
-2. When they do occur, the user sees a Streamlit error page, refreshes, and
-   re-uploads their files (they already have the record bundle locally).
-3. The audit trail (`logs/audit.log`) survives because it writes to a
-   persistent volume, not session state.
+**For many deployments, Pattern B with session affinity is still sufficient** because pod
+restarts are rare in a healthy cluster, and when one does happen the user refreshes and
+re-runs (they already have the record bundle locally). The app stays fully functional
+exactly as it always has.
 
 Pattern C is worth the complexity when you need:
-- Zero-interruption failover (e.g., rolling upgrades during business hours)
-- Pod autoscaling (HPA adds/removes pods based on CPU; sessions must be
-  transferable)
-- Compliance requirements that mandate session audit continuity
+- Runs to survive pod restarts, rolling upgrades, and HPA scale-in
+- Web pods that are interchangeable, so a browser session and a 2,000-page digest stop
+  competing for the same pod's memory
+- Users to be able to close the tab and come back to a finished report
 
 ---
 
@@ -738,9 +744,35 @@ All deployment-relevant variables (see `README.md` for the full list):
 | `VA_LSE_SHUTDOWN_GRACE_SECONDS` | Drain timeout | `30` | 30–60 for large record sets |
 | `VA_LSE_LLM_CALL_TIMEOUT_SECONDS` | Per-call timeout | `300` | 300–600 depending on endpoint speed |
 | `VA_LSE_LOG_DIR` | Diagnostic log directory | (stdout only) | Set to `/app/logs` for persistent logs |
-| `VA_LSE_AUDIT_LOG_DIR` | Audit log directory | `logs` | Set to `/app/logs` for persistent logs |
+| `VA_LSE_AUDIT_LOG_DIR` | Audit log directory | `logs` | Set to `/app/logs` **on a PVC**, not an emptyDir |
+| `VA_LSE_AUDIT_LOG_MAX_BYTES` | Audit file size before rotation | `10485760` | Sets the ceiling; see §16 for the retention interaction |
+| `VA_LSE_AUDIT_LOG_BACKUPS` | Rotated audit files kept | `10` | Raise it if the backup interval could outrun rotation |
+| `VA_LSE_AUDIT_RETENTION_DAYS` | Local age-based retention for rotated audit files | `7` | The live `audit.log` is never swept |
+| `VA_LSE_AUDIT_ERROR_MESSAGES` | Record free-text `error_message` in audit entries | `1` | Set `0` when shipping audit logs off-pod |
+| `VA_LSE_AUDIT_BACKUP_DESTINATION` | Off-pod audit backup backend | (empty = off) | `filesystem`, `s3`, `gcs`, or `azure` |
+| `VA_LSE_AUDIT_BACKUP_INTERVAL_HOURS` | Pass interval for `--loop` | `6` | Bounds how much a pod death can lose |
+| `VA_LSE_AUDIT_BACKUP_CLOUD_RETENTION_DAYS` | Remote object retention | `90` | Prefer a bucket lifecycle rule over `--prune` |
+| `VA_LSE_AUDIT_BACKUP_REQUIRED` | Fail the backup job when unconfigured | `0` | `1` in the shipped CronJob |
+| `VA_LSE_RUN_LOG_MAX_BYTES` | Run-log size before rotation | `10485760` | Previously unbounded — see §16 |
+| `VA_LSE_RUN_LOG_BACKUPS` | Rotated run logs kept | `5` | — |
+| `VA_LSE_DISK_MIN_FREE_BYTES` | Log-volume free-space floor | `268435456` | `/health → disk.below_floor` when crossed |
 | `VA_LSE_LOG_JSON` | JSON log format | `0` | `1` for ELK/CloudWatch/Datadog |
-| `VA_LSE_REDIS_URL` | Redis session store | (empty) | `redis://va-lse-redis:6379/0` for Pattern C |
+| `VA_LSE_JOB_QUEUE` | Submit runs to a worker pool (Pattern C) | `0` | `1` on the web tier and every worker |
+| `VA_LSE_REDIS_URL` | Redis backend for the job queue | (empty) | `redis://va-lse-redis:6379/0` for Pattern C |
+| `VA_LSE_JOB_QUEUE_TTL_SECONDS` | Lifetime of a finished job's payload/result | `86400` | Lower to reclaim Redis sooner |
+| `VA_LSE_JOB_QUEUE_LEASE_SECONDS` | Worker heartbeat window before a job is re-queued | `900` | Must exceed the longest gap between progress updates |
+| `VA_LSE_WORKER_CONCURRENCY` | Jobs one worker process runs at once | `1` | Raise with the worker pod's memory limit |
+| `VA_LSE_WORKER_HEALTH_PORT` | Worker health sidecar port | `8002` | Keep default; probe `/health` on it |
+| `VA_LSE_WORKER_ID` | Worker identity in logs and job records | hostname:pid | Set from `metadata.name`/pod name |
+| `VA_LSE_JOB_QUEUE_INLINE_MAX_BYTES` | Job size above which documents go to the blob store | `262144` | Keep default unless Redis is oversized |
+| `VA_LSE_BLOB_STORE` | Blob backend for job documents | `auto` | `filesystem` or `s3` to pin it explicitly |
+| `VA_LSE_BLOB_DIR` | Filesystem blob root | `blobs` | `/app/blobs` on the shared RWX PVC |
+| `VA_LSE_BLOB_S3_BUCKET` | S3-compatible bucket | (empty) | Only for `s3`; needs `requirements-s3.txt` |
+| `VA_LSE_TRACING` | Emit OpenTelemetry traces | `0` | `1` on the web tier **and** every worker; needs `requirements-otel.txt` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Collector/APM intake for spans | `http://localhost:4318` | In-cluster collector Service, or a vendor OTLP endpoint |
+| `VA_LSE_TRACE_SAMPLE_RATIO` | Fraction of runs traced | `1.0` | Lower it if the backend meters per span |
+| `VA_LSE_TRACE_CHUNK_SPANS` | One span per record-digest chunk | `0` | Leave off: hundreds of spans per large run |
+| `VA_LSE_TRACE_LLM_CALLS` | One span per LLM provider call | `0` | Leave off unless you need per-call endpoint latency |
 
 ### Secrets management in production
 
@@ -840,13 +872,20 @@ a pod that cannot reach the LLM should fail fast on its own, not affect other po
 
 | State | Stored in | Survives pod restart? | Shared across pods? |
 |---|---|---|---|
-| `st.session_state` | In-memory | No (Pattern A/B) / Yes (Pattern C with Redis) | No / Yes (Redis) |
-| `request_id` | `st.session_state` + `ContextVar` | No | No |
+| `st.session_state` | In-memory (bound to the WebSocket) | No — in every pattern | No — the live session cannot move pods |
+| `request_id` | `st.session_state` + `ContextVar`, echoed into the job payload | No | No |
+| Queued jobs + results | Redis (`va_lse:job:*`) | Yes | Yes |
+| Job progress / status | Redis (`va_lse:job:*:meta`) | Yes | Yes |
 | Audit logs | `logs/audit.log` (PV) | Yes | Yes (if shared PVC) |
 | Diagnostic logs | `logs/app.log` (PV) | Yes | Yes (if shared PVC) |
 | `usage_history.json` | Filesystem | No | No (per-pod) |
 | Circuit breaker | In-memory | No | No (per-pod is correct) |
 | Health cache | In-memory | No | No (per-pod is correct) |
+
+Note the first row: **`st.session_state` is never shared in any pattern.** A run's inputs
+and results move between pods through the job queue, which is why a project may render on a
+different pod than the one that submitted it — while the browser session itself stays
+pinned to one pod via affinity.
 
 ---
 
@@ -985,21 +1024,16 @@ If you use Cloudflare as a reverse proxy, configure rate limiting via
 
 ### Per-user session limits
 
-Beyond IP-level rate limiting, enforce per-user concurrency limits in
-the Streamlit app itself. The circuit breaker and concurrency limiter
-(`app/circuit_breaker.py`) already cap global LLM calls per pod, but
-per-session limits prevent one user from monopolizing a pod:
+The circuit breaker and concurrency limiter (`app/circuit_breaker.py`) cap
+global LLM calls per pod. Per-*session* serialization comes from two mechanisms:
 
-```python
-# In app/main.py (already implemented via session state):
-# - One concurrent Evaluate run per session (st.session_state['eval_running'])
-# - One concurrent Draft run per session (st.session_state['draft_running'])
-# - Shutdown gate rejects new runs during drain
-```
+| Mechanism | Pattern | How |
+|---|---|---|
+| The script run owns the session | A/B, C | A running pipeline blocks the Streamlit script run, so a second click in that session is not processed until it returns. |
+| Pending-job guard | C only | If the UI stops waiting on a queued job, the job id stays in `st.session_state`; `app/views/job_runner.py:submit_job` refuses a second submission until that job reaches a terminal state. Without it a user could queue a duplicate digest over the same records after giving up on a slow run. |
+| Shutdown gate | A/B, C | `app/shutdown.py` rejects new runs once SIGTERM has been received. |
 
-These are enforced by the Streamlit rerun model — clicking "Run" while a
-current run is in progress is a no-op (the button is disabled). For
-additional server-side enforcement:
+For additional server-side enforcement:
 
 | Limit | Mechanism | Default |
 |---|---|---|
@@ -1144,6 +1178,16 @@ The health endpoint (`GET /health`) includes a `cache` field with:
 - `reachable`: `true`/`false` (for Upstash)
 - `hits`, `misses`, `hit_rate`, `errors` — effective cache utilization
 
+It also includes a `job_queue` field (see §4, Pattern C):
+- `backend`: `redis`, `upstash_rest`, or `inprocess`
+- `is_distributed`: `true` only when a worker in another process can claim work
+- `enabled`: whether `VA_LSE_JOB_QUEUE=1`
+- `depth`: jobs waiting to be claimed
+
+Alert on `depth` growing without bound (workers dead or under-provisioned), and on
+`is_distributed: false` while `enabled: true` — that combination means runs are
+being queued into a backend no worker can reach.
+
 ---
 
 ## 14. Pattern D — Streamlit Community Cloud
@@ -1223,6 +1267,666 @@ names only take effect after clicking it (the sidebar warns while a change is pe
 
 ---
 
+## 15. Distributed tracing (OpenTelemetry)
+
+Logs and the profiler already answer "what happened on this pod". Tracing adds the two
+things they cannot: a **span tree per run** (which phase was slow, for *this* run, with
+real start/end times) and a trace that **survives the process boundary** — in Pattern C the
+digest runs on a worker, so a log-derived view of a run stops at the queue.
+
+Off by default, and a no-op when the packages are absent, so nothing changes for a
+deployment that does not want it. Full reference: [`TRACING.md`](TRACING.md).
+
+```bash
+pip install -r requirements-otel.txt
+
+kubectl patch secret va-lse-env -p \
+  '{"data":{"VA_LSE_TRACING":"MQ==","OTEL_EXPORTER_OTLP_ENDPOINT":"aHR0cDovL290ZWwtY29sbGVjdG9yLm9ic2VydmFiaWxpdHk6NDMxOA=="}}'
+
+kubectl rollout restart deployment/va-lse deployment/va-lse-worker
+curl -s localhost:8001/health | jq .tracing     # web pod
+curl -s localhost:8002/health | jq .tracing     # worker pod  ← both must show active: true
+```
+
+### Backends
+
+The exporter is OTLP over HTTP, so Jaeger, Grafana Tempo, an OpenTelemetry Collector,
+Datadog, New Relic and Honeycomb all work through the same two variables — switching
+backends is an env change, not a code change (recipes per vendor are in `TRACING.md`).
+For a self-hosted stack:
+
+```bash
+# Collector (otlp receiver → your storage), then point the app at its Service
+docker run --rm -p 16686:16686 -p 4318:4318 jaegertracing/all-in-one:latest
+```
+
+### What the trace looks like in Pattern C
+
+```
+queue:submit (web pod)
+└── run:evaluate (worker pod)
+    ├── records:review
+    │   └── records:digest          chunks, concurrency, pages
+    ├── claims / verify / rubric / topic / revision / report
+    └── …
+```
+
+The web pod injects its W3C trace context into the job payload, so the worker's spans join
+the submit span rather than starting an unrelated trace. Both tiers therefore need
+`VA_LSE_TRACING=1` and the same collector endpoint; a worker without it traces nothing, and
+a web pod without it makes the worker start a fresh trace per job.
+
+### Sampling and cost
+
+Runs are long and few, so the default (`VA_LSE_TRACE_SAMPLE_RATIO=1.0`) traces everything:
+a 2,000-page Evaluate is roughly a dozen spans. Sampling is **parent-based**, so a sampled
+run keeps its whole tree and a worker inherits the web pod's decision. Two knobs are off by
+default for cardinality reasons — `VA_LSE_TRACE_CHUNK_SPANS` and `VA_LSE_TRACE_LLM_CALLS`
+add one span per chunk or per LLM call, which on a 5,000-page set is thousands of spans per
+run. Turn them on deliberately, ideally with a partial sample ratio.
+
+### PHI and data egress
+
+Traces are metadata only: phase names, counts, page/char sizes, model names, job ids, error
+classes, and the run's `request_id`. Statement text, observations, record text and prompts
+are excluded, and attribute names that look like free text (including any `*_text`) are
+dropped before the SDK sees them — there is a test asserting that
+(`tests/test_tracing.py → TestPiiScreening`).
+
+**Spans do leave the deployment.** If the deployment is PHI-sensitive, run a self-hosted
+collector inside your network (Jaeger/Tempo/OTel Collector) rather than a third-party SaaS;
+picking the backend is a compliance decision as much as an operational one.
+
+### Behaviour under failure
+
+- A collector that is down or misconfigured never fails a run — the exporter logs a warning
+  and drops batches. `health.tracing.active` reports configuration, not reachability, because
+  `/health` is polled by probes and must not block on a network round trip.
+- Spans are buffered and flushed on graceful shutdown, **after** the drain
+  ([§8](#8-graceful-shutdown-at-scale)): the trace of the run that just finished is exported
+  instead of dying with the process. `python -m app.worker --once` flushes on exit too.
+- Tracing adds no secrets to the pod: the OTLP headers are read from the same env/secret
+  mechanism as everything else.
+
+```bash
+# Confirm from a shell that tracing is off/on and why
+curl -s localhost:8001/health | jq '.tracing | {enabled, active, exporter, endpoint, reason}'
+```
+
+### Tracing checklist
+
+- [ ] `pip install -r requirements-otel.txt` in the image (or leave tracing disabled)
+- [ ] `VA_LSE_TRACING=1` on the web tier **and** on every worker pod
+- [ ] `OTEL_EXPORTER_OTLP_ENDPOINT` points at a collector reachable from both tiers
+- [ ] `GET /health → tracing.active` is true on both tiers
+- [ ] A test run appears in the backend as one trace spanning the web pod and the worker
+- [ ] Sampling ratio chosen for your backend's pricing
+- [ ] Collector is self-hosted if the deployment is PHI-sensitive
+
+---
+
+## 16. Audit log retention and backup
+
+The audit stream (`logs/audit.log`) is the forensic record of every Evaluate/Draft:
+which action ran, when, with what inputs (counts and classifications only), and how it
+ended. It is written by [`app/audit.py`](app/audit.py) as a JSON-lines stream separate
+from the diagnostic `app.log` so it can be retained under a different policy. Two gaps
+made it insufficient as a compliance artifact, and both are load-bearing:
+
+1. **It lived only on the pod.** In the original manifests `/app/logs` was an
+   `emptyDir` on the web Deployment *and* on the worker. A restart reclaimed the
+   stream, and in Pattern C the two tiers kept *separate* `audit.log` files on two
+   ephemeral disks — so "the audit log" was really two partial files that vanished
+   together. **No backup strategy can fix this; the volume has to change first.**
+2. **Rotation bounds size, not time.** `VA_LSE_AUDIT_LOG_MAX_BYTES` ×
+   (`VA_LSE_AUDIT_LOG_BACKUPS` + 1) is a hard ~110 MiB ceiling, and the rotation
+   handler deletes the oldest file to make room. There was no age rule at all, so a
+   busy day could destroy a file that was minutes old.
+
+### Step 1 — make the log volume persistent and shared
+
+```bash
+kubectl apply -f deploy/k8s/k8s-logs.yaml      # ReadWriteMany PVC: va-lse-logs
+kubectl get pvc -n va-lse va-lse-logs          # must reach Bound, not Pending
+```
+
+`k8s-deployment.yaml` and `k8s-worker.yaml` already mount `va-lse-logs` at
+`/app/logs`. `ReadWriteMany` is required because the backup job runs in its own pod —
+check `kubectl get storageclass` first, since `local-path` and `gp2` are RWO-only.
+
+The containers run as uid 65534 with a read-only root filesystem, so the volume must
+be *writable by 65534*; the manifests set `fsGroup: 65534`, which is what most CSI
+drivers need. A permission mismatch shows up as `audit.write_failures` climbing in
+`/health`, not as a silent failure.
+
+Docker Compose needs nothing here: `app-logs` is already a named volume shared by the
+web tier, the workers, and the `audit-backup` service.
+
+### Step 2 — choose a destination
+
+| Destination | Set | Install | Notes |
+|---|---|---|---|
+| `filesystem` | `VA_LSE_AUDIT_BACKUP_DIR` | — | An NFS/Azure Files/EFS mount. A directory on the pod's *own* volume is permitted but reported `off_pod: false`, because it cannot survive the pod. |
+| `s3` | `VA_LSE_AUDIT_BACKUP_S3_BUCKET` (+ `_PREFIX`, `_ENDPOINT_URL`) | `requirements-backup.txt` | AWS S3, Cloudflare R2, MinIO, DO Spaces. GCS also works in interoperability mode. |
+| `gcs` | `VA_LSE_AUDIT_BACKUP_GCS_BUCKET` | `requirements-backup.txt` | Native GCS API. |
+| `azure` | `VA_LSE_AUDIT_BACKUP_AZURE_CONTAINER` + `AZURE_STORAGE_CONNECTION_STRING` (or `_ACCOUNT_URL` + workload identity) | `requirements-backup.txt` | Azure Blob has no S3-compatible API, hence a native backend. |
+
+Prefer workload identity (IRSA, GCP Workload Identity, Azure Workload Identity) over
+static keys. The SDKs are imported lazily: a missing package is a clear configuration
+error from the job, never an `ImportError` traceback.
+
+### Step 3 — run the job
+
+```bash
+# Kubernetes (recommended shape): a CronJob in its own pod, every 6h
+kubectl apply -f deploy/k8s/k8s-audit-backup.yaml
+kubectl create job --from=cronjob/va-lse-audit-backup audit-backup-manual -n va-lse
+kubectl logs -n va-lse job/audit-backup-manual
+
+# Compose: the audit-backup service runs continuously (--loop --prune)
+docker compose up -d audit-backup && docker compose logs -f audit-backup
+
+# One-off / inspection, from anywhere with the log volume mounted
+python scripts/backup_audit_logs.py --once --prune     # one pass, enforce retention
+python scripts/backup_audit_logs.py --dry-run --once   # report, change nothing
+python scripts/backup_audit_logs.py --status           # what /health would say
+```
+
+A **CronJob is preferred over a sidecar**: a sidecar shares its pod's lifecycle, so it
+dies with the pod whose logs it is meant to rescue and cannot run during an eviction
+or a rolling update. The CronJob uses `concurrencyPolicy: Forbid` plus
+`activeDeadlineSeconds: 900`, and the script additionally takes a cross-process lock so
+two backup processes cannot race the same watermark.
+
+Exit codes are designed to be visible in `kubectl get jobs`: `0` success (or
+unconfigured-and-not-required), `1` misconfiguration, `2` a pass that ran and failed.
+The shipped CronJob passes `--require-destination` so an unconfigured job **fails**
+rather than exiting 0 forever.
+
+### What gets shipped, and why not just the rotated files
+
+Each pass uploads rotated files *and* the un-shipped tail of the live `audit.log`,
+cut back to the last complete line:
+
+```
+audit/2026/09/16/live-audit.log-g3a1b2c4d5e6f-0-48213-9f31c2ab7d10.jsonl
+                └ file          └ file gen    └ byte range └ content hash
+```
+
+The `g<tag>` segment identifies **which** `audit.log` the range came from. Every
+rotation starts a new file at offset 0, so without it a window from the file written
+after a rotation is indistinguishable from a retry of a window from the file before
+it — and a restore would concatenate the two files' heads and call the result
+contiguous. Keys written by an earlier version (no `g` segment) still verify; they are
+reported as generation `unknown` rather than merged into a neighbour.
+
+Shipping only rotated files is the obvious implementation and it fails the actual
+goal. At a few hundred runs a day a 10 MiB file takes *weeks* to rotate, so the live
+file holds every recent event — including the run that just failed. The byte-range
+watermark closes that gap without ever reading a half-written line, and the
+content+range-addressed key means a pass that crashes after uploading but before
+checkpointing **overwrites the same object on retry** instead of duplicating it.
+
+Rotation is detected two ways, because either alone is insufficient: the inode
+changes (`RotatingFileHandler` renames the old file and creates a new one) *and* a
+size regression catches truncation. An inode check alone misses a same-size rewrite;
+a size check alone misses a rotation where the new file happens to be the same length
+as the watermark.
+
+### Retention
+
+| Rule | Setting | Default | Enforced by |
+|---|---|---|---|
+| Local size ceiling | `VA_LSE_AUDIT_LOG_MAX_BYTES` × (`_BACKUPS` + 1) | ~110 MiB | the rotation handler |
+| Local age ceiling | `VA_LSE_AUDIT_RETENTION_DAYS` | 7 days | the backup pass (runs even with no destination) |
+| Remote retention | `VA_LSE_AUDIT_BACKUP_CLOUD_RETENTION_DAYS` | 90 days | `--prune`, or a bucket lifecycle rule |
+
+Effective local retention is **whichever ceiling is reached first** — a busy period
+can delete a file well inside 7 days. That is the intended trade (a bounded volume
+beats an unbounded one), but it is why the interval matters: set
+`VA_LSE_AUDIT_BACKUP_INTERVAL_HOURS` so a pass always runs before rotation can
+consume `_BACKUPS` files. Lowering `VA_LSE_AUDIT_LOG_MAX_BYTES` or raising `_BACKUPS`
+buys time if your audit volume is unusually high.
+
+A **bucket lifecycle rule is the better instrument for remote retention** than
+`--prune`: it survives a broken backup job. Use `--prune` only where the destination
+cannot set one.
+
+### Watch the disk, and the writes
+
+```bash
+curl -s localhost:8001/health | jq '{audit, audit_backup, disk}'
+```
+
+```jsonc
+{
+  "audit":        { "status": "ok", "write_failures": 0, "retention_days": 7 },
+  "audit_backup": { "status": "ok", "destination": "s3", "last_success_utc": "…",
+                    "pending_bytes": 0, "stale": false },
+  "disk":         { "checked": true, "free_bytes": 528536432640, "below_floor": false },
+  "restore":      { "restore_available": true, "destination": "s3", "off_pod": true,
+                    "tool": "scripts/restore_audit_logs.py" }
+}
+```
+
+- `audit.write_failures` is the one that matters most. `logging` swallows handler
+exceptions and every audit call is best-effort, so a **full disk used to stop auditing
+silently** while the app kept serving. It is now counted and reported as
+`status: degraded` — the app is still up, but records are being lost.
+- `audit_backup.status` is `ok` / `stale` / `error` / `never_ran` / `disabled`. It reads
+the state file on the shared volume, never the network: the backup runs in a different
+process, and `/health` must stay under its 2 s SLO. `stale` means one missed interval,
+not a hard failure — audit logs are forensics, not real-time alerting.
+- `pending_bytes` is the honest answer to "what would a pod death cost me right now?".
+
+**`logs/runs.jsonl` was the actual disk-exhaustion risk.** It is a plain append with
+no rotation, so unlike `audit.log` it could grow without bound on a long-lived pod.
+Both are now bounded (`VA_LSE_RUN_LOG_MAX_BYTES`, `VA_LSE_RUN_LOG_BACKUPS`), and
+`VA_LSE_DISK_MIN_FREE_BYTES` flags a volume approaching full *before* writes start
+failing. Audit writes are never dropped to reclaim space — losing compliance records
+to save bytes is the wrong trade, and it is now visible instead of silent.
+
+### Verify the backup, and restore from it
+
+A backup nobody has read back is a hypothesis. `scripts/restore_audit_logs.py` is the
+companion to the backup job and answers the three questions an audit actually asks: is
+the data intact, is any of it missing, and can the record be rebuilt.
+
+```bash
+# download and hash everything, then walk the byte ranges for holes
+python scripts/restore_audit_logs.py --verify
+
+# fast: skip the downloads (no integrity verdict, no gap analysis)
+python scripts/restore_audit_logs.py --verify --no-hash
+
+# rebuild the stream for an investigator
+python scripts/restore_audit_logs.py --restore /tmp/audit-restore
+
+# read from a different bucket than the deployment writes to (e.g. a read-only key)
+python scripts/restore_audit_logs.py --verify --bucket audit-archive --prefix cold
+
+# machine-readable, for a ticket or a compliance record
+python scripts/restore_audit_logs.py --verify --json
+```
+
+Exit codes: `0` verified/restored, `1` misconfiguration (nothing configured), `2` the
+backup is reachable but incomplete, corrupt, or unreachable. `--restore` exits `2`
+when the stream it wrote has gaps — a holey restore must not look like a clean
+success.
+
+**Integrity needs no side manifest.** Every object key already ends in the first 12
+hex characters of the SHA-256 of its own content, so the expected hash travels *with*
+the data and cannot drift from it. A downloaded object whose bytes do not hash to the
+value in its own key is reported `CORRUPT`. There is nothing to keep in sync, and
+nothing to go stale.
+
+**Gaps are the interesting part.** Windows are byte ranges, so an ordinary verify
+reports the exact offsets that were never uploaded — the records written while the
+backup job was failing:
+
+```text
+destination: s3 (off_pod=True)
+objects: 41 (12,884,901 bytes)
+hash-verified: 41 of 41
+file generations: 3
+  - audit.log gen=3a1b2c4d5e6f span 0-10485760 (7 window(s), holding 10582048 bytes)
+  - audit.log gen=9f8e7d6c5b4a span 0-812 (1 window(s), holding 300 bytes)  [512 bytes missing inside]
+  - audit.log gen=1a2b3c4d5e6f span 0-65536 (2 window(s), holding 65536 bytes)
+GAPS (1) — 512 bytes never uploaded:
+  - audit.log gen=9f8e7d6c5b4a offsets 300-812 (512 bytes)
+VERDICT: attention needed
+```
+
+A gap means records are gone from both the pod and the destination. The remedy is not
+in this tool — it is a shorter `VA_LSE_AUDIT_BACKUP_INTERVAL_HOURS`, or a job that is
+actually running.
+
+**What a restore writes** (`--restore DIR`):
+
+| File | Contents |
+|---|---|
+| `restored.jsonl` | The live stream, reassembled in upload order across generations — the chronological record |
+| `rotated/<name>-<size>-<sha>.jsonl` | Every distinct rotated snapshot, named by content so two snapshots of one filename cannot collide |
+| `manifest.json` | The full verification report: gaps, corrupt objects, line counts, what was included and skipped |
+
+The rotated snapshots overlap `restored.jsonl` by design — a file is shipped live *and*
+again in full once it rotates — and they are the only copy of any range the live
+watermark never reached, so they are written out rather than folded in. If a gap is
+reported **and** rotated snapshots are present, check the manifest before concluding
+that a range is unrecoverable.
+
+Two deliberate choices worth knowing:
+
+- **The tool never writes to the destination.** Restoring is a read. A recovery tool
+  that can delete objects during an incident is one that can destroy the only copy.
+- **A corrupt object is still written, and flagged.** For forensics a flagged copy
+  beats no copy; `manifest.json` and the exit code both say the object is damaged, so
+  it cannot be mistaken for a verified record.
+
+**One honest limitation: ordering between file generations.** Order *within* a file is
+exact (byte offsets), but every generation is a fresh file numbered from 0, so the only
+signal that distinguishes them is the upload time the destination reports. If a store
+returns no modification times, or two generations collide, the chronological order is
+unknowable — the verify reports `order_uncertain`, the exit code is `2`, and
+`restored.jsonl` should be re-sorted on the `timestamp` field inside each record. Real
+S3, GCS, Azure, and a filesystem all report times and generations are separated by
+whole backup intervals, so this is the exception rather than the norm; it is reported
+because a silently mis-ordered audit record has no other symptom.
+
+Run `--verify` on a schedule of its own — monthly is usually right for a small business.
+A backup job that reports success while writing objects nothing can read is the failure
+mode this script exists to catch, and it is invisible from the backup job's own logs.
+
+### Metrics for alerting (`GET /metrics`)
+
+`/health` answers "is this instance alive"; it is the wrong instrument for "has the
+backup been failing for three days". The health sidecar also serves Prometheus text
+format on the same port, derived from the same payload — so every value is as cheap as
+`/health` is, and a scrape cannot block on a slow dependency.
+
+```yaml
+# Prometheus scrape config
+- job_name: va-lse
+  metrics_path: /metrics
+  static_configs:
+    - targets: ["va-lse-web.va-lse.svc:8001"]
+```
+
+If you use the Prometheus operator, annotate the web and worker pods instead:
+`prometheus.io/scrape: "true"`, `prometheus.io/port: "8001"`,
+`prometheus.io/path: "/metrics"`.
+
+| Metric | Meaning |
+|---|---|
+| `va_lse_audit_backup_state` | Enum: `0`=ok, `1`=disabled, `2`=never_ran, `3`=stale, `4`=error, `5`=unavailable |
+| `va_lse_audit_backup_last_success_timestamp_seconds` | When the last pass succeeded |
+| `va_lse_audit_backup_pending_bytes` | Audit bytes on this volume not yet shipped — what a pod death would lose |
+| `va_lse_audit_backup_off_pod` | `0` means the destination shares the audit log's volume and cannot survive the pod |
+| `va_lse_audit_write_failures_total` | Audit records lost to failed writes (usually a full or read-only volume) |
+| `va_lse_disk_free_bytes`, `va_lse_disk_below_floor` | Headroom on the log volume against `VA_LSE_DISK_MIN_FREE_BYTES` |
+| `va_lse_job_queue_depth`, `va_lse_job_queue_distributed` | Backlog, and whether a separate worker can claim jobs (Pattern C only) |
+| `va_lse_tracing_enabled`, `va_lse_tracing_active` | Whether spans are configured and actually recording |
+| `va_lse_llm_failover_enabled` | `1` when a second endpoint is configured — no failover exists at `0` |
+| `va_lse_llm_failover_active` | `1` while calls are being served by the fallback endpoint |
+| `va_lse_llm_primary_unhealthy_seconds` | How long the primary has been failing continuously (`0` while healthy) |
+| `va_lse_llm_failover_after_seconds` | The configured grace period before failover engages |
+| `va_lse_llm_failover_total` | Calls moved to the fallback because the primary failed |
+| `va_lse_llm_endpoint_calls_total`, `va_lse_llm_endpoint_duration_ms` | Call volume and latency split by serving endpoint |
+| `va_lse_circuit_breaker_state{breaker="llm-fallback"}` | The backup endpoint's own breaker (appears once it has been used) |
+
+### Shipped monitoring assets
+
+Rather than write these by hand, `deploy/monitoring/` contains a working stack for a
+small-business deployment:
+
+| File | What it is |
+|---|---|
+| `prometheus.yml` | Scrape config for the web and worker health ports, with the `/metrics` path |
+| `alerts.yml` | The alert rules (availability, LLM, pipeline, compliance, self-monitoring) |
+| `alerts.test.yml` | Unit tests for those rules — `promtool test rules alerts.test.yml` |
+| `grafana-dashboard.json` | The operations dashboard (latency percentiles, breaker, queue, backup, failover) |
+| `grafana-provisioning/` | Datasource + dashboard provisioning so Grafana loads it on start |
+| `alertmanager.yml`, `blackbox.yml` | Example routing, and synthetic `/ready` probing |
+
+Two conventions worth keeping if you edit them:
+
+- **Every rule is tested.** `promtool check rules alerts.yml` validates the PromQL, and
+  `promtool test rules alerts.test.yml` proves each rule fires *and* that it stays quiet
+  in the healthy case. A rule that silently never matches is worse than no rule,
+  because it is trusted. Re-run both after any edit.
+- **A metric named in a dashboard or alert must exist.** `tests/test_monitoring_assets.py`
+  fails if an asset references a `va_lse_*` name the app does not emit, and
+  `promtool` catches the rest.
+
+Alerting suggestions for a small-business deployment:
+
+```promql
+# the backup has stopped (2 = never ran, 3 = stale, 4 = error) — page
+max_over_time(va_lse_audit_backup_state[6h]) > 1
+
+# audit records are being dropped right now — page immediately
+increase(va_lse_audit_write_failures_total[10m]) > 0
+
+# the log volume is nearly full — ticket
+va_lse_disk_below_floor == 1
+
+# a destination on the pod's own volume is no protection — ticket
+va_lse_audit_backup_off_pod == 0
+```
+
+For reference, the failover rules shipped in `alerts.yml`: `VaElseLlmRunningOnFallback`
+(`va_lse_llm_failover_active == 1` for 5m — users are on the backup provider) and
+`VaElseLlmPrimaryUnhealthy` (`va_lse_llm_primary_unhealthy_seconds > 120` for 5m — a
+failure that precedes failover, or the whole story on a single-endpoint deployment).
+
+**A value that could not be read is omitted, not zeroed.** If the queue backend is
+remote, `va_lse_job_queue_depth` is absent rather than `0`, because a reported `0`
+during an outage is worse than a missing series — one gets ignored, the other gets
+alerted on. `/health` reports the same distinction as `depth: null` with
+`depth_source: "not_probed"`. Use `/metrics?probe=1` (or the sidebar's **Check
+backlog**) when you actually want that read performed, and expect it to be slower.
+
+### PHI and data egress
+
+Audit entries are designed to be non-PII (counts and classifications only), so backing
+them up is lower-risk than exporting traces. One field is an exception and is worth
+knowing about before you ship these logs to a third party: **`error_message` is
+arbitrary upstream exception text** — a library can put anything in an exception
+message, including fragments of what was sent to it. It is scrubbed of PII-shaped
+tokens (SSNs, long digit runs, email addresses) and whitespace-collapsed, and
+`VA_LSE_AUDIT_ERROR_MESSAGES=0` omits it entirely. For a cloud destination, set it to
+`0`: `error_class` is still recorded and is always safe.
+
+### Audit backup checklist
+
+- [ ] `/app/logs` is a **PVC mounted by web, workers, and the backup job** — not an emptyDir
+- [ ] `kubectl get pvc va-lse-logs` is `Bound`, and the volume is writable by uid 65534
+- [ ] A destination is configured, and `/health → audit_backup.configured` is true
+- [ ] `audit_backup.off_pod` / `filesystem.same_volume` say the destination is really off the pod
+- [ ] One manual backup pass has succeeded and objects are visible in the bucket/dir
+- [ ] `--require-destination` is set on the scheduled job
+- [ ] `VA_LSE_AUDIT_BACKUP_INTERVAL_HOURS` runs before rotation can delete a file
+- [ ] Remote retention is a bucket lifecycle rule, or `--prune` is scheduled
+- [ ] `audit.write_failures` is 0 and `disk.below_floor` is false
+- [ ] `VA_LSE_AUDIT_ERROR_MESSAGES=0` if the destination is third-party storage
+- [ ] Restore rehearsed: download the most recent object and confirm it parses as JSON-lines
+
+---
+
+## 17. LLM endpoint failover (optional)
+
+**Single-endpoint deployments are fully supported and are the default.** If
+`OPENAI_BASE_URL_FALLBACK` is unset, the app runs on exactly one endpoint, with no
+second probe and no change in behaviour. When the endpoint is down, runs fail with a
+fast, actionable error and users retry — see *Manual failover* below for the steps an
+operator takes.
+
+Configuring a second endpoint buys continuity through a provider outage without giving
+up the primary: calls are served by the backup only while the primary is genuinely
+broken, and return to the primary automatically.
+
+### What happens, and when
+
+| Time since the primary started failing | What the app does |
+|---|---|
+| 0 – ~60s (below the breaker threshold ×3) | Retries within each call. Nothing visible. This is the window that `LLM_ENDPOINT_FALLBACK_TIMEOUT_SECONDS=0` does **not** remove: the breaker must open before anything counts as an outage, so the failures that open it still fail. |
+| Breaker opens | Calls fail fast (`CircuitBreakerOpenError`) in under 2s without touching the network, so users are not made to wait behind a dead endpoint. |
+| Up to `LLM_ENDPOINT_FALLBACK_TIMEOUT_SECONDS` (default 300s) | **Still only the primary.** This grace period is the point: a blip, a provider blip, or a rate-limit storm should not move the business onto another provider. The error message says when failover will engage. |
+| Past the grace period | Calls are served by `OPENAI_BASE_URL_FALLBACK`. Users keep working. The run is **stamped** (`llm_endpoints` in the audit record and the run log), and `va_lse_llm_failover_active` becomes `1`. |
+| While failed over | The primary's own recovery window (60s) keeps elapsing, and the next real call is tried there first. If it succeeds, traffic returns to the primary; if it fails, **that same call is served by the fallback**, so a recovery probe never turns into a user-visible error. |
+| Primary answers again | Its breaker closes and the unhealthy clock clears. All traffic is on the primary from the next call. |
+
+Two properties of this design are worth keeping if it is ever reimplemented:
+
+- **The failover trigger is not the breaker's recovery timer.** That timer is reset by
+every failed probe, so with traffic flowing it never ages past one recovery timeout —
+a rule written as "the breaker has been OPEN for 5 minutes" would fire only on an idle
+system, i.e. never during the outage it exists for. `unhealthy_for_seconds()` is a
+separate clock, cleared only by a genuine recovery.
+- **A probe cannot break a user's run.** The primary is re-tested with real traffic and
+a failure falls through to the fallback inside the same call.
+
+### Arming it
+
+```bash
+# Minimum: a second endpoint under the same account (same key, same model names).
+OPENAI_BASE_URL_FALLBACK=https://second-gateway.example.com/v1
+
+# A different provider needs its own key and its own model names.
+OPENAI_BASE_URL_FALLBACK=https://api.openai.com/v1
+OPENAI_API_KEY_FALLBACK=sk-proj-...
+LLM_MODEL_MAIN_FALLBACK=gpt-4-turbo
+LLM_MODEL_FAST_FALLBACK=gpt-4o-mini
+
+# How long the primary must fail before failover engages (a grace period, NOT an
+# HTTP timeout — that is VA_LSE_LLM_CALL_TIMEOUT_SECONDS). 0 = no grace period:
+# failover engages as soon as the primary's breaker opens, i.e. after
+# VA_LSE_CB_FAILURE_THRESHOLD consecutive failures. The failures that trip the
+# breaker still fail; 0 does not prevent them.
+LLM_ENDPOINT_FALLBACK_TIMEOUT_SECONDS=300
+```
+
+Unset fallback values inherit the primary's, so a second gateway under one account
+needs a single variable.
+
+The fallback is configured through the **environment or secret store only**, not the
+sidebar. That is deliberate rather than an omission: in Pattern C a worker 
+builds its own client from the environment (a value typed into a browser session
+cannot reach it), so a fallback that existed only for the web tier would be worse
+than none — it would appear armed and silently not apply to queued runs. The
+primary's own sidebar fields keep working as before.
+
+Verify on a running instance:
+
+```bash
+curl -s localhost:8001/health | jq .llm_failover
+# { "configured": true, "active": false, "after_seconds": 300, "primary_unhealthy_seconds": 0 }
+```
+
+`configured: true` with `active: false` is the normal state — armed, unused. The
+fallback URL is validated at client construction, so a typo or a missing model name is
+reported at startup rather than discovered mid-outage.
+
+Pointing both endpoints at the **same URL** is allowed but logs a warning: it cannot be
+failover, because the same endpoint fails the same way.
+
+### Readiness and alerting
+
+Readiness asks "can this instance serve a run?", so while a healthy fallback is serving,
+`/ready` stays **200** and the pod stays in the load balancer. The primary outage is
+reported instead of hidden:
+
+- `/health → llm_failover` (state above)
+- `va_lse_llm_failover_active == 1`, `va_lse_llm_primary_unhealthy_seconds`
+- `VaElseLlmRunningOnFallback` and `VaElseLlmPrimaryUnhealthy` in `deploy/monitoring/alerts.yml`
+- `va_lse_llm_endpoint_calls_total` / `..._duration_ms` split by `endpoint`, so you can
+  see the backup's volume and latency while it carries traffic
+
+This separation is deliberate: failing readiness during a *handled* failover would drain
+the pod and page on-call for a problem that is already being compensated for. The
+trade-off is that a fallback outage is the only thing that turns `llm_failover` into a
+failing readiness — which is the correct signal, since at that point nothing can serve.
+
+### Manual failover (single-endpoint deployments)
+
+Without a configured fallback, an extended primary outage is a manual operation. Steps,
+in order:
+
+1. **Confirm it is the endpoint, not your credentials or the model.**
+   `curl -s localhost:8001/health | jq .llm_failover.primary_unhealthy_seconds` and
+   `jq .llm_circuit_breaker_open`; then check the provider's status page. A
+   `client`-category error spike means a bad key or model name, which failover cannot
+   fix either.
+2. **Decide the replacement endpoint** and its two model names, and confirm the key is
+   valid with `curl -H "Authorization: Bearer $KEY" $BASE_URL/models`.
+3. **Set the values** — `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `LLM_MODEL_MAIN`,
+   `LLM_MODEL_FAST` — in the deployment's environment or secret store. In
+   **Pattern C the worker reads the environment only**: a key typed into the sidebar
+   cannot reach it, and the submit path refuses a job it knows the worker cannot run.
+4. **Restart the affected processes.** The client is built from settings, so:
+   - web pod / container: a **sidebar → Apply settings** change takes effect on the next
+     script run, with no restart (the process-global breaker however stays OPEN for up
+     to its recovery window, or until a call succeeds);
+   - workers, and any environment change: re-create the pod(s) so the new values are read.
+5. **Verify**: `/ready` returns 200, then run a single small Evaluate and confirm
+   `llm_endpoints: ["primary"]` in the new audit record.
+6. **When the original provider recovers**, reverse steps 3–4. If the outage is over, do
+   not leave the deployment pointed at a provider you did not choose deliberately.
+
+### Rehearsing the outage
+
+A failover path that has never moved traffic is a hypothesis, and the moment you
+find out it does not work is the moment it was supposed to save you. Rehearsing
+costs one restart and no LLM tokens, because the trigger is *making the primary
+unreachable*, not breaking a credential — the circuit breaker reacts to transport
+failure, and an unusable key would fail the same way but take the fallback's
+health check down with it if they share one.
+
+`scripts/rehearse_failover.py` reads the probe port only (`/health` and
+`/metrics`), so it needs no credentials, sends no LLM traffic, and cannot disturb
+a run in progress:
+
+```bash
+python scripts/rehearse_failover.py                       # one snapshot, human readable
+python scripts/rehearse_failover.py --expect-idle         # step 1 and 5 below
+python scripts/rehearse_failover.py --expect-active       # step 3
+python scripts/rehearse_failover.py --watch --interval 5  # follow the stages live
+python scripts/rehearse_failover.py --json | jq .active    # scripted check
+```
+
+Exit codes: `0` consistent and matching `--expect-*`, `1` unreadable or
+self-contradictory, `2` readable but not the stage asserted. `--json` prints
+**only** the JSON document, so it stays pipeable; the `--expect-*` verdict is still
+carried in the exit code.
+
+The drill:
+
+1. `--expect-idle` — the backup is armed and unused.
+2. Cause the outage: point `OPENAI_BASE_URL` at an unroutable host, or block egress
+   to the provider from the web **and** worker pods. Watch with `--watch`. Expect the
+   primary's breaker to go `OPEN`, `primary_unhealthy_seconds` to start growing, and
+   `active` to flip to `1` after `LLM_ENDPOINT_FALLBACK_TIMEOUT_SECONDS`.
+   Before that threshold a call still **fails fast** — that is the documented
+   contract, and the sidebar's failover panel shows the countdown.
+3. `--expect-active` — traffic is being served by the backup.
+4. Restore the primary and watch again. Expect `active` to return to `0` and the
+   unhealthy clock to reset **without a restart**: the primary is re-tested with
+   real traffic, so recovery is detected by the next call.
+5. Undo step 2 and confirm `--expect-idle` passes again.
+
+Submit one small Evaluate while failed over and check the run's audit record — it
+must carry `llm_endpoints: ["primary", "fallback"]`. That stamp is the only
+permanent evidence of which provider produced a document, so a drill that stops
+at `active` has not verified the part that matters.
+
+To do this against a real cluster instead of a local stack, point the tool at the
+probe port from inside the cluster (`kubectl run --rm -it` on the app image, or a
+port-forward) and run the same five steps:
+
+```bash
+kubectl port-forward -n va-lse svc/va-lse-web 8001:8001 &
+python scripts/rehearse_failover.py --expect-idle
+```
+
+### Failover checklist
+
+- [ ] You are running single-endpoint **on purpose**, or `OPENAI_BASE_URL_FALLBACK` is set
+- [ ] The fallback key and both model names are set if it is a different provider
+- [ ] `/health → llm_failover.configured` is `true` and `active` is `false`
+- [ ] `LLM_ENDPOINT_FALLBACK_TIMEOUT_SECONDS` matches your tolerance for a primary blip
+- [ ] Readiness returns 200 with a healthy primary (no false 503s introduced)
+- [ ] `VaElseLlmRunningOnFallback` is routed to someone who can act on it
+- [ ] You have checked what the backup provider costs, and its rate limit fits `VA_LSE_MAX_CONCURRENT_LLM_CALLS`
+- [ ] You know the run output may differ slightly while failed over, and that the audit
+      record's `llm_endpoints` is where that is recorded
+- [ ] `python scripts/rehearse_failover.py --expect-idle` exits 0 against the deployment
+- [ ] You have run the outage drill at least once, and seen `--expect-active` pass
+      mid-outage and `--expect-idle` pass again after recovery, with no restart
+- [ ] The manual steps above are in your runbook if you deploy single-endpoint
+
+---
+
+
 ## Appendix: Checklist for production deployment
 
 - [ ] `.env` is NOT committed to git (see `SECURITY.md`)
@@ -1244,4 +1948,11 @@ names only take effect after clicking it (the sidebar warns while a change is pe
 - [ ] Circuit breaker + concurrency limiter env vars are tuned for your user count
 - [ ] Shared cache (`VA_LSE_SHARED_CACHE_URL/TOKEN`) is configured for multi-instance deployments
 - [ ] Cache hit rate is monitored via `GET /health` → `cache.hit_rate`
+- [ ] Tracing configured on both tiers, or deliberately left off ([§15](#15-distributed-tracing-opentelemetry))
+- [ ] `python scripts/restore_audit_logs.py --verify` reports `VERDICT: ok` (a backup that has never been read back is a hypothesis)
+- [ ] The audit backup destination is off-pod (`/health` → `audit_backup.off_pod` is `true`)
+- [ ] `GET /metrics` is scraped, with an alert on `va_lse_audit_backup_state > 1`
+- [ ] `VA_LSE_AUDIT_ERROR_MESSAGES=0` if audit logs go to a third-party destination
+- [ ] The LLM failover drill has been run to completion ([§17](#17-llm-endpoint-failover-optional)) — an
+      untested failover path fails on the day it is needed, not before
 

@@ -56,6 +56,11 @@ app/
                           12-topic checklist; A&A/SMC-L toggle forces topics B, C, E, J
   condition_topics.json   Body-system -> condition -> topic-checklist mapping (34 conditions)
   agiloop_telemetry.py    Agiloop Inspect telemetry client (impression/interaction/error/goal)
+  job_queue.py            Distributed job queue (Redis / Upstash REST / in-process) for Pattern C
+  job_payload.py          Job + result JSON serialization (documents, digest, usage)
+  worker.py               Worker process: python -m app.worker executes queued runs
+  blob_store.py           Job documents too large to queue: filesystem / S3 backend
+  views/job_runner.py     Web-pod half of Pattern C: submit, poll, resume, hydrate
   knowledge/              legal_framework.md, evaluation_rubric.md, drafting_guide.md,
                           topic_checklist.md
 scripts/
@@ -65,14 +70,22 @@ scripts/
 tests/                    Offline unit tests (no API key required)
 examples/                 Fictional sample statement + sample medical records
 Dockerfile                Production container image (non-root, hash-pinned deps)
-docker-compose.yml        Multi-instance: 3 Streamlit replicas + nginx (Pattern A)
+docker-compose.yml        Multi-instance: 3 Streamlit replicas + nginx (Pattern A);
+                          `--profile pattern-c` adds Redis, a worker, and the shared
+                          blob volume
 nginx/                    Reverse proxy config with session affinity
-deploy/k8s/               Kubernetes manifests (Deployment, Service, Ingress, HPA, Redis)
-DEPLOYMENT.md             Multi-instance deployment guide (Docker Compose, K8s, session persistence)
+deploy/k8s/               Kubernetes manifests (Deployment, Service, Ingress, HPA, Redis, Worker,
+                          shared job-documents PVC)
+DEPLOYMENT.md             Multi-instance deployment guide (Docker Compose, K8s, worker pool)
 ```
 
 Long documents are processed in overlapping, page-labelled chunks so reviews are exhaustive
 regardless of record length. See **Large record sets** below for how very large files scale.
+
+Running this for many users at once? A large digest is CPU- and memory-heavy (a 2,000-page
+bundle peaks near 1.8 GB), so the app can hand runs to a **worker pool** instead of executing
+them inside the pod serving the browser session — runs then survive a pod restart or a closed
+tab. See **`DEPLOYMENT.md` → Pattern C** and `VA_LSE_JOB_QUEUE`.
 
 > 📐 **Design rationale & trade-offs.** The short map above covers *what*. For *why* —
 > why Streamlit, why hierarchical fact merging over a single mega-call, why chunking at
@@ -97,6 +110,10 @@ cp .env.example .env     # then put your API key in .env (never commit .env — 
 Install from **`requirements.lock`** for development, CI, and production so every environment
 runs the identical tested dependency set. `requirements.txt` stays the human-edited input
 (minimum versions); see **Dependency locking** below.
+
+> 📦 `requirements-s3.txt` is a separate, optional install for the S3 blob-store backend
+> (Pattern C only). It is deliberately not part of `requirements.lock`: the default
+> filesystem blob store needs no extra dependency, and nothing else in the app uses boto3.
 
 > This app is tested with QwenCloud Token Plan but works with **any
 > OpenAI-compatible API** (OpenAI, Azure OpenAI via proxy, local Ollama with an
@@ -137,7 +154,34 @@ installs on macOS and Linux CI.
 | `OPENAI_BASE_URL` | OpenAI-compatible base URL (Token Plan) | `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1` |
 | `LLM_MODEL_MAIN` | Low-volume heavy model (analysis/scoring/drafting) | `qwen3.7-max` |
 | `LLM_MODEL_FAST` | Cheap model for the bulk digest/merge passes | `qwen3.7-flash` |
+| `OPENAI_BASE_URL_FALLBACK` | **Optional** second endpoint used when the primary fails for a sustained period; unset = no failover | (empty) |
+| `OPENAI_API_KEY_FALLBACK` | Key for the fallback endpoint (usually a different provider) | primary key |
+| `LLM_MODEL_MAIN_FALLBACK` / `LLM_MODEL_FAST_FALLBACK` | The fallback provider's model names for the two roles | primary models |
+| `LLM_ENDPOINT_FALLBACK_TIMEOUT_SECONDS` | How long the primary must fail before failover engages (a grace period, not an HTTP timeout) | `300` |
 | `VA_LSE_MAX_RECORD_PAGES` | Max total pages across uploaded record files | `5000` |
+| `VA_LSE_JOB_QUEUE` | Run Evaluate/Draft on worker pods instead of in-process (Pattern C) | `0` |
+| `VA_LSE_REDIS_URL` | Redis backend for the job queue | (empty) |
+| `VA_LSE_JOB_QUEUE_TTL_SECONDS` | How long a finished job's payload/result is kept | `86400` |
+| `VA_LSE_JOB_QUEUE_LEASE_SECONDS` | Heartbeat window before a job is re-queued by another worker | `900` |
+| `VA_LSE_JOB_QUEUE_INLINE_MAX_BYTES` | Job size above which documents are externalized to the blob store | `262144` |
+| `VA_LSE_BLOB_STORE` | Where queued job documents live: `auto`/`filesystem`/`s3`/`none` | `auto` |
+| `VA_LSE_BLOB_DIR` | Filesystem blob root — must be a volume shared with every worker | `blobs` |
+| `VA_LSE_BLOB_S3_BUCKET` | S3-compatible bucket for job documents (needs `requirements-s3.txt`) | (empty) |
+| `VA_LSE_WORKER_CONCURRENCY` | Jobs one worker process runs at once | `1` |
+| `VA_LSE_WORKER_HEALTH_PORT` | Worker `/health` sidecar port | `8002` |
+| `VA_LSE_TRACING` | Emit OpenTelemetry traces (needs `requirements-otel.txt`) | `0` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Collector/APM endpoint that receives spans (standard OTel var) | `localhost:4318` |
+| `VA_LSE_TRACE_SAMPLE_RATIO` | Fraction of runs traced (`0`–`1`) | `1.0` |
+| `VA_LSE_AUDIT_RETENTION_DAYS` | Local age-based retention for rotated audit files | `7` |
+| `VA_LSE_AUDIT_ERROR_MESSAGES` | Record free-text `error_message` in audit entries | `1` |
+| `VA_LSE_AUDIT_BACKUP_DESTINATION` | Off-pod audit backup: `filesystem`/`s3`/`gcs`/`azure` | (empty = off) |
+| `VA_LSE_AUDIT_BACKUP_DIR` | Destination directory for `filesystem` (must be off the pod's volume) | (empty) |
+| `VA_LSE_AUDIT_BACKUP_S3_BUCKET` | S3-compatible bucket for audit backups (needs `requirements-backup.txt`) | (empty) |
+| `VA_LSE_AUDIT_BACKUP_INTERVAL_HOURS` | Pass interval, and the exposure window per pod death | `6` |
+| `VA_LSE_AUDIT_BACKUP_CLOUD_RETENTION_DAYS` | Remote retention (prefer a bucket lifecycle rule) | `90` |
+| `VA_LSE_RUN_LOG_MAX_BYTES` | Size at which `runs.jsonl` rotates | `10485760` |
+| `VA_LSE_RUN_LOG_BACKUPS` | Rotated run logs kept | `5` |
+| `VA_LSE_DISK_MIN_FREE_BYTES` | Log-volume floor reported by `/health → disk` | `268435456` |
 | `VA_LSE_RECORDS_CONCURRENCY` | Parallel chunk-digest workers | `2` (Lite plan fits 1–2 concurrent agents) |
 | `VA_LSE_MAX_DIGEST_FACTS` | Max facts kept in the consolidated digest | `1500` |
 | `VA_LSE_DIGEST_CHUNK_CHARS` | Characters per record chunk | `8000` |
@@ -183,6 +227,14 @@ those integrations in mock mode. Partially configuring an integration (e.g. sett
 `AGILOOP_INSPECT_API_KEY` without `AGILOOP_PROJECT_ID`) does not fail startup for this app —
 telemetry simply logs that combination as mock and drops events, since telemetry must never
 block the app.
+
+> **Optional failover.** Set `OPENAI_BASE_URL_FALLBACK` (plus
+> `OPENAI_API_KEY_FALLBACK` and the two `*_FALLBACK` model names if the backup is a
+> different provider) and a sustained primary outage routes calls to the backup
+> endpoint until the primary answers again. Runs served by the fallback are
+> stamped in the audit record, the run log, and the on-screen run summary. Leave it
+> unset and nothing changes: one endpoint, no extra probe. Runbook, including the
+> outage drill: DEPLOYMENT.md → *LLM endpoint failover (optional)*.
 
 All settings can also be overridden live in the app sidebar. Model availability depends on your
 provider: the app checks `GET {base_url}/models` at startup and warns if `LLM_MODEL_MAIN` or
@@ -269,9 +321,10 @@ streamlit run run_app.py --server.port $PORT --server.address 0.0.0.0
 ```
 
 > 🚀 **Scaling to multiple instances?** For multi-instance deployment behind a load
-> balancer, Docker Compose with nginx, Kubernetes with session affinity, or Redis-backed
-> session persistence — see **[`DEPLOYMENT.md`](DEPLOYMENT.md)** (Dockerfile, compose,
-> k8s manifests, session tradeoff analysis).
+> balancer, Docker Compose with nginx, Kubernetes with session affinity, or a Redis-backed
+> worker pool that runs the pipeline off the web pods — see
+> **[`DEPLOYMENT.md`](DEPLOYMENT.md)** (Dockerfile, compose, k8s manifests, placement
+> tradeoff analysis).
 
 ### Evaluate a statement
 
@@ -343,7 +396,17 @@ the pipeline (no API calls) to verify orchestration at scale.
 python -m unittest discover -s tests -v        # offline unit tests (incl. health probes)
 python -m mypy app                             # strict type check (see pyproject.toml)
 python scripts/smoke_test.py all               # live end-to-end (needs valid .env)
+python scripts/live_draft_e2e.py                # one real Draft run against your endpoint
+python scripts/rehearse_failover.py --expect-idle   # is the failover path really armed?
 ```
+
+`scripts/live_draft_e2e.py` is the narrowest live check: it drives one full Draft
+through the real endpoint via Streamlit's `AppTest` and asserts the result is
+grounded and reviewable, plus the watchdog and audit side effects — so a provider
+or prompt change is visible before it reaches a user. `scripts/rehearse_failover.py` is
+read-only and sends no LLM traffic — see
+[`DEPLOYMENT.md` → *LLM endpoint failover*](DEPLOYMENT.md#17-llm-endpoint-failover-optional)
+for the full outage drill.
 
 ### Type checking (mypy — strict)
 
@@ -500,10 +563,18 @@ orchestrator-friendly probes on `0.0.0.0:$VA_LSE_HEALTH_PORT` — no extra depen
 
 | Endpoint | Meaning | Status | Latency |
 |---|---|---|---|
-| `GET /health` | **Liveness** — the process is up | `200` with `{status:"ok", service, uptime_s}` | < 50 ms |
+| `GET /health` | **Liveness** — the process is up | `200` with `{status:"ok", service, uptime_s}` plus `cache`, `job_queue`, `tracing`, `audit`, `audit_backup`, `disk`, `restore` | < 50 ms |
 | `GET /ready` | **Readiness** — LLM endpoint + configured models are reachable (`GET {base_url}/models`) | `200` when ready, `503` when not (JSON always includes `ready` + `detail`) | < 2 s (probe timeout 1.4 s, cached 30 s) |
-| `HEAD /health`, `HEAD /ready` | Same as GET but no body — for probes that use HEAD | same | same |
+| `GET /metrics` | **Prometheus** text format (v0.0.4) over the same payload — see [DEPLOYMENT.md §16](DEPLOYMENT.md#metrics-for-alerting-get-metrics) | `200`, `text/plain; version=0.0.4` | same as `/health` |
+| `HEAD /health`, `HEAD /ready`, `HEAD /metrics` | Same as GET but no body — for probes that use HEAD | same | same |
 | any other path | | `404` | — |
+
+**No probe performs network I/O by default.** Reading the job queue's backlog is two HTTP
+requests on the Upstash tier and one `LLEN` per kind on Redis, so `/health` reports it as
+`depth: null` with `depth_source: "not_probed"` rather than blocking a kubelet poll (every
+10 s) on a slow dependency — and `/metrics` omits `va_lse_job_queue_depth` entirely,
+because a reported `0` during an outage is worse than a missing series. Add `?probe=1` to
+`/health` or `/metrics` when you want that read performed.
 
 ```bash
 # Local quick check
@@ -571,6 +642,60 @@ streamlit run run_app.py
 The audit logger is best-effort and never blocks a run; a failure to open the
 audit file falls back to stdout (the `audit` logger on `sys.stdout`) so
 deployments without a writable log directory still emit the stream.
+
+**Retention and off-pod backup.** A rotating file is not a retention policy: it
+bounds *size*, not time, so it will happily delete a file younger than your
+retention window. Set `VA_LSE_AUDIT_RETENTION_DAYS` (7 by default) for the age rule
+and run [`scripts/backup_audit_logs.py`](scripts/backup_audit_logs.py) as a CronJob or
+sidecar to copy the stream to S3/GCS/Azure or an NFS mount — including the un-shipped
+tail of the live `audit.log`, so a file that will not rotate for weeks is still off
+the pod. See [DEPLOYMENT.md §16](DEPLOYMENT.md#16-audit-log-retention-and-backup).
+
+```bash
+python scripts/backup_audit_logs.py --status        # what /health would report
+python scripts/backup_audit_logs.py --once --prune  # one pass + retention
+```
+
+**Read the backup back.** A backup that has never been read is a hypothesis, so
+[`scripts/restore_audit_logs.py`](scripts/restore_audit_logs.py) verifies and restores it.
+Every object key already ends in the SHA-256 of its own content, so integrity checking needs
+no side manifest, and because windows are byte ranges an ordinary verify reports the exact
+offsets that were never uploaded — the records lost while the job was failing.
+
+```bash
+python scripts/restore_audit_logs.py --verify                       # hash everything, find gaps
+python scripts/restore_audit_logs.py --restore /tmp/audit-restore    # rebuild the stream
+```
+
+```jsonc
+// exit 0 verified, 1 misconfigured, 2 reachable-but-incomplete/corrupt/unreachable
+{
+  "file generations": 2,
+  "gaps": [],
+  "VERDICT": "ok"
+}
+```
+
+A restore writes `restored.jsonl` (the chronological stream), `rotated/` (each distinct
+snapshot), and `manifest.json` (the verification report). It never writes to the
+destination: a recovery tool that can delete objects during an incident is one that can
+destroy the only copy.
+
+Two related facts worth knowing, both visible in `GET /health`:
+
+- **A full disk used to stop auditing silently.** `logging` swallows handler
+exceptions and every audit call is best-effort, so the app kept serving while records
+were dropped with no signal. `audit.write_failures` now counts them and reports
+`status: degraded`; `disk.below_floor` flags the volume *before* that happens.
+- **`error_message` is the one field outside the no-PII contract** — it is arbitrary
+upstream exception text. It is scrubbed of PII-shaped tokens by default, and
+`VA_LSE_AUDIT_ERROR_MESSAGES=0` omits it entirely, which is what you want when the
+destination is third-party storage. `error_class` is always safe and always recorded.
+
+`logs/runs.jsonl` (the diagnostic run log) is size-bounded too
+(`VA_LSE_RUN_LOG_MAX_BYTES`, `VA_LSE_RUN_LOG_BACKUPS`). Before that it was the only
+unbounded writer in the app, so it — not `audit.log` — was what could fill the log
+volume on a long-lived pod.
 
 ## Telemetry (Agiloop Inspect)
 
@@ -669,6 +794,42 @@ rubric=5100ms topic=3400ms revision=3200ms report=1402ms
 ```
 
 See `PERFORMANCE.md` for expected latencies, benchmarks, and tuning guidance.
+
+## Distributed tracing (OpenTelemetry)
+
+Off by default. With `VA_LSE_TRACING=1` and the packages from
+`requirements-otel.txt`, one trace covers a run end to end: the root `run:evaluate`
+/ `run:draft` span, a span per pipeline phase (`records:review`, `claims`,
+`verify`, `rubric`, `topic`, `revision`, `report`; `grounding`, `draft`,
+`review`), and — in Pattern C — the worker that executes it, joined to the web
+pod's `queue:submit` span through the job payload.
+
+```bash
+pip install -r requirements-otel.txt
+VA_LSE_TRACING=1 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 streamlit run run_app.py
+```
+
+Spans export over OTLP, which Jaeger, Grafana Tempo, Datadog, New Relic, and
+Honeycomb all ingest, so the backend is an env change rather than a code change.
+`GET /health → tracing` reports whether tracing is active and where spans go.
+
+| Config | Default | Purpose |
+|---|---|---|
+| `VA_LSE_TRACING` | `0` | Master switch (also needs the OTel packages installed) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4318` | Collector/APM intake (standard OTel variable) |
+| `OTEL_SERVICE_NAME` | `va-lay-statement-evaluator` | Service name in the backend |
+| `VA_LSE_TRACE_SAMPLE_RATIO` | `1.0` | Fraction of runs traced |
+| `VA_LSE_TRACE_CHUNK_SPANS` | `0` | One span per record-digest chunk (high cardinality) |
+| `VA_LSE_TRACE_LLM_CALLS` | `0` | One span per LLM provider call (high cardinality) |
+
+> 🔒 Traces carry phase names, counts, sizes, model names, and the run's request
+> id — never statement, observation, or record text. Attribute names that look
+> like free text (including any `*_text`) are dropped by construction. Spans do
+> leave the deployment, so read the PHI note in `TRACING.md` before pointing a
+> production instance at a third-party backend.
+
+See [`TRACING.md`](TRACING.md) for backend recipes (Jaeger, Tempo, Datadog, New
+Relic), the span reference, and sampling guidance.
 
 ## Rate limiting (reverse proxy)
 

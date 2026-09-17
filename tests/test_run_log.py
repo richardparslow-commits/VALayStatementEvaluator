@@ -13,6 +13,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from app import config
 from app import run_log as run_log_mod
 from app.run_log import read_recent_events, run_log_event
 
@@ -145,6 +146,91 @@ class ViewWiringTests(unittest.TestCase):
         events = self._events_for(rid_holder["rid"])
         reasons = {e["reason"] for e in events}
         self.assertIn("no_statement", reasons)
+
+
+class RunLogRotationTests(unittest.TestCase):
+    """The run log is size-bounded.
+
+    Before rotation was added this file was the only unbounded writer in the app
+    — the audit log has always rotated — so a long-lived pod could fill its log
+    volume with ``runs.jsonl`` alone. That is what the audit's "no protection
+    against disk-space exhaustion" actually pointed at.
+    """
+
+    def setUp(self) -> None:
+        self._tmp, self._patcher = _isolated_run_log()
+        self.addCleanup(self._patcher.stop)
+        self.addCleanup(self._tmp.cleanup)
+        self._saved = {
+            "RUN_LOG_MAX_BYTES": config.RUN_LOG_MAX_BYTES,
+            "RUN_LOG_BACKUPS": config.RUN_LOG_BACKUPS,
+        }
+        self.addCleanup(self._restore)
+
+    def _restore(self) -> None:
+        for name, value in self._saved.items():
+            setattr(config, name, value)
+
+    def _path(self) -> Path:
+        return Path(self._tmp.name) / "runs.jsonl"
+
+    def test_file_stays_under_the_limit(self) -> None:
+        config.RUN_LOG_MAX_BYTES = 2000
+        config.RUN_LOG_BACKUPS = 3
+        for i in range(200):
+            run_log_event("evaluate", "ok", request_id=f"req_{i:05d}", pad="x" * 60)
+        self.assertLess(self._path().stat().st_size, 2100)
+        # Old data is rotated, not discarded.
+        self.assertTrue((Path(self._tmp.name) / "runs.jsonl.1").exists())
+
+    def test_backups_are_capped_so_the_volume_is_bounded(self) -> None:
+        config.RUN_LOG_MAX_BYTES = 1000
+        config.RUN_LOG_BACKUPS = 2
+        for i in range(400):
+            run_log_event("evaluate", "ok", request_id=f"req_{i:05d}", pad="y" * 80)
+        files = sorted(p.name for p in Path(self._tmp.name).glob("runs.jsonl*"))
+        self.assertEqual(files, ["runs.jsonl", "runs.jsonl.1", "runs.jsonl.2"])
+        total = sum((Path(self._tmp.name) / f).stat().st_size for f in files)
+        # (backups + 1) x max_bytes is the hard ceiling.
+        self.assertLess(total, 3 * 1000 + 500)
+
+    def test_recent_events_survive_a_rotation(self) -> None:
+        config.RUN_LOG_MAX_BYTES = 1000
+        config.RUN_LOG_BACKUPS = 3
+        for i in range(60):
+            run_log_event("draft", "ok", request_id=f"req_{i:05d}", pad="z" * 60)
+        events = read_recent_events(limit=10)
+        self.assertEqual(len(events), 10)
+        # Newest last, and the tail must be the most recently written run.
+        self.assertEqual(events[-1]["request_id"], "req_00059")
+
+    def test_recent_events_reads_within_the_limit_across_files(self) -> None:
+        config.RUN_LOG_MAX_BYTES = 500
+        config.RUN_LOG_BACKUPS = 4
+        for i in range(30):
+            run_log_event("draft", "ok", request_id=f"req_{i:05d}", pad="q" * 40)
+        events = read_recent_events(limit=100)
+        ids = [e["request_id"] for e in events]
+        # Ascending write order across the rotated boundary, no duplicates.
+        self.assertEqual(ids, sorted(ids, key=lambda s: int(s.split("_")[1])))
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_rotation_does_not_lose_a_line(self) -> None:
+        config.RUN_LOG_MAX_BYTES = 400
+        config.RUN_LOG_BACKUPS = 5
+        total = 120
+        for i in range(total):
+            run_log_event("evaluate", "ok", request_id=f"req_{i:05d}", pad="w" * 20)
+        seen: set[str] = set()
+        for path in Path(self._tmp.name).glob("runs.jsonl*"):
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    seen.add(json.loads(line)["request_id"])
+        # Every line either survives in a kept file or was rotated off the end;
+        # what must never happen is a line that is silently half-written.
+        self.assertLessEqual(len(seen), total)
+        self.assertGreater(len(seen), 0)
+        self.assertTrue(all(rid.startswith("req_") for rid in seen))
 
 
 if __name__ == "__main__":

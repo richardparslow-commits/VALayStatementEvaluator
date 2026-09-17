@@ -330,3 +330,137 @@ class AuditLoggerTest(unittest.TestCase):
                 self.assertTrue(custom_path.exists())
                 audit_mod._reset_for_tests()  # type: ignore[attr-defined]
                 audit_mod.configure_audit_logging(log_dir=tempfile.mkdtemp(), force=True)
+
+
+class AuditErrorMessageRedactionTest(unittest.TestCase):
+    """``error_message`` is the one audit field outside the no-PII contract.
+
+    It is arbitrary ``str(exc)`` from a library, so it is scrubbed by default and
+    can be dropped entirely for deployments that ship audit logs off-pod.
+    """
+
+    def test_pii_shaped_tokens_are_redacted_in_the_payload(self) -> None:
+        from app import audit as audit_mod
+
+        captured, h = _capture_audit_payloads()
+        try:
+            audit_mod.audit_event(
+                "evaluate",
+                "error",
+                request_id="req_pii",
+                error_class="LLMError",
+                error_message="upstream rejected claim 123-45-6789 for a.b@example.com",
+            )
+            message = str(captured[0].get("error_message", ""))
+            self.assertNotIn("123-45-6789", message)
+            self.assertNotIn("a.b@example.com", message)
+            self.assertIn("[redacted]", message)
+            # The class is always safe and always recorded.
+            self.assertEqual(captured[0].get("error_class"), "LLMError")
+        finally:
+            _cleanup_capture(h)
+
+    def test_error_message_can_be_omitted_entirely(self) -> None:
+        from app import audit as audit_mod
+        from app import config as config_mod
+
+        captured, h = _capture_audit_payloads()
+        try:
+            with patch.object(config_mod, "AUDIT_ERROR_MESSAGES", False):
+                audit_mod.audit_event(
+                    "draft",
+                    "error",
+                    request_id="req_no_text",
+                    error_class="ValueError",
+                    error_message="statement text could be echoed here",
+                )
+            payload = captured[0]
+            self.assertNotIn("error_message", payload)
+            self.assertEqual(payload.get("error_class"), "ValueError")
+        finally:
+            _cleanup_capture(h)
+
+    def test_error_message_is_recorded_by_default(self) -> None:
+        from app import audit as audit_mod
+
+        captured, h = _capture_audit_payloads()
+        try:
+            audit_mod.audit_event(
+                "evaluate", "error", request_id="req_on", error_message="model timeout"
+            )
+            self.assertIn("model timeout", str(captured[0].get("error_message", "")))
+        finally:
+            _cleanup_capture(h)
+
+
+class AuditHealthTest(unittest.TestCase):
+    """A full disk used to stop auditing silently; it must show up in /health."""
+
+    def _configured_logger(self, tmp: str):
+        from app import audit as audit_mod
+
+        audit_mod._reset_for_tests()  # type: ignore[attr-defined]
+        return audit_mod, audit_mod.configure_audit_logging(log_dir=tmp, force=True)
+
+    def test_healthy_stream_reports_ok(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_mod, _ = self._configured_logger(tmp)
+            audit_mod.audit_event("evaluate", "ok", request_id="req_ok", duration_ms=5)
+            health = audit_mod.audit_health()
+            self.assertEqual(health["status"], "ok")
+            self.assertEqual(health["write_failures"], 0)
+            self.assertIn("retention_days", health)
+            self.assertIn("max_bytes", health)
+
+    def test_a_failed_handler_emit_is_counted_and_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_mod, logger = self._configured_logger(tmp)
+            file_handler = next(h for h in logger.handlers if hasattr(h, "baseFilename"))
+
+            class _FullDisk:
+                """A stream whose writes fail the way a full volume fails.
+
+                ``tell`` is needed because ``RotatingFileHandler`` asks the stream
+                for its position (to decide whether to roll over) *before* writing,
+                so a double without it fails on AttributeError and never reaches
+                the write the test is about.
+                """
+
+                def tell(self) -> int:
+                    return 0
+
+                def write(self, _data: str) -> int:
+                    raise OSError(28, "No space left on device")
+
+                def flush(self) -> None:
+                    return None
+
+                def close(self) -> None:
+                    return None
+
+            # Replace the *stream*, not ``emit``: the emit implementation is what
+            # catches its own write failure and calls ``handleError``, so stubbing
+            # ``emit`` would bypass the very path under test.
+            original_stream = file_handler.stream
+            file_handler.stream = _FullDisk()
+            previous = logging.raiseExceptions
+            logging.raiseExceptions = False  # keep the expected failure quiet
+            try:
+                audit_mod.audit_event("evaluate", "ok", request_id="req_full", duration_ms=1)
+            finally:
+                logging.raiseExceptions = previous
+                file_handler.stream = original_stream
+
+            health = audit_mod.audit_health()
+            self.assertEqual(health["write_failures"], 1)
+            self.assertEqual(health["status"], "degraded")
+            self.assertIn("No space left", str(health["last_write_error"]))
+            # The app must keep working: a lost audit record is not a crash.
+            audit_mod.audit_event("evaluate", "ok", request_id="req_after", duration_ms=1)
+
+    def test_health_before_configuration_says_so(self) -> None:
+        from app import audit as audit_mod
+
+        audit_mod._reset_for_tests()  # type: ignore[attr-defined]
+        self.assertEqual(audit_mod.audit_health()["status"], "not_configured")
+        audit_mod.configure_audit_logging(log_dir=tempfile.mkdtemp(), force=True)

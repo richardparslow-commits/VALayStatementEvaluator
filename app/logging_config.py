@@ -383,6 +383,21 @@ def _now_ms() -> float:
     return time.perf_counter() * 1000.0
 
 
+def _record_phase_metric(phase: str, outcome: str, duration_ms: int) -> None:
+    """Feed a completed phase to the metrics registry.
+
+    Imported lazily and guarded because this is called from the logging layer,
+    which sits underneath everything else: a failure to record a metric must never
+    be able to break logging, and logging must never be able to break a run.
+    """
+    try:
+        from .metrics import observe_phase
+
+        observe_phase(phase, outcome, duration_ms)
+    except Exception:  # noqa: BLE001 - instrumentation is best-effort by design
+        pass
+
+
 class PhaseTimer:
     """Context manager that logs phase start/done with ``duration_ms``.
 
@@ -429,6 +444,7 @@ class PhaseTimer:
     ) -> Literal[False]:
         duration_ms = int(_now_ms() - self._t0) if self._t0 else 0
         if exc_type is None:
+            _record_phase_metric(self.phase, "ok", duration_ms)
             self.logger.log(
                 self.level,
                 "phase done: %s (%d ms)",
@@ -444,6 +460,7 @@ class PhaseTimer:
             )
             return False
         # Error path — include stack trace but never body/PII
+        _record_phase_metric(self.phase, "error", duration_ms)
         from types import TracebackType as _TracebackType
 
         _tb: _TracebackType | None = exc_tb if isinstance(exc_tb, _TracebackType) else None

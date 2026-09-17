@@ -16,6 +16,7 @@ import streamlit as st
 from .. import audit as audit_log
 from ..agiloop_telemetry import track_goal, track_impression, track_interaction
 from ..evaluate import DIMENSION_LABELS, run_evaluation
+from ..job_payload import EvaluateJob
 from ..logging_config import get_logger, get_request_id
 from ..documents import (
     EVALUATE_INTERNAL_MAX_CHARS,
@@ -36,6 +37,8 @@ from .follow_up import (
     mark_follow_up_answers_consumed,
     render_follow_up_questions,
 )
+
+from . import job_runner
 from .shared import (
     FEATURE_ID,
     audit_condition_for_slot,
@@ -106,11 +109,21 @@ def render_evaluate_tab() -> None:
 
     render_condition_selector_for_slot("eval")
 
+    if job_runner.queue_mode_active():
+        st.caption(
+            f"⚙️ This run is processed by a background worker ({job_runner.queue_status_line()}). "
+            "You can close this tab — the results will be waiting when you come back."
+        )
+
     run = st.button("🔍 Run exhaustive evaluation", type="primary", key="eval_run")
     if run:
         if not _validate_evaluate_inputs(statement_text, records):
             return
         _run_evaluation_flow(statement_text, records)
+
+    # A queued run outlives this browser session, so re-attach to one started
+    # earlier (a reload mid-digest would otherwise look like nothing happened).
+    job_runner.resume_pending_job("eval", action_label="Evaluation")
 
     cached_eval: Any = st.session_state.get("eval_result")
     if cached_eval is None:
@@ -195,6 +208,9 @@ def _validate_evaluate_inputs(statement_text: str, records: list) -> bool:
 # -------------------------------------------------------------- run pipeline
 def _run_evaluation_flow(statement_text: str, records: list) -> None:
     """Mint a run id, gate shutdown, run the pipeline, persist the result."""
+    if job_runner.queue_mode_active():
+        _run_evaluation_queued(statement_text, records)
+        return
     rid = new_run_request_id()
     llm = get_llm()
     if llm is None:
@@ -365,6 +381,9 @@ def _run_evaluation_flow(statement_text: str, records: list) -> None:
         exit_run()
     duration_ms = int((time.perf_counter() - t0) * 1000)
     total = llm.usage.totals()
+    # Which endpoint(s) actually served this run. Stamped on the audit record and
+    # the run log, because a failover changes who wrote the output.
+    _endpoints = llm.usage.endpoints_used()
     logger.info(
         "evaluate run done duration_ms=%d calls=%d tokens_in=%d tokens_out=%d",
         duration_ms,
@@ -398,8 +417,16 @@ def _run_evaluation_flow(statement_text: str, records: list) -> None:
         record_files=_audit_files,
         record_pages=_audit_pages,
         outcome=_outcome or None,
+        llm_endpoints=_endpoints,
     )
-    run_log_event("evaluate", "ok", request_id=rid, duration_ms=duration_ms, **_outcome)
+    run_log_event(
+        "evaluate",
+        "ok",
+        request_id=rid,
+        duration_ms=duration_ms,
+        endpoints=",".join(_endpoints),
+        **_outcome,
+    )
     if _is_empty_analysis(result):
         # Completed, but the model handed back nothing usable (e.g. ``{}`` for
         # every phase). Log it once here — the results panel re-renders on every
@@ -433,6 +460,49 @@ def _run_evaluation_flow(statement_text: str, records: list) -> None:
 
 
 # ------------------------------------------------------------------ results UI
+def _run_evaluation_queued(statement_text: str, records: list) -> None:
+    """Submit the run to a worker and wait for its result (Pattern C).
+
+    No audit start is emitted here: the worker writes the start/ok/error pair so
+    a run produces exactly one audit record whether it ran in-process or on a
+    worker. The web pod only records that the work was handed off.
+    """
+    rid = new_run_request_id()
+    if not check_shutdown_gate("evaluation"):
+        run_log_event(
+            "evaluate", "rejected", request_id=rid,
+            error="app shutting down", reason="draining",
+        )
+        return
+    config_error = job_runner.worker_config_error()
+    if config_error:
+        run_log_event(
+            "evaluate", "rejected", request_id=rid,
+            error=config_error, reason="worker_key_missing",
+        )
+        st.error(config_error)
+        return
+    _sources, _files, _pages = audit_record_meta("eval", records)
+    _condition = audit_condition_for_slot("eval")
+    outcome = job_runner.submit_job(
+        slot="eval",
+        job=EvaluateJob(
+            statement_text=statement_text.strip(),
+            records=records,
+            request_id=rid,
+            record_sources=_sources,
+        ),
+        request_id=rid,
+        condition=_condition,
+        sources=_sources,
+        files=_files,
+        pages=_pages,
+        action_label="Evaluation",
+    )
+    if outcome is not None and outcome.ok:
+        st.success(f"Evaluation complete — reference `{rid}`.")
+
+
 def _result_reference() -> str:
     """Reference id of the run that produced the cached results, if known."""
     rid_raw: Any = st.session_state.get("eval_request_id", "")

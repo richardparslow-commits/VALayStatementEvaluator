@@ -17,6 +17,7 @@ from .documents import (
     MAX_OBSERVATIONS_CHARS,
 )
 from .llm import LLMClient, LLMError
+from . import tracing
 from .logging_config import PhaseTimer, get_request_id
 from .profiler import phase_timer
 from .prompt_sanitize import GUARD_NOTE, sanitize_digest_text, sanitize_for_prompt, validate_witness_field
@@ -194,49 +195,59 @@ def run_draft(
     """Execute the full drafting pipeline."""
     rid = get_request_id() or "-"
     t0 = time.perf_counter()
+    pages = sum(len(d.pages) for d in records)
     logger.info(
         "draft start pages=%d observations_chars=%d condition=%s",
-        sum(len(d.pages) for d in records),
+        pages,
         len(observations),
         condition[:60] if condition else "-",
         extra={"request_id": rid, "phase": "draft_pipeline", "status": "start"},
     )
-    try:
-        validate_drafting_request(
-            observations=observations,
-            condition=condition,
-            claim_type=claim_type,
-            witness=witness,
-        )
-        result = _run_draft(llm, records, witness, observations, condition, claim_type, progress)
-        duration_ms = int((time.perf_counter() - t0) * 1000)
-        logger.info(
-            "draft done duration_ms=%d draft_chars=%d grounding_items=%d",
-            duration_ms,
-            len(result.output_statement),
-            len(result.grounding) if isinstance(result.grounding, dict) else 0,
-            extra={"request_id": rid, "phase": "draft_pipeline", "status": "ok", "duration_ms": duration_ms},
-        )
-        return result
-    except Exception as exc:  # noqa: BLE001 - feature-error boundary
-        mapped = map_drafting_exception(exc, request_id=rid, phase="draft_pipeline")
-        duration_ms = int((time.perf_counter() - t0) * 1000)
-        logger.error(
-            "draft error duration_ms=%d error=%s",
-            duration_ms,
-            mapped.diagnostics,
-            exc_info=exc,
-            extra={
-                "request_id": rid,
-                "phase": "draft_pipeline",
-                "status": "error",
-                "duration_ms": duration_ms,
-                "error_class": type(exc).__name__,
-                **error_extra(mapped),
-            },
-        )
-        track_feature_error(FEATURE_ID, exc)
-        raise mapped from exc
+    # Root span for the run — see run_evaluation for the mirrored comment.
+    with tracing.run_span("draft", files=len(records), pages=pages, chars=len(observations)):
+        try:
+            validate_drafting_request(
+                observations=observations,
+                condition=condition,
+                claim_type=claim_type,
+                witness=witness,
+            )
+            result = _run_draft(
+                llm, records, witness, observations, condition, claim_type, progress
+            )
+            duration_ms = int((time.perf_counter() - t0) * 1000)
+            logger.info(
+                "draft done duration_ms=%d draft_chars=%d grounding_items=%d",
+                duration_ms,
+                len(result.output_statement),
+                len(result.grounding) if isinstance(result.grounding, dict) else 0,
+                extra={
+                    "request_id": rid,
+                    "phase": "draft_pipeline",
+                    "status": "ok",
+                    "duration_ms": duration_ms,
+                },
+            )
+            return result
+        except Exception as exc:  # noqa: BLE001 - feature-error boundary
+            mapped = map_drafting_exception(exc, request_id=rid, phase="draft_pipeline")
+            duration_ms = int((time.perf_counter() - t0) * 1000)
+            logger.error(
+                "draft error duration_ms=%d error=%s",
+                duration_ms,
+                mapped.diagnostics,
+                exc_info=exc,
+                extra={
+                    "request_id": rid,
+                    "phase": "draft_pipeline",
+                    "status": "error",
+                    "duration_ms": duration_ms,
+                    "error_class": type(exc).__name__,
+                    **error_extra(mapped),
+                },
+            )
+            track_feature_error(FEATURE_ID, exc)
+            raise mapped from exc
 
 
 def _truncate_for_prompt(text: str, limit: int = DRAFT_INTERNAL_MAX_CHARS) -> tuple[str, int]:
@@ -278,7 +289,10 @@ def _run_draft(
             progress(frac, msg)
 
     rid = get_request_id() or "-"
-    with PhaseTimer(logger, "records:review", request_id=rid, chunks=len(records)):
+    with (
+        tracing.phase_span("records:review", files=len(records)),
+        PhaseTimer(logger, "records:review", request_id=rid, chunks=len(records)),
+    ):
         with phase_timer("records:review"):
             report(0.02, "Step 1/4 — Exhaustive review of medical records…")
             try:
@@ -288,7 +302,7 @@ def _run_draft(
             except Exception as exc:  # noqa: BLE001
                 raise map_drafting_exception(exc, request_id=rid, phase="records:review") from exc
 
-    with PhaseTimer(logger, "grounding", request_id=rid):
+    with tracing.phase_span("grounding"), PhaseTimer(logger, "grounding", request_id=rid):
         with phase_timer("grounding"):
             report(0.5, "Step 2/4 — Grounding witness observations against the records and topic checklist…")
             grounding_query = f"{condition} {obs_for_prompt}"
@@ -309,7 +323,7 @@ def _run_draft(
             except Exception as exc:  # noqa: BLE001
                 raise map_drafting_exception(exc, request_id=rid, phase="grounding") from exc
 
-    with PhaseTimer(logger, "draft", request_id=rid):
+    with tracing.phase_span("draft"), PhaseTimer(logger, "draft", request_id=rid):
         with phase_timer("draft"):
             report(0.68, "Step 3/4 — Drafting the statement…")
             try:
@@ -338,7 +352,7 @@ def _run_draft(
             except Exception as exc:  # noqa: BLE001
                 raise map_drafting_exception(exc, request_id=rid, phase="draft") from exc
 
-    with PhaseTimer(logger, "review", request_id=rid):
+    with tracing.phase_span("review"), PhaseTimer(logger, "review", request_id=rid):
         with phase_timer("review"):
             report(0.85, "Step 4/4 — Self-review and improvement pass…")
             try:

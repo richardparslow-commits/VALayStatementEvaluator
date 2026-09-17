@@ -1,0 +1,276 @@
+# Unit tests for alerts.yml, runnable with the real Prometheus toolchain:
+#
+#   promtool test rules deploy/monitoring/alerts.test.yml
+#
+# A rule that parses is not a rule that fires, and the two things that silently
+# break are the expression and the `for:` duration — an alert that waits longer
+# than intended looks identical to a healthy system. Both are assertions below.
+#
+# `exp_alerts: []` cases matter as much as the firing ones: they pin the delay, so
+# a change that makes an alert page on a single blip is caught here rather than at
+# 3am.
+#
+# Note: every `eval_time` must be at least the rule's `for:` duration, or the test
+# asserts against a rule that has not had time to fire. The comments give the
+# reason for each wait.
+#
+# promtool compares annotations in full, so a wording change in alerts.yml must be
+# mirrored here. That is the price of testing the alert rather than its syntax; if
+# an annotation is reworded, update the corresponding `exp_annotations` below.
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # ------------------------------------------------------------------ breaker
+  - name: circuit breaker reports open only after holding for a minute
+    interval: 1m
+    input_series:
+      - series: 'va_lse_circuit_breaker_open{breaker="llm"}'
+        values: '0 1 1 1'
+    alert_rule_test:
+      # `for: 1m` — must not have fired one evaluation into the condition.
+      - eval_time: 1m
+        alertname: VaElseCircuitBreakerOpen
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: VaElseCircuitBreakerOpen
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              breaker: llm
+            exp_annotations:
+              summary: "LLM circuit breaker is OPEN (llm)"
+              description: 'Calls have been failing fast without touching the endpoint for over a minute. Every user who tries a run right now gets a "temporarily unavailable, retry in Ns" error. Check the endpoint''s own status and the key/quota before touching the app; the breaker is working as designed and will re-probe by itself.'
+
+  - name: a breaker that recovers before the delay never pages
+    interval: 1m
+    input_series:
+      - series: 'va_lse_circuit_breaker_open{breaker="llm"}'
+        values: '0 1 0 0'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: VaElseCircuitBreakerOpen
+        exp_alerts: []
+
+  # --------------------------------------------------------------- readiness
+  # probe_success comes from blackbox_exporter, not from the app; the rule is
+  # about the scrape job, so the series is simulated directly.
+  - name: readiness failure pages after three minutes
+    interval: 1m
+    input_series:
+      - series: 'probe_success{job="va-lse-readiness", instance="http://web:8001/ready"}'
+        values: '1 0 0 0 0'
+    alert_rule_test:
+      # `for: 3m` — still quiet at 2m of failure.
+      - eval_time: 2m
+        alertname: VaElseReadinessFailing
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: VaElseReadinessFailing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: va-lse-readiness
+              instance: http://web:8001/ready
+            exp_annotations:
+              summary: "Readiness is failing — the app cannot serve a run"
+              description: '/ready has answered non-200 for three minutes: the LLM gateway is unreachable, or a configured model is no longer listed at {base_url}/models. Check the key/base-URL pairing first — a Token Plan key against a different endpoint is the most common cause, and the app is otherwise healthy (liveness still passes).'
+
+  # ------------------------------------------------------------- compliance
+  # The most important rule here: the app keeps serving while it drops audit
+  # records, so nothing else would notice.
+  - name: a single audit write failure pages
+    interval: 1m
+    input_series:
+      - series: 'va_lse_audit_write_failures_total'
+        values: '0 1 1'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: VaElseAuditWriteFailures
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "Audit records are being dropped"
+              description: 'Writes to the audit stream are failing, which means compliance records were lost — the app keeps serving while that happens by design, so nothing else will tell you. Almost always a full or read-only log volume; check va_lse_disk_free_bytes.'
+
+  - name: an unchanged audit write counter stays quiet
+    interval: 1m
+    input_series:
+      - series: 'va_lse_audit_write_failures_total'
+        values: '0 0 0 0'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: VaElseAuditWriteFailures
+        exp_alerts: []
+
+  # Any non-ok backup state within the last 6h is an incident: 2 = never ran,
+  # 3 = stale, 4 = error. The rule is deliberately not `== 4`, so a deployment
+  # whose backup job was never scheduled still alerts.
+  - name: a backup job that has never succeeded pages
+    interval: 1m
+    input_series:
+      - series: 'va_lse_audit_backup_state{destination="s3"}'
+        values: '2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2'
+    alert_rule_test:
+      # `for: 15m` — quiet at 10m, firing once the delay has elapsed.
+      - eval_time: 10m
+        alertname: VaElseAuditBackupStopped
+        exp_alerts: []
+      - eval_time: 18m
+        alertname: VaElseAuditBackupStopped
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              destination: s3
+            exp_annotations:
+              summary: "Audit backup is not running (state 2)"
+              description: '2 = never ran, 3 = stale, 4 = error. Audit logs currently exist only on the pod, so a restart loses them. Check `kubectl get jobs` for the backup CronJob and the `last_error` field in the backup state file.'
+
+  - name: a healthy backup state stays quiet
+    interval: 1m
+    input_series:
+      - series: 'va_lse_audit_backup_state{destination="s3"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 18m
+        alertname: VaElseAuditBackupStopped
+        exp_alerts: []
+
+  # ------------------------------------------------------------ queue wiring
+  # Tests the `and`: enabled but not distributed is the configuration where the
+  # queue looks on and can never reach a worker.
+  - name: an enabled but non-distributed queue pages
+    interval: 1m
+    input_series:
+      - series: 'va_lse_job_queue_enabled'
+        values: '1 1 1 1 1 1 1 1 1 1 1 1 1 1'
+      - series: 'va_lse_job_queue_distributed'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0 0 0'
+    alert_rule_test:
+      # `for: 10m`.
+      - eval_time: 12m
+        alertname: VaElseJobQueueNotDistributed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Job queue is enabled but cannot serve a worker"
+              description: 'The active backend is single-process (in-process), so queued runs can never be claimed by a separate worker deployment. Set VA_LSE_REDIS_URL or the shared-cache credentials on both tiers.'
+
+  - name: a distributed queue stays quiet
+    interval: 1m
+    input_series:
+      - series: 'va_lse_job_queue_enabled'
+        values: '1 1 1 1 1 1 1 1 1 1 1 1 1 1'
+      - series: 'va_lse_job_queue_distributed'
+        values: '1 1 1 1 1 1 1 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: VaElseJobQueueNotDistributed
+        exp_alerts: []
+
+  # ------------------------------------------------------------------ failover
+  - name: failover engages and is reported
+    interval: 1m
+    input_series:
+      # Primary unhealthy from the start, past the 300s grace period, and failover
+      # active. 40 points so the rule's `for: 5m` has room to elapse.
+      - series: 'va_lse_llm_failover_active'
+        values: '1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1'
+      - series: 'va_lse_llm_failover_enabled'
+        values: '1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1'
+    alert_rule_test:
+      # `for: 5m` — 3m is not enough.
+      - eval_time: 3m
+        alertname: VaElseLlmRunningOnFallback
+        exp_alerts: []
+      - eval_time: 8m
+        alertname: VaElseLlmRunningOnFallback
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "LLM calls are being served by the fallback endpoint"
+              description: 'The primary endpoint has been unhealthy past LLM_ENDPOINT_FALLBACK_TIMEOUT_SECONDS, so runs are being served by the backup provider. Users are still served — readiness stays green, which is why this alert exists separately. Check the primary''s status, and remember the backup provider bills differently and may produce slightly different text, so runs during this window are stamped with the endpoint that served them.'
+
+  - name: a healthy primary on a failover-capable deployment stays quiet
+    interval: 1m
+    input_series:
+      # Failover is *configured* but not active — the state most deployments with
+      # a backup endpoint are in almost all the time. It must not page.
+      - series: 'va_lse_llm_failover_active'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0'
+      - series: 'va_lse_llm_failover_enabled'
+        values: '1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1'
+      - series: 'va_lse_llm_primary_unhealthy_seconds'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: VaElseLlmRunningOnFallback
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: VaElseLlmPrimaryUnhealthy
+        exp_alerts: []
+
+  - name: a single-endpoint deployment is never paged about failover
+    interval: 1m
+    input_series:
+      # No fallback configured: the failover gauges are 0 and there is no
+      # primary-unhealthy series beyond the grace threshold.
+      - series: 'va_lse_llm_failover_active'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0'
+      - series: 'va_lse_llm_failover_enabled'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: VaElseLlmRunningOnFallback
+        exp_alerts: []
+
+  - name: a long primary outage is reported before failover engages
+    interval: 1m
+    input_series:
+      # Unhealthy for 10 minutes, no failover yet (no fallback configured, or
+      # still inside the grace period if there is one).
+      - series: 'va_lse_llm_primary_unhealthy_seconds'
+        values: '0 60 120 180 300 420 480 540 600 660 700 720'
+    alert_rule_test:
+      # `for: 5m` measured from when the expression first became true (>120s at
+      # t=3m), so t=7m is not yet enough.
+      - eval_time: 6m
+        alertname: VaElseLlmPrimaryUnhealthy
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: VaElseLlmPrimaryUnhealthy
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              # Rendered, not the template: the rule's `$value` is the series value
+              # at eval_time (720s), so this also proves the template expands.
+              summary: "Primary LLM endpoint unhealthy for over 12m 0s"
+              description: 'The primary has been failing continuously. With a fallback configured this precedes failover; without one, requests are failing fast and users are being told to retry.'
+
+  # ------------------------------------------------------- monitoring itself
+  - name: dropped metric series are reported
+    interval: 1m
+    input_series:
+      - series: 'va_lse_metrics_series_dropped_total{metric="va_lse_llm_calls_total"}'
+        # 40 values: the drop happens at t=2m, then `for: 30m` must elapse.
+        values: '0 0 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5'
+    alert_rule_test:
+      # `for: 30m` — 20m is not enough.
+      - eval_time: 20m
+        alertname: VaElseMetricsSeriesDropped
+        exp_alerts: []
+      - eval_time: 35m
+        alertname: VaElseMetricsSeriesDropped
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              metric: va_lse_llm_calls_total
+            exp_annotations:
+              summary: "Metric series are being dropped (label cardinality cap)"
+              description: 'A metric family hit MAX_SERIES_PER_METRIC, which means one of its labels is carrying unbounded data. Dashboards and alerts over that family are now incomplete. Check the `metric` label for the culprit.'

@@ -1,14 +1,25 @@
-# k8s-redis.yaml — Redis StatefulSet for session persistence (Pattern C)
+# k8s-redis.yaml — Redis for the Pattern C job queue
 #
-# Optional: only needed if you want session state to survive pod restarts
-# (e.g., rolling upgrades, autoscaling). Without Redis, sessions are
-# in-memory per pod and lost on pod restart.
+# Redis here backs the distributed job queue (app/job_queue.py): the queued
+# jobs, their progress/status, and their results. It is NOT a session store —
+# st.session_state lives in the Streamlit process and cannot be shared, because a
+# session is a live WebSocket pinned to one pod. Pattern C removes the *work*
+# from the web pod (see k8s-worker.yaml), not the session.
 #
-# See DEPLOYMENT.md → Pattern C for integration details.
+# Without this (and without Upstash REST credentials) the app runs the pipeline
+# in-process exactly as it always has, and no Redis is needed at all.
+#
+# See DEPLOYMENT.md → Pattern C for the full setup.
 #
 # Usage:
 #   kubectl apply -f k8s-redis.yaml
-#   # Add VA_LSE_REDIS_URL=redis://va-lse-redis:6379/0 to your va-lse-env secret
+#   # Add VA_LSE_REDIS_URL=redis://va-lse-redis:6379/0 and VA_LSE_JOB_QUEUE=1
+#   # to your va-lse-env secret
+#
+# Sizing: size --maxmemory for the job PAYLOADS (extracted record text, not the
+# uploaded PDFs) — roughly concurrency x peak batch text. allkeys-lru can evict a
+# queued payload, so prefer noeviction or a generous maxmemory once you rely on
+# the queue.
 
 apiVersion: apps/v1
 kind: StatefulSet
