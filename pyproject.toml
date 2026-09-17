@@ -2,6 +2,13 @@
 requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
+[tool.pytest.ini_options]
+# Collect only the real test suite, matching CI (`python -m unittest discover -s tests`).
+# Without this, a stray file elsewhere in the tree (editor/macOS duplicate copies of tests
+# land next to the originals with a " 2.py" suffix and collide on import) turns a working
+# local run into a collection failure.
+testpaths = ["tests"]
+
 [tool.mypy]
 python_version = "3.12"
 # Strict enough to catch missing hints, but pragmatic for a Streamlit app
