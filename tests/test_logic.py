@@ -11,7 +11,7 @@ from app.documents import extract_document  # noqa: E402
 from app.draft import DraftResult, grounding_markdown  # noqa: E402
 from app.evaluate import EvaluationResult, build_report  # noqa: E402
 from app.fetch_client import FetchClient  # noqa: E402
-from app.medical_review import find_relevant_excerpts  # noqa: E402
+from app.medical_review import find_relevant_excerpts, retrieve_evidence  # noqa: E402
 
 
 class TestRelevanceSearch(unittest.TestCase):
@@ -23,7 +23,25 @@ class TestRelevanceSearch(unittest.TestCase):
         )
         excerpts = find_relevant_excerpts([doc], "low back pain lifting pallet work")
         self.assertIn("low back pain", excerpts)
-        self.assertNotIn("parking", excerpts)
+        # Retrieval now ranks instead of filtering: the whole record is offered to
+        # the verifier so it always has context, and the matching paragraph must
+        # come first. The relevance *signal* is what keeps the rest honest.
+        self.assertLess(excerpts.index("low back pain"), excerpts.index("parking"))
+        evidence = retrieve_evidence([doc], "low back pain lifting pallet work")
+        self.assertFalse(evidence.weak)
+        self.assertGreater(evidence.best_overlap, 0.0)
+
+    def test_a_query_the_records_do_not_cover_is_flagged_weak(self):
+        doc = extract_document(
+            "records.txt", b"Patient reports low back pain after lifting a pallet.\n\n"
+            b"Unrelated note about scheduling and parking availability.",
+        )
+        evidence = retrieve_evidence([doc], "torn rotator cuff impingement")
+        self.assertTrue(evidence.weak)
+        self.assertEqual(evidence.best_overlap, 0.0)
+        # Context is still returned — the caller needs it to explain *why* the
+        # claim is unverified, and must never receive an empty prompt here.
+        self.assertTrue(evidence.text)
 
     def test_empty_query_returns_empty(self):
         doc = extract_document("records.txt", b"Some medical text about back pain.")

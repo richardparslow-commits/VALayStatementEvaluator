@@ -1,10 +1,18 @@
-# Local-only extras for browser automation (scripts/va_records_download.py).
+# Local-only extras for the two workflows that run on *your* machine, not in the
+# app: downloading records from VA.gov, and OCR-ing scans before upload.
 #
 # NOT needed to run the app and NOT installed by CI — the Streamlit app and its
-# test suite never import Playwright, and the automation is useless on a hosted
-# deployment anyway (it needs a real browser and a human for the ID.me SMS code).
+# test suite never import these, and neither workflow can work on a hosted
+# deployment anyway (one needs a real browser and a human for the ID.me SMS code,
+# the other needs the local file and a CPU).
 #
 # Install with:
 #   python -m pip install -r requirements-local.txt
 #   python -m playwright install chromium
+#
+# OCR (scripts/ocr_records.py) uses whichever of these is present — ocrmypdf is
+# preferred because it keeps the original pages and only adds a text layer. The
+# fallback needs the `pdftoppm` (Poppler) and `tesseract` binaries on PATH
+# instead, e.g. `brew install tesseract poppler` on macOS.
+ocrmypdf>=16.0
 playwright>=1.49

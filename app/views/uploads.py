@@ -5,6 +5,7 @@ Split out of ``app/views/shared.py``; the actual parsing lives in
 """
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 import streamlit as st
@@ -67,6 +68,36 @@ def check_upload_limits(files: Any) -> tuple[list[Any], list[str]]:
     return accepted, rejected_msgs
 
 
+def _upload_cache_key(slot: str, uploaded: Any) -> str:
+    """Cache key for one upload: slot, name, size **and content hash**.
+
+    Name and size alone are not identity. A user who fixes a file locally and
+    re-uploads a corrected copy with the same name and byte length would otherwise
+    keep getting the old text back from ``session_state`` for the rest of the
+    session — the failure looks like the app ignoring their correction.
+    """
+    try:
+        digest = hashlib.sha1(uploaded.getvalue()).hexdigest()[:16]
+    except Exception:  # noqa: BLE001 - test fakes expose only name/size
+        digest = "nohash"
+    return f"{slot}:{uploaded.name}:{getattr(uploaded, 'size', 0)}:{digest}"
+
+
+def _prune_upload_cache(slot: str, live_keys: set[str]) -> None:
+    """Drop cached extractions for files that are no longer uploaded."""
+    try:
+        state: Any = st.session_state
+        stale = [
+            key
+            for key in list(state.keys())
+            if isinstance(key, str) and key.startswith(f"{slot}:") and key not in live_keys
+        ]
+        for key in stale:
+            del state[key]
+    except Exception:  # noqa: BLE001 - session state is best-effort here
+        return
+
+
 def extract_uploads(files: Any, slot: str) -> list[Any]:
     """Extract text from uploaded files; cache results per file identity.
 
@@ -77,19 +108,22 @@ def extract_uploads(files: Any, slot: str) -> list[Any]:
     """
     documents = []
     to_extract = []
+    live_keys: set[str] = set()
     for uploaded in files:
-        cache_key = f"{slot}:{uploaded.name}:{uploaded.size}"
+        cache_key = _upload_cache_key(slot, uploaded)
+        live_keys.add(cache_key)
         if cache_key in st.session_state:
             documents.append(st.session_state[cache_key])
         else:
             to_extract.append(uploaded)
+    _prune_upload_cache(slot, live_keys)
 
     new_docs, skipped = extract_uploaded_documents(to_extract) if to_extract else ([], [])
     for doc in new_docs:
-        # Cache each successful extraction by its (slot, name, size) identity.
+        # Cache each successful extraction by its (slot, name, size, content) key.
         for uploaded in to_extract:
             if uploaded.name == doc.filename:
-                st.session_state[f"{slot}:{uploaded.name}:{uploaded.size}"] = doc
+                st.session_state[_upload_cache_key(slot, uploaded)] = doc
                 break
         documents.append(doc)
     # The uploader re-delivers files on every rerun, so warnings are recomputed
@@ -109,4 +143,44 @@ def _render_skip_summary(files: Any, documents: list[Any], skipped: list[str]) -
     loaded = len(documents)
     st.caption(
         f"Loaded {loaded} of {total} file(s) — {len(skipped)} skipped (listed below)."
+    )
+
+
+def render_record_volume_warning(documents: list[Any], *, slot: str) -> None:
+    """Warn about a record set big enough to be slow, partial, or over the cap.
+
+    The uploader already says how many pages loaded; what it does not say is that
+    the digest is capped (``MAX_DIGEST_FACTS``) and that a very large set will take
+    a long time and may report fewer facts than the records contain. Better to say
+    so before the run than to have the report quietly be thinner than the records.
+    """
+    if not documents:
+        return
+    text_pages = sum(len(getattr(doc, "pages", []) or []) for doc in documents)
+    try:
+        total_pages = sum(
+            int(getattr(doc, "source_page_count", len(getattr(doc, "pages", []) or [])))
+            for doc in documents
+        )
+    except Exception:  # noqa: BLE001 - defensive: any doc shape
+        total_pages = text_pages
+    if total_pages > config.MAX_RECORD_PAGES:
+        st.error(
+            f"⚠️ This record set is {total_pages:,} pages, over the configured limit of "
+            f"{config.MAX_RECORD_PAGES:,}. The run will be refused — split the files or "
+            "raise VA_LSE_MAX_RECORD_PAGES."
+        )
+    elif total_pages > config.RECORD_SIZE_WARN_PAGES:
+        st.warning(
+            f"⚠️ Large record set ({total_pages:,} pages): the review will take a long time "
+            f"and the digest is capped at {config.MAX_DIGEST_FACTS:,} facts, so a record set "
+            f"this size may not be represented in full. Consider splitting it by date range "
+            "so each run can cover its pages completely."
+        )
+    logger.debug(
+        "record volume slot=%s files=%d pages=%d text_pages=%d",
+        slot,
+        len(documents),
+        total_pages,
+        text_pages,
     )

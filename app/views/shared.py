@@ -29,7 +29,11 @@ from .records import (  # noqa: F401
     remember_source_records,
     render_record_search,
 )
-from .uploads import check_upload_limits, extract_uploads  # noqa: F401
+from .uploads import (  # noqa: F401
+    check_upload_limits,
+    extract_uploads,
+    render_record_volume_warning,
+)
 from .usage import (  # noqa: F401
     effective_credit_rates,
     load_usage_history,

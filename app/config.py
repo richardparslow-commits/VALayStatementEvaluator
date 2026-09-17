@@ -277,6 +277,14 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def _bool_env(name: str, default: bool) -> bool:
+    """Read a boolean env var; accepts 1/true/yes/on (case-insensitive)."""
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
 def _positive_int_env(name: str, default: int) -> int:
     value = _int_env(name, default)
     return value if value > 0 else default
@@ -321,6 +329,10 @@ METRICS_SESSION_TTL_SECONDS = _positive_int_env("VA_LSE_METRICS_SESSION_TTL_SECO
 # Hard cap on total pages across all uploaded record files.
 MAX_RECORD_PAGES = _int_env("VA_LSE_MAX_RECORD_PAGES", 5000)
 
+# Warn (before the run, in the uploader) once a record set is big enough that a
+# full review is slow and the digest cap may leave facts out.
+RECORD_SIZE_WARN_PAGES = _positive_int_env("VA_LSE_RECORD_SIZE_WARN_PAGES", 800)
+
 # Number of record chunks digested in parallel. Tuned down for the QwenCloud
 # Individual Plan Lite, which allows ~1-2 concurrent agents; higher values just
 # trigger rate limiting and burn the small credit quota faster. Raise via
@@ -330,9 +342,42 @@ RECORDS_CONCURRENCY = max(1, _int_env("VA_LSE_RECORDS_CONCURRENCY", 2))
 # Maximum facts kept in the digest after consolidation.
 MAX_DIGEST_FACTS = _int_env("VA_LSE_MAX_DIGEST_FACTS", 1500)
 
+# Pages whose word n-gram overlap is at least this high are treated as the same
+# page reprinted (different footer, scanner noise) and digested only once.
+DUPLICATE_PAGE_SIMILARITY = _float_env("VA_LSE_DUPLICATE_PAGE_SIMILARITY", 0.92) or 0.92
+
+# Undated facts are dated by the model in batches of this size; one call over
+# every undated fact in a large bundle truncates and loses the whole batch.
+UNDATED_FACT_BATCH_SIZE = _positive_int_env("VA_LSE_UNDATED_FACT_BATCH_SIZE", 40)
+
+# Below this keyword-overlap score, retrieved raw evidence counts as "nothing
+# matched" — the verify step then treats an absent record as a coverage gap
+# rather than letting the model call it a contradiction.
+EVIDENCE_WEAK_OVERLAP = _float_env("VA_LSE_EVIDENCE_WEAK_OVERLAP", 0.05) or 0.05
+
 # Characters per record chunk. Smaller chunks => more LLM calls but better
 # recall on dense pages (nothing gets truncated mid-extraction).
 DIGEST_CHUNK_CHARS = _int_env("VA_LSE_DIGEST_CHUNK_CHARS", 8000)
+
+# Characters per synthesized block for sources with no page numbers (.txt/.md/
+# .docx). Long text is addressed in blocks so citations resolve to somewhere in
+# the file instead of every fact claiming "p.1" of a 200-page document.
+DOCUMENT_BLOCK_CHARS = _positive_int_env("VA_LSE_DOCUMENT_BLOCK_CHARS", 4000)
+
+# Upper bound on one retrieval unit. A PDF page with no blank lines arrives as a
+# single block; split past this so a paragraph inside it can still be ranked.
+PARAGRAPH_MAX_CHARS = _positive_int_env("VA_LSE_PARAGRAPH_MAX_CHARS", 1500)
+
+# Try pypdf's layout-preserving extraction on pages whose default read looks weak
+# or carries no dates. Multi-column clinical tables keep date/value rows intact
+# under layout mode, while the default reader interleaves the columns.
+PDF_LAYOUT_EXTRACTION = _bool_env("VA_LSE_PDF_LAYOUT_EXTRACTION", True)
+
+# Running header/footer stripping: a line repeated on more than this fraction of
+# pages is boilerplate, and only in documents with at least this many pages
+# (below that, repetition is normal and stripping would delete real content).
+RUNNING_LINE_RATIO = _float_env("VA_LSE_RUNNING_LINE_RATIO", 0.6) or 0.6
+RUNNING_LINE_MIN_PAGES = _positive_int_env("VA_LSE_RUNNING_LINE_MIN_PAGES", 3)
 
 # DOCX unzip hardening: reject oversized internal members before decompression.
 DOCX_MAX_INTERNAL_FILE_BYTES = _positive_int_env(

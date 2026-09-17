@@ -69,6 +69,10 @@ scripts/
   scale_sim.py            Offline 2,000-page pipeline simulation (no API calls)
   split_records.py        Split an oversized record file into uploadable chunks
                           (see TROUBLESHOOTING.md → *Split Large Record Sets*)
+  ocr_records.py          Add a text layer to a scanned record PDF so the app can
+                          read its pages (see *Scanned pages and OCR* below)
+  va_records_download.py  Walk VA.gov's records-download wizard locally (you sign
+                          in); writes a provenance manifest beside the PDF
 tests/                    Offline unit tests (no API key required)
 examples/                 Fictional sample statement + sample medical records
 Dockerfile                Production container image (non-root, hash-pinned deps)
@@ -408,7 +412,9 @@ The reviewer is built for full VA claim files, including bundles of 1,000–2,00
   workers at once instead of serially, so a ~1,900-page file that would take hours
   sequentially completes in tens of minutes. Progress is reported per chunk.
 - **Duplicate-page skipping** — pages repeated within or across files (very common in
-  VA bundles) are hash-detected and skipped, with the count shown in the results.
+  VA bundles) are detected and skipped. Matching is by content, not bytes: a page
+  re-printed with a different footer, or scanned twice, is recognised as the same page.
+  Every skipped page is named in the coverage report ("`bundle.pdf` p.40 = `bundle.pdf` p.12").
 - **Transient-failure tolerance** — a chunk that fails (e.g. rate limit) is retried
   once; the run only aborts if it still fails, and the failing chunks are named.
 - **Hierarchical fact merging** — thousands of extracted facts are consolidated in
@@ -416,15 +422,40 @@ The reviewer is built for full VA claim files, including bundles of 1,000–2,00
   `VA_LSE_MAX_DIGEST_FACTS`.
 - **No evidence lost to truncation** — claim verification and draft grounding do not
   read only the head of the digest. Each claim batch retrieves the digest facts most
-  relevant to it (IDF-weighted term matching) plus matching raw-record excerpts, so
-  evidence buried on page 1,700 is found just like evidence on page 2.
+  relevant to it (IDF-weighted term matching, with stemming and a small lay↔clinical
+  synonym bridge so "my neck" reaches "cervical") plus matching raw-record excerpts,
+  ranked rather than filtered, so evidence buried on page 1,700 is found just like
+  evidence on page 2. When nothing in the records matches a claim at all, the verifier
+  is told so and a would-be contradiction is reported as a **coverage gap** instead.
 - **Full-timeline summaries** — the narrative record summary samples facts evenly across
   the whole timeline instead of only the earliest documents.
+
+### Reading the results: what the review actually read
+
+Every fact in the digest carries the file and page it came from ("`clinic.pdf p.7`"), and the
+Evaluate results include a **Record coverage & citation check** panel that answers three
+questions a plausible-looking report otherwise hides:
+
+| Signal | What it means |
+|---|---|
+| Source pages vs pages read | `1,240 of 1,500 source pages had no extractable text (image-only scans)` — the review does not cover them; OCR and re-run (see *Scanned pages and OCR*) |
+| Per-file rows | Pages in the file, pages read, unreadable count, whether the source was page-numbered (`.txt`/`.docx` long files are cited by block, e.g. `notes.docx b.3`) |
+| Chunks without facts | Analyzed chunks that yielded nothing — a page the model found genuinely empty, or one it skimmed |
+| Skipped duplicate pages | Named, with the page each one duplicated |
+| Citation self-check | How many facts' quotes were found on the page they cite, with examples of any that were not |
+| Coverage gaps | Claims with no matching record text anywhere — reported instead of being called contradictions |
+
+The same summary is written into the report (`## Record Coverage Gaps`), so a report shared
+with a VSO carries the caveat rather than losing it. An ordinary small run with nothing to
+declare shows no panel at all.
 
 Tuning: raise `VA_LSE_RECORDS_CONCURRENCY` if your endpoint allows more parallel
 requests; lower `VA_LSE_DIGEST_CHUNK_CHARS` for extra recall on very dense pages (at the
 cost of more LLM calls). `scripts/scale_sim.py` runs an offline 2,000-page simulation of
-the pipeline (no API calls) to verify orchestration at scale.
+the pipeline (no API calls) to verify orchestration at scale. Ingest quality is tunable too:
+`VA_LSE_DOCUMENT_BLOCK_CHARS`, `VA_LSE_PARAGRAPH_MAX_CHARS`, `VA_LSE_PDF_LAYOUT_EXTRACTION`,
+`VA_LSE_DUPLICATE_PAGE_SIMILARITY`, `VA_LSE_EVIDENCE_WEAK_OVERLAP` and
+`VA_LSE_RECORD_SIZE_WARN_PAGES` (all documented in `.env.example`).
 
 ## Tests
 
@@ -591,6 +622,34 @@ VA.gov's and ID.me's terms, and for using only your own records.
    VA.gov export from its **text** (not its filename) and labels it as the **VA.gov** source in
    the merged records summary, so the pages are attributed rather than looking like an anonymous
    upload. A private provider's records are left as a plain upload.
+
+### Scanned pages and OCR
+
+Some of what VA.gov and clinics hand back is a scan, and a scan has no text to extract. The app
+never pretends otherwise: the uploader says how many pages could not be read, and the Evaluate
+results carry a **Record coverage & citation check** panel that names the unreadable page count
+against the number of pages the files actually contain (plus the per-file breakdown and a
+citation self-check — see *Reading the results* below). What the app cannot do is read them, so
+OCR happens on your machine, before the upload:
+
+```bash
+python -m pip install -r requirements-local.txt   # ocrmypdf (preferred backend)
+# or: brew install tesseract poppler             # fallback backend
+
+python scripts/ocr_records.py ~/Desktop/va_medical_records.pdf --report-only
+python scripts/ocr_records.py ~/Desktop/va_medical_records.pdf
+# → ~/Desktop/va_medical_records.ocr.pdf: same pages, now with a text layer
+```
+
+`--report-only` prints how many pages are image-only without changing anything; the real run
+writes a **new** file (never the input) and re-reads it to confirm how many pages now carry
+text. Upload the `.ocr.pdf` and leave the original where it is. Exit codes: `0` wrote a copy,
+`1` nothing to do, `2` no OCR tooling installed, `3` bad input or refused to overwrite.
+
+`scripts/va_records_download.py` also inspects what it just downloaded — page count,
+text-vs-image balance, sha256 — prints a warning when the export is implausibly small or mostly
+scans, and writes `<file>.pdf.manifest.json` recording the selections it clicked (date range,
+record type, file type). Keep it with the PDF: it is the provenance record for a run.
 
 ## Health checks (container orchestration)
 

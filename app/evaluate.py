@@ -28,7 +28,8 @@ logger = logging.getLogger("app.evaluate")
 from .medical_review import (
     MedicalDigest,
     ProgressCallback,
-    find_relevant_excerpts,
+    query_has_content_words,
+    retrieve_evidence,
     review_medical_records,
 )
 
@@ -336,6 +337,10 @@ class EvaluationResult:
     # Statement Effectiveness Score & Improvement Recommendations (F4)
     effectiveness_score: int = 0
     recommendations: list[dict] = field(default_factory=list)
+    # Claims whose batch retrieved no matching record text. These are coverage
+    # gaps, not findings: the statement is silent *and* the records supplied
+    # nothing to check it against, which is a different thing to tell a veteran.
+    evidence_gaps: list[dict] = field(default_factory=list)
 
     @property
     def contradiction_count(self) -> int:
@@ -513,7 +518,9 @@ def _run_evaluation(
         with phase_timer("verify"):
             report(0.60, "Step 3/7 — Verifying each claim against the records…")
             assert result.digest is not None  # set by records:review above
-            result.verifications = _verify_claims(llm, result.claims, result.digest, records, report)
+            result.verifications, result.evidence_gaps = _verify_claims(
+                llm, result.claims, result.digest, records, report
+            )
 
     with tracing.phase_span("rubric"), PhaseTimer(logger, "rubric", request_id=rid):
         with phase_timer("rubric"):
@@ -683,37 +690,89 @@ def _verify_claims(
     digest: MedicalDigest,
     records: list[ExtractedDocument],
     report: ProgressCallback,
-) -> list[dict]:
-    """Verify claims in small batches so each prompt stays focused."""
+) -> tuple[list[dict], list[dict]]:
+    """Verify claims in small batches so each prompt stays focused.
+
+    Returns ``(verifications, evidence_gaps)``. ``evidence_gaps`` lists the claims
+    whose batch found no raw record text at all: for those, a CONTRADICTED verdict
+    is downgraded to NOT FOUND, because "the records disagree" and "nothing in the
+    records addresses this" are different findings and only one of them is true.
+    Reporting a coverage gap as a contradiction would put a false statement in front
+    of a veteran who is about to sign it.
+    """
     verdict_by_id: dict[int, dict] = {}
+    evidence_gaps: list[dict] = []
     batch_size = 8
     batches = [claims[i : i + batch_size] for i in range(0, len(claims), batch_size)]
+    claim_text_by_id = {c["id"]: str(c.get("text", "")) for c in claims}
     for index, batch in enumerate(batches, start=1):
         report(
             0.60 + 0.16 * index / max(len(batches), 1),
             f"Verifying claims — batch {index}/{len(batches)}…",
         )
         batch_query = " ".join(str(c.get("text", "")) for c in batch)
-        excerpts = find_relevant_excerpts(records, batch_query, top_k=8)
+        evidence = retrieve_evidence(records, batch_query, top_k=8)
+        # A contradiction needs something to contradict. Downgrade only when the
+        # claims are judgeable (they carry content words), the raw records hold
+        # nothing that overlaps them, AND the digested facts hold nothing either —
+        # otherwise a claim the digest documents in different words would be
+        # rewritten as a record gap, hiding a genuine conflict.
+        overlap = digest.keyword_overlap(batch_query)
+        evidence_absent = (
+            query_has_content_words(batch_query) and evidence.weak and overlap == 0.0
+        )
+        gap_note = (
+            "(No record text in this record set matches these claims, and the analyzed "
+            "record summary contains nothing about them. Where the records simply do "
+            "not address a claim, answer NOT FOUND — do not answer CONTRADICTED.)"
+            if evidence_absent
+            else ""
+        )
         import json as _json
 
         data = llm.chat_json(
             VERIFY_SYSTEM,
             VERIFY_USER.format(
                 digest=sanitize_digest_text(digest.relevant_facts_text(batch_query, max_facts=150), max_chars=120_000),
-                excerpts=sanitize_digest_text(excerpts[:16000] or "(no matching raw excerpts found)", max_chars=20_000),
+                excerpts=sanitize_digest_text(evidence.text[:16000] or "(no matching raw excerpts found)", max_chars=20_000),
                 claims=sanitize_for_prompt(_json.dumps(batch, indent=1), max_chars=20_000),
-                guard_note=GUARD_NOTE,
+                guard_note=(GUARD_NOTE + "\n\n" + gap_note) if gap_note else GUARD_NOTE,
             ),
             phase="verify",
         )
         for item in data.get("verifications", []):
             try:
-                verdict_by_id[int(item.get("id"))] = item
+                claim_id = int(item.get("id"))
             except (TypeError, ValueError):
                 continue
-    return [verdict_by_id.get(c["id"], {"id": c["id"], "verdict": "NOT FOUND",
-            "record_reference": "", "note": "Not returned by verifier."}) for c in claims]
+            if evidence_absent and str(item.get("verdict", "")).upper() == "CONTRADICTED":
+                item = dict(item)
+                item["verdict"] = "NOT FOUND"
+                item["note"] = (
+                    f"{str(item.get('note', '')).strip()} "
+                    "[Downgraded from CONTRADICTED: no matching record text was "
+                    "retrieved for this claim, so it is a record-coverage gap rather "
+                    "than a contradiction.]"
+                ).strip()
+                evidence_gaps.append(
+                    {
+                        "id": claim_id,
+                        "claim": claim_text_by_id.get(claim_id, ""),
+                        "reason": "no matching record text retrieved",
+                    }
+                )
+            verdict_by_id[claim_id] = item
+    return (
+        [
+            verdict_by_id.get(
+                c["id"],
+                {"id": c["id"], "verdict": "NOT FOUND", "record_reference": "",
+                 "note": "Not returned by verifier."},
+            )
+            for c in claims
+        ],
+        evidence_gaps,
+    )
 
 
 # Feature: Evidence Strength Dashboard (F3.S1)
@@ -1162,6 +1221,43 @@ _VERDICT_EMOJI = {
 }
 
 
+def coverage_lines(digest: MedicalDigest) -> list[str]:
+    """Markdown lines describing what was read, what was not, and how citations held.
+
+    Public because the report and the results panel must not be able to disagree
+    about coverage: a partial review is exactly the thing a user needs to notice,
+    and it should read the same wherever they look.
+    """
+    lines: list[str] = []
+    if digest.pages_in_files and digest.unreadable_pages:
+        missing_pct = round((1.0 - digest.coverage_ratio) * 100)
+        lines.append(
+            f"> ⚠️ **Partial coverage:** {digest.unreadable_pages:,} of "
+            f"{digest.pages_in_files:,} source pages ({missing_pct}%) had no extractable "
+            "text (image-only scans) and were not analyzed. OCR those pages and re-run "
+            "for a complete review."
+        )
+    elif digest.pages_in_files:
+        lines.append(f"**Coverage:** all {digest.pages_in_files:,} source page(s) read.")
+    if digest.chunks_without_facts:
+        lines.append(
+            f"- {digest.chunks_without_facts} of {digest.chunks_reviewed} analyzed chunks "
+            "contained no extractable facts."
+        )
+    check = digest.citation_check or {}
+    if check.get("checked"):
+        lines.append(
+            f"- Citations self-checked: {check['checked']:,} quote(s) matched against the "
+            f"page they cite; {check.get('missing', 0):,} not found."
+        )
+        for example in (check.get("examples") or [])[:3]:
+            lines.append(
+                f"  - ⚠️ quote not found on {example.get('document')} "
+                f"p.{example.get('page')}: “{str(example.get('quote', ''))[:120]}”"
+            )
+    return lines
+
+
 def build_report(
     result: EvaluationResult,
     statement_text: str,
@@ -1196,6 +1292,7 @@ def build_report(
             f"({result.digest.duplicates_skipped} duplicate page(s) skipped), "
             f"{len(result.digest.facts):,} facts extracted"
         )
+        lines.extend(coverage_lines(result.digest))
     lines.append("")
 
     lines.append("## Executive Summary")
@@ -1218,6 +1315,21 @@ def build_report(
             "Contradictions materially damage credibility. Correct these statements to match "
             "the records, or obtain a written explanation if the records are wrong."
         )
+        lines.append("")
+
+    if result.evidence_gaps:
+        lines.append("## Record Coverage Gaps (not contradictions)")
+        lines.append("")
+        lines.append(
+            "These claims had no matching text anywhere in the uploaded records, so the "
+            "verification had nothing to check them against. That is a gap in the record "
+            "set — or in what could be read from it — not a statement that the records "
+            "disagree. If the records exist, add them (or OCR the unreadable pages) and "
+            "re-run before relying on this section."
+        )
+        lines.append("")
+        for evidence_gap in result.evidence_gaps:
+            lines.append(f"- {evidence_gap.get('claim', '')}")
         lines.append("")
 
     lines.append("## Claim-by-Claim Verification")
