@@ -14,6 +14,14 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
+try:  # Chart library — guarded like the Redis queue backend (app/job_queue.py): a
+    # slim image or a stale dev venv that lacks it still loads the Evaluate tab,
+    # and the timeline panel degrades to its event list instead of taking the tab
+    # down at import time.
+    import plotly.graph_objects as go
+except ImportError:  # pragma: no cover - the degradation path is covered by tests
+    go = None
+
 from .. import audit as audit_log
 from ..agiloop_telemetry import (
     track_feature_error,
@@ -35,6 +43,7 @@ from ..documents import (
     EVALUATE_INTERNAL_MAX_CHARS,
     MAX_STATEMENT_CHARS,
 )
+from ..medical_review import build_timeline_data
 from ..pdf_export import detect_unconfirmed_placeholders, generate_statement_pdf
 from ..pipeline_guard import (
     PipelineTimeoutError,
@@ -80,6 +89,20 @@ EVIDENCE_DASHBOARD_FEATURE_ID = "b25a523d-b974-43e1-a554-374bbdebb01d"  # eviden
 
 # Feature: Fact Citation Exporter
 EXPORT_FACTS_FEATURE_ID = "051bb638-ac1c-40cf-95f5-164779b4382c"  # fact-citation-exporter
+
+# Feature: Medical Event Timeline Visualization
+TIMELINE_FEATURE_ID = "222efbdb-50be-4ff7-a384-1595d543c842"  # medical-event-timeline-visualization
+
+_TIMELINE_CATEGORY_COLORS: dict[str, str] = {
+    "diagnostic": "#2563eb",
+    "treatment": "#16a34a",
+    "other": "#9333ea",
+}
+_TIMELINE_FILTER_LABELS: dict[str, str] = {
+    "All": "all",
+    "Diagnostic only": "diagnostic",
+    "Treatment only": "treatment",
+}
 
 # Feature: Statement Effectiveness Score & Improvement Recommendations
 EFFECTIVENESS_SCORE_FEATURE_ID = "94104045-aa12-4018-95c6-e6912e659803"  # statement-effectiveness-score-improvement-recommendations
@@ -898,6 +921,207 @@ def _render_fact_export_section(eval_result: Any) -> None:
                         pass
 
 
+# ------------------------------------------------------------- event timeline
+def _build_timeline_figure(
+    events: list[dict[str, Any]], gaps: list[dict[str, Any]]
+) -> "go.Figure":
+    """Build the vertical Plotly timeline figure for the given (already
+    filtered) events. Dated events are plotted with time on the y-axis
+    (earliest at top) and coarse type category on the x-axis; each marker
+    carries the event's index (via ``customdata``) so a click can be mapped
+    back to the full fact for the details panel. Gap periods are shaded as
+    horizontal bands behind the markers.
+    """
+    if go is None:
+        raise RuntimeError(
+            "plotly is not installed, so the interactive timeline chart cannot be drawn"
+        )
+    fig = go.Figure()
+
+    for gap in gaps:
+        fig.add_hrect(
+            y0=gap["start"],
+            y1=gap["end"],
+            fillcolor="rgba(220, 38, 38, 0.10)",
+            line_width=0,
+            annotation_text="gap in records",
+            annotation_position="top left",
+            annotation_font_size=10,
+        )
+
+    for category, color in _TIMELINE_CATEGORY_COLORS.items():
+        subset = [(i, e) for i, e in enumerate(events) if e.get("category") == category and e.get("date_iso")]
+        if not subset:
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=[category] * len(subset),
+                y=[e["date_iso"] for _, e in subset],
+                mode="markers",
+                name=category.capitalize(),
+                marker=dict(size=13, color=color, line=dict(width=1, color="white")),
+                text=[f"{e.get('type', '')}: {e.get('description', '')[:100]}" for _, e in subset],
+                customdata=[[i] for i, _ in subset],
+                hovertemplate="%{y}<br>%{text}<extra>%{fullData.name}</extra>",
+            )
+        )
+
+    fig.update_yaxes(title="Date", autorange="reversed", type="date")
+    fig.update_xaxes(title="Event type", type="category")
+    dated_count = sum(1 for e in events if e.get("date_iso"))
+    fig.update_layout(
+        height=max(360, min(1400, 70 * max(dated_count, 3))),
+        showlegend=True,
+        margin=dict(l=10, r=10, t=30, b=10),
+    )
+    return fig
+
+
+def _render_timeline_event_details(event: dict[str, Any]) -> None:
+    """Render the full fact text + source citation for a clicked timeline event."""
+    with st.container(border=True):
+        st.markdown(f"**{event.get('date_label', 'unknown')} — {event.get('type', '')}**")
+        st.write(event.get("description", "") or "(no description)")
+        if event.get("quote"):
+            st.caption(f"“{event['quote']}”")
+        st.caption(f"Source: {event.get('source', 'unknown')}")
+
+
+def _render_medical_timeline(eval_result: Any, *, request_reference: str) -> None:
+    """Render the Medical Event Timeline subsection (F7.S2, feature id
+    `222efbdb-50be-4ff7-a384-1595d543c842`).
+
+    Builds (and caches in ``st.session_state['timeline_data']``, keyed by the
+    current run's reference so a stale digest never leaks across runs — F7.S1
+    acceptance criterion "only facts from the current request_id are
+    processed") a vertical Plotly timeline from the digest's facts, offers
+    all/diagnostic/treatment filter buttons, and shows full fact text +
+    source citation for a clicked event. A build/render failure here must
+    never break the rest of the Evaluate results panel.
+    """
+    digest = getattr(eval_result, "digest", None)
+    if not digest or not digest.facts:
+        return
+
+    cached_reference = st.session_state.get("timeline_request_id")
+    if st.session_state.get("timeline_data") is None or cached_reference != request_reference:
+        try:
+            llm = get_llm()
+        except Exception:  # noqa: BLE001 - LLM date-inference fallback is optional
+            llm = None
+        st.session_state["timeline_data"] = build_timeline_data(
+            digest, llm, feature_id=TIMELINE_FEATURE_ID
+        )
+        st.session_state["timeline_request_id"] = request_reference
+
+    timeline_data: dict[str, Any] = st.session_state.get("timeline_data") or {}
+    events: list[dict[str, Any]] = timeline_data.get("events") or []
+    if not events:
+        return
+
+    impression_key = f"timeline_impression_sent_{request_reference}"
+    if not st.session_state.get(impression_key):
+        try:
+            track_impression(
+                TIMELINE_FEATURE_ID,
+                entry_point="evaluate",
+                timeline_event_count=len(events),
+            )
+        except Exception:  # noqa: BLE001 - telemetry must never break the UI
+            pass
+        st.session_state[impression_key] = True
+
+    with st.expander("🗓️ Medical event timeline", expanded=True):
+        st.caption(
+            f"{len(events)} event(s) — {timeline_data.get('dated_count', 0)} dated, "
+            f"{timeline_data.get('undated_count', 0)} undated. "
+            f"{timeline_data.get('gap_count', 0)} gap period(s) with no records detected."
+        )
+
+        filter_choice = st.radio(
+            "Filter events",
+            list(_TIMELINE_FILTER_LABELS),
+            key="timeline_filter_choice",
+            horizontal=True,
+        )
+        selected_filter = _TIMELINE_FILTER_LABELS[filter_choice]
+        if st.session_state.get("timeline_filter_tracked") != selected_filter:
+            st.session_state["timeline_filter_tracked"] = selected_filter
+            try:
+                track_interaction(TIMELINE_FEATURE_ID, action="filter", filter=selected_filter)
+            except Exception:  # noqa: BLE001 - telemetry must never break the UI
+                pass
+
+        filtered = (
+            events
+            if selected_filter == "all"
+            else [e for e in events if e.get("category") == selected_filter]
+        )
+
+        if not filtered:
+            st.info("No events match this filter.")
+            return
+
+        undated_in_view = [e for e in filtered if not e.get("date_iso")]
+        dated_in_view = [e for e in filtered if e.get("date_iso")]
+
+        clicked_event: dict[str, Any] | None = None
+        if dated_in_view:
+            # The figure build sits *inside* the guard: an unavailable/broken chart
+            # library must cost the chart, not the whole results panel.
+            try:
+                fig = _build_timeline_figure(filtered, timeline_data.get("gaps") or [])
+                chart_state = st.plotly_chart(
+                    fig,
+                    width="stretch",
+                    key=f"timeline_chart_{request_reference}_{selected_filter}",
+                    on_select="rerun",
+                    selection_mode=("points",),
+                )
+                points = getattr(getattr(chart_state, "selection", None), "points", None) or []
+                if points:
+                    customdata = points[0].get("customdata") or []
+                    if customdata:
+                        idx = int(customdata[0])
+                        if 0 <= idx < len(filtered):
+                            clicked_event = filtered[idx]
+            except Exception as exc:  # noqa: BLE001 - chart build/render must never break the panel
+                logger.warning("timeline chart unavailable error=%s", exc, exc_info=True)
+                try:
+                    track_feature_error(TIMELINE_FEATURE_ID, exc, phase="chart_render")
+                except Exception:  # noqa: BLE001 - telemetry must never break the UI
+                    pass
+                st.info(
+                    "The interactive timeline chart is unavailable — use the event "
+                    "list below instead."
+                )
+
+        if undated_in_view:
+            st.caption(f"{len(undated_in_view)} undated event(s) — select below to view details.")
+
+        options = list(range(len(filtered)))
+        selected_idx = st.selectbox(
+            "Or choose an event from the list",
+            options=options,
+            format_func=lambda i: (
+                f"{filtered[i].get('date_label', 'unknown')} — "
+                f"{filtered[i].get('type', '')}: {filtered[i].get('description', '')[:80]}"
+            ),
+            key=f"timeline_event_select_{selected_filter}",
+            index=None,
+            placeholder="Choose an event…",
+        )
+        if selected_idx is not None:
+            clicked_event = filtered[selected_idx]
+
+        if clicked_event is not None:
+            try:
+                track_interaction(TIMELINE_FEATURE_ID, action="event_click", filter=selected_filter)
+            except Exception:  # noqa: BLE001 - telemetry must never break the UI
+                pass
+            _render_timeline_event_details(clicked_event)
+
+
 def _render_effectiveness_score(eval_result: Any) -> None:
     """Render the effectiveness score badge and ranked recommendations (F4.S2).
 
@@ -1144,6 +1368,7 @@ def _render_evaluation_results(eval_result: Any) -> None:
             _render_pdf_export(revised, entry_point="evaluate")
 
     _render_fact_export_section(eval_result)
+    _render_medical_timeline(eval_result, request_reference=_result_reference())
 
     with st.expander("Full markdown report"):
         st.markdown(eval_result.report_markdown)

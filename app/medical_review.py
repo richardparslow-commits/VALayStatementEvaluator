@@ -10,6 +10,7 @@ citable digest of every uploaded medical document.
 """
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
 import math
@@ -18,13 +19,14 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Callable
+from typing import Any, Callable
 
 import contextvars
 import logging
 import time
 
 from . import config, tracing
+from .agiloop_telemetry import track_feature_error, track_goal
 from .documents import Chunk, ExtractedDocument, chunk_page_labelled_text, paragraph_index
 from .llm import LLMClient, LLMError
 from .logging_config import PhaseTimer, get_request_id
@@ -1050,3 +1052,312 @@ def find_relevant_excerpts(
         if len(unique) >= top_k:
             break
     return "\n\n---\n\n".join(unique)
+
+
+# --------------------------------------------------------- timeline extraction
+# F7.S1 (Medical Event Timeline Visualization, feature id
+# 222efbdb-50be-4ff7-a384-1595d543c842): parse dates out of each `MedicalFact`
+# via regex first, fall back to a small LLM inference pass for facts regex
+# cannot date, group everything by date (or an 'undated' bucket), and detect
+# gap periods (stretches with no records) across the dated events. Pure
+# reuse of `MedicalFact`/`MedicalDigest` — no schema changes.
+
+DIAGNOSTIC_FACT_TYPES = frozenset({"diagnosis", "test_result", "symptom", "provider_visit"})
+TREATMENT_FACT_TYPES = frozenset({"treatment", "medication", "hospitalization"})
+
+_MONTH_NAMES: dict[str, int] = {
+    "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3,
+    "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
+    "august": 8, "aug": 8, "september": 9, "sept": 9, "sep": 9,
+    "october": 10, "oct": 10, "november": 11, "nov": 11, "december": 12, "dec": 12,
+}
+_MONTH_ALTERNATION = "|".join(sorted(_MONTH_NAMES, key=len, reverse=True))
+
+_ISO_DAY_RE = re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b")
+_ISO_MONTH_RE = re.compile(r"\b(\d{4})-(\d{1,2})\b")
+_MONTH_YEAR_RE = re.compile(
+    rf"\b({_MONTH_ALTERNATION})\.?\s+(\d{{4}})\b", re.IGNORECASE
+)
+_CIRCA_YEAR_RE = re.compile(
+    r"\b(?:circa|c\.|around|approx\.?|approximately)\s*['’]?(\d{4})\b", re.IGNORECASE
+)
+_BARE_YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
+
+_TIMELINE_DEFAULT_GAP_DAYS = 180
+
+_UNDATED_LLM_SYSTEM = (
+    "You infer approximate dates for medical-record facts whose date field could not be "
+    "parsed by pattern matching. For each fact, use its description and quote plus general "
+    "context clues (referenced ages, seasons, nearby events) to infer the most likely "
+    "calendar year, and month if evident. Never invent a specific day — return only a year "
+    "('YYYY') or year-month ('YYYY-MM'). If there is truly no inferable date, return null for "
+    "that fact. Output JSON only."
+)
+
+
+def _regex_extract_date(text: str) -> tuple[str, str] | None:
+    """Best-effort (iso_date, precision) parsed from free text via regex only.
+
+    Tries progressively looser patterns (exact day -> month -> named-month/year
+    -> circa-year -> bare year) and returns the first successful match, or
+    ``None`` when no date-like pattern is found at all.
+    """
+    if not text:
+        return None
+    match = _ISO_DAY_RE.search(text)
+    if match:
+        year, month, day = (int(v) for v in match.groups())
+        try:
+            return (datetime.date(year, month, day).isoformat(), "day")
+        except ValueError:
+            pass
+    match = _ISO_MONTH_RE.search(text)
+    if match:
+        year, month = (int(v) for v in match.groups())
+        try:
+            return (datetime.date(year, month, 1).isoformat(), "month")
+        except ValueError:
+            pass
+    match = _MONTH_YEAR_RE.search(text)
+    if match:
+        month_name, month_year = match.groups()
+        named_month = _MONTH_NAMES.get(month_name.lower())
+        if named_month:
+            try:
+                return (datetime.date(int(month_year), named_month, 1).isoformat(), "month")
+            except ValueError:
+                pass
+    match = _CIRCA_YEAR_RE.search(text)
+    if match:
+        try:
+            return (datetime.date(int(match.group(1)), 1, 1).isoformat(), "year")
+        except ValueError:
+            pass
+    match = _BARE_YEAR_RE.search(text)
+    if match:
+        try:
+            return (datetime.date(int(match.group(0)), 1, 1).isoformat(), "year")
+        except ValueError:
+            pass
+    return None
+
+
+def _categorize_fact_type(fact_type: str) -> str:
+    """Map a raw `MedicalFact.type` value to a coarse timeline filter category."""
+    normalized = (fact_type or "").strip().lower()
+    if normalized in DIAGNOSTIC_FACT_TYPES:
+        return "diagnostic"
+    if normalized in TREATMENT_FACT_TYPES:
+        return "treatment"
+    return "other"
+
+
+def _event_from_fact(fact: MedicalFact, *, iso_date: str | None, precision: str) -> dict[str, Any]:
+    return {
+        "date_iso": iso_date,
+        "date_label": fact.date or "unknown",
+        "precision": precision,
+        "bucket": iso_date or "undated",
+        "type": fact.type,
+        "category": _categorize_fact_type(fact.type),
+        "description": fact.description,
+        "source": fact.source,
+        "quote": fact.quote,
+        "date_source": "regex" if iso_date else "none",
+    }
+
+
+def _llm_infer_undated(
+    llm: LLMClient, facts: list[MedicalFact]
+) -> dict[int, tuple[str, str] | None]:
+    """Best-effort LLM date inference for facts regex could not date.
+
+    Returns a mapping of the input list's index to a parsed (iso_date,
+    precision) tuple, or ``None`` when the model also could not infer a date.
+    Never raises — a failed/malformed LLM call simply yields no inferences and
+    those facts remain in the 'undated' bucket.
+    """
+    if not facts:
+        return {}
+    items = [
+        {"index": i, "description": f.description[:300], "quote": f.quote[:200]}
+        for i, f in enumerate(facts)
+    ]
+    try:
+        data = llm.chat_json(
+            _UNDATED_LLM_SYSTEM,
+            "Infer dates for these facts. Return JSON exactly as: "
+            '{"dates": [{"index": <int>, "date": "YYYY" | "YYYY-MM" | null}]}\n\n'
+            + json.dumps(items),
+            model=llm._settings.model_fast,
+            max_tokens=2000,
+            phase="timeline:llm_date_extraction",
+        )
+    except Exception:  # noqa: BLE001 - fallback pass must never break extraction
+        return {}
+    inferred: dict[int, tuple[str, str] | None] = {}
+    for row in data.get("dates", []) or []:
+        if not isinstance(row, dict):
+            continue
+        index = row.get("index")
+        if not isinstance(index, int):
+            continue
+        raw_date = row.get("date")
+        inferred[index] = _regex_extract_date(str(raw_date)) if raw_date else None
+    return inferred
+
+
+def _detect_timeline_gaps(
+    dated_iso: list[str], *, threshold_days: int = _TIMELINE_DEFAULT_GAP_DAYS
+) -> list[dict[str, Any]]:
+    """Identify date ranges with no records among the already-dated events.
+
+    A "gap" is any stretch between two consecutive distinct dated events that
+    exceeds ``threshold_days``. Returns an empty list when fewer than two
+    distinct dates are present (nothing to compare).
+    """
+    unique_sorted = sorted({d for d in dated_iso if d})
+    if len(unique_sorted) < 2:
+        return []
+    gaps: list[dict[str, Any]] = []
+    for previous, current in zip(unique_sorted, unique_sorted[1:]):
+        previous_date = datetime.date.fromisoformat(previous)
+        current_date = datetime.date.fromisoformat(current)
+        span_days = (current_date - previous_date).days
+        if span_days > threshold_days:
+            gaps.append({"start": previous, "end": current, "days": span_days})
+    return gaps
+
+
+def _empty_timeline_data(request_id: str, *, error: bool = False) -> dict[str, Any]:
+    data: dict[str, Any] = {
+        "events": [],
+        "grouped": {},
+        "gaps": [],
+        "dated_count": 0,
+        "undated_count": 0,
+        "gap_count": 0,
+        "request_id": request_id,
+    }
+    if error:
+        data["error"] = True
+    return data
+
+
+def build_timeline_data(
+    digest: MedicalDigest,
+    llm: LLMClient | None = None,
+    *,
+    feature_id: str | None = None,
+) -> dict[str, Any]:
+    """Build the vertical-timeline dataset from a reviewed `MedicalDigest`.
+
+    Groups every fact from the digest by its best-effort parsed date, falling
+    back to an ``'undated'`` bucket when no date can be recovered via regex
+    or (if an ``llm`` client is supplied) a small LLM inference pass. Runs
+    gap detection over the dated events afterward. Only facts belonging to
+    the supplied digest are processed — callers must pass the digest that
+    belongs to the *current* run/request id (see
+    `app/views/evaluate_view.py::_render_medical_timeline`, which keys the
+    cached result by the current run's request id so a stale digest from a
+    previous run is never reused).
+
+    Never raises: any failure is tracked via telemetry and this returns a
+    well-formed, empty timeline so the UI can render a friendly empty state
+    instead of crashing the Evaluate tab. `feature_id` is accepted as a
+    parameter (never hardcoded here — this module is shared pipeline logic)
+    so the caller controls which feature the telemetry event is attributed
+    to.
+    """
+    request_id = get_request_id() or "-"
+    try:
+        events: list[dict[str, Any]] = []
+        undated_indices: list[int] = []
+        undated_facts: list[MedicalFact] = []
+
+        for fact in digest.facts:
+            parsed = _regex_extract_date(fact.date) or _regex_extract_date(fact.quote)
+            if parsed is None:
+                undated_indices.append(len(events))
+                undated_facts.append(fact)
+                events.append(_event_from_fact(fact, iso_date=None, precision="none"))
+            else:
+                iso_date, precision = parsed
+                events.append(_event_from_fact(fact, iso_date=iso_date, precision=precision))
+
+        if undated_facts and llm is not None:
+            inferred = _llm_infer_undated(llm, undated_facts)
+            for local_index, event_index in enumerate(undated_indices):
+                result = inferred.get(local_index)
+                if result is None:
+                    continue
+                iso_date, precision = result
+                event = events[event_index]
+                event["date_iso"] = iso_date
+                event["precision"] = precision
+                event["bucket"] = iso_date
+                event["date_source"] = "llm"
+
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for event in events:
+            grouped.setdefault(event["bucket"], []).append(event)
+
+        dated_iso = [e["date_iso"] for e in events if e["date_iso"]]
+        gaps = _detect_timeline_gaps(dated_iso)
+
+        dated_count = len(dated_iso)
+        undated_count = len(events) - dated_count
+
+        timeline_data: dict[str, Any] = {
+            "events": events,
+            "grouped": grouped,
+            "gaps": gaps,
+            "dated_count": dated_count,
+            "undated_count": undated_count,
+            "gap_count": len(gaps),
+            "request_id": request_id,
+        }
+
+        logger.info(
+            "timeline data built dated=%d undated=%d gaps=%d",
+            dated_count,
+            undated_count,
+            len(gaps),
+            extra={
+                "request_id": request_id,
+                "phase": "timeline:build",
+                "status": "ok",
+                "dated_count": dated_count,
+                "undated_count": undated_count,
+                "gap_count": len(gaps),
+            },
+        )
+
+        if feature_id:
+            try:
+                track_goal(
+                    feature_id,
+                    "timeline data extracted",
+                    dated_event_count=dated_count,
+                    undated_count=undated_count,
+                    gap_count=len(gaps),
+                )
+            except Exception:  # noqa: BLE001 - telemetry must never break the pipeline
+                pass
+
+        return timeline_data
+    except Exception as exc:  # noqa: BLE001 - extraction must degrade gracefully, never crash
+        logger.error(
+            "timeline data extraction failed error=%s",
+            exc,
+            exc_info=True,
+            extra={"request_id": request_id, "phase": "timeline:build", "status": "error"},
+        )
+        if feature_id:
+            try:
+                track_feature_error(
+                    feature_id, exc, phase="build_timeline_data", error_type=type(exc).__name__
+                )
+            except Exception:  # noqa: BLE001 - telemetry must never break the pipeline
+                pass
+        return _empty_timeline_data(request_id, error=True)

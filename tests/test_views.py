@@ -745,6 +745,65 @@ class TestEmptyAnalysisResults(unittest.TestCase):
         self.assertIn("req_84ab42a65e24", guards[0])
         self.assertEqual(len(band_banners), 1)
 
+    def test_panel_renders_the_timeline_and_the_score_panels_exactly_once_each(self) -> None:
+        """Merge regression guard for the timeline + effectiveness-score panels.
+
+        Both branches appended their render function at the *same* anchor in
+        the results panel, and git matched the identical telemetry boilerplate
+        inside them — splitting each function in half. A resolution that simply
+        concatenated both sides of the conflict produced interleaved, duplicated
+        panels; this pins one of each on a fully populated run.
+        """
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+        from app.medical_review import MedicalDigest, MedicalFact
+
+        st_mock, _ = self._st()
+        st_mock.radio.return_value = "All"
+        st_mock.selectbox.return_value = None
+        st_mock.plotly_chart.return_value = MagicMock(selection=MagicMock(points=[]))
+        result = EvaluationResult(
+            claims=[{"id": 1, "text": "Knee pain since 2014."}],
+            verifications=[{"id": 1, "verdict": "SUPPORTED"}],
+            scores={"factual_accuracy": 7.0},
+            executive_summary="Strong statement.",
+            effectiveness_score=90,
+            recommendations=[
+                {"title": "Add dates", "impact": "+4 points", "explanation": "x"}
+            ],
+            digest=MedicalDigest(
+                facts=[
+                    MedicalFact(
+                        date="2020-01-01",
+                        type="diagnosis",
+                        description="Diagnosed with knee condition.",
+                        source="records.pdf p.3",
+                    )
+                ],
+                pages_reviewed=3,
+            ),
+        )
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "track_impression"
+        ), patch.object(evaluate_view, "track_interaction"):
+            evaluate_view._render_evaluation_results(result)
+
+        expander_labels = [str(call.args[0]) for call in st_mock.expander.call_args_list]
+        timelines = [label for label in expander_labels if "Medical event timeline" in label]
+        self.assertEqual(len(timelines), 1)
+
+        metric_labels = [call.args[0] for call in st_mock.metric.call_args_list]
+        self.assertEqual(metric_labels.count("Effectiveness score"), 1)
+        band_banners = [
+            str(call.args[0])
+            for call in st_mock.success.call_args_list
+            if "(GREEN band)" in str(call.args[0])
+        ]
+        self.assertEqual(len(band_banners), 1)
+
+        error_messages = [str(call.args[0]) for call in st_mock.error.call_args_list]
+        self.assertFalse([m for m in error_messages if "no usable analysis" in m])
+
 
 # ------------------------------------------------- fact citation exporter (F7.S1)
 class TestRubricAndPositiveSources(unittest.TestCase):
@@ -1139,6 +1198,220 @@ class TestSidebarSettingsGuards(unittest.TestCase):
         with _patch_st(sidebar, st_mock):
             sidebar._secrets_source_note(self._settings())
         st_mock.caption.assert_not_called()
+
+
+# ------------------------------------------- medical event timeline (F7.S2)
+class TestRenderMedicalTimeline(unittest.TestCase):
+    """Unit tests for the Medical Event Timeline Visualization subsection."""
+
+    def _digest(self):
+        from app.medical_review import MedicalDigest, MedicalFact
+
+        facts = [
+            MedicalFact(
+                date="2020-01-01", type="diagnosis", description="Diagnosed with knee condition.",
+                source="records.pdf p.3", quote="knee condition confirmed",
+            ),
+            MedicalFact(
+                date="2021-06-01", type="treatment", description="Began physical therapy.",
+                source="records.pdf p.8", quote="PT referral",
+            ),
+        ]
+        return MedicalDigest(facts=facts, conditions=["Knee"], pages_reviewed=10)
+
+    def _timeline_data(self, digest):
+        from app.medical_review import build_timeline_data
+
+        return build_timeline_data(digest)
+
+    def _st(self):
+        st_mock, session = _fake_streamlit()
+        st_mock.radio.return_value = "All"
+        st_mock.selectbox.return_value = None
+        st_mock.plotly_chart.return_value = MagicMock(selection=MagicMock(points=[]))
+        return st_mock, session
+
+    def test_no_digest_renders_nothing(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        st_mock, _ = self._st()
+        with _patch_st(evaluate_view, st_mock):
+            evaluate_view._render_medical_timeline(EvaluationResult(), request_reference="req_1")
+        st_mock.expander.assert_not_called()
+
+    def test_builds_and_caches_timeline_data_by_request_reference(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        st_mock, session = self._st()
+        result = EvaluationResult(digest=self._digest())
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "get_llm", return_value=None
+        ), patch.object(
+            evaluate_view, "build_timeline_data", wraps=evaluate_view.build_timeline_data
+        ) as mock_build:
+            evaluate_view._render_medical_timeline(result, request_reference="req_1")
+            evaluate_view._render_medical_timeline(result, request_reference="req_1")
+        mock_build.assert_called_once()
+        self.assertEqual(session["timeline_request_id"], "req_1")
+
+    def test_rebuilds_when_request_reference_changes(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        st_mock, _session = self._st()
+        result = EvaluationResult(digest=self._digest())
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "get_llm", return_value=None
+        ), patch.object(
+            evaluate_view, "build_timeline_data", wraps=evaluate_view.build_timeline_data
+        ) as mock_build:
+            evaluate_view._render_medical_timeline(result, request_reference="req_1")
+            evaluate_view._render_medical_timeline(result, request_reference="req_2")
+        self.assertEqual(mock_build.call_count, 2)
+
+    def test_impression_fires_once_per_request_reference(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        st_mock, _session = self._st()
+        result = EvaluationResult(digest=self._digest())
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "get_llm", return_value=None
+        ), patch.object(evaluate_view, "track_impression") as mock_impression:
+            evaluate_view._render_medical_timeline(result, request_reference="req_1")
+            evaluate_view._render_medical_timeline(result, request_reference="req_1")
+        mock_impression.assert_called_once()
+        self.assertEqual(mock_impression.call_args.args[0], evaluate_view.TIMELINE_FEATURE_ID)
+        self.assertEqual(mock_impression.call_args.kwargs.get("timeline_event_count"), 2)
+
+    def test_diagnostic_filter_narrows_events_and_tracks_interaction(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        st_mock, _session = self._st()
+        st_mock.radio.return_value = "Diagnostic only"
+        result = EvaluationResult(digest=self._digest())
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "get_llm", return_value=None
+        ), patch.object(evaluate_view, "track_interaction") as mock_interaction, patch.object(
+            evaluate_view, "track_impression"
+        ):
+            evaluate_view._render_medical_timeline(result, request_reference="req_1")
+
+        mock_interaction.assert_any_call(
+            evaluate_view.TIMELINE_FEATURE_ID, action="filter", filter="diagnostic"
+        )
+        # Only the diagnostic-typed event should reach the chart builder.
+        chart_args = st_mock.plotly_chart.call_args
+        self.assertIsNotNone(chart_args)
+        figure = chart_args.args[0]
+        self.assertEqual(len(figure.data), 1)
+        self.assertEqual(figure.data[0].name, "Diagnostic")
+
+    def test_event_click_via_selectbox_shows_details_and_tracks_interaction(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        st_mock, _session = self._st()
+        st_mock.selectbox.return_value = 0
+        result = EvaluationResult(digest=self._digest())
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "get_llm", return_value=None
+        ), patch.object(evaluate_view, "track_interaction") as mock_interaction, patch.object(
+            evaluate_view, "track_impression"
+        ):
+            evaluate_view._render_medical_timeline(result, request_reference="req_1")
+
+        mock_interaction.assert_any_call(
+            evaluate_view.TIMELINE_FEATURE_ID, action="event_click", filter="all"
+        )
+        st_mock.markdown.assert_any_call("**2020-01-01 — diagnosis**")
+        st_mock.write.assert_any_call("Diagnosed with knee condition.")
+
+    def test_chart_click_selection_shows_details(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        st_mock, _session = self._st()
+        st_mock.plotly_chart.return_value = MagicMock(
+            selection=MagicMock(points=[{"customdata": [1]}])
+        )
+        result = EvaluationResult(digest=self._digest())
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "get_llm", return_value=None
+        ), patch.object(evaluate_view, "track_interaction") as mock_interaction, patch.object(
+            evaluate_view, "track_impression"
+        ):
+            evaluate_view._render_medical_timeline(result, request_reference="req_1")
+
+        mock_interaction.assert_any_call(
+            evaluate_view.TIMELINE_FEATURE_ID, action="event_click", filter="all"
+        )
+        st_mock.markdown.assert_any_call("**2021-06-01 — treatment**")
+
+    def test_no_events_renders_nothing(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+        from app.medical_review import MedicalDigest
+
+        st_mock, _session = self._st()
+        result = EvaluationResult(digest=MedicalDigest(facts=[]))
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "get_llm", return_value=None
+        ):
+            evaluate_view._render_medical_timeline(result, request_reference="req_1")
+        st_mock.expander.assert_not_called()
+
+    def test_chart_build_failure_costs_only_the_chart_not_the_panel(self) -> None:
+        """A broken chart library must not take the results panel down with it.
+
+        The figure build used to sit outside the render guard, so an
+        ImportError/AttributeError from a missing or broken plotly escaped
+        ``_render_medical_timeline`` and killed the whole Evaluate results
+        panel — the opposite of what this function promises.
+        """
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        st_mock, _session = self._st()
+        result = EvaluationResult(digest=self._digest())
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "get_llm", return_value=None
+        ), patch.object(evaluate_view, "go", None), patch.object(
+            evaluate_view, "track_impression"
+        ), patch.object(evaluate_view, "track_feature_error") as mock_error:
+            evaluate_view._render_medical_timeline(result, request_reference="req_1")
+
+        st_mock.plotly_chart.assert_not_called()
+        # The event list still renders, so the facts stay reachable without the chart.
+        st_mock.selectbox.assert_called_once()
+        info_messages = [str(call.args[0]) for call in st_mock.info.call_args_list]
+        self.assertTrue(
+            any("timeline chart is unavailable" in message for message in info_messages)
+        )
+        mock_error.assert_called_once()
+        self.assertEqual(mock_error.call_args.args[0], evaluate_view.TIMELINE_FEATURE_ID)
+        self.assertEqual(mock_error.call_args.kwargs.get("phase"), "chart_render")
+
+    def test_figure_build_exception_is_tracked_not_raised(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        st_mock, _session = self._st()
+        result = EvaluationResult(digest=self._digest())
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "get_llm", return_value=None
+        ), patch.object(
+            evaluate_view, "_build_timeline_figure", side_effect=RuntimeError("no go")
+        ), patch.object(evaluate_view, "track_impression"), patch.object(
+            evaluate_view, "track_feature_error"
+        ) as mock_error:
+            evaluate_view._render_medical_timeline(result, request_reference="req_1")
+
+        mock_error.assert_called_once()
+        self.assertEqual(mock_error.call_args.kwargs.get("phase"), "chart_render")
 
 
 class _FakeBlobStore:

@@ -354,6 +354,16 @@ streamlit run run_app.py --server.port $PORT --server.address 0.0.0.0
     per type as a horizontal stacked bar chart (hover a segment for the exact count and
     percentage), plus a concise text summary flagging the weakest evidence category.
     Entirely in-memory — no new configuration, endpoints, or env vars.
+5b. Further down, the **🗓️ Medical event timeline** subsection plots every digest fact
+    on a vertical Plotly timeline (earliest at top), colored by type — Diagnostic,
+    Treatment, Other. Facts without a parseable date (regex first, then a small LLM
+    inference pass when an LLM is configured) are grouped into an `undated` bucket
+    instead of being dropped. Filter buttons narrow the chart to **All** / **Diagnostic
+    only** / **Treatment only**; clicking a point on the chart (or picking an event from
+    the dropdown) opens a details panel with the full fact text and source citation.
+    Shaded red bands mark gap periods — stretches of 180+ days with no records. Timeline
+    data is built once per evaluation run and cached in `st.session_state['timeline_data']`
+    so switching filters never re-extracts it.
 6. Review the **proposed rewrite**: a change-by-change table (original → suggested → why),
    the revised statement with `[Confirm: ...]` placeholders, and downloads for both the
    report and the revised statement.
