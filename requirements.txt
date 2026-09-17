@@ -5,3 +5,4 @@ pypdf>=6.0
 python-dotenv>=1.0
 reportlab>=5.0
 fpdf2>=2.8
+plotly>=6.0
