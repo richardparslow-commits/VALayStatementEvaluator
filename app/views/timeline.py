@@ -218,10 +218,10 @@ def _format_date_range(events: list[medical_review.TimelineEvent]) -> str:
 
 
 def _date_to_string(date_obj: Any) -> str:
-    """Convert a date object to YYYY-MM-DD string."""
+    """Convert a date object to YYYY-MM-DD string (empty string when absent)."""
     if date_obj is None:
-        return None
-    return date_obj.strftime("%Y-%m-%d")
+        return ""
+    return str(date_obj.strftime("%Y-%m-%d"))
 
 
 def _export_timeline_pdf(digest: medical_review.MedicalDigest, events: list[medical_review.TimelineEvent]) -> None:
@@ -258,7 +258,7 @@ def _copy_timeline_markdown(events: list[medical_review.TimelineEvent]) -> None:
     # Also copy to clipboard if possible
     try:
         import pyperclip
-        pyperperclip.copy(markdown)
+        pyperclip.copy(markdown)
         st.success("Timeline markdown copied to clipboard!")
     except ImportError:
         st.info("Markdown exported. Install pyperclip for clipboard support.")

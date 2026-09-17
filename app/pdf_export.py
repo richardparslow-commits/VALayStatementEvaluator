@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import re
 from io import BytesIO
+from typing import Any
 
 from reportlab.lib.enums import TA_LEFT
 from reportlab.lib.pagesizes import LETTER

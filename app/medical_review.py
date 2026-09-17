@@ -845,7 +845,7 @@ def detect_timeline_gaps(
                         start_date=current.date,
                         end_date=next_event.date,
                         duration_months=gap_months,
-                        note=(n                        f"No recorded medical events for approximately {gap_months} months "
+                        note=(f"No recorded medical events for approximately {gap_months} months "
                         f"({current.date} to {next_event.date}). "
                         f"Consider whether treatment continued during this period or if records "
                         f"are missing."
