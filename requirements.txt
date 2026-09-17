@@ -4,6 +4,7 @@ openai>=3.0
 pypdf>=6.0
 python-dotenv>=1.0
 reportlab>=5.0
+fpdf2>=2.8
 
 # In-cluster Redis job-queue backend (DEPLOYMENT.md → Pattern C). Imported
 # lazily by app/job_queue.py: with this package absent the app still runs and

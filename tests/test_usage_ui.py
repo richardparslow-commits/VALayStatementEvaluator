@@ -129,7 +129,17 @@ class TestUsageUi(unittest.TestCase):
         inner = [c.value for e in expanders for c in e.caption]
         inner_text = " ".join(inner)
         self.assertIn("Total:", inner_text)
-        self.assertIn("7 call(s)", inner_text)
+        # 7 calls for the pipeline phases (record digest + summary, claims,
+        # verify, rubric, topic, revision) plus 1 for the effectiveness-score
+        # recommendations pass. Pin the total so an accidental extra call still
+        # fails here, and read the caption back rather than trusting it.
+        calls = fake.usage.totals().calls
+        self.assertEqual(
+            calls,
+            8,
+            "pipeline LLM call count changed — update this expectation deliberately",
+        )
+        self.assertIn(f"{calls} call(s)", inner_text)
 
         # Contents of the fake tracker should include the pipeline phases.
         phases = set(fake.usage.per_phase().keys())

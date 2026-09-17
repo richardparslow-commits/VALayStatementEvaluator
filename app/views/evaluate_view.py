@@ -11,11 +11,24 @@ import time
 import traceback
 from typing import Any
 
+import pandas as pd
 import streamlit as st
 
 from .. import audit as audit_log
-from ..agiloop_telemetry import track_goal, track_impression, track_interaction
-from ..evaluate import DIMENSION_LABELS, run_evaluation
+from ..agiloop_telemetry import (
+    track_feature_error,
+    track_goal,
+    track_impression,
+    track_interaction,
+)
+from ..evaluate import (
+    DIMENSION_LABELS,
+    VERDICTS,
+    build_evidence_dashboard,
+    compute_score_band,
+    run_evaluation,
+)
+from ..exporter import export_facts, filter_facts
 from ..job_payload import EvaluateJob
 from ..logging_config import get_logger, get_request_id
 from ..documents import (
@@ -52,6 +65,7 @@ from .shared import (
     progress_widgets,
     records_uploader,
     render_condition_selector_for_slot,
+    render_record_search,
     render_usage_summary,
     record_watchdog_run,
 )
@@ -60,6 +74,21 @@ logger = get_logger("app.views.evaluate")
 
 # Feature: Final Statement PDF Export
 PDF_EXPORT_FEATURE_ID = "0d76d70b-8dd6-4561-a874-f768d5929222"  # final-statement-pdf-export
+
+# Feature: Evidence Strength Dashboard
+EVIDENCE_DASHBOARD_FEATURE_ID = "b25a523d-b974-43e1-a554-374bbdebb01d"  # evidence-strength-dashboard
+
+# Feature: Fact Citation Exporter
+EXPORT_FACTS_FEATURE_ID = "051bb638-ac1c-40cf-95f5-164779b4382c"  # fact-citation-exporter
+
+# Feature: Statement Effectiveness Score & Improvement Recommendations
+EFFECTIVENESS_SCORE_FEATURE_ID = "94104045-aa12-4018-95c6-e6912e659803"  # statement-effectiveness-score-improvement-recommendations
+
+_SCORE_BAND_DISPLAY = {
+    "green": ("🟢", "Strong statement"),
+    "yellow": ("🟡", "Needs improvement"),
+    "red": ("🔴", "Weak — act on recommendations below"),
+}
 
 
 def render_evaluate_tab() -> None:
@@ -106,6 +135,7 @@ def render_evaluate_tab() -> None:
                 "Large record set: chunks are digested in parallel with duplicate pages "
                 "skipped, but expect a longer run for a meticulous review."
             )
+        render_record_search("eval", records)
 
     render_condition_selector_for_slot("eval")
 
@@ -573,6 +603,371 @@ def _render_pdf_export(statement_text: str, *, entry_point: str) -> None:
             pass
 
 
+def _render_evidence_dashboard(eval_result: Any) -> None:
+    """Render the Evidence Strength Dashboard below the verification table.
+
+    Groups verified claims by inferred record type (Diagnosis, Medication,
+    Symptom, Other) and shows verdict counts as a horizontal stacked bar
+    chart (``st.bar_chart`` renders native hover tooltips with the exact
+    per-segment count and, via the percentage caption below, the share of
+    each verdict), plus a concise text summary of overall evidence
+    strength. A dashboard build failure must never break the rest of the
+    Evaluate results panel — it is caught, tracked, and skipped.
+    """
+    try:
+        dashboard = build_evidence_dashboard(
+            eval_result.verifications, eval_result.claims
+        )
+    except Exception as exc:  # noqa: BLE001 - dashboard is best-effort, never fatal
+        logger.warning("evidence dashboard build failed error=%s", exc, exc_info=True)
+        try:
+            track_feature_error(EVIDENCE_DASHBOARD_FEATURE_ID, exc, phase="dashboard_build")
+        except Exception:  # noqa: BLE001 - telemetry must never break the UI
+            pass
+        return
+
+    if not dashboard:
+        return
+
+    impression_key = "evidence_dashboard_impression_sent"
+    if not st.session_state.get(impression_key):
+        try:
+            track_impression(
+                EVIDENCE_DASHBOARD_FEATURE_ID,
+                entry_point="evaluate_report",
+                recordTypeCount=len(dashboard),
+            )
+        except Exception:  # noqa: BLE001 - telemetry must never break the UI
+            pass
+        st.session_state[impression_key] = True
+
+    with st.expander("📊 Evidence strength dashboard", expanded=True):
+        st.caption(
+            "Claims grouped by the type of medical record most likely to confirm them, "
+            "with verdict counts from the verification step above. Hover a bar segment "
+            "for the exact count and percentage of that record type."
+        )
+        chart_df = pd.DataFrame(dashboard).T.reindex(columns=list(VERDICTS)).fillna(0).astype(int)
+        st.bar_chart(chart_df, horizontal=True)
+
+        total_claims = sum(sum(counts.values()) for counts in dashboard.values())
+        verdict_totals = {
+            verdict: sum(counts.get(verdict, 0) for counts in dashboard.values())
+            for verdict in VERDICTS
+        }
+        supported = verdict_totals["SUPPORTED"] + verdict_totals["PARTIALLY SUPPORTED"]
+        supported_pct = (supported / total_claims * 100) if total_claims else 0.0
+        contradicted_pct = (
+            (verdict_totals["CONTRADICTED"] / total_claims * 100) if total_claims else 0.0
+        )
+
+        percentage_rows = [
+            {
+                "Record type": record_type,
+                **{
+                    verdict: f"{counts.get(verdict, 0)} ({counts.get(verdict, 0) / max(sum(counts.values()), 1) * 100:.0f}%)"
+                    for verdict in VERDICTS
+                },
+            }
+            for record_type, counts in sorted(dashboard.items())
+        ]
+        st.dataframe(percentage_rows, width="stretch", hide_index=True)
+
+        weakest_type = min(
+            dashboard.items(),
+            key=lambda item: (
+                item[1].get("SUPPORTED", 0) + item[1].get("PARTIALLY SUPPORTED", 0)
+            )
+            / max(sum(item[1].values()), 1),
+        )[0]
+        summary = (
+            f"Of {total_claims} verified claim(s) across {len(dashboard)} record type(s), "
+            f"{supported} ({supported_pct:.0f}%) are supported or partially supported by the "
+            f"medical records"
+            + (f", while {contradicted_pct:.0f}% are contradicted" if verdict_totals["CONTRADICTED"] else "")
+            + f". **{weakest_type}** evidence is the weakest category — consider requesting "
+            "or reviewing additional records in that area."
+        )
+        st.write(summary)
+
+        try:
+            track_interaction(
+                EVIDENCE_DASHBOARD_FEATURE_ID,
+                action="dashboard_viewed",
+                claimCount=total_claims,
+            )
+            track_goal(
+                EVIDENCE_DASHBOARD_FEATURE_ID,
+                "evidence_strength_dashboard_rendered",
+                supportedPct=round(supported_pct, 1),
+            )
+        except Exception:  # noqa: BLE001 - telemetry must never break the UI
+            pass
+
+
+# --------------------------------------------------------- fact citation export
+_SUPPORTIVE_VERDICTS = ("SUPPORTED", "PARTIALLY SUPPORTED")
+
+
+def _rubric_and_positive_sources(eval_result: Any) -> tuple[set[str], set[str]]:
+    """Cross-reference digest facts against rubric verification results.
+
+    `MedicalFact` carries no `rubric_verified`/`positive_outcome` flag (no
+    schema changes — see `.implement/technical-spec.md`), and
+    `EvaluationResult.verifications` carries no direct fact id either — each
+    verification's `record_reference` is free text ("source label + date of
+    the supporting/conflicting record fact", see `app/evaluate.py`). This
+    does a best-effort substring match of each fact's `source` label against
+    every verification's `record_reference` (case-insensitive) to recover the
+    link the acceptance criteria calls for:
+
+    - "cited in rubric verification": the fact's source appears in *any*
+      verification's `record_reference` (regardless of verdict).
+    - "supporting positive outcomes": the fact's source appears in a
+      verification whose verdict is SUPPORTED or PARTIALLY SUPPORTED — i.e.
+      the record corroborates the lay statement rather than contradicting it.
+    """
+    digest = getattr(eval_result, "digest", None)
+    verifications = getattr(eval_result, "verifications", None) or []
+    cited: set[str] = set()
+    positive: set[str] = set()
+    if not digest or not digest.facts:
+        return cited, positive
+
+    references = [
+        (str(v.get("record_reference", "") or "").lower(), str(v.get("verdict", "") or ""))
+        for v in verifications
+    ]
+    references = [(ref, verdict) for ref, verdict in references if ref]
+    if not references:
+        return cited, positive
+
+    for fact in digest.facts:
+        source_lower = fact.source.lower().strip()
+        if not source_lower:
+            continue
+        for ref, verdict in references:
+            if source_lower in ref:
+                cited.add(fact.source)
+                if verdict in _SUPPORTIVE_VERDICTS:
+                    positive.add(fact.source)
+                    break
+    return cited, positive
+
+
+def _render_fact_export_section(eval_result: Any) -> None:
+    """Render the "Export Facts" panel: digest summary, filters, and downloads.
+
+    Implements F7.S1 (Fact Citation Exporter, feature id
+    `051bb638-ac1c-40cf-95f5-164779b4382c`) — placed immediately after the
+    medical-digest summary so the export controls sit next to the data they
+    export. Fires `impression` on first render, `interaction` on the Export
+    Facts click and each individual download, `error` at the export boundary,
+    and `goal` once files are generated. No fact content (descriptions,
+    quotes, document names) is ever attached to a telemetry payload — only
+    counts, format labels, and the two filter booleans.
+    """
+    digest = getattr(eval_result, "digest", None)
+    if not digest or not digest.facts:
+        return
+
+    impression_key = "export_facts_impression_sent"
+    if not st.session_state.get(impression_key):
+        try:
+            track_impression(
+                EXPORT_FACTS_FEATURE_ID,
+                entry_point="evaluate",
+                fact_count=len(digest.facts),
+            )
+        except Exception:  # noqa: BLE001 - telemetry must never break the UI
+            pass
+        st.session_state[impression_key] = True
+
+    with st.expander("📑 Medical record digest — export fact citations", expanded=False):
+        st.caption(
+            f"{len(digest.facts):,} facts extracted from {digest.pages_reviewed:,} pages "
+            f"({digest.chunks_reviewed} chunk(s), {digest.duplicates_skipped} duplicate "
+            "page(s) skipped)."
+        )
+        if digest.summary:
+            st.write(digest.summary)
+
+        only_rubric = st.checkbox(
+            "Only show facts cited in rubric verification",
+            key="export_facts_only_rubric",
+        )
+        only_positive = st.checkbox(
+            "Only show facts supporting positive outcomes",
+            key="export_facts_only_positive",
+        )
+
+        rid = get_request_id() or "-"
+        if st.button("📤 Export Facts", key="export_facts_button"):
+            try:
+                track_interaction(
+                    EXPORT_FACTS_FEATURE_ID,
+                    action="export_click",
+                    filter_rubric=only_rubric,
+                    filter_positive=only_positive,
+                )
+            except Exception:  # noqa: BLE001 - telemetry must never break the UI
+                pass
+
+            cited_sources, positive_sources = _rubric_and_positive_sources(eval_result)
+            generated: dict[str, bytes] = {}
+            errors: list[str] = []
+            for fmt in ("csv", "pdf", "md"):
+                try:
+                    generated[fmt] = export_facts(
+                        digest,
+                        fmt,
+                        only_rubric_cited=only_rubric,
+                        only_positive_outcomes=only_positive,
+                        rubric_cited_sources=cited_sources,
+                        positive_outcome_sources=positive_sources,
+                    )
+                except Exception as exc:  # noqa: BLE001 - one format failing must not block the rest
+                    errors.append(f"{fmt}: {exc}")
+                    logger.error(
+                        "fact export generation failed format=%s error=%s",
+                        fmt,
+                        exc,
+                        exc_info=True,
+                        extra={
+                            "request_id": rid,
+                            "phase": "export_facts",
+                            "status": "error",
+                            "format": fmt,
+                        },
+                    )
+            st.session_state["export_facts_files"] = generated
+            filtered_count = len(
+                filter_facts(
+                    digest.facts,
+                    only_rubric_cited=only_rubric,
+                    only_positive_outcomes=only_positive,
+                    rubric_cited_sources=cited_sources,
+                    positive_outcome_sources=positive_sources,
+                )
+            )
+            if errors:
+                st.error("Some export formats could not be generated: " + "; ".join(errors))
+            if generated:
+                try:
+                    track_goal(
+                        EXPORT_FACTS_FEATURE_ID,
+                        "facts exported",
+                        fact_count=filtered_count,
+                        filtered=only_rubric or only_positive,
+                    )
+                except Exception:  # noqa: BLE001 - telemetry must never break the UI
+                    pass
+                st.success(f"Generated export files for {filtered_count} fact row(s).")
+
+        files_any: Any = st.session_state.get("export_facts_files")
+        files: dict[str, bytes] = files_any if isinstance(files_any, dict) else {}
+        if files:
+            labels = {
+                "csv": ("⬇️ Download CSV", "text/csv", "medical_digest_facts.csv"),
+                "pdf": ("⬇️ Download PDF", "application/pdf", "medical_digest_facts.pdf"),
+                "md": ("⬇️ Download Markdown", "text/markdown", "medical_digest_facts.md"),
+            }
+            columns = st.columns(3)
+            for col, fmt in zip(columns, ("csv", "pdf", "md")):
+                data = files.get(fmt)
+                if data is None:
+                    continue
+                label, mime, filename = labels[fmt]
+                clicked = col.download_button(
+                    label,
+                    data=data,
+                    file_name=filename,
+                    mime=mime,
+                    key=f"export_facts_download_{fmt}",
+                )
+                if clicked:
+                    try:
+                        track_interaction(
+                            EXPORT_FACTS_FEATURE_ID,
+                            action="download",
+                            format=fmt,
+                            filter_rubric=only_rubric,
+                            filter_positive=only_positive,
+                        )
+                    except Exception:  # noqa: BLE001 - telemetry must never break the UI
+                        pass
+
+
+def _render_effectiveness_score(eval_result: Any) -> None:
+    """Render the effectiveness score badge and ranked recommendations (F4.S2).
+
+    Fires `impression` once per rendered run (`entryPoint` attribute) when
+    the score becomes visible, and `interaction` on each recommendation
+    button click (`recommendationIndex` + `action`). The `goal` event for the
+    computed score itself is fired at the compute boundary in
+    `app/evaluate.py::_score_and_recommend` — not here — since it must fire
+    exactly once per computation, not once per render.
+    """
+    score = int(getattr(eval_result, "effectiveness_score", 0) or 0)
+    band = getattr(eval_result, "score_band", "") or compute_score_band(score)
+    rid = _result_reference() or "no-ref"
+
+    impression_key = f"effectiveness_score_impression_sent_{rid}"
+    if not st.session_state.get(impression_key):
+        try:
+            track_impression(EFFECTIVENESS_SCORE_FEATURE_ID, entry_point="evaluate_report_tab")
+        except Exception:  # noqa: BLE001 - telemetry must never break the UI
+            pass
+        st.session_state[impression_key] = True
+
+    st.subheader("🎯 Statement Effectiveness Score")
+    emoji, label = _SCORE_BAND_DISPLAY.get(band, _SCORE_BAND_DISPLAY["red"])
+    st.metric("Effectiveness score", f"{score}/100")
+    banner = {"green": st.success, "yellow": st.warning, "red": st.error}.get(band, st.error)
+    banner(f"{emoji} {label} ({band.upper()} band)")
+
+    recommendations = getattr(eval_result, "recommendations", None) or []
+    if not recommendations:
+        return
+
+    st.markdown("**Top improvement recommendations (ranked by estimated impact):**")
+    claims = getattr(eval_result, "claims", None) or []
+    claim_text = {c.get("id"): c.get("text", "") for c in claims}
+    for index, rec in enumerate(recommendations, start=1):
+        title = str(rec.get("title", ""))
+        impact = str(rec.get("impact", ""))
+        explanation = str(rec.get("explanation", ""))
+        claim_id = rec.get("claim_id")
+        st.markdown(f"**{index}. {title}** _{impact}_")
+        st.caption(explanation)
+        has_matching_claim = claim_id is not None and claim_id in claim_text
+        action_label = (
+            f"🔍 Jump to claim #{claim_id}" if has_matching_claim else "✏️ Apply to rewrite"
+        )
+        clicked = st.button(action_label, key=f"eval_rec_action_{rid}_{index}")
+        if clicked:
+            action = "jump_to_claim" if has_matching_claim else "trigger_rewrite"
+            st.session_state["eval_recommendation_target"] = {
+                "claim_id": claim_id,
+                "recommendation_index": index,
+                "action": action,
+            }
+            try:
+                track_interaction(
+                    EFFECTIVENESS_SCORE_FEATURE_ID,
+                    recommendationIndex=index,
+                    action=action,
+                )
+            except Exception:  # noqa: BLE001 - telemetry must never break the UI
+                pass
+            if has_matching_claim:
+                st.info(f"📍 Claim #{claim_id}: {claim_text.get(claim_id, '')}")
+            else:
+                st.info(
+                    "✏️ Marked for rewrite — see 'Suggested improvements — proposed rewrite' below."
+                )
+
+
 def _render_evaluation_results(eval_result: Any) -> None:
     render_usage_summary(st.session_state.get("eval_usage"))
 
@@ -600,6 +995,9 @@ def _render_evaluation_results(eval_result: Any) -> None:
             f"⚠️ {eval_result.truncation_warning} (input was {eval_result.input_chars:,} chars; "
             f"{eval_result.truncated_chars:,} truncated). Review the report header for details."
         )
+
+    st.divider()
+    _render_effectiveness_score(eval_result)
 
     st.divider()
     st.subheader("📋 Evaluation Results")
@@ -630,6 +1028,8 @@ def _render_evaluation_results(eval_result: Any) -> None:
                 }
             )
         st.dataframe(rows, width="stretch", hide_index=True)
+
+    _render_evidence_dashboard(eval_result)
 
     with st.expander("Rubric scores", expanded=True):
         score_rows = [
@@ -742,6 +1142,8 @@ def _render_evaluation_results(eval_result: Any) -> None:
                 mime="text/markdown",
             )
             _render_pdf_export(revised, entry_point="evaluate")
+
+    _render_fact_export_section(eval_result)
 
     with st.expander("Full markdown report"):
         st.markdown(eval_result.report_markdown)

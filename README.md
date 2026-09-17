@@ -67,6 +67,8 @@ scripts/
   extract_pdfs.py         Build reference_docs/extracted/*.txt from source PDFs
   smoke_test.py           End-to-end pipeline test against the live LLM endpoint
   scale_sim.py            Offline 2,000-page pipeline simulation (no API calls)
+  split_records.py        Split an oversized record file into uploadable chunks
+                          (see TROUBLESHOOTING.md → *Split Large Record Sets*)
 tests/                    Offline unit tests (no API key required)
 examples/                 Fictional sample statement + sample medical records
 Dockerfile                Production container image (non-root, hash-pinned deps)
@@ -347,9 +349,33 @@ streamlit run run_app.py --server.port $PORT --server.address 0.0.0.0
    rubric scoring, improvement drafting, and report generation progress.
 5. Review the verdict table (✅ supported / 🟡 partial / ❌ contradicted / ⚪ not found),
    scores, and the prioritized improvement plan.
+5a. Below the verdict table, the **📊 Evidence strength dashboard** groups claims by
+    inferred record type (Diagnosis, Medication, Symptom, Other) and shows verdict counts
+    per type as a horizontal stacked bar chart (hover a segment for the exact count and
+    percentage), plus a concise text summary flagging the weakest evidence category.
+    Entirely in-memory — no new configuration, endpoints, or env vars.
 6. Review the **proposed rewrite**: a change-by-change table (original → suggested → why),
    the revised statement with `[Confirm: ...]` placeholders, and downloads for both the
    report and the revised statement.
+
+### Medical record search & citation index
+
+Once at least one medical record is loaded in **Evaluate**, a **🔎 Search medical records**
+panel appears below the record list:
+
+1. Enter a search query; optionally narrow by **From/To date** (matches any date mentioned
+   in a passage) and/or **Provider** (case-insensitive text match). Results are ranked with
+   an in-memory TF-IDF scorer over the record paragraphs (top 20 shown), with the matched
+   terms **highlighted** and a source label (`filename p.N`) per result.
+2. Click **➕ Export excerpt** on any result to add its excerpt + source to the session's
+   `citation_index`.
+3. Once the citation index has entries, **⬇️ Export citations (.csv)** / **(.json)** buttons
+   appear, producing a downloadable file with `excerpt` and `source` fields.
+4. Running **Run exhaustive evaluation** afterward appends a **Sources** section to the
+   generated report listing every collected citation.
+
+No new configuration is required — search and the citation index are entirely in-memory
+for the session (no new endpoints, no new env vars).
 
 ### Draft a statement
 

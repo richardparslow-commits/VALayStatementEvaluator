@@ -86,7 +86,7 @@ manifest change is needed — nothing in the app requires sidecars.
 | `records:review`, `records:merge`, `records:summary` | `app/medical_review.py` | digest phases; `facts`/`files` where known |
 | `records:digest` | `app/medical_review.py` | the parallel fan-out: `chunks`, `concurrency`, `pages` (plus `retry=true` on the retry round) |
 | `records:digest.chunk` | `app/medical_review.py` | **opt-in** (`VA_LSE_TRACE_CHUNK_SPANS=1`): one per chunk, `chunk=<index>` |
-| `claims`, `verify`, `rubric`, `topic`, `revision`, `report` | `app/evaluate.py` | one per Evaluate phase |
+| `claims`, `verify`, `rubric`, `topic`, `revision`, `score`, `report` | `app/evaluate.py` | one per Evaluate phase |
 | `grounding`, `draft`, `review` | `app/draft.py` | one per Draft phase |
 | `llm:<phase>` | `app/llm.py` | **opt-in** (`VA_LSE_TRACE_LLM_CALLS=1`): one per provider call, `model`, `attempt` |
 

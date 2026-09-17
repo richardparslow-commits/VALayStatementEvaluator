@@ -330,6 +330,168 @@ class TestIsLocalRun(unittest.TestCase):
             self.assertFalse(records.is_local_run())
 
 
+class TestRenderRecordSearch(unittest.TestCase):
+    """F2.S1 — search widget: query+filters -> ranked/highlighted results;
+    export adds to ``citation_index`` in session state."""
+
+    def _widget_mock(self, query_value: str, button_hits: dict) -> tuple:
+        import app.views.records as records
+        from app.documents import SearchResult
+
+        st_mock, session = _fake_streamlit()
+        col_from, col_to, col_provider = MagicMock(), MagicMock(), MagicMock()
+        col_from.date_input.return_value = None
+        col_to.date_input.return_value = None
+        col_provider.text_input.return_value = ""
+
+        def columns_side_effect(spec, *args, **kwargs):
+            n = spec if isinstance(spec, int) else len(spec)
+            if n == 3:
+                return (col_from, col_to, col_provider)
+            return tuple(MagicMock() for _ in range(n))
+
+        st_mock.columns.side_effect = columns_side_effect
+        st_mock.text_input.return_value = query_value
+
+        def button_side_effect(label, key=None, **kwargs):
+            return button_hits.get(key, False)
+
+        st_mock.button.side_effect = button_side_effect
+        return records, st_mock, session, SearchResult
+
+    def test_search_click_stores_results_and_fires_telemetry(self) -> None:
+        records, st_mock, session, SearchResult = self._widget_mock(
+            "asthma", {"search_submit_eval": True}
+        )
+        fake_result = SearchResult(
+            label="clinic.pdf p.1", excerpt="**asthma** flare", score=1.0,
+            filename="clinic.pdf", page=1,
+        )
+        with _patch_st(records, st_mock), patch.object(
+            records, "search_records", return_value=[fake_result]
+        ) as mock_search, patch.object(
+            records, "track_impression"
+        ) as mock_impression, patch.object(
+            records, "track_interaction"
+        ) as mock_interaction:
+            records.render_record_search("eval", [MagicMock()])
+
+        mock_search.assert_called_once()
+        self.assertEqual(session["search_results_eval"], [fake_result])
+        mock_impression.assert_called_once()
+        self.assertEqual(mock_impression.call_args.kwargs.get("entry_point"), "eval")
+        # one interaction for the search action
+        actions = [c.kwargs.get("action") for c in mock_interaction.call_args_list]
+        self.assertIn("search", actions)
+
+    def test_search_failure_fires_error_telemetry_and_shows_message(self) -> None:
+        records, st_mock, session, _SearchResult = self._widget_mock(
+            "asthma", {"search_submit_eval": True}
+        )
+        with _patch_st(records, st_mock), patch.object(
+            records, "search_records", side_effect=RuntimeError("boom")
+        ), patch.object(records, "track_feature_error") as mock_error, patch.object(
+            records, "track_impression"
+        ), patch.object(records, "track_interaction"):
+            records.render_record_search("eval", [MagicMock()])
+
+        mock_error.assert_called_once()
+        self.assertEqual(mock_error.call_args.kwargs.get("stage"), "search")
+        self.assertEqual(session["search_results_eval"], [])
+        st_mock.error.assert_called()
+
+    def test_export_excerpt_adds_to_citation_index(self) -> None:
+        records, st_mock, session, SearchResult = self._widget_mock(
+            "", {"search_export_eval_0": True}
+        )
+        result = SearchResult(
+            label="clinic.pdf p.2", excerpt="**knee** pain noted", score=2.0,
+            filename="clinic.pdf", page=2,
+        )
+        session["search_results_eval"] = [result]
+        with _patch_st(records, st_mock), patch.object(
+            records, "track_impression"
+        ), patch.object(records, "track_interaction") as mock_interaction:
+            records.render_record_search("eval", [MagicMock()])
+
+        self.assertEqual(
+            session["citation_index"],
+            [{"excerpt": "**knee** pain noted", "source": "clinic.pdf p.2"}],
+        )
+        export_calls = [
+            c for c in mock_interaction.call_args_list
+            if c.kwargs.get("action") == "export_excerpt"
+        ]
+        self.assertEqual(len(export_calls), 1)
+        self.assertEqual(export_calls[0].kwargs.get("source"), "clinic.pdf p.2")
+
+    def test_export_excerpt_does_not_duplicate(self) -> None:
+        records, st_mock, session, SearchResult = self._widget_mock(
+            "", {"search_export_eval_0": True}
+        )
+        result = SearchResult(
+            label="clinic.pdf p.2", excerpt="**knee** pain noted", score=2.0,
+            filename="clinic.pdf", page=2,
+        )
+        session["search_results_eval"] = [result]
+        session["citation_index"] = [{"excerpt": "**knee** pain noted", "source": "clinic.pdf p.2"}]
+        with _patch_st(records, st_mock), patch.object(
+            records, "track_impression"
+        ), patch.object(records, "track_interaction"):
+            records.render_record_search("eval", [MagicMock()])
+
+        self.assertEqual(len(session["citation_index"]), 1)
+
+    def test_no_documents_renders_nothing(self) -> None:
+        records, st_mock, _session, _SearchResult = self._widget_mock("", {})
+        with _patch_st(records, st_mock):
+            records.render_record_search("eval", [])
+        st_mock.expander.assert_not_called()
+
+
+class TestRenderCitationIndexExport(unittest.TestCase):
+    """F2.S2 — CSV/JSON download buttons for the accumulated citation index."""
+
+    def _run(self, citations, clicked_fmt: str | None):
+        import app.views.records as records
+
+        st_mock, session = _fake_streamlit()
+        session["citation_index"] = citations
+        col_csv, col_json = MagicMock(), MagicMock()
+        col_csv.download_button.return_value = clicked_fmt == "csv"
+        col_json.download_button.return_value = clicked_fmt == "json"
+        st_mock.columns.return_value = (col_csv, col_json)
+        with _patch_st(records, st_mock), patch.object(
+            records, "track_interaction"
+        ) as mock_interaction, patch.object(records, "track_feature_error") as mock_error:
+            records._render_citation_index_export("eval")
+        return st_mock, session, col_csv, col_json, mock_interaction, mock_error
+
+    def test_no_export_buttons_when_index_empty(self) -> None:
+        st_mock, *_ = self._run([], None)
+        st_mock.columns.assert_not_called()
+
+    def test_renders_both_download_buttons_when_citations_present(self) -> None:
+        citations = [{"excerpt": "e", "source": "s"}]
+        st_mock, session, col_csv, col_json, mock_interaction, mock_error = self._run(
+            citations, None
+        )
+        col_csv.download_button.assert_called_once()
+        col_json.download_button.assert_called_once()
+        mock_interaction.assert_not_called()
+        mock_error.assert_not_called()
+
+    def test_csv_click_fires_interaction_telemetry(self) -> None:
+        citations = [{"excerpt": "e", "source": "s"}]
+        _st_mock, _session, _col_csv, _col_json, mock_interaction, _mock_error = self._run(
+            citations, "csv"
+        )
+        mock_interaction.assert_called_once()
+        self.assertEqual(mock_interaction.call_args.kwargs.get("action"), "export_citation_index")
+        self.assertEqual(mock_interaction.call_args.kwargs.get("format"), "csv")
+        self.assertEqual(mock_interaction.call_args.kwargs.get("citation_count"), 1)
+
+
 class TestRememberSourceRecords(unittest.TestCase):
     def test_stores_docs_per_source_label(self) -> None:
         import app.views.records as records
@@ -523,9 +685,16 @@ class TestEmptyAnalysisResults(unittest.TestCase):
         with _patch_st(evaluate_view, st_mock):
             evaluate_view._render_evaluation_results(EvaluationResult())
 
-        st_mock.error.assert_called_once()
-        message = str(st_mock.error.call_args[0][0])
-        self.assertIn("no usable analysis", message)
+        # The results panel also renders the effectiveness-score band banner,
+        # which uses st.error for the RED band, so scope this assertion to the
+        # empty-analysis message instead of counting every st.error call.
+        empty_analysis_errors = [
+            str(call.args[0])
+            for call in st_mock.error.call_args_list
+            if "no usable analysis" in str(call.args[0])
+        ]
+        self.assertEqual(len(empty_analysis_errors), 1)
+        message = empty_analysis_errors[0]
         self.assertIn("req_84ab42a65e24", message)
         # Which run the panel belongs to is stated, so a cached re-render cannot
         # pass for a fresh run.
@@ -547,7 +716,230 @@ class TestEmptyAnalysisResults(unittest.TestCase):
         with _patch_st(evaluate_view, st_mock):
             evaluate_view._render_evaluation_results(result)
 
-        st_mock.error.assert_not_called()
+        # Only the effectiveness-score band banner may use st.error here; the
+        # empty-analysis guard must stay silent for a populated result.
+        error_messages = [str(call.args[0]) for call in st_mock.error.call_args_list]
+        self.assertFalse([m for m in error_messages if "no usable analysis" in m])
+
+    def test_blank_result_renders_the_score_band_banner_alongside_the_guard(self) -> None:
+        """The empty-analysis guard and the RED score band both use st.error.
+
+        Merge regression guard: the effectiveness-score panel renders its RED
+        band through ``st.error`` as well, so on a blank run the panel must
+        emit both messages — the guard exactly once and still naming the
+        reference — instead of one crowding the other out.
+        """
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        st_mock, _ = self._st()
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "track_impression"
+        ):
+            evaluate_view._render_evaluation_results(EvaluationResult())
+
+        error_messages = [str(call.args[0]) for call in st_mock.error.call_args_list]
+        guards = [m for m in error_messages if "no usable analysis" in m]
+        band_banners = [m for m in error_messages if "(RED band)" in m]
+        self.assertEqual(len(guards), 1)
+        self.assertIn("req_84ab42a65e24", guards[0])
+        self.assertEqual(len(band_banners), 1)
+
+
+# ------------------------------------------------- fact citation exporter (F7.S1)
+class TestRubricAndPositiveSources(unittest.TestCase):
+    def _digest(self, facts):
+        from app.medical_review import MedicalDigest
+
+        return MedicalDigest(facts=facts)
+
+    def _fact(self, **overrides):
+        from app.medical_review import MedicalFact
+
+        base = dict(
+            date="2020-01-01", type="diagnosis", description="d", source="records.pdf p.3",
+            quote="q",
+        )
+        base.update(overrides)
+        return MedicalFact(**base)
+
+    def test_no_digest_returns_empty_sets(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        cited, positive = evaluate_view._rubric_and_positive_sources(EvaluationResult())
+        self.assertEqual(cited, set())
+        self.assertEqual(positive, set())
+
+    def test_matches_fact_source_substring_in_record_reference(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        fact = self._fact(source="records.pdf p.3")
+        result = EvaluationResult(
+            digest=self._digest([fact]),
+            verifications=[
+                {"id": 1, "verdict": "SUPPORTED", "record_reference": "records.pdf p.3, 2020-01-01"}
+            ],
+        )
+        cited, positive = evaluate_view._rubric_and_positive_sources(result)
+        self.assertEqual(cited, {"records.pdf p.3"})
+        self.assertEqual(positive, {"records.pdf p.3"})
+
+    def test_contradicted_verdict_is_cited_but_not_positive(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        fact = self._fact(source="records.pdf p.5")
+        result = EvaluationResult(
+            digest=self._digest([fact]),
+            verifications=[
+                {"id": 1, "verdict": "CONTRADICTED", "record_reference": "records.pdf p.5"}
+            ],
+        )
+        cited, positive = evaluate_view._rubric_and_positive_sources(result)
+        self.assertEqual(cited, {"records.pdf p.5"})
+        self.assertEqual(positive, set())
+
+    def test_later_supportive_match_marks_source_positive(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        fact = self._fact(source="records.pdf p.7")
+        result = EvaluationResult(
+            digest=self._digest([fact]),
+            verifications=[
+                {"id": 1, "verdict": "CONTRADICTED", "record_reference": "records.pdf p.7"},
+                {
+                    "id": 2,
+                    "verdict": "PARTIALLY SUPPORTED",
+                    "record_reference": "records.pdf p.7, 2020-01-01",
+                },
+            ],
+        )
+        cited, positive = evaluate_view._rubric_and_positive_sources(result)
+        self.assertEqual(cited, {"records.pdf p.7"})
+        self.assertEqual(positive, {"records.pdf p.7"})
+
+    def test_fact_not_referenced_anywhere_is_excluded(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        fact = self._fact(source="unreferenced.pdf p.1")
+        result = EvaluationResult(
+            digest=self._digest([fact]),
+            verifications=[{"id": 1, "verdict": "SUPPORTED", "record_reference": "other.pdf p.9"}],
+        )
+        cited, positive = evaluate_view._rubric_and_positive_sources(result)
+        self.assertEqual(cited, set())
+        self.assertEqual(positive, set())
+
+
+class TestRenderFactExportSection(unittest.TestCase):
+    def _digest(self):
+        from app.medical_review import MedicalDigest, MedicalFact
+
+        fact = MedicalFact(
+            date="2020-01-01", type="diagnosis", description="d",
+            source="records.pdf p.3", quote="q",
+        )
+        return MedicalDigest(facts=[fact], conditions=["PTSD"], pages_reviewed=10)
+
+    def test_no_digest_renders_nothing(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        st_mock, _ = _fake_streamlit()
+        with _patch_st(evaluate_view, st_mock):
+            evaluate_view._render_fact_export_section(EvaluationResult())
+        st_mock.expander.assert_not_called()
+
+    def test_impression_fires_once_per_session(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        st_mock, session = _fake_streamlit()
+        st_mock.checkbox.return_value = False
+        st_mock.button.return_value = False
+        result = EvaluationResult(digest=self._digest())
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "track_impression"
+        ) as mock_impression:
+            evaluate_view._render_fact_export_section(result)
+            evaluate_view._render_fact_export_section(result)
+        mock_impression.assert_called_once()
+        self.assertEqual(
+            mock_impression.call_args.args[0], evaluate_view.EXPORT_FACTS_FEATURE_ID
+        )
+
+    def test_export_click_generates_all_three_formats_and_fires_goal(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        st_mock, _session = _fake_streamlit()
+        st_mock.checkbox.return_value = False
+        st_mock.button.return_value = True
+        st_mock.columns.return_value = (MagicMock(), MagicMock(), MagicMock())
+        result = EvaluationResult(digest=self._digest())
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "export_facts", wraps=evaluate_view.export_facts
+        ) as mock_export, patch.object(evaluate_view, "track_goal") as mock_goal, patch.object(
+            evaluate_view, "track_interaction"
+        ), patch.object(evaluate_view, "track_impression"):
+            evaluate_view._render_fact_export_section(result)
+
+        formats = {c.args[1] for c in mock_export.call_args_list}
+        self.assertEqual(formats, {"csv", "pdf", "md"})
+        mock_goal.assert_called_once()
+        self.assertEqual(mock_goal.call_args.args[0], evaluate_view.EXPORT_FACTS_FEATURE_ID)
+
+    def test_download_click_fires_interaction_telemetry(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        st_mock, session = _fake_streamlit()
+        st_mock.checkbox.return_value = False
+        st_mock.button.return_value = False
+        session["export_facts_files"] = {"csv": b"data", "pdf": b"%PDF", "md": b"# md"}
+        col_csv, col_pdf, col_md = MagicMock(), MagicMock(), MagicMock()
+        col_csv.download_button.return_value = True
+        col_pdf.download_button.return_value = False
+        col_md.download_button.return_value = False
+        st_mock.columns.return_value = (col_csv, col_pdf, col_md)
+        result = EvaluationResult(digest=self._digest())
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "track_interaction"
+        ) as mock_interaction, patch.object(evaluate_view, "track_impression"):
+            evaluate_view._render_fact_export_section(result)
+
+        mock_interaction.assert_called_once()
+        self.assertEqual(mock_interaction.call_args.kwargs.get("action"), "download")
+        self.assertEqual(mock_interaction.call_args.kwargs.get("format"), "csv")
+
+    def test_export_error_in_one_format_does_not_block_others(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        st_mock, _session = _fake_streamlit()
+        st_mock.checkbox.return_value = False
+        st_mock.button.return_value = True
+        st_mock.columns.return_value = (MagicMock(), MagicMock(), MagicMock())
+        result = EvaluationResult(digest=self._digest())
+
+        def _flaky(digest, fmt, **kwargs):
+            if fmt == "pdf":
+                raise RuntimeError("boom")
+            return b"ok"
+
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "export_facts", side_effect=_flaky
+        ), patch.object(evaluate_view, "track_goal"), patch.object(
+            evaluate_view, "track_interaction"
+        ), patch.object(evaluate_view, "track_impression"):
+            evaluate_view._render_fact_export_section(result)
+
+        st_mock.error.assert_called_once()
+        self.assertIn("pdf", str(st_mock.error.call_args[0][0]))
 
 
 # ------------------------------------------------- run bookkeeping
@@ -1310,6 +1702,135 @@ class TestLlmFailoverPanel(unittest.TestCase):
             sidebar._llm_failover_panel()
         caption = " ".join(str(c[0][0]) for c in st_mock.caption.call_args_list)
         self.assertIn("worker", caption)
+
+
+# ------------------------------------------------ effectiveness score (F4.S2)
+class TestRenderEffectivenessScore(unittest.TestCase):
+    def _result(self, score: int = 80, recommendations=None, claims=None):
+        from app.evaluate import EvaluationResult
+
+        return EvaluationResult(
+            effectiveness_score=score,
+            recommendations=recommendations
+            if recommendations is not None
+            else [
+                {"title": "Add supporting evidence", "impact": "+8 points", "explanation": "x", "claim_id": 1},
+                {"title": "Clarify frequency", "impact": "+5 points", "explanation": "y", "claim_id": None},
+                {"title": "Add functional impact", "impact": "+3 points", "explanation": "z", "claim_id": None},
+            ],
+            claims=claims if claims is not None else [{"id": 1, "text": "Injured knee lifting."}],
+        )
+
+    def test_green_band_uses_success_banner(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+
+        st_mock, _session = _fake_streamlit()
+        st_mock.columns.return_value = (MagicMock(), MagicMock())
+        st_mock.button.return_value = False
+        result = self._result(score=90)
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "track_impression"
+        ):
+            evaluate_view._render_effectiveness_score(result)
+        st_mock.success.assert_called_once()
+        st_mock.error.assert_not_called()
+        st_mock.warning.assert_not_called()
+
+    def test_red_band_uses_error_banner_and_shows_all_recommendations(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+
+        st_mock, _session = _fake_streamlit()
+        st_mock.columns.return_value = (MagicMock(), MagicMock())
+        st_mock.button.return_value = False
+        result = self._result(score=20)
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "track_impression"
+        ):
+            evaluate_view._render_effectiveness_score(result)
+        st_mock.error.assert_called_once()
+        # All 3 recommendations rendered (one markdown title line each).
+        title_calls = [
+            c for c in st_mock.markdown.call_args_list if "1." in str(c) or "2." in str(c) or "3." in str(c)
+        ]
+        self.assertGreaterEqual(len(title_calls), 3)
+
+    def test_yellow_band_uses_warning_banner(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+
+        st_mock, _session = _fake_streamlit()
+        st_mock.columns.return_value = (MagicMock(), MagicMock())
+        st_mock.button.return_value = False
+        result = self._result(score=60)
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "track_impression"
+        ):
+            evaluate_view._render_effectiveness_score(result)
+        st_mock.warning.assert_called_once()
+
+    def test_impression_fires_once_per_reference(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+
+        st_mock, _session = _fake_streamlit()
+        st_mock.columns.return_value = (MagicMock(), MagicMock())
+        st_mock.button.return_value = False
+        result = self._result()
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "track_impression"
+        ) as mock_impression:
+            evaluate_view._render_effectiveness_score(result)
+            evaluate_view._render_effectiveness_score(result)
+        mock_impression.assert_called_once()
+        self.assertEqual(
+            mock_impression.call_args.args[0], evaluate_view.EFFECTIVENESS_SCORE_FEATURE_ID
+        )
+
+    def test_click_on_claim_linked_recommendation_fires_interaction_and_jumps(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+
+        st_mock, _session = _fake_streamlit()
+        st_mock.columns.return_value = (MagicMock(), MagicMock())
+        # First recommendation's button click returns True, others False.
+        st_mock.button.side_effect = [True, False, False]
+        result = self._result()
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "track_impression"
+        ), patch.object(evaluate_view, "track_interaction") as mock_interaction:
+            evaluate_view._render_effectiveness_score(result)
+        mock_interaction.assert_called_once_with(
+            evaluate_view.EFFECTIVENESS_SCORE_FEATURE_ID,
+            recommendationIndex=1,
+            action="jump_to_claim",
+        )
+
+    def test_click_on_generic_recommendation_triggers_rewrite(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+
+        st_mock, _session = _fake_streamlit()
+        st_mock.columns.return_value = (MagicMock(), MagicMock())
+        # Second recommendation (claim_id=None) clicked.
+        st_mock.button.side_effect = [False, True, False]
+        result = self._result()
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "track_impression"
+        ), patch.object(evaluate_view, "track_interaction") as mock_interaction:
+            evaluate_view._render_effectiveness_score(result)
+        mock_interaction.assert_called_once_with(
+            evaluate_view.EFFECTIVENESS_SCORE_FEATURE_ID,
+            recommendationIndex=2,
+            action="trigger_rewrite",
+        )
+
+    def test_no_recommendations_still_renders_score(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+
+        st_mock, _session = _fake_streamlit()
+        st_mock.columns.return_value = (MagicMock(), MagicMock())
+        result = self._result(recommendations=[])
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "track_impression"
+        ):
+            evaluate_view._render_effectiveness_score(result)
+        st_mock.button.assert_not_called()
 
 
 if __name__ == "__main__":
