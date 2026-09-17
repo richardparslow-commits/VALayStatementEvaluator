@@ -14,10 +14,14 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import tempfile
 import time
+import types
 import unittest
 from pathlib import Path
+from typing import Any
+from unittest.mock import patch
 
 from app import audit_backup, config
 
@@ -481,18 +485,40 @@ class TestCloudBackendConfiguration(_BackupCase):
     traceback from a library the operator did not install.
     """
 
+    @staticmethod
+    def _stub_sdk(*names: str) -> Any:
+        """Register empty stub modules in ``sys.modules`` for the test's duration.
+
+        The GCS/Azure destinations import their SDK *before* they validate the
+        bucket/container, and installing every cloud SDK is deliberately not
+        required (``requirements-backup.txt`` is opt-in), so on a lean image
+        these misconfiguration assertions would otherwise see the "SDK not
+        installed" message instead. Yields the stub mapping so a test can set
+        the one attribute the import line needs. The missing-SDK path has its
+        own test below.
+        """
+        stubs: dict[str, Any] = {name: types.ModuleType(name) for name in names}
+        for name in names:
+            parent, _, leaf = name.rpartition(".")
+            if parent in stubs:
+                setattr(stubs[parent], leaf, stubs[name])
+        return patch.dict(sys.modules, stubs)
+
     def test_gcs_without_a_bucket_names_the_variable(self) -> None:
-        config.AUDIT_BACKUP_DESTINATION = "gcs"
-        config.AUDIT_BACKUP_GCS_BUCKET = ""
-        with self.assertRaises(audit_backup.BackupError) as ctx:
-            audit_backup.build_destination()
+        with self._stub_sdk("google", "google.cloud", "google.cloud.storage"):
+            config.AUDIT_BACKUP_DESTINATION = "gcs"
+            config.AUDIT_BACKUP_GCS_BUCKET = ""
+            with self.assertRaises(audit_backup.BackupError) as ctx:
+                audit_backup.build_destination()
         self.assertIn("VA_LSE_AUDIT_BACKUP_GCS_BUCKET", str(ctx.exception))
 
     def test_azure_without_a_container_names_the_variable(self) -> None:
-        config.AUDIT_BACKUP_DESTINATION = "azure"
-        config.AUDIT_BACKUP_AZURE_CONTAINER = ""
-        with self.assertRaises(audit_backup.BackupError) as ctx:
-            audit_backup.build_destination()
+        with self._stub_sdk("azure", "azure.storage", "azure.storage.blob") as stubs:
+            stubs["azure.storage.blob"].BlobServiceClient = object
+            config.AUDIT_BACKUP_DESTINATION = "azure"
+            config.AUDIT_BACKUP_AZURE_CONTAINER = ""
+            with self.assertRaises(audit_backup.BackupError) as ctx:
+                audit_backup.build_destination()
         self.assertIn("VA_LSE_AUDIT_BACKUP_AZURE_CONTAINER", str(ctx.exception))
 
     def test_azure_without_credentials_explains_both_options(self) -> None:
@@ -515,7 +541,6 @@ class TestCloudBackendConfiguration(_BackupCase):
 
     def test_a_missing_sdk_is_reported_as_a_dependency_not_a_crash(self) -> None:
         """Simulate an image built without requirements-backup.txt."""
-        import sys
 
         class _Blocked:
             """A meta-path finder that makes the cloud SDKs unimportable."""

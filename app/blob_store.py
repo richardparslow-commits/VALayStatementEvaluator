@@ -194,7 +194,11 @@ class FilesystemBlobStore(BlobStore):
         self._root = Path(root).expanduser()
         self._sweep_age = sweep_age_seconds
         self._lock = threading.Lock()
-        self._last_sweep = 0.0
+        # ``-inf`` rather than 0.0: this is compared against ``time.monotonic()``,
+        # which counts from an arbitrary origin — on a freshly booted host (a CI
+        # runner, a just-started container) 0.0 is *not* "long ago", so the first
+        # put would skip its sweep and the next one would land inside the interval.
+        self._last_sweep = float("-inf")
 
     @property
     def root(self) -> Path:

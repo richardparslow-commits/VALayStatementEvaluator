@@ -53,6 +53,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install --require-hashes -r requirements.lock
 
+      # The runtime lock deliberately omits the optional SDKs the suite asserts
+      # against (requirements-otel.txt / requirements-backup.txt are opt-in), and
+      # the tests exercising them fail rather than skip when the package is
+      # absent — so without this the tracing tests only ever assert the
+      # "SDK not installed" branch. Installing after the lock adds only what the
+      # lock is missing; the lock still pins the runtime itself.
+      - name: Install test extras
+        run: pip install -r requirements-dev.txt
+
       - name: Run offline unit tests
         run: python -m unittest discover -s tests -v
 
