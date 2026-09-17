@@ -29,6 +29,11 @@ from ..pipeline_guard import (
 from ..profiler import RunProfiler, get_profiler
 from ..run_log import run_log_event
 from ..shutdown import enter_run, exit_run
+from .follow_up import (
+    append_follow_up_answers,
+    draft_follow_up_questions,
+    render_follow_up_questions,
+)
 from .shared import (
     audit_condition_for_slot,
     audit_record_meta,
@@ -308,7 +313,7 @@ def _run_draft_flow(
             llm,
             records,
             witness,
-            observations.strip(),
+            append_follow_up_answers(observations.strip(), slot="draft"),
             condition.strip(),
             claim_type,
             progress=update,
@@ -535,6 +540,17 @@ def _render_draft_results(draft_result: Any) -> None:
 
     with st.expander("Grounding analysis — how the draft ties to the records", expanded=True):
         st.markdown(grounding_markdown(draft_result))
+
+    render_follow_up_questions(
+        slot="draft",
+        source_id=str(st.session_state.get("draft_request_id", "") or ""),
+        questions=draft_follow_up_questions(draft_result),
+        empty_message=(
+            "No follow-up questions are needed — the grounding analysis found no uncovered "
+            "applicable checklist topics."
+        ),
+        next_run_label="draft",
+    )
 
     if draft_result.review_issues:
         with st.expander("Self-review findings (fixed in the final version)"):
