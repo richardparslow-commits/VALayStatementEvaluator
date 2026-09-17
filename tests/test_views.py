@@ -720,6 +720,30 @@ class TestEmptyAnalysisResults(unittest.TestCase):
         error_messages = [str(call.args[0]) for call in st_mock.error.call_args_list]
         self.assertFalse([m for m in error_messages if "no usable analysis" in m])
 
+    def test_blank_result_renders_the_score_band_banner_alongside_the_guard(self) -> None:
+        """The empty-analysis guard and the RED score band both use st.error.
+
+        Merge regression guard: the effectiveness-score panel renders its RED
+        band through ``st.error`` as well, so on a blank run the panel must
+        emit both messages — the guard exactly once and still naming the
+        reference — instead of one crowding the other out.
+        """
+        import app.views.evaluate_view as evaluate_view
+        from app.evaluate import EvaluationResult
+
+        st_mock, _ = self._st()
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "track_impression"
+        ):
+            evaluate_view._render_evaluation_results(EvaluationResult())
+
+        error_messages = [str(call.args[0]) for call in st_mock.error.call_args_list]
+        guards = [m for m in error_messages if "no usable analysis" in m]
+        band_banners = [m for m in error_messages if "(RED band)" in m]
+        self.assertEqual(len(guards), 1)
+        self.assertIn("req_84ab42a65e24", guards[0])
+        self.assertEqual(len(band_banners), 1)
+
 
 # ------------------------------------------------- fact citation exporter (F7.S1)
 class TestRubricAndPositiveSources(unittest.TestCase):
