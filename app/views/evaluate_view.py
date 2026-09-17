@@ -30,6 +30,12 @@ from ..pipeline_guard import (
 from ..profiler import RunProfiler, get_profiler
 from ..run_log import run_log_event
 from ..shutdown import enter_run, exit_run
+from .follow_up import (
+    append_follow_up_answers,
+    evaluate_follow_up_questions,
+    mark_follow_up_answers_consumed,
+    render_follow_up_questions,
+)
 from .shared import (
     FEATURE_ID,
     audit_condition_for_slot,
@@ -237,7 +243,11 @@ def _run_evaluation_flow(statement_text: str, records: list) -> None:
     try:
         check_memory_before_run()
         result = run_with_timeout(
-            run_evaluation, llm, statement_text.strip(), records, progress=update
+            run_evaluation,
+            llm,
+            append_follow_up_answers(statement_text.strip(), slot="eval"),
+            records,
+            progress=update,
         )
     except MemoryError as mem_exc:
         bar.empty()
@@ -418,6 +428,7 @@ def _run_evaluation_flow(statement_text: str, records: list) -> None:
     st.session_state.eval_result = result
     st.session_state.eval_usage = llm.usage
     st.session_state.eval_request_id = rid
+    mark_follow_up_answers_consumed("eval")
     record_watchdog_run(llm.usage)
 
 
@@ -590,6 +601,17 @@ def _render_evaluation_results(eval_result: Any) -> None:
                     st.write(f"- {gap}")
             if eval_result.topic_notes:
                 st.caption(eval_result.topic_notes)
+
+    render_follow_up_questions(
+        slot="eval",
+        source_id=_result_reference(),
+        questions=evaluate_follow_up_questions(eval_result),
+        empty_message=(
+            "No follow-up questions are needed — every applicable checklist topic is already "
+            "covered well enough for this run."
+        ),
+        next_run_label="evaluation",
+    )
 
     with st.expander("Improvements & record facts to add", expanded=True):
         for imp in eval_result.improvements:
