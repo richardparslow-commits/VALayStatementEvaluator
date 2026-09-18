@@ -27,11 +27,16 @@ Two published constraints shape the code below:
    ones, and that citations should be read from the response's own ``search_results`` /
    ``fetch_url_results`` items. :func:`_collect_citations` is accordingly the only source
    of links here, and the schemas this module builds never contain a URL field.
-2. **The SDK is an optional install.** ``perplexityai`` is deliberately not in the
-   hash-pinned lockfile (see ``requirements-perplexity.txt``), so every import of it is
-   function-local and a missing package reports a configuration problem rather than
-   raising ``ImportError`` at import time — the same contract ``app/blob_store.py`` and
-   ``app/audit_backup.py`` hold for boto3.
+2. **Imports of the SDK are function-local, and a missing package is a configuration
+   problem.** ``perplexityai`` *is* in the deployed dependency set (``requirements.txt``
+   and the hash-pinned ``requirements.lock``), because a host that installs from
+   ``requirements.txt`` — Streamlit Community Cloud — has no shell and could otherwise
+   never switch this feature on. The graceful-degradation contract is kept anyway, for
+   the same reason ``app/blob_store.py`` and ``app/audit_backup.py`` keep it for boto3:
+   an install can legitimately be partial (a slim image, a contributor's venv, a future
+   decision to drop a provider), and the failure has to read as *"here is what is
+   missing"* rather than an ``ImportError`` traceback at import time. See
+   ``requirements-perplexity.txt`` for the standalone install and the cost controls.
 """
 
 from __future__ import annotations

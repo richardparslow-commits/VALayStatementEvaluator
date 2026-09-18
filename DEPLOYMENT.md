@@ -1219,6 +1219,30 @@ Optional extras, same file: `FETCH_SANDBOX_API_KEY`, `FETCH_SANDBOX_BASE_URL`,
 Then **reboot the app** — the running process reads its configuration at startup, so secret
 edits do not affect it until it restarts.
 
+### Dependencies on a host with no shell
+
+Community Cloud installs **`requirements.txt`** from the repository when it builds the app.
+There is no shell on the platform, so a package that is not in that file cannot be added at
+runtime — a deploy-time gap that surfaces as a *feature* politely refusing to run, never as an
+error anyone can act on from the dashboard.
+
+That is why the Perplexity SDK is listed in the **core** `requirements.txt` even though the
+integration treats it as optional in code: with it as an optional `requirements-*.txt`, the
+Research tab and the framework-currency check could only ever render "install this package"
+here. Nothing else needs it, and every import of it stays function-local, so a partial install
+elsewhere still degrades to an explanatory message rather than an `ImportError`.
+
+Two consequences for a hosted deployment:
+
+* **Docker, CI, and K8s use `requirements.lock`** (`pip install --require-hashes -r
+  requirements.lock`, §5), so the SDK must be in both files — keep them in step with
+  `pip-compile` (see `README.md → Dependency locking`). Community Cloud ignores the lockfile
+  and resolves `requirements.txt` unpinned, so a deployed upgrade can pick up a newer SDK than
+  CI tested.
+* **The key is still required.** The package ships the *ability* to research; the features
+  stay off until `PERPLEXITY_API_KEY` is set (auto-derived from `OPENAI_API_KEY` when the base
+  URL is Perplexity's, see the resolution order below). Reboot after adding it.
+
 ### Resolution order
 
 1. process environment (platform-injected var, K8s/Docker secret, CI secret),
@@ -1249,6 +1273,9 @@ names only take effect after clicking it (the sidebar warns while a change is pe
 
 - [ ] `OPENAI_API_KEY` + `OPENAI_BASE_URL` set together in **Settings → Secrets** (same account)
 - [ ] `LLM_MODEL_MAIN` / `LLM_MODEL_FAST` name models the endpoint actually serves
+- [ ] Perplexity SDK present in `requirements.txt` (makes the Research tab and the
+      framework-currency check loadable on the platform); no `pip install` step is possible here
+- [ ] `PERPLEXITY_API_KEY` set if the base URL is *not* Perplexity's, or the Research tab is off
 - [ ] App rebooted after editing secrets
 - [ ] Sidebar **Test connection** reports "Endpoint reachable" on the deployed URL
 - [ ] Sidebar captions the values as `🔐 From Streamlit secrets:`

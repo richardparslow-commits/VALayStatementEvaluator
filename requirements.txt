@@ -11,3 +11,21 @@ plotly>=6.0
 # lazily by app/job_queue.py: with this package absent the app still runs and
 # falls back to the Upstash REST tier (stdlib-only) or in-process execution.
 redis>=5.0
+
+# Official Perplexity SDK for the Research tab and the framework-currency check
+# (app/perplexity_agent.py, app/knowledge_currency.py).
+#
+# It lives in the core set, not in an optional requirements-*.txt, because the two
+# features it serves are unreachable on a host that cannot install at runtime —
+# Streamlit Community Cloud builds from requirements.txt and offers no shell, so
+# leaving it out meant the tab could only ever render "install this package"
+# there. Local Docker/CI paths install the hash-pinned requirements.lock, so it
+# has to be in both files or the deployed set and the tested set differ.
+#
+# The code still treats the SDK as optional at the import boundary (function-local
+# imports, and unavailable_reason() explains what is missing rather than raising),
+# which is what keeps a lean or partial install working — see
+# requirements-perplexity.txt for the standalone install and the Agent API's cost
+# controls. Adding it pulls httpx into the lock; that is safe alongside the
+# httpx2 fork because they provide different import names (httpx vs httpx2).
+perplexityai>=0.43

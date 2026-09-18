@@ -121,6 +121,13 @@ runs the identical tested dependency set. `requirements.txt` stays the human-edi
 > (Pattern C only). It is deliberately not part of `requirements.lock`: the default
 > filesystem blob store needs no extra dependency, and nothing else in the app uses boto3.
 
+> 🌐 The **Perplexity SDK is in the core set**, not an optional file, and that is a
+> deliberate exception to the pattern above. The Research tab and the framework-currency
+> check need it, and Streamlit Community Cloud installs from `requirements.txt` with no
+> shell — as an optional install the tab could render nothing but "install this package"
+> there. It is the last line of `requirements.txt`; `requirements-perplexity.txt` remains
+> as the standalone installer. The app still degrades cleanly if the package is absent.
+
 > This app is tested with QwenCloud Token Plan but works with **any
 > OpenAI-compatible API** (OpenAI, Azure OpenAI via proxy, local Ollama with an
 > OpenAI-compat shim). See [`COMPATIBILITY.md`](COMPATIBILITY.md) for supported
@@ -151,6 +158,13 @@ git add requirements.txt requirements.lock && git diff --cached
 Use `pip-compile --upgrade` (optionally with `-P <package>`) for a deliberate bulk or
 single-package bump; pip-compile pins hashes for every platform wheel, so the same lockfile
 installs on macOS and Linux CI.
+
+> The header line records the Python version `pip-compile` ran under, which depends on the
+> contributor's machine (3.13 locally, while CI and Docker are 3.12). That is cosmetic: the
+> lockfile carries **no environment markers**, so the same pins and hashes install on every
+> supported interpreter — CI installs this lock under both 3.12 and 3.13. Don't "fix" the
+> header, and don't hand-edit pins: a hand-written entry that no wheel hash matches fails the
+> `--require-hashes` install on every path.
 
 ### Environment variables (`.env`)
 
@@ -497,6 +511,7 @@ the pipeline (no API calls) to verify orchestration at scale. Ingest quality is 
 ```bash
 python -m unittest discover -s tests -v        # offline unit tests (incl. health probes)
 python -m tests.hostile                        # …the same suite, with every knob hostile
+pip install -U streamlit && python -m unittest discover -s tests    # …on the newest Streamlit
 python -m mypy app                             # strict type check (see pyproject.toml)
 python scripts/smoke_test.py all               # live end-to-end (needs valid .env)
 python scripts/live_draft_e2e.py                # one real Draft run against your endpoint
@@ -537,6 +552,20 @@ CI runs the whole suite that way as its own check — the `hermetic` job, which 
 (`tests/hostile.py`, so the two cannot drift apart). Ambient dependence that arrives
 with a future test therefore fails the build, instead of surfacing later as a mystery
 on somebody else's machine.
+
+A second scheduled job watches the *dependency* rather than the diff: `streamlit-latest`
+(weekly Monday, plus manual dispatch) installs the newest Streamlit on top of
+`requirements.lock` — upgrading only what the new release requires, so the lock still
+pins the rest — and runs the same offline suite. The lock is what makes it necessary: a
+release can change option resolution, or rename one of the private hooks the harness
+reaches into (`get_config_files`, `secrets.files`), while every other check stays green.
+`tests/test_hermetic.py` pins the measurement the harness's *scope* rests on — the
+environment is honoured for `sensitive` options only, 2 of 343 on 1.63.0, though
+Streamlit's own documentation claims the wider behaviour — so if upstream ever makes that
+route general, the guard fails and names what to update instead of the harness quietly
+under-protecting. It is scheduled rather than per-PR because the news arrives weekly
+("a release is not a commit"), and it is left able to fail: the job exists to *surface*
+the change, and a canary that reports green while its assertions fail would defeat that.
 
 ### Type checking (mypy — strict)
 

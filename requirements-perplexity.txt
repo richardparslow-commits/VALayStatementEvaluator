@@ -1,12 +1,19 @@
-# Optional dependency for the web-grounded "Research" tab (PERPLEXITY_API_KEY).
+# Perplexity SDK for the web-grounded "Research" tab and the framework-currency check
+# (PERPLEXITY_API_KEY).
 #
-# Not part of requirements.txt / requirements.lock on purpose: web-grounded research is
-# an additive capability, every code path degrades to "here is how to enable it" when the
-# package is missing, and nothing in the Evaluate/Draft pipeline imports it. Adding it to
-# the hash-pinned lockfile would also drag the lock's transitive graph along with it for
-# a feature most deployments will never switch on.
+# THIS PACKAGE IS ALSO IN THE CORE SET: requirements.txt and the hash-pinned
+# requirements.lock include it, because the two features it serves are unreachable on a
+# host that cannot install at runtime — Streamlit Community Cloud builds from
+# requirements.txt and offers no shell, so an optional-only dependency meant the tab could
+# never be switched on there. This file is kept as the *standalone* installer for an image
+# or venv that deliberately does not take the core set, and as where the Agent API's cost
+# controls are documented.
 #
-#   pip install -r requirements-perplexity.txt
+#   pip install -r requirements-perplexity.txt   # just this SDK
+#
+# Nothing else needs it: the Evaluate/Draft pipeline never imports it, and the SDK's
+# absence is reported as a configuration problem (app/perplexity_agent.unavailable_reason)
+# rather than raised at import time.
 #
 # Then create an API key at https://console.perplexity.ai and set it in the environment
 # or, for local development, in the git-ignored .env file:
