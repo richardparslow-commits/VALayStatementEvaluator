@@ -19,6 +19,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 
 
 def _capture_audit_payloads():

@@ -22,6 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote_plus
 
+from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 from app import audit_backup, config
 
 try:

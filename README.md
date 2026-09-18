@@ -514,6 +514,8 @@ the pipeline (no API calls) to verify orchestration at scale. Ingest quality is 
 ```bash
 python -m unittest discover -s tests -v        # offline unit tests (incl. health probes)
 python -m tests.hostile                        # …the same suite, with every knob hostile
+pip install --target /tmp/sl-dev --no-deps -U streamlit   # a developer's install layout (no site-packages)
+PYTHONPATH=/tmp/sl-dev python -m tests.devlayout          # …the same suite, run in it
 pip install -U streamlit && python -m unittest discover -s tests    # …on the newest Streamlit
 python -m mypy app                             # strict type check (see pyproject.toml)
 python scripts/smoke_test.py all               # live end-to-end (needs valid .env)
@@ -546,7 +548,10 @@ a dead runner thread rather than as the message: a `KeyError` about
 `$$STREAMLIT_INTERNAL_KEY_SCRIPT_RUN_WITHOUT_ERRORS`, or a bare `AppTest script run timed
 out`, with the real error only on stderr. Since the view tests are almost all
 AppTest-driven, that is the difference between the deployment's behaviour and a dozen
-view tests failing for no visible reason. The two `STREAMLIT_*` variables Streamlit honours
+view tests failing for no visible reason. The pin is exercised in CI against a real
+non-`site-packages` install — the `dev-layout` job below — rather than only against the
+simulation the in-suite guard can build, because a simulation that has drifted from what
+it simulates passes while testing nothing. The two `STREAMLIT_*` variables Streamlit honours
 (the options it marks "sensitive") are stripped like any other ambient name; note that
 the documented `STREAMLIT_SERVER_PORT`-style overrides are inert on 1.63.0 — see
 [Production hardening](#production-hardening-streamlit). A test that *needs* a value
@@ -565,7 +570,20 @@ CI runs the whole suite that way as its own check — the `hermetic` job, which 
 with a future test therefore fails the build, instead of surfacing later as a mystery
 on somebody else's machine.
 
-A second scheduled job watches the *dependency* rather than the diff: `streamlit-latest`
+A second job exercises the *install layout* rather than the diff: `dev-layout` installs the
+version `requirements.lock` pins **outside** `site-packages` — `pip install --target`, with
+`PYTHONPATH` pointing at it — and runs the whole suite there. The in-suite guard for that pin
+has to simulate the layout (it writes the option's value before anything parses, because a
+test process cannot reinstall Streamlit), and this is the other half: `tests/devlayout.py`
+refuses to continue unless the install really is a development layout and the pin really
+holds in it, printing the install it measured as it goes. That refusal is also the sensor for
+drift — if Streamlit ever derives the mode from something else, the job says so instead of
+the simulated guard quietly asserting about a layout that no longer exists. It pins the locked
+version deliberately (`--no-deps`, so the lock still supplies Streamlit's dependencies): the
+variable is the layout, so a red run has one explanation. It gates on every push and PR,
+because it is the pin's only exercise against a real install.
+
+A third job watches the *dependency* rather than the diff: `streamlit-latest`
 (weekly Monday, plus manual dispatch) installs the newest Streamlit on top of
 `requirements.lock` — upgrading only what the new release requires, so the lock still
 pins the rest — and runs the same offline suite. The lock is what makes it necessary: a

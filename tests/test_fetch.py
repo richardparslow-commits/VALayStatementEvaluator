@@ -7,6 +7,7 @@ from typing import Any
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 
 from app.config import Settings  # noqa: E402
 from app.fetch_client import FetchClient, FetchSandboxError  # noqa: E402

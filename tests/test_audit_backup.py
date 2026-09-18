@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 from app import audit_backup, config
 
 

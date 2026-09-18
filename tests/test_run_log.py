@@ -13,6 +13,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 from app import config
 from app import run_log as run_log_mod
 from app.run_log import read_recent_events, run_log_event
