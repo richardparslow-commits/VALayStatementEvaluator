@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from app.llm import ModelProbe  # noqa: E402
 from app.usage import UsageTracker  # noqa: E402
 
 
@@ -1351,7 +1352,9 @@ class TestSidebarSettingsGuards(unittest.TestCase):
         session["base_url_input"] = "https://ws-example.us-east-1.maas.aliyuncs.com"
         session["api_key_input"] = "test-workspace-key"
         with _patch_st(sidebar, st_mock), patch.object(
-            sidebar, "check_model_availability", return_value={"qwen3.7-max", "qwen3.7-flash"}
+            sidebar,
+            "probe_models",
+            return_value=ModelProbe({"qwen3.7-max", "qwen3.7-flash"}, 200, ""),
         ):
             sidebar._test_connection_report(self._settings())
         st_mock.success.assert_called_once()
@@ -1364,11 +1367,73 @@ class TestSidebarSettingsGuards(unittest.TestCase):
         session["base_url_input"] = "https://token-plan.example/v1"
         session["api_key_input"] = "test-workspace-key"
         with _patch_st(sidebar, st_mock), patch.object(
-            sidebar, "check_model_availability", return_value=None
+            sidebar,
+            "probe_models",
+            return_value=ModelProbe(None, 401, 'HTTP 401: {"error":"invalid api key"}'),
         ):
             sidebar._test_connection_report(self._settings())
         st_mock.error.assert_called_once()
         self.assertIn("same provider account", str(st_mock.error.call_args[0][0]))
+
+    def test_connection_failure_quotes_the_status_and_body(self) -> None:
+        """A 401 was reported as equal possibilities ("unreachable or bad key")."""
+        import app.views.sidebar as sidebar
+
+        st_mock, session = _fake_streamlit()
+        session["api_key_input"] = "test-workspace-key"
+        with _patch_st(sidebar, st_mock), patch.object(
+            sidebar,
+            "probe_models",
+            return_value=ModelProbe(None, 401, "HTTP 401: invalid api key"),
+        ):
+            sidebar._test_connection_report(self._settings())
+        msg = str(st_mock.error.call_args[0][0])
+        self.assertIn("HTTP 401", msg)
+        self.assertNotIn("unreachable", msg)
+
+    def test_a_perplexity_key_without_router_access_is_named(self) -> None:
+        """The live failure: a platform key the Router API will not serve."""
+        import app.views.sidebar as sidebar
+
+        st_mock, session = _fake_streamlit()
+        session["base_url_input"] = "https://api.perplexity.ai/router/v1"
+        session["api_key_input"] = "test-workspace-key"
+        with _patch_st(sidebar, st_mock), patch.object(
+            sidebar,
+            "probe_models",
+            return_value=ModelProbe(None, 403, "HTTP 403: router access not enabled"),
+        ):
+            sidebar._test_connection_report(self._settings())
+        msg = str(st_mock.error.call_args[0][0])
+        self.assertIn("private preview", msg)
+
+    def test_a_wrong_path_is_distinguished_from_a_bad_key(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, session = _fake_streamlit()
+        session["api_key_input"] = "test-workspace-key"
+        with _patch_st(sidebar, st_mock), patch.object(
+            sidebar,
+            "probe_models",
+            return_value=ModelProbe(None, 404, "HTTP 404: Not Found"),
+        ):
+            sidebar._test_connection_report(self._settings())
+        msg = str(st_mock.error.call_args[0][0])
+        self.assertIn("does not exist on that host", msg)
+
+    def test_no_response_blames_the_host_not_the_key(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, session = _fake_streamlit()
+        session["api_key_input"] = "test-workspace-key"
+        with _patch_st(sidebar, st_mock), patch.object(
+            sidebar,
+            "probe_models",
+            return_value=ModelProbe(None, None, "URLError: name or service not known"),
+        ):
+            sidebar._test_connection_report(self._settings())
+        msg = str(st_mock.error.call_args[0][0])
+        self.assertIn("No HTTP response", msg)
 
     def test_connection_flags_models_the_endpoint_lacks(self) -> None:
         import app.views.sidebar as sidebar
@@ -1376,7 +1441,9 @@ class TestSidebarSettingsGuards(unittest.TestCase):
         st_mock, session = _fake_streamlit()
         session["api_key_input"] = "test-workspace-key"
         with _patch_st(sidebar, st_mock), patch.object(
-            sidebar, "check_model_availability", return_value={"some-other-model"}
+            sidebar,
+            "probe_models",
+            return_value=ModelProbe({"some-other-model"}, 200, ""),
         ):
             sidebar._test_connection_report(self._settings())
         st_mock.warning.assert_called_once()
