@@ -131,6 +131,35 @@ class _WorkerCase(unittest.TestCase):
 
 
 class TestExecuteJobSuccess(_WorkerCase):
+    def test_progress_stops_when_the_attempt_is_reclaimed(self):
+        self.backend.enqueue(KIND_EVALUATE, "{}")
+        old, _ = self.backend.claim([KIND_EVALUATE], worker_id="old")
+        callback = worker._progress_callback(self.backend, old)
+        with patch.object(config, "JOB_QUEUE_LEASE_SECONDS", 0):
+            self.backend.requeue_stale()
+        current, _ = self.backend.claim([KIND_EVALUATE], worker_id="new")
+        with self.assertRaises(worker.JobLeaseLost):
+            callback(1.0, "late progress")
+        self.assertEqual(self.backend.get(old.job_id).claim_token, current.claim_token)
+
+    def test_lost_ownership_at_completion_is_not_reported_as_success(self):
+        job = _evaluate_job()
+        self.backend.enqueue(KIND_EVALUATE, encode_job(KIND_EVALUATE, job))
+        old, payload = self.backend.claim([KIND_EVALUATE], worker_id="old")
+        original = self.backend.complete
+
+        def reclaimed_complete(job_id, **kwargs):
+            with patch.object(config, "JOB_QUEUE_LEASE_SECONDS", 0):
+                self.backend.requeue_stale()
+            self.backend.claim([KIND_EVALUATE], worker_id="new")
+            original(job_id, **kwargs)
+
+        with patch.object(self.backend, "complete", side_effect=reclaimed_complete):
+            self.assertFalse(worker.execute_job(old, payload, self.backend, llm=_UsageStub()))
+        self.assertEqual(self.backend.get(old.job_id).worker_id, "new")
+        self.assertEqual(self.backend.get(old.job_id).status, "running")
+        self.assertIsNone(self.backend.get_result(old.job_id))
+
     def test_evaluate_job_stores_a_decodable_result(self):
         job = _evaluate_job()
         record = self.backend.enqueue(KIND_EVALUATE, encode_job(KIND_EVALUATE, job), request_id=job.request_id)
@@ -171,9 +200,9 @@ class TestExecuteJobSuccess(_WorkerCase):
         seen: list[float] = []
         real_set_progress = self.backend.set_progress
 
-        def spy(job_id: str, progress: float, message: str) -> None:
+        def spy(job_id: str, progress: float, message: str, *, claim_token: str) -> None:
             seen.append(progress)
-            real_set_progress(job_id, progress, message)
+            real_set_progress(job_id, progress, message, claim_token=claim_token)
 
         self.backend.set_progress = spy  # type: ignore[method-assign]
         worker.execute_job(claimed[0], claimed[1], self.backend, llm=_UsageStub())

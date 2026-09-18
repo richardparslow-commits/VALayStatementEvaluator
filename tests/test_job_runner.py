@@ -87,15 +87,15 @@ class _PresetBackend(InProcessJobBackend):
     def enqueue(self, kind: str, payload: str, *, request_id: str = ""):  # noqa: ANN201
         record = super().enqueue(kind, payload, request_id=request_id)
         self.last_payload = payload
+        claimed, _ = self.claim([kind], worker_id="w1")
         if self._finish:
-            self.store_result(record.job_id, self._result)
-            self.complete(record.job_id)
+            self.store_result(record.job_id, self._result, claim_token=claimed.claim_token)
+            self.complete(record.job_id, claim_token=claimed.claim_token)
         else:
             # Simulate a worker holding the job without finishing.
-            claimed = self.claim([kind], worker_id="w1")
-            assert claimed is not None
-            self.set_progress(record.job_id, 0.4, "digesting records")
-        return record
+            self.set_progress(record.job_id, 0.4, "digesting records", claim_token=claimed.claim_token)
+        # Polling may be patched to simulate an outage after submission.
+        return super().get(record.job_id)
 
 
 class TestQueueModeDetection(unittest.TestCase):
@@ -194,7 +194,7 @@ class TestSubmitAndPoll(unittest.TestCase):
     def test_failed_job_reports_the_worker_error(self):
         backend = _PresetBackend(finish=False)
         record = backend.enqueue(KIND_EVALUATE, encode_job(KIND_EVALUATE, _job()))
-        backend.fail(record.job_id, error="LLMError: endpoint down", error_class="LLMError")
+        backend.fail(record.job_id, claim_token=record.claim_token, error="LLMError: endpoint down", error_class="LLMError")
 
         with patch.object(job_runner, "get_job_backend", return_value=backend), patch.object(
             config, "JOB_QUEUE_UI_POLL_SECONDS", 0.01
@@ -286,7 +286,6 @@ class TestSubmitAndPoll(unittest.TestCase):
         self.assertTrue(outcome.ok)
         # A stale marker for a *finished* job must not lock the tab.
         record = backend.enqueue(KIND_EVALUATE, encode_job(KIND_EVALUATE, _job()))
-        backend.complete(record.job_id)
         st.session_state["va_lse_pending_job_eval"] = record.job_id
         self.assertTrue(self._submit(backend).ok)
 

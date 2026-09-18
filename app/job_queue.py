@@ -45,7 +45,7 @@ import urllib.request
 import uuid
 from collections import deque
 from collections.abc import Iterator
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from typing import Any, Sequence
 
 from . import config
@@ -76,6 +76,10 @@ class JobQueueUnavailable(JobQueueError):
     """Raised when a backend's dependency or configuration is missing."""
 
 
+class JobLeaseLost(JobQueueError):
+    """The caller no longer owns this attempt and must stop writing."""
+
+
 # --------------------------------------------------------------------- records
 @dataclass
 class JobRecord:
@@ -93,6 +97,7 @@ class JobRecord:
     progress: float = 0.0
     message: str = ""
     worker_id: str = ""
+    claim_token: str = ""
     error: str = ""
     error_class: str = ""
     created_at: float = 0.0
@@ -183,17 +188,17 @@ class JobBackend:
         raise NotImplementedError
 
     def set_progress(
-        self, job_id: str, progress: float, message: str
+        self, job_id: str, progress: float, message: str, *, claim_token: str
     ) -> None:
         raise NotImplementedError
 
-    def store_result(self, job_id: str, result: str) -> None:
+    def store_result(self, job_id: str, result: str, *, claim_token: str) -> None:
         raise NotImplementedError
 
-    def complete(self, job_id: str, *, message: str = "") -> None:
+    def complete(self, job_id: str, *, claim_token: str, message: str = "") -> None:
         raise NotImplementedError
 
-    def fail(self, job_id: str, *, error: str, error_class: str = "") -> None:
+    def fail(self, job_id: str, *, claim_token: str, error: str, error_class: str = "") -> None:
         raise NotImplementedError
 
     def get(self, job_id: str) -> JobRecord | None:
@@ -202,7 +207,7 @@ class JobBackend:
     def get_result(self, job_id: str) -> str | None:
         raise NotImplementedError
 
-    def requeue(self, job_id: str, *, reason: str = "") -> bool:
+    def requeue(self, job_id: str, *, claim_token: str, reason: str = "") -> bool:
         """Hand a claimed job back untouched, without burning an attempt.
 
         Used when a worker claims a job it then refuses to run (it is draining),
@@ -297,7 +302,7 @@ class InProcessJobBackend(JobBackend):
             self._payloads[record.job_id] = payload
             self._queues.setdefault(kind, deque()).append(record.job_id)
             self._cv.notify_all()
-        return record
+        return replace(record)
 
     # -- consumer -----------------------------------------------------------
     def claim(
@@ -323,7 +328,7 @@ class InProcessJobBackend(JobBackend):
                     ):
                         continue
                     self._start(record, worker_id)
-                    return record, payload
+                    return replace(record), payload
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return None
@@ -332,40 +337,48 @@ class InProcessJobBackend(JobBackend):
     def _start(self, record: JobRecord, worker_id: str) -> None:
         record.status = STATUS_RUNNING
         record.worker_id = worker_id
+        record.claim_token = uuid.uuid4().hex
+        record.progress = 0.0
+        self._results.pop(record.job_id, None)
         record.attempts += 1
         record.heartbeat_at = _now()
         record.updated_at = record.heartbeat_at
         record.message = "claimed by worker"
 
-    def set_progress(self, job_id: str, progress: float, message: str) -> None:
+    def _owned_record(self, job_id: str, claim_token: str) -> JobRecord:
+        record = self._records.get(job_id)
+        if (
+            record is None or record.status != STATUS_RUNNING
+            or not claim_token or record.claim_token != claim_token
+        ):
+            raise JobLeaseLost(f"job claim is no longer owned: {job_id}")
+        return record
+
+    def set_progress(self, job_id: str, progress: float, message: str, *, claim_token: str) -> None:
         with self._lock:
-            record = self._records.get(job_id)
-            if record is None:
-                return
+            record = self._owned_record(job_id, claim_token)
             record.progress = min(max(progress, 0.0), 1.0)
             record.message = message
             record.heartbeat_at = _now()
             record.updated_at = record.heartbeat_at
 
-    def store_result(self, job_id: str, result: str) -> None:
+    def store_result(self, job_id: str, result: str, *, claim_token: str) -> None:
         with self._lock:
+            self._owned_record(job_id, claim_token)
             self._results[job_id] = result
 
-    def complete(self, job_id: str, *, message: str = "") -> None:
+    def complete(self, job_id: str, *, claim_token: str, message: str = "") -> None:
         with self._lock:
-            record = self._records.get(job_id)
-            if record is None:
-                return
+            record = self._owned_record(job_id, claim_token)
             record.status = STATUS_DONE
             record.progress = 1.0
             record.message = message or "completed"
             record.updated_at = _now()
 
-    def fail(self, job_id: str, *, error: str, error_class: str = "") -> None:
+    def fail(self, job_id: str, *, claim_token: str, error: str, error_class: str = "") -> None:
         with self._lock:
-            record = self._records.get(job_id)
-            if record is None:
-                return
+            record = self._owned_record(job_id, claim_token)
+            self._results.pop(job_id, None)
             record.status = STATUS_ERROR
             record.error = error[:2000]
             record.error_class = error_class
@@ -374,20 +387,25 @@ class InProcessJobBackend(JobBackend):
 
     def get(self, job_id: str) -> JobRecord | None:
         with self._lock:
-            return self._records.get(job_id)
+            record = self._records.get(job_id)
+            return replace(record) if record is not None else None
 
     def get_result(self, job_id: str) -> str | None:
         with self._lock:
             return self._results.get(job_id)
 
-    def requeue(self, job_id: str, *, reason: str = "") -> bool:
+    def requeue(self, job_id: str, *, claim_token: str, reason: str = "") -> bool:
         with self._cv:
             record = self._records.get(job_id)
             # Only a *running* job can be handed back; re-queueing an already
             # queued job would put it in the queue twice.
-            if record is None or record.status != STATUS_RUNNING:
+            if (record is None or record.status != STATUS_RUNNING
+                    or not claim_token or record.claim_token != claim_token):
                 return False
             record.status = STATUS_QUEUED
+            record.claim_token = ""
+            record.worker_id = ""
+            self._results.pop(job_id, None)
             record.attempts = max(0, record.attempts - 1)
             record.message = reason or "re-queued"
             record.updated_at = _now()
@@ -402,6 +420,9 @@ class InProcessJobBackend(JobBackend):
             for record in self._records.values():
                 if record.status != STATUS_RUNNING or record.heartbeat_at > cutoff:
                     continue
+                record.claim_token = ""
+                record.worker_id = ""
+                self._results.pop(record.job_id, None)
                 if record.attempts >= MAX_ATTEMPTS:
                     record.status = STATUS_ERROR
                     record.error = (
@@ -426,16 +447,238 @@ class InProcessJobBackend(JobBackend):
 
     def ping(self) -> bool:
         return True
+# Lua runs on Redis for both transports. All keys are explicit, and types are
+# checked before any write: Redis scripts are atomic but do not roll back errors.
+# A recovery lease is written BEFORE removing queue membership; recovery removes
+# its lease LAST. Thus even an interrupted write leaves a discoverable job.
+_TRANSITION_SCRIPT = """
+local op, id, kind = ARGV[1], ARGV[2], ARGV[3]
+local token, now, ttl = ARGV[4], tonumber(ARGV[5]), tonumber(ARGV[6])
+local expected_types = {'string', 'string', 'string', 'list', 'zset'}
+for i, expected in ipairs(expected_types) do
+    local actual = redis.call('TYPE', KEYS[i]).ok
+    if actual ~= 'none' and actual ~= expected then
+        return redis.error_reply('invalid job key type')
+    end
+end
+if not ttl or ttl <= 0 or ttl ~= math.floor(ttl) then
+    return redis.error_reply('invalid job TTL')
+end
+local raw = redis.call('GET', KEYS[1])
+local r = nil
+if raw then
+    local ok, parsed = pcall(cjson.decode, raw)
+    if not ok or type(parsed) ~= 'table' or parsed.job_id ~= id
+        or parsed.kind ~= kind then
+        return redis.error_reply('invalid job metadata')
+    end
+    r = parsed
+end
+local function save()
+    redis.call('SET', KEYS[1], cjson.encode(r), 'EX', ttl)
+end
+local function clear_queue()
+    redis.call('LREM', KEYS[4], 0, id)
+end
+local function release()
+    redis.call('ZREM', KEYS[5], id)
+end
+local function requeue(message, attempts)
+    r.status, r.claim_token, r.worker_id = 'queued', '', ''
+    r.message, r.updated_at, r.attempts = message, now, attempts
+    -- Retain the lease until queue membership AND metadata are committed.
+    clear_queue()
+    redis.call('LPUSH', KEYS[4], id)
+    redis.call('DEL', KEYS[3])
+    save()
+    release()
+    return 1
+end
+if op == 'claim' then
+    if redis.call('LINDEX', KEYS[4], -1) ~= id then return nil end
+    if not r or r.status ~= 'queued' then
+        clear_queue()
+        return nil
+    end
+    local payload = redis.call('GET', KEYS[2])
+    if not payload then
+        r.status, r.error_class = 'error', 'JobPayloadMissing'
+        r.error, r.message = 'queued job payload expired or is missing', 'failed'
+        r.updated_at = now
+        save()
+        clear_queue()
+        release()
+        return nil
+    end
+    r.status, r.worker_id, r.claim_token = 'running', ARGV[7], token
+    r.attempts = (tonumber(r.attempts) or 0) + 1
+    r.progress, r.heartbeat_at, r.updated_at = 0, now, now
+    r.message = 'claimed by worker'
+    local encoded = cjson.encode(r)
+    redis.call('ZADD', KEYS[5], now, id)
+    redis.call('SET', KEYS[1], encoded, 'EX', ttl)
+    redis.call('EXPIRE', KEYS[2], ttl)
+    redis.call('DEL', KEYS[3])
+    clear_queue()
+    return {encoded, payload}
+end
+if op == 'recover' then
+    local score = tonumber(redis.call('ZSCORE', KEYS[5], id))
+    local cutoff = tonumber(ARGV[7])
+    if not score or score > cutoff then return 0 end
+    if not r or (r.status ~= 'running' and r.status ~= 'queued') then
+        release()
+        return 0
+    end
+    if r.status == 'running' and (tonumber(r.heartbeat_at) or 0) > cutoff then
+        return 0
+    end
+    local attempts = tonumber(r.attempts) or 0
+    -- Queued + lease can result from an interrupted claim/recovery script.
+    if r.status == 'queued' or attempts < tonumber(ARGV[8]) then
+        return requeue('re-queued after worker lease expired', attempts)
+    end
+    r.status, r.claim_token, r.worker_id = 'error', '', ''
+    r.error = 'abandoned after ' .. attempts .. ' attempts (worker lease expired each time)'
+    r.error_class, r.message, r.updated_at = 'JobAbandoned', 'failed', now
+    redis.call('DEL', KEYS[3])
+    save()
+    clear_queue()
+    release()
+    return 0
+end
+if not r or r.status ~= 'running' or token == '' or r.claim_token ~= token then
+    return 0
+end
+if op == 'progress' then
+    r.progress, r.message = tonumber(ARGV[7]), ARGV[8]
+    r.heartbeat_at, r.updated_at = now, now
+    redis.call('ZADD', KEYS[5], now, id)
+    redis.call('EXPIRE', KEYS[2], ttl)
+    save()
+elseif op == 'result' then
+    redis.call('SET', KEYS[3], ARGV[7], 'EX', ttl)
+elseif op == 'requeue' then
+    return requeue(ARGV[7], math.max(0, (tonumber(r.attempts) or 0) - 1))
+elseif op == 'done' or op == 'error' then
+    r.status, r.message, r.updated_at = op, ARGV[7], now
+    r.error, r.error_class = ARGV[8], ARGV[9]
+    if op == 'done' then r.progress = 1 else redis.call('DEL', KEYS[3]) end
+    save()
+    clear_queue()
+    release()
+else
+    return redis.error_reply('unknown job transition')
+end
+return 1
+"""
+
+
+class _AtomicJobBackend(JobBackend):
+    """Shared Redis state machine, independent of TCP versus REST transport."""
+
+    _prefix: str
+    _ttl: int
+    _poll_min_seconds = 0.05
+
+    def _command(self, *args: str | int | float) -> Any:
+        raise NotImplementedError
+
+    def _read_record(self, job_id: str) -> JobRecord | None:
+        raise NotImplementedError
+
+    def _transition(
+        self, operation: str, job_id: str, kind: str, token: str, *args: str | int | float
+    ) -> Any:
+        return self._command(
+            "EVAL", _TRANSITION_SCRIPT, 5,
+            _meta_key(self._prefix, job_id), _payload_key(self._prefix, job_id),
+            _result_key(self._prefix, job_id), _queue_key(self._prefix, kind),
+            _lease_key(self._prefix, kind),
+            operation, job_id, kind, token, _now(), self._ttl, *args,
+        )
+
+    def claim(
+        self, kinds: Sequence[str], *, worker_id: str
+    ) -> tuple[JobRecord, str] | None:
+        deadline = time.monotonic() + float(config.JOB_QUEUE_CLAIM_TIMEOUT_SECONDS)
+        poll = max(self._poll_min_seconds, float(config.JOB_QUEUE_POLL_SECONDS))
+        while True:
+            for kind in kinds:
+                # Peeking is non-destructive. The script rechecks membership and
+                # status, then commits ownership, lease and removal together.
+                job_id = self._command("LINDEX", _queue_key(self._prefix, kind), -1)
+                if not isinstance(job_id, str):
+                    continue
+                result = self._transition("claim", job_id, kind, uuid.uuid4().hex, worker_id)
+                if result:
+                    record = JobRecord.from_json(result[0])
+                    if record is None:
+                        raise JobQueueError("claim returned invalid metadata")
+                    return record, str(result[1])
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            time.sleep(min(poll, remaining))
+
+    def _owned_transition(
+        self, operation: str, job_id: str, claim_token: str, *args: str | int | float
+    ) -> None:
+        record = self._read_record(job_id)
+        # This read only determines the key names. Ownership is checked again
+        # inside the atomic operation, never trusted from a client-side read.
+        if record is None or not self._transition(
+            operation, job_id, record.kind, claim_token, *args
+        ):
+            raise JobLeaseLost(f"job claim is no longer owned: {job_id}")
+
+    def set_progress(
+        self, job_id: str, progress: float, message: str, *, claim_token: str
+    ) -> None:
+        self._owned_transition(
+            "progress", job_id, claim_token, min(max(progress, 0.0), 1.0), message
+        )
+
+    def store_result(self, job_id: str, result: str, *, claim_token: str) -> None:
+        self._owned_transition("result", job_id, claim_token, result)
+
+    def complete(self, job_id: str, *, claim_token: str, message: str = "") -> None:
+        self._owned_transition("done", job_id, claim_token, message or "completed", "", "")
+
+    def fail(
+        self, job_id: str, *, claim_token: str, error: str, error_class: str = ""
+    ) -> None:
+        self._owned_transition("error", job_id, claim_token, "failed", error[:2000], error_class)
+
+    def requeue(self, job_id: str, *, claim_token: str, reason: str = "") -> bool:
+        try:
+            self._owned_transition("requeue", job_id, claim_token, reason or "re-queued")
+            return True
+        except JobLeaseLost:
+            return False
+        except JobQueueError:
+            logger.exception("requeue failed job_id=%s", job_id)
+            return False
+
+    def requeue_stale(self) -> int:
+        cutoff = _now() - float(config.JOB_QUEUE_LEASE_SECONDS)
+        requeued = 0
+        for kind in KINDS:
+            stale = self._command(
+                "ZRANGEBYSCORE", _lease_key(self._prefix, kind), "-inf", cutoff
+            )
+            for job_id in stale or []:
+                requeued += int(self._transition(
+                    "recover", str(job_id), kind, "", cutoff, MAX_ATTEMPTS
+                ))
+        return requeued
 
 
 # ------------------------------------------------------------- redis-py impl
-class RedisJobBackend(JobBackend):
+class RedisJobBackend(_AtomicJobBackend):
     """redis-py backend for in-cluster Redis (``VA_LSE_REDIS_URL``).
 
-    Claiming polls ``RPOP`` rather than blocking on ``BRPOP`` so the same claim
-    loop, lease bookkeeping, and timeout semantics apply to every backend —
-    Upstash's REST API has no blocking pop, and one code path is easier to
-    reason about than two.
+    Uses the same atomic transitions as the REST transport.
     """
 
     name = "redis"
@@ -490,11 +733,9 @@ class RedisJobBackend(JobBackend):
             raw = self._client.get(_meta_key(self._prefix, job_id))
         return JobRecord.from_json(raw if isinstance(raw, str) else None)
 
-    def _touch_lease(self, record: JobRecord) -> None:
-        with self._transport("update job lease"):
-            self._client.zadd(
-                _lease_key(self._prefix, record.kind), {record.job_id: record.heartbeat_at}
-            )
+    def _command(self, *args: str | int | float) -> Any:
+        with self._transport(str(args[0])):
+            return self._client.execute_command(*args)
 
     # -- producer -----------------------------------------------------------
     def enqueue(self, kind: str, payload: str, *, request_id: str = "") -> JobRecord:
@@ -517,79 +758,6 @@ class RedisJobBackend(JobBackend):
             raise JobQueueError(f"enqueue failed: {type(exc).__name__}: {exc}") from exc
         return record
 
-    # -- consumer -----------------------------------------------------------
-    def claim(
-        self, kinds: Sequence[str], *, worker_id: str
-    ) -> tuple[JobRecord, str] | None:
-        deadline = time.monotonic() + float(config.JOB_QUEUE_CLAIM_TIMEOUT_SECONDS)
-        poll = max(0.05, float(config.JOB_QUEUE_POLL_SECONDS))
-        while True:
-            for kind in kinds:
-                with self._transport("claim"):
-                    raw_id = self._client.rpop(_queue_key(self._prefix, kind))
-                job_id = raw_id if isinstance(raw_id, str) else ""
-                if not job_id:
-                    continue
-                record = self._read_record(job_id)
-                with self._transport("read job payload"):
-                    payload = self._client.get(_payload_key(self._prefix, job_id))
-                # Only a queued job may be claimed, so a duplicate queue entry
-                # cannot start a second concurrent run of the same job.
-                if (
-                    record is None
-                    or not isinstance(payload, str)
-                    or record.status != STATUS_QUEUED
-                ):
-                    continue
-                record.status = STATUS_RUNNING
-                record.worker_id = worker_id
-                record.attempts += 1
-                record.heartbeat_at = _now()
-                record.updated_at = record.heartbeat_at
-                record.message = "claimed by worker"
-                self._set_record(record)
-                self._touch_lease(record)
-                return record, payload
-            if time.monotonic() >= deadline:
-                return None
-            time.sleep(poll)
-
-    def set_progress(self, job_id: str, progress: float, message: str) -> None:
-        record = self._read_record(job_id)
-        if record is None:
-            return
-        record.progress = min(max(progress, 0.0), 1.0)
-        record.message = message
-        record.heartbeat_at = _now()
-        record.updated_at = record.heartbeat_at
-        self._set_record(record)
-        self._touch_lease(record)
-
-    def store_result(self, job_id: str, result: str) -> None:
-        with self._transport("store result"):
-            self._client.set(_result_key(self._prefix, job_id), result, ex=self._ttl)
-
-    def _finish(self, job_id: str, status: str, message: str, error: str = "", error_class: str = "") -> None:
-        record = self._read_record(job_id)
-        if record is None:
-            return
-        record.status = status
-        record.message = message
-        record.error = error[:2000]
-        record.error_class = error_class
-        record.updated_at = _now()
-        if status == STATUS_DONE:
-            record.progress = 1.0
-        self._set_record(record)
-        with self._transport("release job lease"):
-            self._client.zrem(_lease_key(self._prefix, record.kind), job_id)
-
-    def complete(self, job_id: str, *, message: str = "") -> None:
-        self._finish(job_id, STATUS_DONE, message or "completed")
-
-    def fail(self, job_id: str, *, error: str, error_class: str = "") -> None:
-        self._finish(job_id, STATUS_ERROR, "failed", error, error_class)
-
     def get(self, job_id: str) -> JobRecord | None:
         try:
             return self._read_record(job_id)
@@ -603,61 +771,6 @@ class RedisJobBackend(JobBackend):
         except Exception:  # noqa: BLE001
             return None
         return raw if isinstance(raw, str) else None
-
-    def requeue(self, job_id: str, *, reason: str = "") -> bool:
-        try:
-            record = self._read_record(job_id)
-            # Only a *running* job can be handed back; re-queueing an already
-            # queued job would put it in the queue twice.
-            if record is None or record.status != STATUS_RUNNING:
-                return False
-            record.status = STATUS_QUEUED
-            record.attempts = max(0, record.attempts - 1)
-            record.message = reason or "re-queued"
-            record.updated_at = _now()
-            self._set_record(record)
-            with self._transport("requeue"):
-                self._client.zrem(_lease_key(self._prefix, record.kind), job_id)
-                self._client.lpush(_queue_key(self._prefix, record.kind), job_id)
-            return True
-        except Exception as exc:  # noqa: BLE001
-            logger.error(
-                "requeue failed job_id=%s error=%s", job_id, f"{type(exc).__name__}: {exc}"
-            )
-            return False
-
-    def requeue_stale(self) -> int:
-        cutoff = _now() - float(config.JOB_QUEUE_LEASE_SECONDS)
-        requeued = 0
-        for kind in KINDS:
-            lease_key = _lease_key(self._prefix, kind)
-            with self._transport("sweep stale jobs"):
-                stale = self._client.zrangebyscore(lease_key, "-inf", f"({cutoff}")
-            for raw_id in stale if isinstance(stale, list) else []:
-                job_id = str(raw_id)
-                record = self._read_record(job_id)
-                with self._transport("clear expired lease"):
-                    self._client.zrem(lease_key, job_id)
-                if record is None or record.status != STATUS_RUNNING:
-                    continue
-                if record.attempts >= MAX_ATTEMPTS:
-                    self._finish(
-                        job_id,
-                        STATUS_ERROR,
-                        "failed",
-                        f"abandoned after {record.attempts} attempts "
-                        "(worker lease expired each time)",
-                        "JobAbandoned",
-                    )
-                    continue
-                record.status = STATUS_QUEUED
-                record.message = "re-queued after worker lease expired"
-                record.updated_at = _now()
-                self._set_record(record)
-                with self._transport("re-queue stale job"):
-                    self._client.lpush(_queue_key(self._prefix, kind), job_id)
-                requeued += 1
-        return requeued
 
     def depth(self) -> int:
         try:
@@ -717,16 +830,17 @@ class _UpstashRest:
         return data
 
 
-class UpstashJobBackend(JobBackend):
+class UpstashJobBackend(_AtomicJobBackend):
     """Upstash Redis / Vercel KV backend over HTTP REST.
 
     Reuses the same credentials as the reference-data cache, so Pattern C can be
-    adopted without deploying an in-cluster Redis. Claiming polls ``RPOP``
-    because the REST API has no blocking pop.
+    adopted without deploying an in-cluster Redis. The same atomic script as
+    the TCP backend is executed via the REST JSON command API.
     """
 
     name = "upstash_rest"
     is_distributed = True
+    _poll_min_seconds = 0.25
 
     def __init__(
         self,
@@ -740,6 +854,9 @@ class UpstashJobBackend(JobBackend):
         self._prefix = prefix
         self._ttl = ttl_seconds
         self._rest = _UpstashRest(url, token, timeout_seconds=timeout_seconds)
+
+    def _command(self, *args: str | int | float) -> Any:
+        return self._rest.command(*args)
 
     # -- helpers ------------------------------------------------------------
     def _set_record(self, record: JobRecord) -> None:
@@ -774,89 +891,6 @@ class UpstashJobBackend(JobBackend):
             raise JobQueueError(f"enqueue failed: {type(exc).__name__}: {exc}") from exc
         return record
 
-    # -- consumer -----------------------------------------------------------
-    def claim(
-        self, kinds: Sequence[str], *, worker_id: str
-    ) -> tuple[JobRecord, str] | None:
-        deadline = time.monotonic() + float(config.JOB_QUEUE_CLAIM_TIMEOUT_SECONDS)
-        poll = max(0.25, float(config.JOB_QUEUE_POLL_SECONDS))
-        while True:
-            for kind in kinds:
-                raw_id = self._rest.command("RPOP", _queue_key(self._prefix, kind))
-                job_id = raw_id if isinstance(raw_id, str) else ""
-                if not job_id:
-                    continue
-                record = self._read_record(job_id)
-                payload_raw = self._rest.command("GET", _payload_key(self._prefix, job_id))
-                if (
-                    record is None
-                    or not isinstance(payload_raw, str)
-                    or record.status != STATUS_QUEUED
-                ):
-                    continue
-                record.status = STATUS_RUNNING
-                record.worker_id = worker_id
-                record.attempts += 1
-                record.heartbeat_at = _now()
-                record.updated_at = record.heartbeat_at
-                record.message = "claimed by worker"
-                self._set_record(record)
-                self._rest.command(
-                    "ZADD",
-                    _lease_key(self._prefix, kind),
-                    record.heartbeat_at,
-                    job_id,
-                )
-                return record, payload_raw
-            if time.monotonic() >= deadline:
-                return None
-            time.sleep(poll)
-
-    def set_progress(self, job_id: str, progress: float, message: str) -> None:
-        record = self._read_record(job_id)
-        if record is None:
-            return
-        record.progress = min(max(progress, 0.0), 1.0)
-        record.message = message
-        record.heartbeat_at = _now()
-        record.updated_at = record.heartbeat_at
-        self._set_record(record)
-        self._rest.command(
-            "ZADD", _lease_key(self._prefix, record.kind), record.heartbeat_at, job_id
-        )
-
-    def store_result(self, job_id: str, result: str) -> None:
-        self._rest.command(
-            "SET", _result_key(self._prefix, job_id), result, "EX", self._ttl
-        )
-
-    def _finish(
-        self,
-        job_id: str,
-        status: str,
-        message: str,
-        error: str = "",
-        error_class: str = "",
-    ) -> None:
-        record = self._read_record(job_id)
-        if record is None:
-            return
-        record.status = status
-        record.message = message
-        record.error = error[:2000]
-        record.error_class = error_class
-        record.updated_at = _now()
-        if status == STATUS_DONE:
-            record.progress = 1.0
-        self._set_record(record)
-        self._rest.command("ZREM", _lease_key(self._prefix, record.kind), job_id)
-
-    def complete(self, job_id: str, *, message: str = "") -> None:
-        self._finish(job_id, STATUS_DONE, message or "completed")
-
-    def fail(self, job_id: str, *, error: str, error_class: str = "") -> None:
-        self._finish(job_id, STATUS_ERROR, "failed", error, error_class)
-
     def get(self, job_id: str) -> JobRecord | None:
         try:
             return self._read_record(job_id)
@@ -869,58 +903,6 @@ class UpstashJobBackend(JobBackend):
         except Exception:  # noqa: BLE001
             return None
         return raw if isinstance(raw, str) else None
-
-    def requeue(self, job_id: str, *, reason: str = "") -> bool:
-        try:
-            record = self._read_record(job_id)
-            if record is None or record.status != STATUS_RUNNING:
-                return False
-            record.status = STATUS_QUEUED
-            record.attempts = max(0, record.attempts - 1)
-            record.message = reason or "re-queued"
-            record.updated_at = _now()
-            self._set_record(record)
-            self._rest.command("ZREM", _lease_key(self._prefix, record.kind), job_id)
-            self._rest.command("LPUSH", _queue_key(self._prefix, record.kind), job_id)
-            return True
-        except Exception as exc:  # noqa: BLE001
-            logger.error(
-                "requeue failed job_id=%s error=%s", job_id, f"{type(exc).__name__}: {exc}"
-            )
-            return False
-
-    def requeue_stale(self) -> int:
-        cutoff = _now() - float(config.JOB_QUEUE_LEASE_SECONDS)
-        requeued = 0
-        for kind in KINDS:
-            lease_key = _lease_key(self._prefix, kind)
-            try:
-                stale = self._rest.command("ZRANGEBYSCORE", lease_key, "-inf", f"({cutoff}")
-            except JobQueueError:
-                continue
-            for raw_id in stale if isinstance(stale, list) else []:
-                job_id = str(raw_id)
-                self._rest.command("ZREM", lease_key, job_id)
-                record = self._read_record(job_id)
-                if record is None or record.status != STATUS_RUNNING:
-                    continue
-                if record.attempts >= MAX_ATTEMPTS:
-                    self._finish(
-                        job_id,
-                        STATUS_ERROR,
-                        "failed",
-                        f"abandoned after {record.attempts} attempts "
-                        "(worker lease expired each time)",
-                        "JobAbandoned",
-                    )
-                    continue
-                record.status = STATUS_QUEUED
-                record.message = "re-queued after worker lease expired"
-                record.updated_at = _now()
-                self._set_record(record)
-                self._rest.command("LPUSH", _queue_key(self._prefix, kind), job_id)
-                requeued += 1
-        return requeued
 
     def depth(self) -> int:
         total = 0

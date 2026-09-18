@@ -425,6 +425,26 @@ under `VA_LSE_JOB_QUEUE_PREFIX` (default `va_lse`):
 All three carry `VA_LSE_JOB_QUEUE_TTL_SECONDS` (24 h default), so completed jobs expire on
 their own.
 
+Claims and worker updates use a shared Lua script (`EVAL`) on both Redis and
+Upstash. Claiming records a unique attempt token and recovery lease before
+removing queue membership. Recovery rechecks the heartbeat atomically; progress,
+results, completion, failure, and draining requeues require the current token.
+An interrupted request may have succeeded on the server: let its lease expire
+and let the stale sweep recover it. Execution remains at-least-once, not
+exactly-once. Recovery depends on retaining queue metadata and leases; database
+loss, eviction, and payload expiration are not worker-interruption recovery.
+
+**Upgrade:** drain/stop all old worker processes before starting this version.
+Old workers do not enforce attempt ownership and must not overlap new workers.
+Existing queued jobs and leased running jobs keep their key layout and remain
+readable. Jobs already orphaned by an older version (absent from both the queue
+and lease set) need operator reconciliation or resubmission; this change does
+not scan all historical metadata. Redis credentials must permit `EVAL` and the
+commands it executes. The supplied deployment uses standalone Redis; on Redis
+Cluster, all queue keys must share a hash tag in `VA_LSE_JOB_QUEUE_PREFIX`
+(for example `{va_lse}`). Changing that prefix creates a separate queue, so
+drain the original queue before changing it.
+
 Redis holds the *payload*, not the uploaded PDFs: extraction still happens on the web pod,
 so what crosses the queue is the page-labelled record text. That text is what makes a large
 job large, so above `VA_LSE_JOB_QUEUE_INLINE_MAX_BYTES` (256 KB default) the payload is
@@ -1955,4 +1975,3 @@ python scripts/rehearse_failover.py --expect-idle
 - [ ] `VA_LSE_AUDIT_ERROR_MESSAGES=0` if audit logs go to a third-party destination
 - [ ] The LLM failover drill has been run to completion ([§17](#17-llm-endpoint-failover-optional)) — an
       untested failover path fails on the day it is needed, not before
-

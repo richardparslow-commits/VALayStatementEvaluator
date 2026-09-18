@@ -53,7 +53,7 @@ from .job_payload import (
     decode_job,
     encode_result,
 )
-from .job_queue import KINDS, JobBackend, JobQueueError, JobRecord, get_job_backend
+from .job_queue import KINDS, JobBackend, JobLeaseLost, JobQueueError, JobRecord, get_job_backend
 from .llm import LLMClient, LLMError
 from .logging_config import configure_logging, get_logger, set_request_id
 from .pipeline_guard import (
@@ -116,7 +116,9 @@ def _progress_callback(backend: JobBackend, record: JobRecord) -> ProgressCallba
             return
         last_sent = now
         try:
-            backend.set_progress(record.job_id, fraction, message)
+            backend.set_progress(record.job_id, fraction, message, claim_token=record.claim_token)
+        except JobLeaseLost:
+            raise
         except Exception as exc:  # noqa: BLE001 - progress must never kill a run
             logger.warning(
                 "progress update failed job_id=%s error=%s",
@@ -356,7 +358,7 @@ def execute_job(
 
     duration_ms = int((time.perf_counter() - t0) * 1000)
     try:
-        backend.store_result(record.job_id, encode_result(run))
+        backend.store_result(record.job_id, encode_result(run), claim_token=record.claim_token)
     except Exception as exc:  # noqa: BLE001 - an unstorable result is a failed job
         _fail(
             backend, record, exc, type(exc).__name__,
@@ -364,14 +366,18 @@ def execute_job(
         )
         return False
     try:
-        backend.complete(record.job_id, message=f"completed in {duration_ms / 1000:.0f}s")
-    except Exception as exc:  # noqa: BLE001 - result is stored; state write is best-effort
+        backend.complete(
+            record.job_id, claim_token=record.claim_token,
+            message=f"completed in {duration_ms / 1000:.0f}s",
+        )
+    except Exception as exc:  # noqa: BLE001 - an unconfirmed completion is not success
         logger.error(
             "could not mark job complete job_id=%s error=%s",
             record.job_id,
             f"{type(exc).__name__}: {exc}",
             extra={"phase": "worker", "status": "error"},
         )
+        return False
     totals = run.usage.totals()
     # Preserved across the queue round trip (see job_payload), so the record of a
     # run served by the backup provider survives to the audit log and the run log.
@@ -471,7 +477,9 @@ def _fail(
         except Exception:  # noqa: BLE001 - audit is best-effort
             pass
     try:
-        backend.fail(record.job_id, error=detail, error_class=error_class)
+        backend.fail(
+            record.job_id, claim_token=record.claim_token, error=detail, error_class=error_class
+        )
     except Exception as write_exc:  # noqa: BLE001
         logger.error(
             "could not record job failure job_id=%s error=%s",
@@ -565,7 +573,10 @@ def run_worker(
                 "shutdown in progress; re-queueing claimed job job_id=%s", record.job_id
             )
             try:
-                active.requeue(record.job_id, reason="re-queued: worker was draining")
+                active.requeue(
+                    record.job_id, claim_token=record.claim_token,
+                    reason="re-queued: worker was draining",
+                )
             except Exception:  # noqa: BLE001
                 pass
             stats.requeued += 1

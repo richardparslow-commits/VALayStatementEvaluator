@@ -8,9 +8,8 @@ comes back decodable.
 
 This runs the Upstash REST protocol against a real ``ThreadingHTTPServer`` on a
 loopback port, with a producer backend and a consumer backend constructed
-separately — so nothing is shared except the HTTP contract. It deliberately uses
-the Upstash tier because it is stdlib-only: no Redis server, no extra package, so
-CI and local runs behave identically.
+separately — so nothing is shared except the HTTP contract. The HTTP transport remains stdlib-only; the test server uses fakeredis with
+Lua support to execute the same atomic transitions used in production.
 """
 import json
 import sys
@@ -23,6 +22,7 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from test_job_queue import _FakeRedisClient
 from log_isolation import isolate_app_logs  # noqa: E402
 
 from app import config  # noqa: E402
@@ -53,9 +53,7 @@ class _FakeUpstashHandler(BaseHTTPRequestHandler):
     rather than a silently green test.
     """
 
-    store: dict[str, str] = {}
-    lists: dict[str, list[str]] = {}
-    zsets: dict[str, dict[str, float]] = {}
+    client = _FakeRedisClient()
     lock = threading.Lock()
     commands: list[list] = []
 
@@ -78,38 +76,7 @@ class _FakeUpstashHandler(BaseHTTPRequestHandler):
         self.wfile.write(encoded)
 
     def _run(self, body: list) -> object:
-        op = str(body[0]).upper()
-        if op == "SET":
-            self.store[str(body[1])] = str(body[2])
-            return "OK"
-        if op == "GET":
-            return self.store.get(str(body[1]))
-        if op == "LPUSH":
-            self.lists.setdefault(str(body[1]), []).insert(0, str(body[2]))
-            return len(self.lists[str(body[1])])
-        if op == "RPOP":
-            items = self.lists.get(str(body[1])) or []
-            return items.pop() if items else None
-        if op == "LLEN":
-            return len(self.lists.get(str(body[1])) or [])
-        if op == "ZADD":
-            self.zsets.setdefault(str(body[1]), {})[str(body[3])] = float(body[2])
-            return 1
-        if op == "ZREM":
-            return 1 if self.zsets.get(str(body[1]), {}).pop(str(body[2]), None) else 0
-        if op == "ZRANGEBYSCORE":
-            exclusive = str(body[3]).startswith("(")
-            bound = float(str(body[3]).lstrip("("))
-            return [
-                member
-                for member, score in sorted(
-                    self.zsets.get(str(body[1]), {}).items(), key=lambda kv: kv[1]
-                )
-                if (score < bound if exclusive else score <= bound)
-            ]
-        if op == "PING":
-            return "PONG"
-        raise ValueError(f"unsupported command {op}")
+        return self.client.execute_command(*body)
 
     def log_message(self, format: str, *args: object) -> None:  # noqa: A002
         pass
@@ -162,9 +129,7 @@ class TestTwoClientQueueFlow(unittest.TestCase):
         cls.server.server_close()
 
     def setUp(self) -> None:
-        _FakeUpstashHandler.store.clear()
-        _FakeUpstashHandler.lists.clear()
-        _FakeUpstashHandler.zsets.clear()
+        _FakeUpstashHandler.client.flushall()
         _FakeUpstashHandler.commands.clear()
         self._tmpdir = isolate_app_logs(self)
         shutdown.reset_for_tests()
