@@ -63,6 +63,7 @@ from .follow_up import (
 )
 
 from . import job_runner
+from .ops import render_failure_detail
 from .shared import (
     FEATURE_ID,
     audit_condition_for_slot,
@@ -354,6 +355,7 @@ def _run_evaluation_flow(statement_text: str, records: list) -> None:
             },
         )
         st.error(f"Evaluation aborted: {format_error_for_user(mem_exc, rid)}")
+        render_failure_detail(rid)
         return
     except PipelineTimeoutError as timeout_exc:
         bar.empty()
@@ -375,6 +377,7 @@ def _run_evaluation_flow(statement_text: str, records: list) -> None:
             },
         )
         st.error(f"Evaluation aborted: {format_error_for_user(timeout_exc, rid)}")
+        render_failure_detail(rid)
         return
     except Exception as exc:  # noqa: BLE001
         bar.empty()
@@ -407,6 +410,7 @@ def _run_evaluation_flow(statement_text: str, records: list) -> None:
             record_pages=_audit_pages,
         )
         st.error(f"Evaluation failed: {format_error_for_user(exc, rid)}")
+        render_failure_detail(rid)
         return
     except BaseException as ctrl:  # noqa: BLE001 - Streamlit control flow (see comment)
         # Last clause on purpose: ``RerunException``/``StopException`` derive from
@@ -1252,6 +1256,10 @@ def _render_evaluation_results(eval_result: Any) -> None:
             + " Check the sidebar model names and base URL (About → Recent run log "
             "shows the LLM call count for this run), then re-run."
         )
+        # A run that returned nothing usable is still a failed run: the reference
+        # is in the message, so the lines it points at belong beside it too.
+        if rid:
+            render_failure_detail(rid)
 
     if getattr(eval_result, "truncation_warning", ""):
         st.warning(

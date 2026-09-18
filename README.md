@@ -1037,6 +1037,10 @@ record (`request_id`), appended to every user-facing error as `reference: req_�
 correlation, and never carries PII — logs emit only phases, timings, counts, and classifications
 (prompt/response bodies, statements, observations, and record text are excluded).
 
+- **`app/views/ops.py`** — `render_failure_detail()` puts that lookup beside the failure that quoted
+  the reference (the draft, evaluate and queued-run failure paths, plus the root render boundary and
+  the empty-analysis guard), remembering each answer for the session so a repainting expander does
+  not re-read the run log.
 - **`app/diagnostics.py`** — resolves a reference to the lines behind it, so "what happened to my run?"
   is answerable without a shell on the pod: `About → Look up a reference` takes the id (or the whole
   error message) and returns the run-log events plus the log lines, with secrets scrubbed. It reads
@@ -1080,7 +1084,10 @@ Configure via env (see `.env.example`): `VA_LSE_LOG_LEVEL`, `VA_LSE_LOG_JSON` (J
 When the Draft tab shows `Drafting failed: ... (reference: req_...)`, keep the reference id and
 look it up in the structured logs:
 
-- **In the app:** `About → 🔎 Look up a reference`, which resolves the id (or the whole error
+- **Under the error:** every failed run renders a **What happened?** expander right beneath it,
+  already resolved to that reference's lines — including a queued run, whose lines were written by a
+  worker in another process. Nothing to paste, nothing to look up.
+- **In the app:** `About → 🔎 Look up a reference`, which resolves any id (or a whole error
   message) to its run-log events and log lines. Needs no shell on the server.
 - Diagnostic log: `${VA_LSE_LOG_DIR:-stdout}/app.log`
 - Audit trail: `${VA_LSE_AUDIT_LOG_DIR:-logs}/audit.log`

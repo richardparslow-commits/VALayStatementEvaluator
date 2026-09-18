@@ -75,6 +75,66 @@ def _unattributable_renders() -> list[str]:
     return offenders
 
 
+def _quotes_a_reference(call: ast.Call) -> bool:
+    """True when this render hands the user the reference of a run that failed.
+
+    Deliberately narrower than "mentions a reference". A render that calls
+    ``report_failure`` is *creating* a reference for a message that already
+    explains itself, and a pre-run rejection or an export failure has nothing for
+    a run lookup to find — neither should be pushed to grow a detail expander. The
+    trigger is a render that carries an id the user could quote *about a run*:
+    the run-level error formatter, or a run-log style ``(reference: …)`` suffix.
+    """
+    if "format_error_for_user" in _names_in(call):
+        return True
+    return any(
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and "reference:" in node.value.lower()
+        for node in ast.walk(call)
+    )
+
+
+def _failures_without_detail() -> list[str]:
+    """Run failures that quote a reference but do not resolve it in place.
+
+    A reference the user has to carry to another tab (or a shell) is only half the
+    answer, so each of these renders is expected to sit next to a
+    ``render_failure_detail`` call in the same function.
+    """
+    offenders: list[str] = []
+    for path in sorted(APP_DIR.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            renders = [
+                node
+                for node in ast.walk(fn)
+                if _is_streamlit_render(node)
+                and isinstance(node, ast.Call)
+                and _quotes_a_reference(node)
+            ]
+            if not renders:
+                continue
+            # Counted, not merely present: a run function renders several distinct
+            # failures (memory, timeout, general), and one shared call further up
+            # would leave the others quoting a reference with nothing beside it.
+            resolves = [
+                node
+                for node in ast.walk(fn)
+                if isinstance(node, ast.Call) and "render_failure_detail" in _names_in(node)
+            ]
+            if len(resolves) < len(renders):
+                rel = path.relative_to(PROJECT_ROOT)
+                lines = ", ".join(str(r.lineno) for r in renders)
+                offenders.append(
+                    f"{rel}:{lines} in {fn.name}() — {len(renders)} reference "
+                    f"render(s), {len(resolves)} detail expander(s)"
+                )
+    return offenders
+
+
 class TestEveryFailureIsAttributable(unittest.TestCase):
     def test_exception_renders_route_through_a_reporter(self):
         offenders = _unattributable_renders()
@@ -89,6 +149,65 @@ class TestEveryFailureIsAttributable(unittest.TestCase):
                 "rid) when the run id is already known:\n  " + "\n  ".join(offenders)
             ),
         )
+
+    def test_a_failure_that_quotes_a_reference_resolves_it_in_place(self):
+        offenders = _failures_without_detail()
+        self.assertEqual(
+            offenders,
+            [],
+            msg=(
+                "These renders hand the user a reference without giving them the "
+                "lines: add render_failure_detail(<the same id>) directly beneath, "
+                "so the reason is one click from the failure rather than a trip to "
+                "the About tab:\n  " + "\n  ".join(offenders)
+            ),
+        )
+
+    def test_the_detail_guard_detects_a_render_without_it(self):
+        """The scan must fail on the shape it forbids, not merely pass today."""
+        tree = ast.parse(
+            'def f(rid):\n'
+            '    st.error(f"Drafting failed: {format_error_for_user(exc, rid)}")\n'
+        )
+        fn = tree.body[0]
+        assert isinstance(fn, ast.FunctionDef)
+        renders = [
+            n
+            for n in ast.walk(fn)
+            if _is_streamlit_render(n) and isinstance(n, ast.Call) and _quotes_a_reference(n)
+        ]
+        self.assertEqual(len(renders), 1)
+        self.assertFalse(
+            [
+                n
+                for n in ast.walk(fn)
+                if isinstance(n, ast.Call) and "render_failure_detail" in _names_in(n)
+            ]
+        )
+
+    def test_counting_catches_one_missing_call_among_several(self):
+        """Three failure branches, two expanders: the count must fail."""
+        tree = ast.parse(
+            'def f(rid):\n'
+            '    st.error(format_error_for_user(a, rid))\n'
+            '    render_failure_detail(rid)\n'
+            '    st.error(format_error_for_user(b, rid))\n'
+            '    render_failure_detail(rid)\n'
+            '    st.error(format_error_for_user(c, rid))\n'
+        )
+        fn = tree.body[0]
+        assert isinstance(fn, ast.FunctionDef)
+        renders = [
+            n
+            for n in ast.walk(fn)
+            if _is_streamlit_render(n) and isinstance(n, ast.Call) and _quotes_a_reference(n)
+        ]
+        resolves = [
+            n
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Call) and "render_failure_detail" in _names_in(n)
+        ]
+        self.assertEqual((len(renders), len(resolves)), (3, 2))
 
     def test_the_guard_detects_a_bare_render(self):
         """The scan must fail on the shape it forbids, not merely pass today."""

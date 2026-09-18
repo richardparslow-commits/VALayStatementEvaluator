@@ -10,6 +10,10 @@ After 3 consecutive failures the breaker opened for 60s.). Re-run the review; if
 persists, split the record set into smaller files. (reference: req_xxxxx)
 ```
 
+The failure itself carries a **What happened?** expander holding the lines for that
+reference — the run's own log entries and traceback — so start there rather than
+searching the logs by hand.
+
 ## What Happened
 
 The **circuit breaker** (a protective mechanism) detected that the LLM endpoint was

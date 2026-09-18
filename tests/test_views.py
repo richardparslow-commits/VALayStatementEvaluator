@@ -2318,5 +2318,107 @@ class TestRenderEffectivenessScore(unittest.TestCase):
         st_mock.button.assert_not_called()
 
 
+# --------------------------------------------- failure detail beside the error
+class TestRenderFailureDetail(unittest.TestCase):
+    """The in-place resolve of a failure's own reference (app/views/ops.py)."""
+
+    def setUp(self) -> None:
+        from app.diagnostics import install_capture
+        from app.logging_config import clear_request_id
+
+        clear_request_id()
+        self.addCleanup(clear_request_id)
+        install_capture().clear()
+
+    def _fail(self, message: str = "Drafting failed: model returned nothing usable") -> str:
+        """Report a failure the way a view does, and return the id it used."""
+        from app.error_report import report_failure
+        from app.logging_config import new_request_id, set_request_id
+
+        rid = new_request_id()
+        set_request_id(rid)
+        report_failure(message, phase="draft", exc=RuntimeError("boom"))
+        return rid
+
+    def test_expander_renders_the_lines_for_the_reference(self):
+        import app.views.ops as ops
+
+        rid = self._fail()
+        st_mock, _session = _fake_streamlit()
+        with _patch_st(ops, st_mock), patch("app.run_log.read_recent_events", return_value=[]):
+            ops.render_failure_detail(rid)
+
+        st_mock.expander.assert_called_once()
+        self.assertEqual(st_mock.expander.call_args[0][0], "What happened?")
+        rendered = "\n".join(call.args[0] for call in st_mock.code.call_args_list)
+        self.assertIn("model returned nothing usable", rendered)
+        self.assertIn("RuntimeError: boom", rendered)  # the traceback, not just the line
+        # The id is stated once, in the caption, rather than repeated on every line.
+        captions = "\n".join(call.args[0] for call in st_mock.caption.call_args_list)
+        self.assertIn(rid, captions)
+
+    def test_a_non_reference_renders_nothing(self):
+        import app.views.ops as ops
+
+        st_mock, _session = _fake_streamlit()
+        with _patch_st(ops, st_mock):
+            for query in ("", "-", "../etc/passwd", "logs/runs.jsonl"):
+                ops.render_failure_detail(query)
+        st_mock.expander.assert_not_called()
+
+    def test_a_rerun_does_not_read_the_run_log_again(self):
+        """An expander body runs on every rerun, collapsed or not, and the lookup
+        reads the run log — so the answer is remembered per session."""
+        import app.views.ops as ops
+
+        rid = self._fail()
+        st_mock, _session = _fake_streamlit()
+        with _patch_st(ops, st_mock), patch(
+            "app.run_log.read_recent_events", return_value=[]
+        ) as reader:
+            ops.render_failure_detail(rid)
+            ops.render_failure_detail(rid)
+            ops.render_failure_detail(rid)
+
+        self.assertEqual(reader.call_count, 1)
+
+    def test_the_cache_is_bounded(self):
+        import app.views.ops as ops
+
+        st_mock, session = _fake_streamlit()
+        with _patch_st(ops, st_mock), patch("app.run_log.read_recent_events", return_value=[]):
+            for _ in range(ops._FAILURE_CACHE_LIMIT + 5):
+                ops.render_failure_detail(self._fail())
+
+        self.assertLessEqual(
+            len(session[ops._FAILURE_CACHE_KEY]), ops._FAILURE_CACHE_LIMIT
+        )
+
+    def test_worker_only_events_still_answer(self):
+        """A queued run's lines live in another process; the shared run log is what
+        makes the reference resolvable at all."""
+        import app.views.ops as ops
+        from app.logging_config import new_request_id
+
+        rid = new_request_id()
+        event = {
+            "timestamp": "2026-09-18T14:00:00+00:00",
+            "action": "evaluate",
+            "status": "error",
+            "request_id": rid,
+            "error": "RuntimeError: worker exploded",
+            "duration_ms": 12,
+        }
+        st_mock, _session = _fake_streamlit()
+        with _patch_st(ops, st_mock), patch(
+            "app.run_log.read_recent_events", return_value=[event]
+        ):
+            ops.render_failure_detail(rid)
+
+        shown = st_mock.dataframe.call_args[0][0]
+        self.assertEqual(len(shown), 1)
+        self.assertIn("worker exploded", str(shown[0]))
+
+
 if __name__ == "__main__":
     unittest.main()
