@@ -4,6 +4,7 @@ from __future__ import annotations
 import streamlit as st
 
 from ..config import load_knowledge
+from ..diagnostics import CAPTURE_LIMIT, MAX_LINES, lookup
 from .ops import render_run_log_tail
 
 
@@ -68,13 +69,79 @@ specific cause can be found in the logs — no run fails without a trace.
 | ``logs/app.log`` | Structured application log (when file logging is enabled via ``VA_LSE_LOG_DIR``). |
 
 **Reading a reference:** search any of these files for the id, e.g.
-``grep req_4f8a2b1c9d0e logs/runs.jsonl``. Each event line includes a UTC
-timestamp, the action (``draft``/``evaluate``/``app``), the status, and — for
-failures — the exact error and a short traceback. The logs never contain
-statement text, observations, or medical-record content; only sizes, counts,
-and classifications.
+``grep req_4f8a2b1c9d0e logs/runs.jsonl`` — or use **Look up a reference**
+below, which does the search for you and needs no shell access to the server.
+Each event line includes a UTC timestamp, the action (``draft``/``evaluate``/
+``app``), the status, and — for failures — the exact error and a short traceback.
+The logs never contain statement text, observations, or medical-record content;
+only sizes, counts, and classifications. Uploaded **filenames** do appear in
+messages, because "which file failed" is usually the whole question — they are
+stored in the log exactly as the file was named. Secret-shaped strings are
+replaced with ``[redacted]`` before anything is shown here.
 """
     )
 
+    with st.expander("🔎 Look up a reference", expanded=False):
+        _render_reference_lookup()
+
     with st.expander("Recent run log (live)", expanded=False):
         render_run_log_tail()
+
+
+def _render_reference_lookup() -> None:
+    """Resolve a ``req_…`` reference to its lines, from inside the app.
+
+    A form rather than a bare text input: Streamlit reruns on every keystroke, and
+    the lookup reads the run log, so unsubmitted typing must not do I/O. This is
+    also why the panel is here instead of on the health sidecar — that port binds
+    ``0.0.0.0`` with no authentication, and log content should not be published to
+    it. The user's own session is the authorization.
+    """
+    st.caption(
+        "Paste a reference from an error message — the whole message works — to see "
+        "what this app recorded for that run. Nothing is sent anywhere."
+    )
+    with st.form("diagnostics_lookup", clear_on_submit=False):
+        query = st.text_input(
+            "Reference",
+            key="diagnostics_reference_query",
+            placeholder="req_4f8a2b1c9d0e",
+            label_visibility="collapsed",
+        )
+        submitted = st.form_submit_button("Look up", key="diagnostics_lookup_submit")
+    if not submitted or not query.strip():
+        return
+
+    detail = lookup(query)
+    if not detail.valid:
+        st.warning(detail.problem)
+        return
+
+    st.markdown(f"**Reference `{detail.reference}`**")
+
+    if detail.events:
+        st.markdown(
+            f"**Run-log events** ({len(detail.events)} of {detail.scanned} examined) — "
+            "written by whichever process ran the job, including workers:"
+        )
+        st.dataframe(detail.events, width="stretch", hide_index=True)
+    else:
+        st.caption(
+            f"No run-log event for `{detail.reference}` in the last "
+            f"{detail.scanned} event(s)."
+        )
+
+    if detail.lines:
+        st.markdown(
+            f"**Log lines** ({len(detail.lines)} from this process's last "
+            f"{detail.buffered} record(s)):"
+        )
+        st.code("\n".join(detail.lines), language=None)
+    elif detail.note:
+        st.info(detail.note)
+
+    if detail.truncated:
+        st.caption(
+            f"Showing at most {MAX_LINES} lines and {CAPTURE_LIMIT} buffered records; "
+            "older detail is on the server's log files."
+        )
