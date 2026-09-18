@@ -124,6 +124,15 @@ cp scripts/hooks/pre-commit .git/hooks/pre-commit
 chmod +x .git/hooks/pre-commit
 ```
 
+That copy goes stale the next time the hook changes, so it is worth installing as a
+link or a configured hooks path instead — either one keeps the checks below at the
+version in this repository:
+
+```bash
+ln -sfn ../../scripts/hooks/pre-commit .git/hooks/pre-commit   # a link to the file
+git config core.hooksPath scripts/hooks                        # or point git at the directory
+```
+
 The hook rejects any staged path matching:
 
 - `.env` (any `.env` file, including `.env`, `.env.example` is allowed)
@@ -132,6 +141,15 @@ The hook rejects any staged path matching:
 - `*.pem`, `*.key`
 
 and scans staged diffs for lines that look like `KEY=sk-...` or `OPENAI_API_KEY=`.
+
+It also refuses staged test modules that are not wired into the hermetic test
+harness (`tests/harness_imports.py`) — either importing no harness at all or
+importing it after an `app` import, which would let that module read whatever
+configuration this machine happens to have. It is the same rule the suite scans
+with, read from the staged copy, and it has already caught a real mistake: a new
+`tests/test_job_queue_*.py` reached `main` unwired and failed only in CI, on the
+merge result. It needs `python3` on `PATH` (the project's `.venv` is preferred);
+when no interpreter exists the commit is **blocked**, not waved through.
 
 To install as a `pre-commit` framework hook instead, add to `.pre-commit-config.yaml`:
 
@@ -142,6 +160,7 @@ repos:
       - id: no-secrets
         name: Block .env and sk-* secrets
         entry: bash scripts/hooks/pre-commit
+        # Also enforces the test-harness import (tests/harness_imports.py).
         language: system
         pass_filenames: false
 ```

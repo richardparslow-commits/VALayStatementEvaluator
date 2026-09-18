@@ -584,7 +584,11 @@ opposite is invisible in both directions: a test can pass locally and fail in CI
 reverse) for no reason the code can explain. `tests/test_hermetic.py` enforces it, and
 fails if a test module forgets the harness, imports it after the app, if the app starts
 reading a Streamlit config option, or if the suite stops ignoring a deliberately hostile
-environment, secrets file, or machine-scoped config file.
+environment, secrets file, or machine-scoped config file. The commit hook runs the same
+harness rule over the *staged* modules (`tests/harness_imports.py`, so the two cannot
+disagree), because the scan can only see a branch that is already merged: a new test module
+that forgets the harness reached `main` once and failed in CI, on a merge result, one module
+late and unreproducible locally. See [Preventing accidental commits](SECURITY.md#6-preventing-accidental-commits).
 
 CI runs the whole suite that way as its own check — the `hermetic` job, which is
 `python -m tests.hostile` above, using the same fixtures the in-suite canaries use
@@ -1330,6 +1334,6 @@ with your proxy if the stream is TLS-terminated there.
 
 - **Streamlit hardening:** `.streamlit/config.toml` (committed) sets XSRF, toolbar, and `maxUploadSize`; missed config triggers a startup warning (see Production hardening above).
 - **Secrets are never committed.** `.env`, `.env.local`, `.env.*.local`, and `.streamlit/secrets.toml` are git-ignored (see `SECURITY.md`). Rotate keys after any leak. On a hosted deployment without `.env`, inject secrets through the platform (Streamlit *Settings → Secrets*, K8s/Docker secret, or a cloud secret manager) — never in code or `secrets.toml` in git.
-- **Pre-commit guard.** `scripts/hooks/pre-commit` rejects staged `.env` files, `*.pem`/`*.key`, and key assignments (`OPENAI_API_KEY=`, `sk-*`). Install with `cp scripts/hooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit`.
+- **Pre-commit guard.** `scripts/hooks/pre-commit` rejects staged `.env` files, `*.pem`/`*.key`, and key assignments (`OPENAI_API_KEY=`, `sk-*`), and refuses test modules that are not wired into the hermetic harness (`tests/harness_imports.py` — the same rule the suite scans with). Install with `cp scripts/hooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit`.
 - Medical records stay local: they are only sent to the configured LLM endpoint. VA.gov credentials and session tokens are never written to disk, `.env`, or logs.
 - See [`SECURITY.md`](SECURITY.md) for full secrets management guidance (local `.env.local` overrides, CI/CD with GitHub Secrets, managed secret stores in production).

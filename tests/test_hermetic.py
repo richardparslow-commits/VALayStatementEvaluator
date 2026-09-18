@@ -41,7 +41,7 @@ TESTS_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = TESTS_DIR.parent
 
 sys.path.insert(0, str(PROJECT_ROOT))
-from tests import devlayout, hermetic, hostile  # noqa: E402
+from tests import devlayout, harness_imports, hermetic, hostile  # noqa: E402
 
 #: Names the app reads, spread across the modules that read them. A derivation
 #: that stops seeing these has stopped seeing whole files.
@@ -87,29 +87,6 @@ CANARY_TESTS = (
     "tests.test_ingest_quality.TestArchiveUploads",
 )
 
-STDLIB = set(sys.stdlib_module_names) | {"__future__"}
-
-
-def _import_roots(node: ast.AST) -> list[str]:
-    if isinstance(node, ast.Import):
-        return [alias.name.split(".")[0] for alias in node.names]
-    if isinstance(node, ast.ImportFrom):
-        return [(node.module or "").split(".")[0]]
-    return []
-
-
-def _first_foreign_import(tree: ast.Module, skip_line: int) -> int | None:
-    """Line of the first module-level import that is not from the stdlib."""
-    found = [
-        int(node.lineno)
-        for node in tree.body
-        if isinstance(node, (ast.Import, ast.ImportFrom))
-        and int(node.lineno) != skip_line
-        and any(root and root not in STDLIB for root in _import_roots(node))
-    ]
-    return min(found) if found else None
-
-
 #: Ways a module could ask Streamlit for an option's value. Compiled once so the
 #: scan and its self-tests cannot disagree about what is being matched.
 OPTION_READ_PATTERNS = tuple(re.compile(pattern) for pattern in (
@@ -127,30 +104,6 @@ def option_read_offence(name: str | Path, source: str) -> list[str]:
         for number, line in enumerate(source.splitlines(), start=1)
         if any(pattern.search(line) for pattern in OPTION_READ_PATTERNS)
     ]
-
-
-def harness_import_offence(name: str, source: str) -> str | None:
-    """Why ``source`` fails to protect itself, or None when it is fine.
-
-    The ordering rule is the whole point: ``app/config.py`` reads its constants
-    once, at import, so a module that imports the app *before* the harness freezes
-    whatever the machine had into the app the rest of the session tests.
-    """
-    tree = ast.parse(source)
-    harness = [
-        node
-        for node in tree.body
-        if isinstance(node, ast.ImportFrom)
-        and node.module == "tests"
-        and any(alias.name == "hermetic" for alias in node.names)
-    ]
-    if not harness:
-        return f"{name}: does not import the hermetic harness"
-    line = min(int(node.lineno) for node in harness)
-    foreign = _first_foreign_import(tree, skip_line=line)
-    if foreign is not None and foreign < line:
-        return f"{name}:{line}: harness import lands after the import on line {foreign}"
-    return None
 
 
 class TestTheScanFindsTheConfigSurface(unittest.TestCase):
@@ -890,28 +843,24 @@ class TestTheAppReadsNoStreamlitConfigOption(unittest.TestCase):
 
 
 class TestEveryTestModuleImportsTheHarness(unittest.TestCase):
+    """The rule itself lives in ``tests/harness_imports.py``.
+
+    It has two callers — this scan and ``scripts/hooks/pre-commit`` — and a second
+    copy would drift, so both read it from there. That module's own tests are
+    pinned here and its behaviour under the hook in
+    ``tests/test_security_gitignore.py``.
+    """
+
     def test_no_test_module_is_left_unprotected(self) -> None:
-        offenders = []
-        for path in sorted(TESTS_DIR.glob("test_*.py")):
-            offence = harness_import_offence(
-                path.name, path.read_text(encoding="utf-8")
-            )
-            if offence:
-                offenders.append(offence)
-        self.assertEqual(
-            offenders,
-            [],
-            "a test module that does not import the harness can read this machine's "
-            "configuration; one that imports it after the app freezes that "
-            "configuration into the app. Add, near the top and before any app "
-            "import:\n"
-            "  from tests import hermetic  # noqa: E402,F401\n  ",
+        offenders = harness_imports.offenders(
+            harness_imports.test_module_sources(TESTS_DIR)
         )
+        self.assertEqual(offenders, [], harness_imports.REMEDY)
 
     def test_the_scan_flags_a_module_that_forgets(self) -> None:
         """A guard that cannot fail is decoration, so the scan is self-tested."""
         source = "import unittest\n\n\nclass T(unittest.TestCase):\n    pass\n"
-        offence = harness_import_offence("forgot.py", source)
+        offence = harness_imports.harness_import_offence("forgot.py", source)
         self.assertIsNotNone(offence)
         self.assertIn("does not import", str(offence))
 
@@ -921,7 +870,7 @@ class TestEveryTestModuleImportsTheHarness(unittest.TestCase):
             "from app import config\n"
             "from tests import hermetic  # noqa: E402,F401\n"
         )
-        offence = harness_import_offence("too_late.py", source)
+        offence = harness_imports.harness_import_offence("too_late.py", source)
         self.assertIsNotNone(offence)
         self.assertIn("lands after", str(offence))
 
@@ -931,7 +880,72 @@ class TestEveryTestModuleImportsTheHarness(unittest.TestCase):
             "from tests import hermetic  # noqa: E402,F401\n"
             "from app import config\n"
         )
-        self.assertIsNone(harness_import_offence("fine.py", source))
+        self.assertIsNone(
+            harness_imports.harness_import_offence("fine.py", source)
+        )
+
+    def test_the_stdlib_set_is_exact_where_the_interpreter_has_one(self) -> None:
+        """The rule's discriminator has to be the stdlib, not an approximation.
+
+        ``sys.stdlib_module_names`` arrived in 3.10 and is what this suite runs
+        with; anything else is a fallback for the interpreter the *commit hook*
+        may find (see below), never the path under test.
+        """
+        if not hasattr(sys, "stdlib_module_names"):
+            self.skipTest("this interpreter predates sys.stdlib_module_names")
+        self.assertEqual(
+            harness_imports.stdlib_names(), set(sys.stdlib_module_names)
+        )
+
+    def test_the_fallback_covers_builtins_not_only_the_stdlib_directory(self) -> None:
+        """A measured false positive, pinned.
+
+        On Python 3.9 — which the hook picks up when a checkout has no ``.venv``
+        and ``python3`` is the Command Line Tools one — ``sys`` has no file in the
+        stdlib directory, because it is compiled into the interpreter. A fallback
+        built from that directory alone therefore called ``import sys`` foreign and
+        refused a *correctly wired* module. Both other sources are asserted here.
+        """
+        names = harness_imports._interpreter_stdlib_names()
+        for builtin in ("sys", "builtins"):
+            self.assertIn(builtin, names, "compiled in, so no file anywhere")
+        for module in ("unittest", "pathlib", "ast", "json"):
+            self.assertIn(module, names, "a file or package in the stdlib directory")
+        self.assertNotIn("app", names)
+        self.assertNotIn("tests", names)
+        self.assertNotIn("site-packages", names)
+
+    def test_the_fallback_answers_for_this_project_not_for_the_interpreter(
+        self,
+    ) -> None:
+        """The second measured false positive, and the worse one.
+
+        ``tomllib`` arrived in 3.11. A fallback that reported only what the running
+        interpreter has declared a *correctly wired* module unwired — on the commit
+        that added this very rule, under the 3.9 the hook found with no ``.venv`` —
+        and refused it. The hook asks whether the import is stdlib for this code,
+        whose floor is 3.12, so the names added since 3.8 have to be there.
+        """
+        with patch.object(sys, "stdlib_module_names", None):
+            names = harness_imports.stdlib_names()
+        self.assertIn("sys", names)
+        self.assertIn("unittest", names)
+        self.assertIn("tomllib", names)
+        self.assertNotIn("app", names)
+
+    def test_the_newer_stdlib_names_are_a_subset_of_this_interpreter(self) -> None:
+        """So a wrong entry fails here rather than misjudging somebody's commit."""
+        if not hasattr(sys, "stdlib_module_names"):
+            self.skipTest("this interpreter predates sys.stdlib_module_names")
+        unknown = harness_imports.STDLIB_BEYOND_3_8 - set(sys.stdlib_module_names)
+        self.assertEqual(
+            unknown,
+            set(),
+            "these entries are not stdlib in the interpreter the suite runs on, so "
+            "the fallback would treat a real module as foreign and refuse a "
+            "correctly wired commit",
+        )
+
 
 
 class TestAHostileEnvironmentCannotReachTheSuite(unittest.TestCase):
