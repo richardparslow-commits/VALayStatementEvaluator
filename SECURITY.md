@@ -105,7 +105,9 @@ For any hosted / multi-user deployment (Agiloop, Streamlit Cloud, Docker, etc.):
   - Agiloop / platform-managed environment secrets (preferred when available)
 - Inject secrets as **runtime environment variables** or **mounted secret files** — not baked into the image.
 - Scope roles narrowly (least privilege) and enable rotation/autorotation.
-- Ensure app logs do not emit secret values — this app logs only phase/timing counts and never prompt bodies, record text, or API keys. Treat any log line containing `sk-sp` as an incident.
+- Ensure app logs do not emit secret values — this app logs phase/timing counts and never prompt bodies, statement text, observations, or API keys. Treat any logged provider key (the `sk-` prefix) as an incident.
+- **One deliberate exception to "no record content":** an upload *filename* appears in the log when that file fails to extract, because "which file failed" is usually the whole question — and a filename is a string the user themself chose. A file named after a person is therefore a name in the log. Everything the app shows from a log line passes through `app/diagnostics.py:redact_secrets()` first (provider keys, `Bearer`/`Basic` credentials, and `key=value` secrets), so what reaches a screen is scrubbed even when the line on disk is not.
+- **Log content is never served over HTTP.** `app/diagnostics.py` resolves a `req_…` reference to its lines inside the app's own session (About → **Look up a reference**). It is deliberately not a route on the health sidecar: that port binds `0.0.0.0` without authentication, and a lookup endpoint there would publish log content to anything able to reach its port.
 
 `.agiloop/deploy.json` (if present) should not contain literal keys; set secrets
 in the Agiloop environment and reference them.

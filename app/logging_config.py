@@ -349,6 +349,18 @@ def configure_logging(
     ):
         decorate_logger_with_request_id(logging.getLogger(child_name))
 
+    # In-process log capture, so a user-visible ``req_…`` reference can be resolved
+    # from inside the app (app/diagnostics.py) rather than by grepping a log file the
+    # person reporting the failure has no access to. Installed after the managed
+    # handlers exist and left deliberately unmanaged, because reconfiguring logging
+    # must not clear the buffer. Lazy import: app/run_log.py imports this module.
+    try:
+        from .diagnostics import install_capture
+
+        install_capture(app_logger)
+    except Exception as exc:  # noqa: BLE001 - logging setup must never crash the app
+        app_logger.warning("in-process log capture unavailable: %s", exc)
+
     _CONFIGURED = True
     # Marker so tests can detect that setup ran even if handlers were replaced.
     setattr(sys.modules[__name__], _CONFIGURED_KEY, True)
