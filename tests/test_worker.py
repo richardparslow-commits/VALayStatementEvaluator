@@ -186,6 +186,43 @@ class TestExecuteJobSuccess(_WorkerCase):
 
 
 class TestExecuteJobFailures(_WorkerCase):
+    def test_timeout_fails_promptly_and_rejects_late_progress_and_result(self):
+        job = _evaluate_job()
+        record = self.backend.enqueue(KIND_EVALUATE, encode_job(KIND_EVALUATE, job))
+        claimed = self.backend.claim([KIND_EVALUATE], worker_id="w1")
+        release = threading.Event()
+        finished = threading.Event()
+
+        def blocked(kind, job, llm, progress):
+            try:
+                release.wait(2)
+                progress(1.0, "late success")
+                return MagicMock()
+            finally:
+                finished.set()
+
+        with (
+            patch.object(worker, "_run_pipeline", side_effect=blocked),
+            patch("app.pipeline_guard._pipeline_timeout_seconds", return_value=0.1),
+            patch.object(self.backend, "set_progress", wraps=self.backend.set_progress) as progress,
+            patch.object(self.backend, "store_result", wraps=self.backend.store_result) as store,
+            patch.object(self.backend, "complete", wraps=self.backend.complete) as complete,
+        ):
+            try:
+                t0 = time.monotonic()
+                ok = worker.execute_job(claimed[0], claimed[1], self.backend, llm=_UsageStub())
+                self.assertLess(time.monotonic() - t0, 0.5)
+                self.assertFalse(ok)
+                self.assertEqual(self.backend.get(record.job_id).error_class, "PipelineTimeoutError")
+            finally:
+                release.set()
+                self.assertTrue(finished.wait(2))
+            progress.assert_not_called()
+            store.assert_not_called()
+            complete.assert_not_called()
+        self.assertEqual(self.backend.get(record.job_id).status, STATUS_ERROR)
+        self.assertIsNone(self.backend.get_result(record.job_id))
+
     def test_payload_that_cannot_decode_fails_the_job(self):
         record = self.backend.enqueue(KIND_EVALUATE, "{not a payload}")
         claimed = self.backend.claim([KIND_EVALUATE], worker_id="w1")

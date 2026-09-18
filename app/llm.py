@@ -8,13 +8,16 @@ import time
 from typing import Any, NamedTuple
 from urllib.parse import urlparse
 
-from openai import OpenAI
+from openai import NOT_GIVEN, OpenAI
 
 from . import tracing
 from . import metrics
 from .circuit_breaker import CircuitBreakerOpenError, QueueFullError, get_llm_breaker, get_llm_limiter
 from .config import FALLBACK_ENDPOINT, PRIMARY_ENDPOINT, Settings
 from .logging_config import get_request_id
+from .pipeline_guard import (
+    check_pipeline_cancelled, pipeline_remaining_seconds, wait_with_cancellation,
+)
 from .prompt_sanitize import validate_model_name
 from .usage import UsageTracker
 
@@ -535,7 +538,8 @@ class LLMClient:
         self._settings = settings
         _timeout_s = _configured_timeout_seconds()
         self._client = OpenAI(
-            api_key=settings.api_key, base_url=settings.base_url, timeout=max(1.0, _timeout_s)
+            api_key=settings.api_key, base_url=settings.base_url, timeout=max(1.0, _timeout_s),
+            max_retries=0,  # Application retries must observe pipeline cancellation.
         )
         # Built once here (not lazily on the failover path) so a bad fallback URL
         # or key is reported at startup rather than discovered mid-outage.
@@ -546,6 +550,7 @@ class LLMClient:
                 api_key=fallback.api_key,
                 base_url=fallback.base_url,
                 timeout=max(1.0, _timeout_s),
+                max_retries=0,
             )
         self.usage = UsageTracker()
 
@@ -642,10 +647,12 @@ class LLMClient:
         provider right now" — but a genuine call failure is, so the primary's
         recovery probe costs the user nothing.
         """
+        check_pipeline_cancelled()
         request_model = (model or self._settings.model_main).strip()
         candidates = self._endpoint_candidates()
         last_error: Exception | None = None
         for index, endpoint in enumerate(candidates):
+            check_pipeline_cancelled()
             try:
                 return self._chat_on_endpoint(
                     endpoint,
@@ -723,9 +730,18 @@ class LLMClient:
 
         limiter = get_llm_limiter()
         # Acquire a concurrency slot (queues up to max_queue_depth, else QueueFullError).
-        limiter.acquire()
+        remaining = pipeline_remaining_seconds()
+        try:
+            if remaining is None:
+                limiter.acquire()
+            else:
+                limiter.acquire(timeout=min(limiter.queue_timeout, remaining))
+        except QueueFullError:
+            check_pipeline_cancelled()
+            raise
         acquired = True
         try:
+            check_pipeline_cancelled()
             # Re-check breaker after queuing — it may have opened while we waited.
             try:
                 breaker.check_or_raise()
@@ -739,6 +755,7 @@ class LLMClient:
             nudged = False
             t0 = time.perf_counter()
             for attempt in range(MAX_RETRIES):
+                check_pipeline_cancelled()
                 attempt_t0 = time.perf_counter()
                 try:
                     # Opt-in span around the provider call itself
@@ -747,6 +764,13 @@ class LLMClient:
                     with tracing.llm_call_span(
                         phase, model=model, attempt=attempt + 1, endpoint=endpoint
                     ):
+                        remaining = pipeline_remaining_seconds()
+                        request_timeout = (
+                            min(
+                                max(1.0, _configured_timeout_seconds()), remaining
+                            )
+                            if remaining is not None else NOT_GIVEN
+                        )
                         response = self._endpoint_client(endpoint).chat.completions.create(
                             model=model,
                             temperature=temperature,
@@ -755,7 +779,9 @@ class LLMClient:
                                 {"role": "system", "content": system},
                                 {"role": "user", "content": user},
                             ],
+                            timeout=request_timeout,
                         )
+                    check_pipeline_cancelled()
                     content = response.choices[0].message.content
                     if not content or not content.strip():
                         raise LLMError("Model returned an empty response.")
@@ -814,6 +840,7 @@ class LLMClient:
                     # Never count limiter/breaker rejections as endpoint failures.
                     raise
                 except Exception as exc:  # noqa: BLE001 - retry on any provider error
+                    check_pipeline_cancelled()
                     # Normalize onto the error taxonomy. Deterministic failures
                     # (moderation filter 400s, bad key/model, malformed request)
                     # come back with retriable=False — identical input would
@@ -901,7 +928,7 @@ class LLMClient:
                         # A nudge retry does not sleep: the rejection was
                         # instantaneous, not a load/rate-limit signal.
                         if not nudge_next:
-                            time.sleep(_retry_backoff_seconds(attempt))
+                            wait_with_cancellation(_retry_backoff_seconds(attempt))
             # Exhausted retries — counts as one logical failure for the breaker.
             breaker.record_failure()
             metrics.observe_llm_call(

@@ -59,6 +59,7 @@ from .logging_config import configure_logging, get_logger, set_request_id
 from .pipeline_guard import (
     PipelineTimeoutError,
     check_memory_before_run,
+    check_pipeline_cancelled,
     run_with_timeout,
 )
 from .profiler import RunProfiler, get_profiler
@@ -109,6 +110,7 @@ def _progress_callback(backend: JobBackend, record: JobRecord) -> ProgressCallba
 
     def update(fraction: float, message: str) -> None:
         nonlocal last_sent
+        check_pipeline_cancelled()
         now = time.monotonic()
         if fraction < 1.0 and (now - last_sent) < _PROGRESS_MIN_INTERVAL_SECONDS:
             return

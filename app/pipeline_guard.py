@@ -23,9 +23,9 @@ Wraps the long-running ``run_evaluation`` and ``run_draft`` calls with:
   if peak usage exceeds ``VA_LSE_MEMORY_WARN_MB`` (adjustable).  This makes
   memory growth visible in structured logs without adding a dependency.
 
-All helpers are stdlib-only and never raise on their own (memory checks
-gracefully degrade on unsupported platforms).  ``PipelineTimeoutError`` is the
-only exception the guard raises.
+Cancellation is cooperative: checkpoints stop further work, but cannot kill a
+thread blocked inside a library call. A hard CPU/memory cutoff requires process
+isolation. Memory checks gracefully degrade on unsupported platforms.
 """
 
 from __future__ import annotations
@@ -37,6 +37,8 @@ import os
 import threading
 import time
 from typing import Any, Callable, TypeVar
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass, field
 
 logger = logging.getLogger("app.pipeline_guard")
 
@@ -73,7 +75,7 @@ def _memory_warn_mb() -> int:
 class PipelineTimeoutError(RuntimeError):
     """Raised when a pipeline run exceeds the configured timeout."""
 
-    def __init__(self, elapsed_seconds: float, limit_seconds: int) -> None:
+    def __init__(self, elapsed_seconds: float, limit_seconds: float) -> None:
         self.elapsed_seconds = elapsed_seconds
         self.limit_seconds = limit_seconds
         super().__init__(
@@ -82,6 +84,63 @@ class PipelineTimeoutError(RuntimeError):
             f"The record set may be too large for the configured timeout. "
             f"Split the records into smaller files or raise VA_LSE_PIPELINE_TIMEOUT_SECONDS."
         )
+
+
+class PipelineCancelledError(BaseException):
+    """Internal control flow; must bypass provider retries and best-effort fallbacks."""
+
+
+@dataclass
+class _PipelineRun:
+    deadline: float
+    cancelled: threading.Event = field(default_factory=threading.Event)
+
+
+_pipeline_run: contextvars.ContextVar[_PipelineRun | None] = contextvars.ContextVar(
+    "pipeline_run", default=None
+)
+
+
+def pipeline_remaining_seconds() -> float | None:
+    """Remaining run budget, or None outside a guarded run; raises on cancellation."""
+    run = _pipeline_run.get()
+    if run is None:
+        return None
+    remaining = run.deadline - time.monotonic()
+    if run.cancelled.is_set() or remaining <= 0:
+        raise PipelineCancelledError("Pipeline deadline exceeded or run cancelled.")
+    return remaining
+
+
+def check_pipeline_cancelled() -> None:
+    """Stop at a safe boundary before starting work or publishing progress."""
+    pipeline_remaining_seconds()
+
+
+def wait_with_cancellation(seconds: float) -> None:
+    """Interrupt retry backoff when the run is cancelled."""
+    remaining = pipeline_remaining_seconds()
+    run = _pipeline_run.get()
+    if run is None or remaining is None:
+        time.sleep(seconds)
+        return
+    run.cancelled.wait(min(seconds, remaining))
+    check_pipeline_cancelled()
+
+
+def pipeline_as_completed(
+    futures: Iterable[concurrent.futures.Future[T]],
+) -> Iterator[concurrent.futures.Future[T]]:
+    """Wait for child work without blocking cancellation on a stalled child."""
+    pending = set(futures)
+    while pending:
+        check_pipeline_cancelled()
+        done, pending = concurrent.futures.wait(
+            pending, timeout=0.05, return_when=concurrent.futures.FIRST_COMPLETED
+        )
+        for future in done:
+            check_pipeline_cancelled()
+            yield future
 
 
 # --------------------------------------------------------- memory helpers
@@ -310,17 +369,17 @@ def _propagate_streamlit_ctx(fn: Callable[..., T], *args: Any, **kwargs: Any) ->
 def run_with_timeout(
     fn: Callable[..., T],
     *args: Any,
-    timeout_seconds: int | None = None,
+    timeout_seconds: float | None = None,
     **kwargs: Any,
 ) -> T:
     """Run *fn* in a worker thread with a wall-clock timeout.
 
     Returns the result of ``fn(*args, **kwargs)``.  Raises
     ``PipelineTimeoutError`` if the function does not complete within the
-    timeout.  The worker thread is abandoned (it continues running in the
-    background but the caller is no longer blocked) — this matches the
-    graceful-shutdown model where the orchestrator's SIGKILL handles stuck
-    processes.
+    timeout. The caller never waits for executor shutdown on timeout. A per-run
+    cancellation signal stops further phases, retries, and progress updates.
+    Already-running library calls cannot be forcibly stopped by a thread guard;
+    they must return or hit their own timeout before their thread exits.
 
     The worker inherits the caller's Streamlit ``ScriptRunContext`` and
     ``contextvars`` (see :func:`_propagate_streamlit_ctx`) so pipeline progress
@@ -348,42 +407,51 @@ def run_with_timeout(
         },
     )
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(_propagate_streamlit_ctx(fn, *args, **kwargs))
-        try:
-            result = future.result(timeout=timeout_seconds)
-            elapsed = time.perf_counter() - t0
-            logger.info(
-                "pipeline completed within timeout elapsed=%.0fs limit=%ds",
-                elapsed,
-                timeout_seconds,
-                extra={
-                    "request_id": rid,
-                    "phase": "pipeline_guard",
-                    "status": "ok",
-                    "elapsed_s": round(elapsed),
-                },
-            )
-            return result
-        except concurrent.futures.TimeoutError:
-            elapsed = time.perf_counter() - t0
-            # Log the timeout event at ERROR for visibility in logs/alerts.
-            logger.error(
-                "pipeline timeout elapsed=%.0fs limit=%ds",
-                elapsed,
-                timeout_seconds,
-                extra={
-                    "request_id": rid,
-                    "phase": "pipeline_guard",
-                    "status": "timeout",
-                    "elapsed_s": round(elapsed),
-                    "timeout_seconds": timeout_seconds,
-                },
-            )
-            raise PipelineTimeoutError(elapsed, timeout_seconds) from None
-        except Exception:
-            # Re-raise pipeline errors (LLMError, ValueError, etc.) as-is.
-            raise
+    run = _PipelineRun(deadline=time.monotonic() + timeout_seconds)
+
+    def checked() -> T:
+        check_pipeline_cancelled()
+        result = fn(*args, **kwargs)
+        check_pipeline_cancelled()
+        return result
+
+    token = _pipeline_run.set(run)
+    try:
+        wrapped = _propagate_streamlit_ctx(checked)
+    finally:
+        _pipeline_run.reset(token)
+
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        future = pool.submit(wrapped)
+        done, _ = concurrent.futures.wait(
+            [future], timeout=max(0.0, run.deadline - time.monotonic())
+        )
+        if not done:
+            raise PipelineCancelledError()
+        # A TimeoutError raised by fn is its own error, not a wait timeout.
+        result = future.result()
+        elapsed = time.perf_counter() - t0
+        logger.info(
+            "pipeline completed within timeout elapsed=%.0fs limit=%ds",
+            elapsed, timeout_seconds,
+            extra={"request_id": rid, "phase": "pipeline_guard", "status": "ok",
+                   "elapsed_s": round(elapsed)},
+        )
+        return result
+    except PipelineCancelledError:
+        run.cancelled.set()
+        elapsed = time.perf_counter() - t0
+        logger.error(
+            "pipeline timeout elapsed=%.0fs limit=%ds",
+            elapsed, timeout_seconds,
+            extra={"request_id": rid, "phase": "pipeline_guard", "status": "timeout",
+                   "elapsed_s": round(elapsed), "timeout_seconds": timeout_seconds},
+        )
+        raise PipelineTimeoutError(elapsed, timeout_seconds) from None
+    finally:
+        run.cancelled.set()
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 def _get_request_id() -> str:

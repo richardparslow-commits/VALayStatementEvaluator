@@ -22,6 +22,7 @@ from .. import telemetry
 from ..logging_config import get_logger, get_request_id, new_request_id, set_request_id
 from ..llm import LLMClient, LLMError
 from ..run_log import run_log_event
+from ..pipeline_guard import check_pipeline_cancelled
 from ..shutdown import is_shutting_down
 from .records import (  # noqa: F401
     is_local_run,
@@ -179,6 +180,7 @@ def progress_widgets(llm: LLMClient | None = None, *, request_id: str | None = N
     rid = request_id or get_request_id() or "-"
 
     def update(frac: float, msg: str) -> None:
+        check_pipeline_cancelled()
         logger.debug(
             "progress %.0f%% — %s",
             frac * 100,

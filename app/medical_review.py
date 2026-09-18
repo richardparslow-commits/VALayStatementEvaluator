@@ -16,7 +16,7 @@ import json
 import math
 import re
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, Callable
@@ -30,6 +30,7 @@ from .agiloop_telemetry import track_feature_error, track_goal
 from .documents import Chunk, ExtractedDocument, chunk_page_labelled_text, paragraph_index
 from .llm import LLMClient, LLMError
 from .logging_config import PhaseTimer, get_request_id
+from .pipeline_guard import check_pipeline_cancelled, pipeline_as_completed
 from .profiler import get_current_run_profiler, worker_timer
 from .prompt_sanitize import GUARD_NOTE, sanitize_for_prompt
 from .va_gov_export import section_map
@@ -625,6 +626,7 @@ def _dedupe_facts(facts: list[MedicalFact]) -> list[MedicalFact]:
     seen: set[str] = set()
     unique: list[MedicalFact] = []
     for fact in facts:
+        check_pipeline_cancelled()
         key = f"{_norm_key(fact.date)}|{_norm_key(fact.description)}"
         if key in seen:
             continue
@@ -644,6 +646,7 @@ def review_medical_records(
     chunks are skipped, failed chunks are retried, and large fact lists are
     merged hierarchically instead of in one oversized call.
     """
+    check_pipeline_cancelled()
     if not documents:
         raise ValueError("No medical records provided.")
 
@@ -681,6 +684,7 @@ def review_medical_records(
     for doc in unique_docs:
         sections = section_map(doc)
         for doc_page in doc.pages:
+            check_pipeline_cancelled()
             dates = _dates_in_text(doc_page.text)
             if dates:
                 page_dates[doc_page.label] = ", ".join(dates)
@@ -711,6 +715,7 @@ def review_medical_records(
     _ctx_span = tracing.current_span_context()
 
     def digest_chunk(chunk: Chunk) -> dict[str, object]:
+        check_pipeline_cancelled()
         # Propagate the run's correlation id into the worker thread.
         from .logging_config import _request_id_var  # local import to avoid cycle at import time
         from .profiler import _current_run_var  # local import to avoid cycle at import time
@@ -750,6 +755,7 @@ def review_medical_records(
                     max_tokens=8000,
                     phase="records:digest",
                 )
+            check_pipeline_cancelled()
             duration_ms = int((time.perf_counter() - t0) * 1000)
             logger.debug(
                 "chunk digest ok label=%s facts=%d duration_ms=%d",
@@ -811,9 +817,13 @@ def review_medical_records(
 
     def run_round(pending: list[Chunk]) -> None:
         nonlocal completed
-        with ThreadPoolExecutor(max_workers=config.RECORDS_CONCURRENCY) as pool:
-            future_map = {pool.submit(digest_chunk, c): c for c in pending}
-            for future in as_completed(future_map):
+        pool = ThreadPoolExecutor(max_workers=config.RECORDS_CONCURRENCY)
+        try:
+            future_map = {
+                pool.submit(contextvars.copy_context().run, digest_chunk, c): c
+                for c in pending
+            }
+            for future in pipeline_as_completed(future_map):
                 chunk = future_map[future]
                 completed += 1
                 try:
@@ -825,6 +835,8 @@ def review_medical_records(
                         0.05 + 0.55 * completed / max(total_units, 1),
                         f"Extracting facts — {completed}/{total_units} chunks done…",
                     )
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
 
     with tracing.phase_span(
         "records:digest", chunks=total_units, concurrency=config.RECORDS_CONCURRENCY, pages=pages
@@ -879,6 +891,7 @@ def review_medical_records(
     chunks_without_facts = 0
     chunks_by_index = {chunk.index: chunk for chunk in chunks}
     for index in sorted(results):
+        check_pipeline_cancelled()
         data = results[index]
         chunk = chunks_by_index.get(index)
         fallback = chunk.source_hint if chunk is not None else f"chunk {index}/{len(chunks)}"
@@ -941,9 +954,11 @@ def review_medical_records(
         _mem_cp("records:post_merge")
     except Exception:  # noqa: BLE001
         pass
+    check_pipeline_cancelled()
     digest.citation_check = verify_citations(digest.facts, documents)
     with tracing.phase_span("records:summary"), PhaseTimer(logger, "records:summary", request_id=rid):
         digest.summary = _summarize(llm, digest)
+    check_pipeline_cancelled()
     duration_ms = int((time.perf_counter() - _review_t0) * 1000)
     logger.info(
         "records review done pages=%d pages_in_files=%d unreadable_pages=%d chunks=%d "
@@ -1036,6 +1051,7 @@ def _merge_facts(
     the list fits one call or stops shrinking. Mechanical dedup runs between
     rounds so facts resolving to the same date+description collapse.
     """
+    check_pipeline_cancelled()
     facts = _dedupe_facts(digest.facts)
     if len(facts) <= MERGE_SINGLE_LIMIT:
         try:
@@ -1046,6 +1062,7 @@ def _merge_facts(
     current = facts
     _merge_rid = get_request_id() or "-"
     for round_no in range(1, 4):
+        check_pipeline_cancelled()
         batches = [
             current[i : i + MERGE_BATCH_SIZE]
             for i in range(0, len(current), MERGE_BATCH_SIZE)
@@ -1073,23 +1090,27 @@ def _merge_facts(
         # Capture correlation id for merge workers as well.
         _merge_ctx = _merge_rid
         def _merge_with_ctx(batch: list[MedicalFact]) -> list[MedicalFact]:
+            check_pipeline_cancelled()
             from .logging_config import _request_id_var as _rid_var
 
             tok = _rid_var.set(_merge_ctx)
             try:
-                return _restore_citations(_merge_once(llm, batch), batch)
+                merged = _restore_citations(_merge_once(llm, batch), batch)
+                check_pipeline_cancelled()
+                return merged
             finally:
                 try:
                     _rid_var.reset(tok)
                 except ValueError:
                     pass
 
-        with ThreadPoolExecutor(max_workers=config.RECORDS_CONCURRENCY) as pool:
+        pool = ThreadPoolExecutor(max_workers=config.RECORDS_CONCURRENCY)
+        try:
             future_map = {
-                pool.submit(_merge_with_ctx, batch): batch_index
+                pool.submit(contextvars.copy_context().run, _merge_with_ctx, batch): batch_index
                 for batch_index, batch in enumerate(batches)
             }
-            for future in as_completed(future_map):
+            for future in pipeline_as_completed(future_map):
                 batch_index = future_map[future]
                 try:
                     merged_by_batch[batch_index] = future.result() or batches[batch_index]
@@ -1107,6 +1128,8 @@ def _merge_facts(
                         },
                     )
                     merged_by_batch[batch_index] = batches[batch_index]  # keep raw facts
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
 
         merged: list[MedicalFact] = []
         for batch_index in sorted(merged_by_batch):

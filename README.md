@@ -864,14 +864,26 @@ via `app/pipeline_guard.py`:
 
 | Guard | Default | What happens |
 |---|---|---|
-| **Pipeline timeout** | `VA_LSE_PIPELINE_TIMEOUT_SECONDS=1800` (30 min) | Run is aborted with `PipelineTimeoutError`; user sees a clear error message with elapsed time and the configured limit |
+| **Pipeline timeout** | `VA_LSE_PIPELINE_TIMEOUT_SECONDS=1800` (30 min) | Caller receives `PipelineTimeoutError` at the deadline; cooperative cancellation stops subsequent pipeline work |
 | **Memory pre-check** | `VA_LSE_MEMORY_WARN_MB=500` MB RSS | Warning logged if RSS exceeds threshold; run aborted with `MemoryError` if RSS < 200 MB |
 | **Memory checkpoints** | After chunk dedup and merge | RSS logged at INFO (or WARNING if above threshold) so operators can see memory growth in structured logs |
 
 The timeout wraps `run_evaluation` and `run_draft` in a worker thread via
 `concurrent.futures.ThreadPoolExecutor`; when the deadline expires the caller
-receives a `PipelineTimeoutError` (not `signal.alarm`, which only works on
-the main thread).  Memory checks use `/proc/self/status` (Linux) or
+receives a `PipelineTimeoutError` without waiting for active threads to finish.
+A per-run cancellation signal follows parallel digest and merge tasks. Queued
+tasks are cancelled; checkpoints stop further model calls, retries, fallback
+calls, pipeline phases, and progress writes. Retry backoff is interruptible,
+and each model request's timeout is capped by the remaining run budget.
+
+This is cooperative cancellation, not a hard resource cutoff. An HTTP request
+already in flight (including provider-side generation or billing), a stuck
+library call, or code without checkpoints may continue after the caller returns.
+Late results are discarded. Deployments requiring a hard CPU/memory cutoff must
+run each job in a separately terminable process or container; thread timeouts
+alone cannot provide that guarantee.
+
+Memory checks use `/proc/self/status` (Linux) or
 `resource.getrusage` (macOS) and gracefully degrade on unsupported platforms.
 
 ```bash
@@ -881,9 +893,8 @@ VA_LSE_PIPELINE_TIMEOUT_SECONDS=3600 streamlit run run_app.py  # 60 min
 VA_LSE_MEMORY_WARN_MB=1024 streamlit run run_app.py
 ```
 
-Both guards are also wired into `DEPLOYMENT.md` scaling guidance: with 100
-users the per-pod timeout and memory limits prevent one user's runaway
-process from destabilizing shared infrastructure.
+See `DEPLOYMENT.md` for scaling guidance. Combine these application guards with
+process isolation and per-pod resource limits on shared deployments.
 
 ## Performance profiling
 

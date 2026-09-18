@@ -25,6 +25,9 @@ from app.pipeline_guard import (  # noqa: E402
     PipelineTimeoutError,
     check_memory_before_run,
     memory_checkpoint,
+    check_pipeline_cancelled,
+    pipeline_remaining_seconds,
+    wait_with_cancellation,
     run_with_timeout,
     _pipeline_timeout_seconds,
     _memory_warn_mb,
@@ -42,25 +45,50 @@ class TestPipelineTimeout(unittest.TestCase):
         self.assertEqual(result, 7)
 
     def test_raises_timeout_when_slow(self) -> None:
+        release = threading.Event()
+        finished = threading.Event()
+
         def slow() -> None:
-            time.sleep(2)
+            try:
+                release.wait(2)
+            finally:
+                finished.set()
 
         t0 = time.perf_counter()
-        with self.assertRaises(PipelineTimeoutError) as ctx:
-            run_with_timeout(slow, timeout_seconds=0.3)
-        elapsed = time.perf_counter() - t0
-        self.assertLess(elapsed, 3.0, "timeout should fire before the function completes")
+        try:
+            with self.assertRaises(PipelineTimeoutError) as ctx:
+                run_with_timeout(slow, timeout_seconds=0.05)
+            elapsed = time.perf_counter() - t0
+            self.assertLess(elapsed, 0.5, "caller must return while work is still blocked")
+            self.assertFalse(finished.is_set())
+        finally:
+            release.set()
+            self.assertTrue(finished.wait(2))
         self.assertIn("timed out", str(ctx.exception))
         self.assertGreater(ctx.exception.limit_seconds, 0)
 
     def test_timeout_error_has_elapsed_and_limit(self) -> None:
+        finished = threading.Event()
+
         def sleeper() -> None:
-            time.sleep(2)
+            try:
+                wait_with_cancellation(2)
+            finally:
+                finished.set()
 
         with self.assertRaises(PipelineTimeoutError) as ctx:
             run_with_timeout(sleeper, timeout_seconds=0.2)
         self.assertGreater(ctx.exception.elapsed_seconds, 0.1)
         self.assertGreater(ctx.exception.limit_seconds, 0)
+        self.assertTrue(finished.wait(0.5), "cooperative work must stop promptly")
+
+    def test_cancellation_does_not_leak_into_next_run_or_caller(self) -> None:
+        with self.assertRaises(PipelineTimeoutError):
+            run_with_timeout(wait_with_cancellation, 2, timeout_seconds=0.05)
+        check_pipeline_cancelled()
+        self.assertIsNone(pipeline_remaining_seconds())
+        remaining = run_with_timeout(pipeline_remaining_seconds, timeout_seconds=5)
+        self.assertGreater(remaining, 4)
 
     def test_re_raises_pipeline_error(self) -> None:
         def failing() -> None:
@@ -69,6 +97,16 @@ class TestPipelineTimeout(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             run_with_timeout(failing, timeout_seconds=5)
         self.assertIn("bad input", str(ctx.exception))
+
+    def test_pipeline_own_timeout_error_is_not_a_guard_timeout(self) -> None:
+        error = TimeoutError("upstream operation timed out")
+
+        def failing() -> None:
+            raise error
+
+        with self.assertRaises(TimeoutError) as ctx:
+            run_with_timeout(failing, timeout_seconds=5)
+        self.assertIs(ctx.exception, error)
 
     def test_timeout_default_from_config(self) -> None:
         """When no timeout_seconds given, uses _pipeline_timeout_seconds()."""

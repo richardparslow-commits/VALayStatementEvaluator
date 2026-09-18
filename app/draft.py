@@ -20,6 +20,7 @@ from .llm import LLMClient, LLMError
 from . import tracing
 from .logging_config import PhaseTimer, get_request_id
 from .profiler import phase_timer
+from .pipeline_guard import check_pipeline_cancelled
 from .prompt_sanitize import GUARD_NOTE, sanitize_digest_text, sanitize_for_prompt, validate_witness_field
 
 logger = logging.getLogger("app.draft")
@@ -285,6 +286,7 @@ def _run_draft(
             )
 
     def report(frac: float, msg: str) -> None:
+        check_pipeline_cancelled()
         if progress:
             progress(frac, msg)
 
