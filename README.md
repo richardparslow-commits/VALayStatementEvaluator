@@ -198,7 +198,7 @@ installs on macOS and Linux CI.
 | `FETCH_SANDBOX_BASE_URL` | Fetch Sandbox base URL (`fetchsandbox.com` or subdomain) | `https://fetchsandbox.com` |
 | `FETCH_SANDBOX_RECORDS_PATH` | GET path for the records endpoint | `/medical_records/{patient_id}` |
 | `FETCH_SANDBOX_MAX_RESPONSE_BYTES` | Max bytes accepted from a Fetch Sandbox HTTP response | `104857600` |
-| `VA_LSE_ALLOW_LOCAL_PATHS` | Force-enable the local folder/file record source (`1`) even when the local-run check can't detect localhost | (auto) |
+| `VA_LSE_ALLOW_LOCAL_PATHS` | Explicitly enable local folder/file imports (`1`) for trusted single-user use only; keep unset or `0` on hosted/shared deployments | `0` (disabled) |
 | `VA_LSE_CREDITS_PER_1M_MAIN` | Approx credits per 1M tokens for the main model (enables the credit-burn gauge) | (unset — gauge shows tokens/calls only) |
 | `VA_LSE_CREDITS_PER_1M_FAST` | Approx credits per 1M tokens for the fast model (enables the credit-burn gauge) | (unset — gauge shows tokens/calls only) |
 | `VA_LSE_CREDIT_QUOTA` | Your plan's weekly credit quota, used to render %-of-quota burn | `2500` |
@@ -332,6 +332,22 @@ streamlit run run_app.py --server.port $PORT --server.address 0.0.0.0
 > **[`DEPLOYMENT.md`](DEPLOYMENT.md)** (Dockerfile, compose, k8s manifests, placement
 > tradeoff analysis).
 
+### Local folder imports (trusted single-user use only)
+
+Local filesystem access is disabled by default, even when the browser uses
+localhost. To enable it on your own machine, set `VA_LSE_ALLOW_LOCAL_PATHS=1`
+in the project's local `.env`, then bind Streamlit to loopback:
+
+```bash
+streamlit run run_app.py --server.address 127.0.0.1
+```
+
+Do not expose this instance through a public proxy or tunnel. The opt-in allows
+every user of the instance to import supported files readable by its server
+process. On hosted/shared deployments, keep the setting unset or `0` and use
+uploads. Host headers, forwarded headers, and browser URLs do not enable this
+capability.
+
 ### Evaluate a statement
 
 1. Upload or paste the lay statement.
@@ -340,8 +356,8 @@ streamlit run run_app.py --server.port $PORT --server.address 0.0.0.0
    - **Fetch Sandbox** (enter a patient or record ID and import from your sandbox endpoint),
    - **VA.gov** (secure per-session login + explicit consent, then automatic fetch of all
      available records — see **VA.gov record source** below), or
-   - **Local folder / file** (local runs only — read records straight from a path on this
-     machine, e.g. `~/Desktop/ClaimRecords`; hidden when the app is served remotely).
+   - **Local folder / file** (disabled by default, including on localhost; explicitly
+     enable only for trusted single-user use as described above).
    - Security hardening: DOCX uploads with oversized uncompressed internal ZIP contents are
      rejected to prevent decompression-bomb memory exhaustion.
 3. Pick the **claimed condition**: choose a body system (radio buttons), then search and
@@ -394,7 +410,7 @@ for the session (no new endpoints, no new env vars).
 ### Draft a statement
 
 1. Choose the veteran's medical-record source: upload files, import from Fetch Sandbox, or
-   read from a local folder/file path (local runs only).
+   read from a local folder/file path (requires the explicit local-use opt-in above).
 2. Pick the **claimed condition** (body system + searchable dropdown) the same way as in
    Evaluate mode; adjust the pre-selected topics or toggle **Aid & Attendance / SMC-L**, then
    click **Proceed**.

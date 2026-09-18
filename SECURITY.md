@@ -84,6 +84,14 @@ without any secrets.
 
 ## 5. Production deployments (cloud apps)
 
+Local filesystem imports are disabled by default. Keep `VA_LSE_ALLOW_LOCAL_PATHS`
+unset or `0` on hosted/shared deployments and use file uploads. Request headers
+(including Host and forwarded headers) and browser URLs never grant filesystem
+access. Setting `VA_LSE_ALLOW_LOCAL_PATHS=1` grants every user of that app access
+to supported files readable by the server process; it is not per-user authorization.
+Enable it only for trusted single-user use with Streamlit bound to `127.0.0.1`,
+without a public reverse proxy or tunnel. See README for the local launch command.
+
 For any hosted / multi-user deployment (Agiloop, Streamlit Cloud, Docker, etc.):
 
 - **Use a managed secret store**, never a checked-in `.env`. Examples:

@@ -7,6 +7,7 @@ plus a fake session_state dict.
 
 from __future__ import annotations
 
+import os
 import sys
 import types
 import unittest
@@ -350,18 +351,82 @@ class TestIsLocalRun(unittest.TestCase):
         ):
             self.assertTrue(is_local_run())
 
-    def test_env_opt_out_falls_through_to_context(self) -> None:
+    def test_request_context_cannot_enable_local_paths(self) -> None:
         import app.views.records as records
 
         st_mock, _ = _fake_streamlit()
-        ctx = MagicMock()
-        ctx.headers = {"Host": "example.com:8501"}
-        ctx.url = "https://example.com"
-        st_mock.context = ctx
+        contexts = [
+            ({"Host": "localhost:8501"}, "https://example.com"),
+            ({"Host": "127.0.0.1:8501"}, "https://example.com"),
+            ({"Host": "[::1]:8501"}, "http://[::1]:8501"),
+            ({"Host": "example.com"}, "http://localhost:8501"),
+            ({"Host": "example.com"}, "http://127.0.0.1:8501"),
+            ({"Host": "example.com", "X-Forwarded-Host": "localhost",
+              "X-Forwarded-For": "127.0.0.1", "Origin": "http://localhost:8501"},
+             "https://example.com"),
+        ]
+        for value in (None, "", "0", "true", "yes"):
+            for headers, url in contexts:
+                with self.subTest(value=value, headers=headers, url=url):
+                    st_mock.context = types.SimpleNamespace(headers=headers, url=url)
+                    with _patch_st(records, st_mock), patch.dict("os.environ", {}, clear=True):
+                        if value is not None:
+                            os.environ["VA_LSE_ALLOW_LOCAL_PATHS"] = value
+                        self.assertFalse(records.is_local_run())
+
+
+class TestLocalRecordsAccess(unittest.TestCase):
+    def test_disabled_source_is_hidden_and_forced_selection_cannot_read(self) -> None:
+        import app.views.records as records
+
+        for slot in ("eval", "draft"):
+            with self.subTest(slot=slot):
+                st_mock, session = _fake_streamlit()
+                st_mock.context = types.SimpleNamespace(
+                    headers={"Host": "localhost:8501"}, url="http://localhost:8501"
+                )
+                st_mock.radio.return_value = "Local folder / file"
+                st_mock.button.return_value = True
+                st_mock.text_input.return_value = "/server/private.txt"
+                session[f"local_records_{slot}"] = [MagicMock(filename="cached.txt")]
+                with _patch_st(records, st_mock), patch.dict(
+                    "os.environ", {"VA_LSE_ALLOW_LOCAL_PATHS": "0"}
+                ), patch.object(records, "records_from_local_path") as read:
+                    self.assertEqual(records.records_uploader(slot), [])
+                self.assertNotIn("Local folder / file", st_mock.radio.call_args.args[1])
+                read.assert_not_called()
+                st_mock.text_input.assert_not_called()
+                st_mock.error.assert_called_once()
+
+    def test_disabled_import_handler_cannot_read_or_return_cached_records(self) -> None:
+        import app.views.records as records
+
+        st_mock, session = _fake_streamlit()
+        st_mock.button.return_value = True
+        session["local_records_eval"] = [MagicMock(filename="cached.txt")]
         with _patch_st(records, st_mock), patch.dict(
-            "os.environ", {"VA_LSE_ALLOW_LOCAL_PATHS": ""}
-        ):
-            self.assertFalse(records.is_local_run())
+            "os.environ", {"VA_LSE_ALLOW_LOCAL_PATHS": "0"}
+        ), patch.object(records, "records_from_local_path") as read:
+            self.assertEqual(records._local_records("eval"), [])
+        read.assert_not_called()
+        st_mock.text_input.assert_not_called()
+
+    def test_explicit_opt_in_preserves_local_import(self) -> None:
+        import app.views.records as records
+
+        st_mock, session = _fake_streamlit()
+        st_mock.radio.return_value = "Local folder / file"
+        st_mock.text_input.return_value = "/trusted/records.txt"
+        st_mock.button.return_value = True
+        doc = MagicMock(filename="records.txt")
+        with _patch_st(records, st_mock), patch.dict(
+            "os.environ", {"VA_LSE_ALLOW_LOCAL_PATHS": "1"}
+        ), patch.object(records, "records_from_local_path", return_value=([doc], [])) as read:
+            self.assertEqual(records.records_uploader("eval"), [doc])
+        self.assertIn("Local folder / file", st_mock.radio.call_args.args[1])
+        read.assert_called_once_with("/trusted/records.txt")
+        self.assertEqual(session["source_records_eval"]["Local folder / file"], [doc])
+        st_mock.error.assert_not_called()
 
 
 class TestRenderRecordSearch(unittest.TestCase):

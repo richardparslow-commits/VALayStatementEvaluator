@@ -34,27 +34,15 @@ CITATION_INDEX_KEY = "citation_index"
 
 
 def is_local_run() -> bool:
-    """True when the app is served on the same machine as the browser.
+    """Whether the server explicitly permits local record imports.
 
-    Used to gate reading records directly from the local filesystem: that is
-    only safe for a local Streamlit run, never for a public deployment (where
-    it would let anyone read server files). Fall back to an explicit opt-in
-    env var for unusual local setups.
+    The legacy name is retained for callers. Request headers and URLs cannot
+    establish that a browser is local, so only the server-side opt-in counts.
+    Enable this only for a trusted, single-user installation bound to loopback.
     """
     import os
-    from urllib.parse import urlparse
 
-    if os.getenv("VA_LSE_ALLOW_LOCAL_PATHS", "").strip() == "1":
-        return True
-    try:
-        context = st.context
-        host = (context.headers.get("Host") or "").split(":")[0].lower()
-        if host in ("localhost", "127.0.0.1", "::1"):
-            return True
-        url_host = urlparse(context.url or "").hostname or ""
-        return url_host in ("localhost", "127.0.0.1", "::1")
-    except Exception:  # noqa: BLE001 - context may be unavailable in tests
-        return False
+    return os.getenv("VA_LSE_ALLOW_LOCAL_PATHS", "").strip() == "1"
 
 
 def _track_selector_impression(slot: str) -> None:
@@ -152,6 +140,10 @@ def _label_detected_va_gov_exports(slot: str, documents: list[Any]) -> None:
 
 def _local_records(slot: str) -> list:
     """Load record files straight from a path on the local machine."""
+    # Enforce the capability at the handler, including stale source selections.
+    if not is_local_run():
+        st.error("Local file access is disabled on this server. Upload records instead.")
+        return []
     st.caption(
         "Reads supported record files (.pdf/.txt/.md/.docx) directly from this "
         "machine's filesystem. Only available when the app runs locally."
