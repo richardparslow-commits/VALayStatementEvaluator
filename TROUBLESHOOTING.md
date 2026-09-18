@@ -247,11 +247,34 @@ Key metrics:
 - `va_lse_llm_failover_active` — 1 when serving from fallback
 - `va_lse_llm_primary_unhealthy_seconds` — how long primary has been down
 
+## The run did not start
+
+A message ending in **Run not started** above the run button is not a failure: it is the
+preflight refusing to spend a run on a configuration that cannot work. Nothing was sent to the
+model and no credits were used.
+
+| Message | What it means | What to do |
+|---|---|---|
+| The endpoint rejected this API key (HTTP 401/403) | The key and the base URL are not from the same provider account — or, on Perplexity's Router API, the account does not have Router access (private preview) | Fix the key/base URL pair, click **Test connection** to confirm, then re-run. **Run not started** disappears on its own once the settings change |
+| The endpoint does not offer `model-x` (or several) | The configured model id is not in the endpoint's published catalog, so every call would be rejected | Correct `LLM_MODEL_MAIN`/`LLM_MODEL_FAST` (or the sidebar fields) against the provider's list; `COMPATIBILITY.md` has the per-provider ids |
+
+What does **not** block: an unreachable host, a `404` on `/models` (some OpenAI-compatible
+servers serve completions without listing models), and provider-side `5xx`. Those are reported
+and the run proceeds, because an inconclusive check must not refuse to start a working run.
+
+If the check is wrong about your endpoint — a gateway that answers `/models` differently than it
+serves completions, or a catalog that lags what is actually served — open **The check can be
+wrong — start the run anyway** under the message and tick the waiver. It applies to that exact
+endpoint, key and model set; changing any of them asks you again. Every decision is logged at
+`phase=endpoint_preflight`, and a refusal is a `rejected` run-log event, so it resolves through
+the same **What happened?** panel as any other failure.
+
 ## Common Causes and Fixes
 
 | Symptom | Likely Cause | Fix |
 |---------|--------------|-----|
 | All chunks fail immediately | API key/base URL mismatch | Verify key matches endpoint provider |
+| The run will not start at all ("Run not started") | The preflight proved the configuration cannot work | See **The run did not start** above |
 | Fails after some successful calls | Rate limiting | Reduce `VA_LSE_RECORDS_CONCURRENCY` or wait |
 | Intermittent failures | Provider outage or network issue | Configure fallback endpoint |
 | Fails only on large files | Timeout or payload too large | Split records or increase `VA_LSE_LLM_CALL_TIMEOUT_SECONDS` |

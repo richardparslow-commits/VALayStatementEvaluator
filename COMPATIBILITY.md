@@ -124,6 +124,23 @@ path in the base URL (`404`) from a host that does not answer.
 See `app/llm.py` (`app.llm.probe_models`, and `check_model_availability` for the advisory
 model-list-only form) and `app/main.py:_sidebar_settings`.
 
+### The same check, with teeth, at the moment a run starts
+
+The launch check is advisory; the **preflight** is not. Pressing a run button probes once and
+refuses to start when the configuration cannot work: a configured model missing from the
+endpoint's catalog, or a key the endpoint rejects (`401`/`403`). Both mean every call in the
+run would be rejected, and the probe costs one request instead of the first minutes of the
+bundle's chunks.
+
+Nothing inconclusive blocks: an unreachable host, `404` (some OpenAI-compatible servers serve
+completions without listing models), and provider-side `5xx` are reported and the run proceeds.
+A block carries a per-configuration waiver for endpoints whose `/models` answer does not
+describe what they serve — see `README.md → Before a run starts` and
+`TROUBLESHOOTING.md → The run did not start`.
+
+See `app/preflight.py` (policy, socket-free to test) and `app/views/shared.py`
+(`check_endpoint_gate`, `render_endpoint_preflight_notice`).
+
 ## What to do when QwenCloud (or any provider) changes their API
 
 1. Confirm the new `base_url` and required key prefix with the provider.

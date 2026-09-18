@@ -1250,6 +1250,12 @@ class TestEvaluateRunBookkeeping(unittest.TestCase):
             evaluate_view, "new_run_request_id", return_value="req_84ab42a65e24"
         ), patch.object(evaluate_view, "get_llm", return_value=llm), patch.object(
             evaluate_view, "check_shutdown_gate", return_value=True
+        ), patch.object(
+            # The gate itself makes a network request and is covered in
+            # tests/test_preflight.py; here it must simply not reach out.
+            evaluate_view,
+            "check_endpoint_gate",
+            return_value=True,
         ), patch.object(evaluate_view, "enter_run", return_value=True), patch.object(
             evaluate_view, "exit_run"
         ), patch.object(

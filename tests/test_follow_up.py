@@ -223,6 +223,9 @@ class TestFollowUpRunIntegration(unittest.TestCase):
             patch.object(evaluate_view, "new_run_request_id", return_value="req_eval_1"),
             patch.object(evaluate_view, "get_llm", return_value=llm),
             patch.object(evaluate_view, "check_shutdown_gate", return_value=True),
+            # The endpoint preflight makes a real request; this test is about the
+            # follow-up text, so it asserts the gate is *passed*, not what it probed.
+            patch.object(evaluate_view, "check_endpoint_gate", return_value=True),
             patch.object(evaluate_view, "enter_run", return_value=True),
             patch.object(evaluate_view, "exit_run"),
             patch.object(evaluate_view, "progress_widgets", return_value=(MagicMock(), lambda *a, **k: None)),
@@ -272,6 +275,7 @@ class TestFollowUpRunIntegration(unittest.TestCase):
             patch.object(draft_view, "st", st_mock),
             patch.object(draft_view, "get_llm", return_value=llm),
             patch.object(draft_view, "check_shutdown_gate", return_value=True),
+            patch.object(draft_view, "check_endpoint_gate", return_value=True),
             patch.object(draft_view, "enter_run", return_value=True),
             patch.object(draft_view, "exit_run"),
             patch.object(draft_view, "progress_widgets", return_value=(MagicMock(), lambda *a, **k: None)),

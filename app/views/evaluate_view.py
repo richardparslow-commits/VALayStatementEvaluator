@@ -70,6 +70,7 @@ from .shared import (
     FEATURE_ID,
     audit_condition_for_slot,
     audit_record_meta,
+    check_endpoint_gate,
     check_shutdown_gate,
     check_upload_limits,
     ensure_request_id,
@@ -80,6 +81,7 @@ from .shared import (
     progress_widgets,
     records_uploader,
     render_condition_selector_for_slot,
+    render_endpoint_preflight_notice,
     render_record_search,
     render_usage_summary,
     record_watchdog_run,
@@ -183,6 +185,10 @@ def render_evaluate_tab() -> None:
             "You can close this tab — the results will be waiting when you come back."
         )
 
+    # A blocked preflight is kept on screen (with its waiver) from here, above the
+    # button that would start the run — see app/views/shared.py.
+    render_endpoint_preflight_notice("evaluation")
+
     run = st.button("🔍 Run exhaustive evaluation", type="primary", key="eval_run")
     if run:
         if not _validate_evaluate_inputs(statement_text, records):
@@ -278,6 +284,12 @@ def _validate_evaluate_inputs(statement_text: str, records: list) -> bool:
 # -------------------------------------------------------------- run pipeline
 def _run_evaluation_flow(statement_text: str, records: list) -> None:
     """Mint a run id, gate shutdown, run the pipeline, persist the result."""
+    # Before anything is spent: a configuration whose every call is rejected is
+    # detectable in one request. This is the only entry point into the pipeline, so
+    # the queued path is covered too, and the worker never re-checks inside its own
+    # session-less run.
+    if not check_endpoint_gate("evaluation", log_action="evaluate"):
+        return
     if job_runner.queue_mode_active():
         _run_evaluation_queued(statement_text, records)
         return

@@ -446,10 +446,12 @@ class TestFailureDetailNextToTheError(unittest.TestCase):
         settings.api_key = "test-key-unused-because-the-run-is-patched"
         at.session_state["settings"] = settings
 
-        # Fail the run the way a provider failure would, and leave the rest real.
+        # Fail the run the way a provider failure would, and leave the rest real. The
+        # endpoint preflight is patched for the same reason the pipeline is: it makes
+        # a live request, and this test is about what a *failing run* renders.
         with mock.patch.object(
             draft_view, "run_draft", side_effect=RuntimeError("model returned nothing usable")
-        ):
+        ), mock.patch.object(draft_view, "check_endpoint_gate", return_value=True):
             at.button(key="draft_run").click().run()
 
         self.assertFalse(at.exception, msg=str(at.exception))
@@ -468,6 +470,67 @@ class TestFailureDetailNextToTheError(unittest.TestCase):
         # The id shown in the error is the id the detail was resolved against.
         captions = "\n".join(c.value for c in at.caption)
         self.assertIn(reference, captions)
+
+    def test_a_dead_endpoint_stops_the_run_before_it_spends_anything(self):
+        """The promise, on the real page: a run that cannot work never starts.
+
+        This drives the same real pipeline as the test above and fails its preflight
+        instead of its pipeline, which is the shape of the incident this guards: a
+        configuration whose every call is rejected used to burn minutes of chunks
+        before saying so.
+        """
+        from streamlit.testing.v1 import AppTest
+
+        import app.views.draft_view as draft_view
+        import app.views.shared as shared
+        from app.preflight import BLOCKED, Verdict
+
+        at = AppTest.from_file(str(PROJECT_ROOT / "run_app.py"), default_timeout=30)
+        at.run()
+        at.file_uploader(key="files_draft").set_value(
+            [("records.txt", b"Knee pain noted during visit.", "text/plain")]
+        )
+        at.run()
+        at.text_input(key="draft_condition").set_value("knee strain")
+        at.text_area(key="draft_observations").set_value("Observed limping on stairs.")
+        at.run()
+
+        settings = load_settings()
+        settings.api_key = "pplx-a-key-the-router-will-not-serve"
+        at.session_state["settings"] = settings
+
+        verdict = Verdict(
+            BLOCKED,
+            headline="The endpoint rejected this API key (HTTP 401).",
+            fix="Fix the key, then re-run.",
+            status=401,
+        )
+        # The gate itself is left real: this asserts the wiring from the button all
+        # the way to the notice, and only the probe answer is canned.
+        with mock.patch.object(
+            draft_view, "run_draft"
+        ) as run_draft, mock.patch.object(
+            shared.preflight, "check_endpoint", return_value=verdict
+        ):
+            at.button(key="draft_run").click().run()
+
+        self.assertFalse(at.exception, msg=str(at.exception))
+        run_draft.assert_not_called()
+        errors = [e.value for e in at.error]
+        self.assertTrue(
+            any("Run not started" in e and "HTTP 401" in e for e in errors), msg=f"errors: {errors}"
+        )
+        self.assertFalse(
+            any("Drafting failed" in e for e in errors),
+            msg="the run must not have started: " + str(errors),
+        )
+        # The waiver is the escape hatch for a check that is wrong about an endpoint,
+        # and it has to be on the page rather than in the docs.
+        self.assertIn(
+            "Ignore the endpoint check and run anyway",
+            [c.label for c in at.checkbox],
+            msg="no waiver was offered with the block",
+        )
 
     def test_a_successful_run_renders_no_such_expander(self):
         """The expander is attached to failures, not to every run."""

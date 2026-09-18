@@ -276,6 +276,28 @@ provider: the app checks `GET {base_url}/models` at startup and warns if `LLM_MO
 > host or the network. With no key in the environment, enter the key **and** the matching base
 > URL, then click *Apply settings*.
 
+### Before a run starts: the endpoint preflight
+
+Pressing **Draft the statement** or **Run exhaustive evaluation** first checks that the
+configured endpoint can serve the configured models — one `GET {base_url}/models` request, no
+model call. A run that cannot possibly work therefore costs a second instead of the first
+minutes of a bundle, which is the failure this was built for: a rejected key or an unusable
+model id fails *every* chunk identically, and the run only says so after the chunks have been
+paid for.
+
+It stops the run in two cases, both unambiguous: the endpoint lists models and one of the
+configured names is not among them, or the endpoint rejects the key (`401`/`403`). Everything
+else is **reported but allowed** — a host that does not answer, a provider that serves
+completions without listing models (`404`), a provider-side `5xx`. Refusing to start a working
+run is worse than the failure this prevents, so an inconclusive check never blocks.
+
+The block appears above the run button with the reason and the fix, plus an expander to run
+anyway: some OpenAI-compatible servers answer `/models` differently than they serve
+completions, and a catalog can lag what a provider actually serves. A waiver applies to that
+exact endpoint + key + model set; changing any of them asks you again. The decision is logged
+(`phase=endpoint_preflight`) and the refusal is a `rejected` run-log event, so the failure
+detail panel resolves it like any other.
+
 **Configuration can also come from Streamlit secrets.** Each value above is resolved
 **process environment → `.env` → `.streamlit/secrets.toml` → code default**, so a hosted
 deployment — where `.env` is git-ignored and never ships — is configured entirely from the
