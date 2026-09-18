@@ -3,9 +3,37 @@
 # Copy intentionally committed to source control so shared deployments cannot
 # silently run with unsafe Streamlit defaults.
 #
-# To override for local debugging only: set an env var per
-# https://docs.streamlit.io/develop/api-reference/configuration
-# or use `.streamlit/config.local.toml` (blocked from version control).
+# To override for local debugging, pass a flag to `streamlit run` — e.g.
+# `streamlit run run_app.py --server.maxUploadSize 500`. Flags are applied after
+# every config file, so they win.
+#
+# An environment variable is NOT an override here, whatever the documentation at
+# https://docs.streamlit.io/develop/api-reference/configuration says. On Streamlit
+# 1.63.0 the environment is consulted for only the two options marked "sensitive"
+# (`server.cookieSecret`, `mapbox.token`), so `STREAMLIT_SERVER_MAX_UPLOAD_SIZE`,
+# `STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION`, and the documented example
+# `STREAMLIT_SERVER_PORT` are all inert (measured, not assumed). Read the other way
+# that is reassuring: no ambient variable can turn this hardening off. Nor does
+# `.streamlit/config.local.toml` do anything — Streamlit reads `config.toml` from
+# `~` and from the working directory and reads no other name — so a
+# project-local override means editing this committed file, visible in the diff.
+# (Running the app from outside the repository root also drops this file, because
+# the working directory is what Streamlit resolves for it. `app/main.py` warns at
+# startup if the file is missing, reading it by absolute path.)
+#
+# Do NOT add `[server] port` here, or to any config file this app might read. On an
+# install Streamlit treats as a *development* one — its package not under a
+# `site-packages` directory, so a source checkout, `pip install -e`, or a vendored
+# install — a configured port is fatal at parse time rather than ignored, from any
+# source including this file and the documented `--server.port` flag:
+#
+#   RuntimeError: server.port does not work when global.developmentMode is true.
+#
+# The app would then not start at all. Reproduced on Streamlit 1.63.0 and 1.64.0 and
+# reported upstream as streamlit/streamlit#17031; see README → Production hardening.
+# The port is set by the container's `--server.port=8501` instead, which works only
+# because Streamlit is installed into a `site-packages` directory there.
+# tests/test_hermetic.py fails if a port appears in this file.
 
 [server]
 # Headless prevents the browser auto-launch and suits containerized deploys.

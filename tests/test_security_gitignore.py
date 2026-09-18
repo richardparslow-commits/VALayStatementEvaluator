@@ -10,6 +10,7 @@ from pathlib import Path
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 GITIGNORE = PROJECT_ROOT / ".gitignore"

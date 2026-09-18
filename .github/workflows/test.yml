@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  # Weekly, because the thing this catches is a *release*, not a commit. See the
+  # streamlit-latest job below for what it does with it. The tick also re-runs the
+  # jobs that have no `if` — a weekly green on main at no extra maintenance — while
+  # the live-credentials/smoke pair skips itself, as it does on any non-dispatch run.
+  schedule:
+    - cron: "0 6 * * 1"
 
 jobs:
   lint:
@@ -93,6 +99,215 @@ jobs:
 
       - name: Run 2,000-page scale simulation (no API calls)
         run: python scripts/scale_sim.py
+
+  # Ambient configuration is the failure mode this suite cannot catch by itself.
+  # app/config.py reads ~130 names into module constants when it is imported, and
+  # falls back to .env and to Streamlit's secrets file — so a test can pass on one
+  # machine and fail on another for no reason the code can explain, and a secrets
+  # file is worse than a read, because parsing it writes its values into
+  # os.environ (past any sweep that already happened).
+  #
+  # tests/hermetic.py is the defence; this job is the proof. It runs the *whole*
+  # suite with every knob at a non-default value and a hostile secrets.toml in
+  # place, using the same fixtures the in-suite canaries use (tests/hostile.py).
+  # Before that harness existed, this exact run produced 13 failures and 11 errors
+  # across eight modules, none of them real. It is a separate job rather than a
+  # step so a regression here is legible as its own check rather than buried in the
+  # offline-test job's output.
+  hermetic:
+    name: Offline tests (hostile environment)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements.lock
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --require-hashes -r requirements.lock
+          # The suite fails rather than skips when a dev-only dependency is
+          # missing, so the test extras are needed here too.
+          pip install -r requirements-dev.txt
+
+      # Writes the hostile fixtures, refuses to run if they are not actually live
+      # (a green job that tests nothing is worse than a red one), runs the suite,
+      # and cleans the secrets file up again.
+      - name: Run the offline suite under the hostile fixtures
+        run: python -m tests.hostile
+
+  # The fifth ambient source is not a setting at all: it is the install *layout*.
+  # Streamlit derives `global.developmentMode` from its own package path (`"site-packages"
+  # not in __file__`), so a source checkout, an editable install and a vendored one all
+  # report true — and tests/hermetic.py pins it false, because production is installed
+  # under site-packages. The in-suite guard for that pin has to *simulate* the layout (it
+  # writes the option's value before anything parses; a test process cannot reinstall
+  # Streamlit), and a simulation that has drifted from what it simulates passes while
+  # testing nothing. So this job installs Streamlit where site-packages is not in its
+  # path and runs the whole suite there, making the pin meet real material.
+  #
+  # tests/devlayout.py refuses to run unless the install really is a development layout
+  # and the pin really holds in it — a green job whose precondition did not hold is worse
+  # than a red one — so it also acts as the drift sensor: if Streamlit ever derives the
+  # mode some other way, this fails and says so instead of the simulated guard quietly
+  # asserting about a layout that no longer exists.
+  dev-layout:
+    name: Offline tests (Streamlit outside site-packages)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements.lock
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --require-hashes -r requirements.lock
+          # The suite fails rather than skips when a dev-only dependency is
+          # missing, so the test extras are needed here too.
+          pip install -r requirements-dev.txt
+
+      # The *version* the lock installs, deliberately: the variable this job moves is
+      # the layout, so a failure here has one explanation. `--no-deps` keeps Streamlit's
+      # own dependencies coming from the lock's site-packages — this relocates the
+      # package's path and nothing else. `--upgrade` because pip otherwise treats the
+      # copy already installed in site-packages as satisfying the requirement and
+      # installs nothing into the target.
+      - name: Install Streamlit outside site-packages
+        run: |
+          LOCKED_VERSION="$(pip show streamlit | awk '/^Version:/ {print $2}')"
+          TARGET="${RUNNER_TEMP:-/tmp}/streamlit-dev-layout"
+          python -m pip install --target "$TARGET" --no-deps --upgrade "streamlit==$LOCKED_VERSION"
+          echo "installed streamlit $LOCKED_VERSION into $TARGET"
+          echo "PYTHONPATH=$TARGET" >> "$GITHUB_ENV"
+
+      # Prints which install it measured, refuses to continue if that install is not a
+      # development layout or if the pin does not hold in it, then runs the suite.
+      - name: Run the offline suite as a development-layout install
+        run: python -m tests.devlayout
+
+  # The suite is pinned: requirements.lock fixes Streamlit to one version, so a
+  # *release* can change option resolution and every other job stays green while
+  # the harness quietly stops working — the failure mode here is silence, not red.
+  # Two measured facts make that concrete. Streamlit honours `STREAMLIT_*`
+  # variables for only the options it marks "sensitive" (2 of 343 on 1.63.0), which
+  # is why tests/hermetic.py strips exactly those names; its own documentation
+  # claims the wider behaviour, so the narrow one may well be fixed upstream. And
+  # tests/hermetic.py reaches into `streamlit.config` (`get_config_files`,
+  # `get_option`, `secrets.files`, `ConfigOption.sensitive`) because no public API
+  # covers those routes — `STREAMLIT_SECRETS_FILES` was measured not to work.
+  #
+  # So this job installs the newest Streamlit on top of the lock and runs the same
+  # offline suite, whose hermetic guards are the sensors: if the environment
+  # becomes live for non-sensitive options, or a hook point is renamed, they fail
+  # and name the reason.
+  #
+  # `pip install --upgrade streamlit` deliberately upgrades *only* what the new
+  # Streamlit requires (pip's default `only-if-needed` strategy), so the lock still
+  # pins everything else and a failure is attributable to Streamlit rather than to
+  # whatever else moved.
+  #
+  # Scheduled and manual only. It is not a gate on this repository's diff — the
+  # pinned suite is — and running it per-PR would install a fresh dependency
+  # resolution on every push for news that arrives weekly. It is left able to fail
+  # (no `continue-on-error`): the point is to surface a change, and a canary that
+  # reports green while its assertions fail is the outcome this repository has
+  # already been bitten by.
+  streamlit-latest:
+    name: Offline tests (newest Streamlit)
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements.lock
+
+      - name: Install the locked runtime and the test extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install --require-hashes -r requirements.lock
+          # requirements-dev.txt includes `-r requirements.txt`, which asks for
+          # `streamlit>=1.62` — satisfied by the locked version, so this adds the
+          # dev-only packages without moving the runtime underneath them.
+          pip install -r requirements-dev.txt
+
+      - name: Upgrade Streamlit to the newest release
+        run: |
+          echo "locked:  $(pip show streamlit | awk '/^Version:/ {print $2}')"
+          pip install --upgrade streamlit
+          echo "running: $(pip show streamlit | awk '/^Version:/ {print $2}')"
+
+      # Same guard as the test job: the suite fails rather than skips when a
+      # dev-only dependency is missing, and this job is the one most likely to
+      # change the resolution underneath those packages.
+      - name: Verify test prerequisites
+        run: |
+          python - <<'PY'
+          import importlib.util
+          import sys
+
+          required = {
+              "yaml": "PyYAML (requirements-dev.txt) — deploy/manifest asset tests",
+              "boto3": "boto3 (requirements-dev.txt) — S3 backup backend tests",
+              "opentelemetry.sdk": "opentelemetry-sdk (requirements-dev.txt) — tracing tests",
+          }
+          missing = [
+              f"{module}: {why}"
+              for module, why in required.items()
+              if importlib.util.find_spec(module) is None
+          ]
+          if missing:
+              sys.exit("missing test prerequisites:\n  " + "\n  ".join(missing))
+          print(f"all {len(required)} suite-required prerequisites present")
+          PY
+
+      # Runs before the suite so the log says *what* this version resolves to even
+      # when nothing is wrong, and says it next to the failure when something is.
+      - name: Report the option surface this version exposes
+        run: |
+          python - <<'PY'
+          import streamlit
+          import streamlit.config as config
+
+          config.get_config_options()
+          options = config._config_options_template
+          sensitive = sorted(
+              option.env_var
+              for option in options.values()
+              if option.sensitive and option.env_var
+          )
+          print(f"streamlit {streamlit.__version__}")
+          print(f"options: {len(options)}")
+          print(f"env-var honoured (sensitive): {sensitive or 'none'}")
+          print(f"honoured count: {sum(1 for o in options.values() if o.sensitive)}")
+          # What this version consults *before* tests/hermetic.py pins it. A
+          # machine-level file appearing here that did not before is news.
+          print("config files consulted by default: " + repr(config.get_config_files("config.toml")))
+          PY
+
+      - name: Run offline unit tests
+        run: python -m unittest discover -s tests -v
 
   # The rest of the suite fakes the queue transport, which cannot catch a
   # redis-py API mismatch (a renamed method or changed kwarg would pass the fakes

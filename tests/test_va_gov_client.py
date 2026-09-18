@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 
 from app import va_gov_client  # noqa: E402
 from app.va_gov_client import (  # noqa: E402

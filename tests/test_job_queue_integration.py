@@ -22,6 +22,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 
 from log_isolation import isolate_app_logs  # noqa: E402
 

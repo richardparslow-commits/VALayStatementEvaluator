@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 from app import config
 from app.documents import document_from_text
 from app.draft import run_draft

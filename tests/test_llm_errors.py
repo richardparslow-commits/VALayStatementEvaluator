@@ -18,6 +18,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 
 from app.circuit_breaker import reset_all_for_tests  # noqa: E402
 from app.llm import (  # noqa: E402

@@ -23,6 +23,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
+from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 from app import audit_backup, audit_restore, config
 
 

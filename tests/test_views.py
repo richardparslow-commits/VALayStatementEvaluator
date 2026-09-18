@@ -16,6 +16,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 
 from app.llm import ModelProbe  # noqa: E402
 from app.usage import UsageTracker  # noqa: E402
