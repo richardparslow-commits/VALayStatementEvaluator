@@ -1,0 +1,63 @@
+# .dockerignore — what the build context may not carry.
+#
+# This file is not about image size. The context is uploaded to a builder, and
+# the `sandbox` target's image can be pushed to a registry and snapshotted, so a
+# path listed here cannot reach *any* stage's COPY — including a future one that
+# asks for a directory holding it.
+#
+# tests/test_dockerignore.py keeps it honest in both directions: it expands every
+# COPY source in the Dockerfile against this context and fails if a secret, a
+# log, a blob or an exported report would come with it, and it fails if ignoring
+# something left a COPY with nothing to copy. It also simulates `COPY . .`, so
+# the filter — not today's COPY lines — is what protects the image.
+#
+# Docker's matching rules, not git's — and this file originally got that wrong in
+# exactly the way the test then caught. Patterns are anchored at the *context
+# root*, so `*.pem` matches only a top-level `*.pem` and `__pycache__/` only a
+# top-level one. That is why almost every entry below starts with `**/`, which
+# matches zero or more directories and so covers the root as well; `*` and `?`
+# never cross `/`; a pattern naming a directory also excludes its contents; `!`
+# re-includes; the last matching line wins.
+
+# --- secrets and credential files ------------------------------------------
+# .env.example is deliberately *kept*: it is a placeholder, not a credential, and
+# the sandbox image copies it so a runbook can be followed. That re-include is
+# why the pattern above it can be as broad as it is.
+**/.env
+**/.env.*
+!**/.env.example
+**/*.pem
+**/*.key
+.streamlit/secrets.toml
+.streamlit/secrets.*
+.streamlit/config.local.toml
+
+# --- patient data and run artifacts ----------------------------------------
+# Produced by *running* the app, never by building it: the audit trail, the
+# content-addressed blob store, exported reports, and the usage history. The
+# image creates /app/logs and /app/blobs itself (see the Dockerfile), so nothing
+# here needs to come from the context.
+**/logs/
+**/blobs/
+**/outputs/
+**/usage_history.json
+**/*.log
+
+# --- local scratch, caches, editor state -----------------------------------
+# `.git` without the slash on purpose: in a linked worktree `.git` is a *file*
+# holding a gitdir pointer, and a trailing slash would not match it.
+.git
+**/.venv/
+**/venv/
+**/__pycache__/
+**/*.py[cod]
+**/.mypy_cache/
+**/.pytest_cache/
+**/.ruff_cache/
+.freebuff/
+_leftover_backup/
+**/.DS_Store
+**/.idea/
+**/.vscode/
+**/* 2.*
+**/* 3.*

@@ -560,6 +560,13 @@ The production Dockerfile is optimized for the smallest possible image and
 fastest startup. It installs from the hash-pinned lockfile and runs as a
 non-root user.
 
+What can reach either stage is decided by [`.dockerignore`](.dockerignore) as
+well as by the `COPY` lines: it excludes credentials, the audit trail, the blob
+store and exported reports from the build context entirely, so a later
+`COPY . .` cannot pick them up either. See
+[SECURITY.md §8](SECURITY.md#the-same-audit-for-dockerignore) for the guard that
+keeps it that way.
+
 ```dockerfile
 # Dockerfile
 FROM python:3.12-slim AS runtime

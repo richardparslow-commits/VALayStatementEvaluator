@@ -119,10 +119,12 @@ RUN pip install --no-cache-dir -r requirements-dev.txt
 # fails when a root page or workflow file is added and not listed here.
 COPY *.md ./
 COPY .github/workflows/ ./.github/workflows/
-# The Dockerfile itself: tests/test_sandbox_image.py reads it (it is how the
-# contract in that file is checked), and it is the one file that explains to
-# whoever opens the box how the box was built.
-COPY Dockerfile ./
+# These two files are how the box was built and what it was built *without*:
+# tests/test_sandbox_image.py and tests/test_dockerignore.py read them, so the
+# image can check its own recipe from the inside — and SECURITY.md and
+# DEPLOYMENT.md link to .dockerignore by relative path, which
+# tests/test_docs_structure.py resolves.
+COPY Dockerfile .dockerignore ./
 COPY .gitignore .env.example pyproject.toml docker-compose.yml ./
 COPY tests/ ./tests/
 COPY scripts/ ./scripts/

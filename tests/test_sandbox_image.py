@@ -5,7 +5,9 @@ change in this repository that *nothing* verified: drop a COPY and the suite
 fails only inside a sandbox, with an error that looks nothing like its cause;
 drop the ``USER root`` and an agent gets a workspace it cannot write to; drop
 ``git`` and the git-ground-truth tests error instead of passing. So the file is
-parsed here and its contract asserted.
+parsed here and its contract asserted. The parser itself, and the .dockerignore
+matcher, live in ``tests/dockerfile.py`` — shared with ``test_dockerignore.py``,
+because two copies would drift and drift here fails open.
 
 The contract has two halves, and the second is what keeps the first from being
 "just ship everything":
@@ -21,8 +23,6 @@ The contract has two halves, and the second is what keeps the first from being
 """
 from __future__ import annotations
 
-import fnmatch
-import glob
 import sys
 import unittest
 from pathlib import Path
@@ -30,69 +30,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DOCKERFILE = PROJECT_ROOT / "Dockerfile"
+from tests import dockerfile  # noqa: E402
 
+PROJECT_ROOT = dockerfile.PROJECT_ROOT
 RUNTIME_STAGE = "runtime"
 SANDBOX_STAGE = "sandbox"
-
-
-def _instructions(text: str) -> list[str]:
-    """Dockerfile instructions, with continuations joined and comments dropped.
-
-    Line continuations matter here: most of the interesting instructions in this
-    file are multi-line, and a per-line scan would see ``COPY x \\`` and nothing
-    else.
-    """
-    out: list[str] = []
-    buffer = ""
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not buffer and (not line or line.startswith("#")):
-            continue
-        buffer += line[:-1].strip() + " " if line.endswith("\\") else line
-        if not raw.rstrip().endswith("\\"):
-            out.append(buffer)
-            buffer = ""
-    return out
-
-
-def _stages(text: str) -> dict[str, list[str]]:
-    """``stage name -> its instructions``, keyed by ``AS <name>``."""
-    stages: dict[str, list[str]] = {}
-    current: str | None = None
-    for instruction in _instructions(text):
-        if instruction.startswith("FROM "):
-            tokens = instruction.split()
-            current = tokens[3] if len(tokens) >= 4 and tokens[2].upper() == "AS" else tokens[-1]
-            stages[current] = []
-        elif current is not None:
-            stages[current].append(instruction)
-    return stages
-
-
-def _copy_sources(stage: list[str]) -> list[str]:
-    """The source paths of every ``COPY`` in *stage* (destination dropped)."""
-    sources: list[str] = []
-    for instruction in stage:
-        if instruction.startswith("COPY "):
-            tokens = instruction.split()
-            sources.extend(tokens[1:-1])
-    return sources
-
-
-def _carries(stage: list[str], path: str) -> bool:
-    """Is repo-relative *path* carried into a stage by one of its ``COPY``s?"""
-    for source in _copy_sources(stage):
-        if source == path:
-            return True
-        if source.endswith("/") and (path == source[:-1] or path.startswith(source)):
-            return True
-        # A glob source is matched only against the same directory: fnmatch's `*`
-        # happily crosses `/`, so `*.md` would otherwise claim every nested page.
-        if "/" not in source and "/" not in path and fnmatch.fnmatch(path, source):
-            return True
-    return False
 
 
 class SandboxImageTestCase(unittest.TestCase):
@@ -100,8 +42,8 @@ class SandboxImageTestCase(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.text = DOCKERFILE.read_text(encoding="utf-8")
-        cls.stages = _stages(cls.text)
+        cls.text = dockerfile.DOCKERFILE.read_text(encoding="utf-8")
+        cls.stages = dockerfile.stages(cls.text)
         for name in (RUNTIME_STAGE, SANDBOX_STAGE):
             assert name in cls.stages, f"Dockerfile has no `{name}` stage"
 
@@ -115,7 +57,7 @@ class SandboxImageTestCase(unittest.TestCase):
 
     def carries(self, path: str) -> bool:
         """Path present in the final sandbox *image* — its own COPYs or inherited."""
-        return _carries(self.sandbox, path) or _carries(self.runtime, path)
+        return dockerfile.carries(self.sandbox, path) or dockerfile.carries(self.runtime, path)
 
     def last_user(self, stage: list[str]) -> str | None:
         users = [i.split()[1] for i in stage if i.startswith("USER ")]
@@ -202,12 +144,13 @@ class TestSandboxCarriesWhatTheSuiteReads(SandboxImageTestCase):
         "docker-compose.yml",
         # mypy's settings, so `mypy app` in the box means what it means in CI
         "pyproject.toml",
-        # this module reads it, so the contract can be re-checked from inside the
-        # sandbox as well as from a checkout
-        "Dockerfile",
         # tests/test_security_gitignore.py asks git about these
         ".gitignore",
         ".env.example",
+        # these two are what the guards read and what the docs link to, so the
+        # contract can be re-checked from inside the sandbox as well
+        "Dockerfile",
+        ".dockerignore",
         # sample inputs for a manual run
         "examples",
     )
@@ -231,7 +174,7 @@ class TestSandboxCarriesWhatTheSuiteReads(SandboxImageTestCase):
         the image breaks the suite inside the sandbox."""
         pages = sorted(p.name for p in PROJECT_ROOT.glob("*.md"))
         self.assertTrue(pages, "no root pages found — the path must be wrong")
-        missing = [page for page in pages if not _carries(self.sandbox, page)]
+        missing = [page for page in pages if not dockerfile.carries(self.sandbox, page)]
         self.assertEqual(
             missing,
             [],
@@ -244,18 +187,17 @@ class TestSandboxCarriesWhatTheSuiteReads(SandboxImageTestCase):
             for path in (PROJECT_ROOT / ".github" / "workflows").glob("*")
         )
         self.assertTrue(workflows, "no workflow files found — the path must be wrong")
-        missing = [w for w in workflows if not _carries(self.sandbox, w)]
+        missing = [w for w in workflows if not dockerfile.carries(self.sandbox, w)]
         self.assertEqual(missing, [], "workflows left out of the image: " + ", ".join(missing))
 
     def test_no_copy_source_is_stale(self) -> None:
-        """Every source must still match something on disk — a COPY that matches
-        nothing is a silent omission, since Docker will not fail the build for it
-        until the path is a single missing file."""
-        stale = []
-        for source in _copy_sources(self.sandbox):
-            matches = glob.glob(str(PROJECT_ROOT / source), recursive=True)
-            if not matches:
-                stale.append(source)
+        """Every source must still match something on disk — Docker will not fail
+        a build for a glob that matches nothing, so the omission would be silent."""
+        stale = [
+            source
+            for source in dockerfile.copy_sources(self.sandbox)
+            if not dockerfile.expand(source)
+        ]
         self.assertEqual(stale, [], "these COPY sources match nothing on disk: " + ", ".join(stale))
 
 
@@ -273,7 +215,7 @@ class TestTheDeploymentImageIsUnchanged(SandboxImageTestCase):
         for path in ("tests", "scripts"):
             with self.subTest(path=path):
                 self.assertFalse(
-                    _carries(self.runtime, path),
+                    dockerfile.carries(self.runtime, path),
                     f"the deployment image now carries {path}: say so in its comments, "
                     "or take it out",
                 )
