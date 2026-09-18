@@ -50,6 +50,8 @@ from .shared import (
     render_condition_selector_for_slot,
     render_usage_summary,
     record_watchdog_run,
+    reference_suffix,
+    report_failure,
 )
 
 logger = get_logger("app.views.draft")
@@ -279,7 +281,9 @@ def _validate_draft_inputs(records: list, observations: str, condition: str, rid
     if not records:
         msg = "Upload at least one medical record file first."
         run_log_event("draft", "rejected", request_id=rid, error=msg, reason="no_records")
-        st.error(msg)
+        # Shown with the id the run log recorded, so a rejection the user quotes
+        # is findable even though it never reached the audit log.
+        st.error(f"{msg}{reference_suffix(rid)}")
         return False
     if not observations.strip() or not condition.strip():
         msg = "Enter the condition and the witness's observations."
@@ -287,7 +291,7 @@ def _validate_draft_inputs(records: list, observations: str, condition: str, rid
             "draft", "rejected", request_id=rid, error=msg,
             reason="missing_observations" if not observations.strip() else "missing_condition",
         )
-        st.error(msg)
+        st.error(f"{msg}{reference_suffix(rid)}")
         return False
     if len(observations) > MAX_OBSERVATIONS_CHARS and not st.session_state.get(
         "draft_confirm_oversize"
@@ -305,7 +309,7 @@ def _validate_draft_inputs(records: list, observations: str, condition: str, rid
             "draft", "rejected", request_id=rid, error=msg,
             reason="observations_oversize", observations_chars=len(observations),
         )
-        st.error(msg)
+        st.error(f"{msg}{reference_suffix(rid)}")
         return False
     return True
 
@@ -412,11 +416,11 @@ def _run_draft_flow(
         )
     except MemoryError as mem_exc:
         _handle_draft_abort(rid, "error", mem_exc, t0, _audit_condition_d, _audit_sources_d, _audit_files_d, _audit_pages_d)
-        st.error(f"Draft aborted: {mem_exc} (reference: {rid})")
+        st.error(f"Draft aborted: {format_error_for_user(mem_exc, rid)}")
         return
     except PipelineTimeoutError as timeout_exc:
         _handle_draft_abort(rid, "timeout", timeout_exc, t0, _audit_condition_d, _audit_sources_d, _audit_files_d, _audit_pages_d)
-        st.error(f"Draft aborted: {timeout_exc} (reference: {rid})")
+        st.error(f"Draft aborted: {format_error_for_user(timeout_exc, rid)}")
         return
     except Exception as exc:  # noqa: BLE001
         _handle_draft_error(rid, exc, t0, _audit_condition_d, _audit_sources_d, _audit_files_d, _audit_pages_d)
@@ -602,7 +606,13 @@ def _render_pdf_export(statement_text: str) -> None:
     try:
         pdf_bytes = generate_statement_pdf(statement_text, condition, witness_role)
     except Exception as exc:  # noqa: BLE001 - PDF generation is best-effort in the UI
-        st.error(f"Could not generate the PDF export: {exc}")
+        st.error(
+            report_failure(
+                f"Could not generate the PDF export: {exc}",
+                phase="draft_pdf_export",
+                exc=exc,
+            )
+        )
         return
 
     has_placeholders = detect_unconfirmed_placeholders(statement_text)

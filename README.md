@@ -1027,10 +1027,17 @@ reported in the health endpoint and structured logs.
 
 Every Evaluate/Draft run mints a correlation id (`req_…`) stored in `st.session_state` and a
 `ContextVar` so parallel record-digest/merge workers carry it. The id is attached to every log
-record (`request_id`), appended to user-facing errors as `reference: req_…` for post-mortem
+record (`request_id`), appended to every user-facing error as `reference: req_…` for post-mortem
 correlation, and never carries PII — logs emit only phases, timings, counts, and classifications
 (prompt/response bodies, statements, observations, and record text are excluded).
 
+- **`app/error_report.py`** — the one path a failure takes to become text a user reads:
+  `report_failure()` logs it (with a traceback when there is one) and returns the message with
+  `reference: req_…` appended, minting an id when none is active so the reference always resolves to
+  the line just written. `format_error_for_user()` covers paths that already hold the run id, and
+  `once=True` covers panels that repaint every rerun. A message the app could not otherwise record
+  (an unreadable upload, a rejected settings change) is recorded here, and
+  `tests/test_error_attribution.py` fails the build on a new bare `st.error(str(exc))`.
 - **`app/logging_config.py`** — `configure_logging()` (idempotent), `JsonFormatter` (one JSON line
   per record for ELK/CloudWatch/Datadog) and `PlainFormatter` fallback, `PhaseTimer` context
   manager, and the `ContextVar` helpers. The `app` parent logger fans out to all `app.*`

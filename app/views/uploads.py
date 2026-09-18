@@ -12,6 +12,7 @@ import streamlit as st
 
 from .. import config
 from ..documents import extract_uploaded_documents
+from ..error_report import report_failure
 from ..logging_config import get_logger
 
 logger = get_logger("app.views.uploads")
@@ -132,8 +133,16 @@ def extract_uploads(files: Any, slot: str) -> list[Any]:
     # fresh each run: they persist while a bad file is still uploaded and clear
     # as soon as it is removed or replaced.
     _render_skip_summary(files, documents, skipped)
+    # These are the only record of a file the app could not read, so each one is
+    # logged with a reference the user can quote: the extractor builds them as
+    # plain strings and would otherwise leave nothing behind. ``once`` because
+    # this loop is recomputed on every rerun while the bad file stays uploaded.
     for message in skipped:
-        st.warning(message)
+        st.warning(
+            report_failure(
+                message, phase="upload_extract", severity="warning", once=True
+            )
+        )
     return documents
 
 

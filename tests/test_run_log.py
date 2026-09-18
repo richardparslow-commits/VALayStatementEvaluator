@@ -137,13 +137,20 @@ class ViewWiringTests(unittest.TestCase):
     def test_evaluate_validation_failure_logged(self):
         import app.views.evaluate_view as ev
 
-        rid_holder = {"rid": "req_evalfail1"}
-        with mock.patch.object(ev, "get_request_id", return_value=rid_holder["rid"]), \
-             mock.patch.object(ev.st, "error") as err:
+        from app.logging_config import clear_request_id, set_request_id
+
+        rid = "req_evalfail1"
+        # The id is established on the context, which is where the view and the
+        # run log both read it from, rather than by patching one module's lookup.
+        token = set_request_id(rid)
+        self.addCleanup(clear_request_id, token)
+        with mock.patch.object(ev.st, "error") as err:
             ok = ev._validate_evaluate_inputs(statement_text="   ", records=[])
         self.assertFalse(ok)
         err.assert_called_once()
-        events = self._events_for(rid_holder["rid"])
+        # The rejection is shown with the id the run log recorded for it.
+        self.assertIn(f"(reference: {rid})", str(err.call_args[0][0]))
+        events = self._events_for(rid)
         reasons = {e["reason"] for e in events}
         self.assertIn("no_statement", reasons)
 

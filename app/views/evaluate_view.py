@@ -69,6 +69,7 @@ from .shared import (
     audit_record_meta,
     check_shutdown_gate,
     check_upload_limits,
+    ensure_request_id,
     extract_uploads,
     format_error_for_user,
     get_llm,
@@ -79,6 +80,8 @@ from .shared import (
     render_record_search,
     render_usage_summary,
     record_watchdog_run,
+    reference_suffix,
+    report_failure,
 )
 
 logger = get_logger("app.views.evaluate")
@@ -136,7 +139,14 @@ def render_evaluate_tab() -> None:
         if files is not None:
             accepted, rejections = check_upload_limits([files])
             for msg in rejections:
-                st.warning(msg)
+                st.warning(
+                    report_failure(
+                        msg,
+                        phase="statement_upload_limits",
+                        severity="warning",
+                        once=True,
+                    )
+                )
             if rejections:
                 docs = []
             else:
@@ -228,11 +238,13 @@ def _render_statement_length_guidance(statement_text: str) -> None:
 
 def _validate_evaluate_inputs(statement_text: str, records: list) -> bool:
     """Pre-run validation; shows the specific error and returns False when invalid."""
-    rid = get_request_id() or "-"
+    # Minted rather than defaulted to "-": each rejection below is written to the
+    # run log under this id, and an id the user cannot see is not a reference.
+    rid = ensure_request_id()
     if not statement_text.strip():
         msg = "Provide the lay statement first (upload or paste)."
         run_log_event("evaluate", "rejected", request_id=rid, error=msg, reason="no_statement")
-        st.error(msg)
+        st.error(f"{msg}{reference_suffix(rid)}")
         return False
     if len(statement_text) > MAX_STATEMENT_CHARS and not st.session_state.get(
         "eval_confirm_oversize"
@@ -250,12 +262,12 @@ def _validate_evaluate_inputs(statement_text: str, records: list) -> bool:
             "evaluate", "rejected", request_id=rid, error=msg,
             reason="statement_oversize", statement_chars=len(statement_text),
         )
-        st.error(msg)
+        st.error(f"{msg}{reference_suffix(rid)}")
         return False
     if not records:
         msg = "Upload at least one medical record file."
         run_log_event("evaluate", "rejected", request_id=rid, error=msg, reason="no_records")
-        st.error(msg)
+        st.error(f"{msg}{reference_suffix(rid)}")
         return False
     return True
 
@@ -341,7 +353,7 @@ def _run_evaluation_flow(statement_text: str, records: list) -> None:
                 "error_class": type(mem_exc).__name__,
             },
         )
-        st.error(f"Evaluation aborted: {mem_exc} (reference: {rid})")
+        st.error(f"Evaluation aborted: {format_error_for_user(mem_exc, rid)}")
         return
     except PipelineTimeoutError as timeout_exc:
         bar.empty()
@@ -362,7 +374,7 @@ def _run_evaluation_flow(statement_text: str, records: list) -> None:
                 "error_class": "PipelineTimeoutError",
             },
         )
-        st.error(f"Evaluation aborted: {timeout_exc} (reference: {rid})")
+        st.error(f"Evaluation aborted: {format_error_for_user(timeout_exc, rid)}")
         return
     except Exception as exc:  # noqa: BLE001
         bar.empty()
@@ -601,7 +613,13 @@ def _render_pdf_export(statement_text: str, *, entry_point: str) -> None:
     try:
         pdf_bytes = generate_statement_pdf(statement_text, condition, witness_role="")
     except Exception as exc:  # noqa: BLE001 - PDF generation is best-effort in the UI
-        st.error(f"Could not generate the PDF export: {exc}")
+        st.error(
+            report_failure(
+                f"Could not generate the PDF export: {exc}",
+                phase="evaluate_pdf_export",
+                exc=exc,
+            )
+        )
         return
 
     has_placeholders = detect_unconfirmed_placeholders(statement_text)
