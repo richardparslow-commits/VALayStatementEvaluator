@@ -16,9 +16,14 @@ from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 GITIGNORE = PROJECT_ROOT / ".gitignore"
 HOOK = PROJECT_ROOT / "scripts/hooks/pre-commit"
-#: The harness-import rule the hook runs. A throwaway repository needs a copy of
-#: it, because the hook resolves the module from the checkout it is committing to.
-HARNESS_IMPORTS = PROJECT_ROOT / "tests" / "harness_imports.py"
+#: Every module the hook runs — each rule, plus the plumbing they share. A
+#: throwaway repository needs copies of all of them, because the hook resolves each
+#: one from the checkout it is committing to.
+RULE_MODULES = (
+    PROJECT_ROOT / "tests" / "staged_sources.py",
+    PROJECT_ROOT / "tests" / "harness_imports.py",
+    PROJECT_ROOT / "tests" / "streamlit_option_reads.py",
+)
 
 
 def _gitignore_patterns() -> list[str]:
@@ -116,6 +121,30 @@ class TestPreCommitHook(unittest.TestCase):
         mode = HOOK.stat().st_mode
         self.assertTrue(mode & stat.S_IXUSR, msg="hook should be executable")
 
+    def test_the_header_installs_it_in_a_way_that_does_not_go_stale(self):
+        """A copy of the hook checks less than the hook, and reports green.
+
+        Every rule below lives in a module the hook resolves from the checkout it
+        is committing to, and this file is edited whenever one is added — so a
+        checkout that holds a *copy* keeps running the version it was copied from,
+        silently enforcing the rules of the day it was installed. ``README.md``
+        and ``SECURITY.md`` therefore say to link it or to point
+        ``core.hooksPath`` at ``scripts/hooks``; the header a contributor reads
+        when their commit is refused has to say the same thing, because that is
+        the moment they (re)install it.
+        """
+        header = HOOK.read_text(encoding="utf-8")
+        self.assertIn(
+            "core.hooksPath",
+            header,
+            "the header should name the install that keeps the hook current",
+        )
+        self.assertNotIn(
+            "cp scripts/hooks/pre-commit",
+            header,
+            "the header must not recommend a copy, which goes stale",
+        )
+
     def test_hook_blocks_env_file(self):
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td)
@@ -195,49 +224,26 @@ class TestPreCommitHook(unittest.TestCase):
             self.assertEqual(result.returncode, 0)
 
 
-class TestTheHookEnforcesTheHarnessImport(unittest.TestCase):
-    """The harness rule, at the moment the mistake is made rather than after a push.
+class HookRepository(unittest.TestCase):
+    """A throwaway repository holding the real hook and a copy of every rule.
 
-    ``tests/test_job_queue_atomic.py`` reached main without the harness import,
-    and the only thing that noticed was CI — on a *merge result*, one module late,
-    in a build nobody could reproduce locally. The scan in
-    ``tests/test_hermetic.py`` cannot see a module whose branch is not merged; the
-    commit hook can, because it looks at what is being committed. Both call
-    ``tests/harness_imports.py``, so they cannot disagree about what is required.
-
-    These run the real hook in a throwaway repository, so they exercise the path a
-    contributor's commit takes: the hook's interpreter choice, its staged-file
-    read, and its exit status.
+    Both rule classes below run the *actual* hook file from such a tree, with no
+    venv and nothing installed, so what they exercise is the path a contributor's
+    commit takes: the interpreter choice, the staged-file read, and the exit
+    status.
     """
-
-    WIRED = (
-        "import sys\n"
-        "from pathlib import Path\n"
-        "\n"
-        "sys.path.insert(0, str(Path(__file__).resolve().parent.parent))\n"
-        "from tests import hermetic  # noqa: E402,F401\n"
-        "\n"
-        "from app import config  # noqa: E402\n"
-    )
-    FORGOT = "import unittest\n\n\nclass T(unittest.TestCase):\n    pass\n"
-    APP_FIRST = (
-        "import sys\n"
-        "from pathlib import Path\n"
-        "\n"
-        "sys.path.insert(0, str(Path(__file__).resolve().parent.parent))\n"
-        "from app import config  # noqa: E402\n"
-        "from tests import hermetic  # noqa: E402,F401\n"
-    )
 
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.repo = Path(tmp.name)
         subprocess.run(["git", "init", "-q"], cwd=str(self.repo), check=True)
-        (self.repo / "tests").mkdir()
-        (self.repo / "tests" / "harness_imports.py").write_text(
-            HARNESS_IMPORTS.read_text(encoding="utf-8"), encoding="utf-8"
-        )
+        rules = self.repo / "tests"
+        rules.mkdir()
+        for module in RULE_MODULES:
+            (rules / module.name).write_text(
+                module.read_text(encoding="utf-8"), encoding="utf-8"
+            )
         self.hook = self.repo / "hook.sh"
         self.hook.write_text(HOOK.read_text(encoding="utf-8"), encoding="utf-8")
         self.hook.chmod(0o755)
@@ -266,13 +272,45 @@ class TestTheHookEnforcesTheHarnessImport(unittest.TestCase):
             env=env,
         )
 
+
+class TestTheHookEnforcesTheHarnessImport(HookRepository):
+    """The harness rule, at the moment the mistake is made rather than after a push.
+
+    ``tests/test_job_queue_atomic.py`` reached main without the harness import,
+    and the only thing that noticed was CI — on a *merge result*, one module late,
+    in a build nobody could reproduce locally. The scan in
+    ``tests/test_hermetic.py`` cannot see a module whose branch is not merged; the
+    commit hook can, because it looks at what is being committed. Both call
+    ``tests/harness_imports.py``, so they cannot disagree about what is required.
+    """
+
+    WIRED = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "\n"
+        "sys.path.insert(0, str(Path(__file__).resolve().parent.parent))\n"
+        "from tests import hermetic  # noqa: E402,F401\n"
+        "\n"
+        "from app import config  # noqa: E402\n"
+    )
+    FORGOT = "import unittest\n\n\nclass T(unittest.TestCase):\n    pass\n"
+    APP_FIRST = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "\n"
+        "sys.path.insert(0, str(Path(__file__).resolve().parent.parent))\n"
+        "from app import config  # noqa: E402\n"
+        "from tests import hermetic  # noqa: E402,F401\n"
+    )
+
     def test_the_hook_runs_the_shared_rule(self) -> None:
         """A gate wired to nothing is a gate that cannot fail."""
-        self.assertTrue(
-            HARNESS_IMPORTS.exists(),
-            "the rule the hook and the suite share is missing, so the hook either "
-            "does nothing or carries a second copy that can drift from CI's",
-        )
+        for module in RULE_MODULES:
+            self.assertTrue(
+                module.exists(),
+                f"{module.name} is missing, so its rule either does nothing or "
+                "carries a second copy that can drift from CI's",
+            )
         hook = HOOK.read_text(encoding="utf-8")
         self.assertIn("tests.harness_imports", hook)
         self.assertIn("--staged", hook)
@@ -353,6 +391,75 @@ class TestTheHookEnforcesTheHarnessImport(unittest.TestCase):
         result = self.run_hook(env)
         self.assertNotEqual(result.returncode, 0, "a check that cannot run must not pass")
         self.assertIn("no python3 on PATH", result.stderr)
+
+
+class TestTheHookRefusesAStreamlitOptionRead(HookRepository):
+    """The option rule, at the moment the mistake is made rather than after a push.
+
+    ``app/`` must decide nothing from a Streamlit option's *value*: it comes from
+    the machine and from the directory the process started in, so the same code
+    behaves differently in two deployments — and for the hardening check in
+    ``app/main.py`` it would answer the wrong question ("is XSRF on here?") instead
+    of the one that matters ("does this deployment ship it?"). The scan in
+    ``tests/test_hermetic.py`` cannot see an unmerged branch; the hook can, because
+    it looks at what is being committed. Both call
+    ``tests/streamlit_option_reads.py``, so they cannot disagree about the rule.
+    """
+
+    OPTION_READ = (
+        "import streamlit as st\n"
+        "\n"
+        "\n"
+        "def port() -> int:\n"
+        "    return st.get_option('server.port')\n"
+    )
+    FILE_READ = (
+        "from pathlib import Path\n"
+        "\n"
+        "CONFIG = Path(__file__).parent.parent / '.streamlit' / 'config.toml'\n"
+        "TEXT = CONFIG.read_text(encoding='utf-8')\n"
+    )
+
+    def test_the_hook_runs_the_shared_rule(self) -> None:
+        hook = HOOK.read_text(encoding="utf-8")
+        self.assertIn("tests.streamlit_option_reads", hook)
+        self.assertIn("--staged", hook)
+
+    def test_the_hook_blocks_a_staged_app_module_that_reads_an_option(self) -> None:
+        self.stage("app/views/thing.py", self.OPTION_READ)
+        result = self.run_hook()
+        self.assertNotEqual(result.returncode, 0, "the commit should have been refused")
+        self.assertIn("app/views/thing.py", result.stderr)
+        self.assertIn("get_option", result.stderr, "name the offending read")
+        self.assertIn("config.toml", result.stderr, "say what to do instead")
+
+    def test_the_hook_allows_reading_the_committed_file(self) -> None:
+        """The *intended* shape: the deployment's own file, read as text."""
+        self.stage("app/main.py", self.FILE_READ)
+        result = self.run_hook()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_the_hook_ignores_modules_outside_the_app(self) -> None:
+        """Scope is ``app/``, because ``tests/hermetic.py`` reads streamlit.config
+        on purpose — it has to reach into internals no public API exposes."""
+        self.stage("scripts/probe.py", self.OPTION_READ)
+        self.stage("harness_probe.py", self.OPTION_READ)
+        result = self.run_hook()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_both_rules_report_in_one_commit(self) -> None:
+        """Neither rule may mask the other, in either direction.
+
+        The rules are separate modules and the hook runs each in its own process,
+        so a refusal from the first must not stop the second from reporting: the
+        failure a contributor sees should list everything wrong with the commit.
+        """
+        self.stage("tests/test_forgot.py", "import unittest\n")
+        self.stage("app/thing.py", self.OPTION_READ)
+        result = self.run_hook()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not import the hermetic harness", result.stderr)
+        self.assertIn("get_option", result.stderr)
 
 
 if __name__ == "__main__":

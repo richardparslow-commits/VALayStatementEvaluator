@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
-# Prevent accidental commit of secrets / .env files.
-# Install:
-#   cp scripts/hooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+# Prevent accidental commit of secrets / .env files, and refuse the two
+# repository rules below at the moment they are broken rather than in CI.
+#
+# Install as a *link*, or point git at this directory — not a copy. This file's
+# rules are modules it resolves from the checkout (and it is edited whenever one
+# is added), so a checkout holding a copy keeps running the version it was copied
+# from: it reports green while checking less than this file claims, which is the
+# one failure a gate may not have.
+#   ln -sfn ../../scripts/hooks/pre-commit .git/hooks/pre-commit
+#   git config core.hooksPath scripts/hooks
 # Or wire via pre-commit.com (see SECURITY.md).
 #
 # This hook:
@@ -10,6 +17,8 @@
 #      (sk-*, OPENAI_API_KEY=, etc.) or generic high-entropy key assignments.
 #   3. Refuses staged test modules that are not wired into the hermetic harness
 #      (tests/harness_imports.py, the same rule the suite scans with).
+#   4. Refuses staged app modules that read a Streamlit config option
+#      (tests/streamlit_option_reads.py, likewise shared with the suite).
 
 set -e
 
@@ -77,24 +86,39 @@ if echo "$STAGED_DIFF_FOR_SECRETS" | grep -E -q '^\+\s*[^#]*sk-[A-Za-z0-9]' 2>/d
   FAIL=1
 fi
 
-# ---------------------------------------------------------------- test harness
-# A test module that never imports tests/hermetic.py — or imports it after an app
-# import — reads whatever configuration this machine happens to have, so it can
-# pass here and fail in CI for no reason the code explains. That mistake has
-# already reached main once (tests/test_job_queue_atomic.py), where it showed up
-# only on the merge result. The rule lives in tests/harness_imports.py, which the
-# suite scans with as well, so the hook and CI cannot disagree about what is
-# required; this reads the *staged* copy, because that is what the commit contains.
+# ---------------------------------------------------------------- repo rules
+# Both rules run here for the same reason: the mistake they catch costs a red
+# build later, and the suite cannot see a module whose branch is not merged. Each
+# lives in a module the suite scans with as well, so the hook and CI cannot
+# disagree about what is required, and each reads the *staged* copy, because that
+# is what the commit contains.
 #
-# The gate below is deliberately coarser than the rule (anything under tests/
-# rather than only test modules): it exists to avoid paying for an interpreter on
-# commits that touch no test code, and *which* files count is the module's answer,
-# not a second glob here that could drift away from it.
+#   tests/harness_imports.py         tests/test_*.py — wired into tests/hermetic.py
+#                                    (that mistake reached main once, as
+#                                    tests/test_job_queue_atomic.py, visible only
+#                                    on the merge result)
+#   tests/streamlit_option_reads.py  app/*.py — no Streamlit config option read,
+#                                    because an option's value comes from the
+#                                    machine rather than from the deployment
+#
+# The gates below are deliberately coarser than the rules (anything under tests/
+# or app/ rather than only the files each rule judges): they exist to avoid paying
+# for an interpreter on commits that touch neither, and *which* files count is the
+# module's answer, not a second glob here that could drift away from it.
+check_tests_rule=0
+check_app_rule=0
 if echo "$STAGED_FILES" | grep -q '^tests/'; then
+  check_tests_rule=1
+fi
+if echo "$STAGED_FILES" | grep -q '^app/'; then
+  check_app_rule=1
+fi
+
+if [ "$check_tests_rule" = 1 ] || [ "$check_app_rule" = 1 ]; then
   # An activated virtualenv, else the project's own .venv, else whatever python3
-  # is on PATH — the rule is stdlib-only, so any of them reaches the same verdict.
-  # No interpreter at all blocks the commit rather than skipping the check: this is
-  # the file whose whole job is to not fail open.
+  # is on PATH — both rules are stdlib-only, so any of them reaches the same
+  # verdict. No interpreter at all blocks the commit rather than skipping the
+  # checks: this is the file whose whole job is to not fail open.
   PYTHON_BIN=""
   if [ -n "${VIRTUAL_ENV:-}" ] && [ -x "$VIRTUAL_ENV/bin/python" ]; then
     PYTHON_BIN="$VIRTUAL_ENV/bin/python"
@@ -104,19 +128,29 @@ if echo "$STAGED_FILES" | grep -q '^tests/'; then
     PYTHON_BIN="$(command -v python3 || command -v python || true)"
   fi
   if [ -z "$PYTHON_BIN" ]; then
-    echo "✖  Blocked: cannot check the test harness import — no python3 on PATH." >&2
-    echo "   Install Python and retry; the check is not skipped, because a gate that" >&2
-    echo "   silently does not run is the thing this hook exists to prevent." >&2
+    echo "✖  Blocked: cannot check the repository rules — no python3 on PATH." >&2
+    echo "   Install Python and retry; the checks are not skipped, because a gate" >&2
+    echo "   that silently does not run is the thing this hook exists to prevent." >&2
     FAIL=1
-  elif ! "$PYTHON_BIN" -m tests.harness_imports --staged; then
-    FAIL=1
+  else
+    if [ "$check_tests_rule" = 1 ]; then
+      if ! "$PYTHON_BIN" -m tests.harness_imports --staged; then
+        FAIL=1
+      fi
+    fi
+    if [ "$check_app_rule" = 1 ]; then
+      if ! "$PYTHON_BIN" -m tests.streamlit_option_reads --staged; then
+        FAIL=1
+      fi
+    fi
   fi
 fi
 
 if [[ "$FAIL" != 0 ]]; then
   echo "" >&2
   echo "Commit aborted. See SECURITY.md for secret handling, and" >&2
-  echo "tests/harness_imports.py for the test-harness rule." >&2
+  echo "tests/harness_imports.py / tests/streamlit_option_reads.py for the" >&2
+  echo "repository rules." >&2
   exit 1
 fi
 

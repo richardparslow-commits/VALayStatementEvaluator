@@ -35,13 +35,15 @@ installed and without paying for Streamlit's import.
 from __future__ import annotations
 
 import ast
-import subprocess
+import fnmatch
 import sys
 import sysconfig
 from collections.abc import Iterable
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+from tests import staged_sources
+
+PROJECT_ROOT = staged_sources.PROJECT_ROOT
 TESTS_DIR = PROJECT_ROOT / "tests"
 
 #: What counts as a test module: the same glob the suite's scan uses.
@@ -162,45 +164,33 @@ def harness_import_offence(name: str, source: str) -> str | None:
     return None
 
 
+def is_test_module(path: str | Path) -> bool:
+    """Whether *path* is a test module, by the same rule the staged scan uses."""
+    return fnmatch.fnmatch(Path(path).name, MODULE_GLOB)
+
+
 def test_module_sources(directory: Path | None = None) -> list[tuple[str, str]]:
-    """``(name, source)`` for every test module in *directory* — the working tree."""
+    """``(repo-relative path, source)`` for every test module — the working tree."""
     root = TESTS_DIR if directory is None else directory
     return [
-        (path.name, path.read_text(encoding="utf-8"))
-        for path in sorted(root.glob(MODULE_GLOB))
+        (path, source)
+        for path, source in staged_sources.worktree(root)
+        if is_test_module(path)
     ]
 
 
-def _git(*args: str) -> str:
-    result = subprocess.run(
-        ["git", *args],
-        cwd=str(PROJECT_ROOT),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise SystemExit(f"git {' '.join(args)} failed:\n{result.stderr.strip()}")
-    return result.stdout
-
-
 def staged_test_module_sources() -> list[tuple[str, str]]:
-    """``(name, source)`` for the test modules staged for commit.
+    """``(repo-relative path, source)`` for the test modules staged for commit.
 
     The **index** copy rather than the file on disk, because a commit is what is
-    staged and the two differ for anyone who edits a file after staging it.
-    Renames are included so a module cannot drop the import by moving; deletions
-    are excluded, having no content to check.
+    staged — see ``tests/staged_sources.py``, which owns that distinction for every
+    rule rather than letting each one decide it.
     """
-    names = _git(
-        "diff",
-        "--cached",
-        "--name-only",
-        "--diff-filter=ACMR",
-        "--",
-        f"tests/{MODULE_GLOB}",
-    ).split()
-    return [(Path(name).name, _git("show", f":{name}")) for name in names]
+    return [
+        (path, source)
+        for path, source in staged_sources.staged("tests/")
+        if is_test_module(path)
+    ]
 
 
 def offenders(sources: Iterable[tuple[str, str]]) -> list[str]:

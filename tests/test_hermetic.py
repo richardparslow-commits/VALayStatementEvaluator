@@ -28,7 +28,6 @@ from __future__ import annotations
 import ast
 import json
 import os
-import re
 import subprocess
 import sys
 import tempfile
@@ -41,7 +40,13 @@ TESTS_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = TESTS_DIR.parent
 
 sys.path.insert(0, str(PROJECT_ROOT))
-from tests import devlayout, harness_imports, hermetic, hostile  # noqa: E402
+from tests import (  # noqa: E402
+    devlayout,
+    harness_imports,
+    hermetic,
+    hostile,
+    streamlit_option_reads,
+)
 
 #: Names the app reads, spread across the modules that read them. A derivation
 #: that stops seeing these has stopped seeing whole files.
@@ -87,24 +92,10 @@ CANARY_TESTS = (
     "tests.test_ingest_quality.TestArchiveUploads",
 )
 
-#: Ways a module could ask Streamlit for an option's value. Compiled once so the
-#: scan and its self-tests cannot disagree about what is being matched.
-OPTION_READ_PATTERNS = tuple(re.compile(pattern) for pattern in (
-    r"\bget_option\s*\(",
-    r"\bset_option\s*\(",
-    r"\bst\.config\b",
-    r"\bstreamlit\.config\b",
-))
-
-
-def option_read_offence(name: str | Path, source: str) -> list[str]:
-    """Lines where *source* reads a Streamlit config option, as ``name:line``."""
-    return [
-        f"{name}:{number}: {line.strip()}"
-        for number, line in enumerate(source.splitlines(), start=1)
-        if any(pattern.search(line) for pattern in OPTION_READ_PATTERNS)
-    ]
-
+# The Streamlit-option rule — what it covers and why — lives in
+# ``tests/streamlit_option_reads.py``: the scan below and ``scripts/hooks/pre-commit``
+# both read it from there, because a second copy would drift and a drifted gate
+# fails open. Its patterns and self-tests moved with it.
 
 class TestTheScanFindsTheConfigSurface(unittest.TestCase):
     """The derivation is the load-bearing part, so it is pinned, not assumed."""
@@ -798,26 +789,22 @@ class TestTheDevelopmentLayoutRunnerRefusesAVacuousRun(unittest.TestCase):
 
 
 class TestTheAppReadsNoStreamlitConfigOption(unittest.TestCase):
-    """Why the file above can be pinned at all: nothing in ``app/`` asks for an
-    option.
+    """Why the pinned config file can be relied on at all: nothing in ``app/``
+    asks Streamlit what an option is set to.
 
-    The app's hardening check reads the committed file as *text* on purpose —
-    Streamlit exposes no way to ask which source a value came from, so asking for
-    the value would answer a different question ("is XSRF on in this process?",
-    which a machine's own config file can answer wrongly) instead of the one that
-    matters ("does the deployment ship the hardening?"). This keeps that
-    distinction from being lost by a future refactor that reaches for
-    ``get_option`` — which would make the app's security posture depend on the
-    environment it happens to start in.
+    The rule itself lives in ``tests/streamlit_option_reads.py``, for the reason in
+    its docstring, and it has two callers this class keeps honest: the scan below
+    (which CI runs as part of the suite) and ``scripts/hooks/pre-commit`` (which
+    runs the same code over the staged copy, so the mistake fails at the commit
+    rather than after a push). The hook's behaviour is pinned in
+    ``tests/test_security_gitignore.py``; what is pinned here is the rule, its
+    scope, and the fact that the app currently satisfies it.
     """
 
     def test_no_app_module_reads_a_streamlit_option(self) -> None:
-        offenders: list[str] = []
-        for path in sorted((PROJECT_ROOT / "app").rglob("*.py")):
-            found = option_read_offence(
-                path.relative_to(PROJECT_ROOT), path.read_text(encoding="utf-8")
-            )
-            offenders.extend(found)
+        offenders = streamlit_option_reads.offenders(
+            streamlit_option_reads.app_module_sources()
+        )
         self.assertEqual(
             offenders,
             [],
@@ -830,7 +817,9 @@ class TestTheAppReadsNoStreamlitConfigOption(unittest.TestCase):
     def test_the_scan_flags_a_planted_read(self) -> None:
         """A guard that cannot fail is decoration."""
         source = "import streamlit as st\n\n\ndef f():\n    return st.get_option('server.port')\n"
-        self.assertTrue(option_read_offence("planted.py", source))
+        self.assertTrue(
+            streamlit_option_reads.option_read_offence("app/planted.py", source)
+        )
 
     def test_the_scan_accepts_reading_the_file(self) -> None:
         """The committed file read as text is the *intended* shape."""
@@ -839,7 +828,39 @@ class TestTheAppReadsNoStreamlitConfigOption(unittest.TestCase):
             "cfg = Path(__file__).parent.parent / '.streamlit' / 'config.toml'\n"
             "text = cfg.read_text(encoding='utf-8')\n"
         )
-        self.assertEqual(option_read_offence("fine.py", source), [])
+        self.assertEqual(
+            streamlit_option_reads.option_read_offence("app/fine.py", source), []
+        )
+
+    def test_the_rule_covers_the_app_and_nothing_else(self) -> None:
+        """The scope is exactly ``app/``, and the scan really looks at something.
+
+        ``tests/hermetic.py`` reads ``streamlit.config`` on purpose — it has to
+        reach into ``get_config_files``/``get_option``/``ConfigOption.sensitive``
+        because no public API covers those routes. A rule that covered the whole
+        repository, or a scan whose scope silently emptied out, would either flag
+        the harness that makes the suite hermetic or check nothing at all, and both
+        would read as green.
+        """
+        names = [
+            path for path, _ in streamlit_option_reads.app_module_sources()
+        ]
+        self.assertTrue(names, "the scan found no app modules at all")
+        self.assertTrue(
+            all(name.startswith("app/") for name in names),
+            f"the scan reached outside app/: {sorted(names)[:5]}",
+        )
+        for outside in ("tests/hermetic.py", "main.py", "app"):
+            self.assertFalse(
+                streamlit_option_reads.is_app_module(outside),
+                f"{outside} is not an app module",
+            )
+        self.assertTrue(streamlit_option_reads.is_app_module("app/main.py"))
+        self.assertTrue(
+            streamlit_option_reads.is_app_module(PROJECT_ROOT / "app" / "main.py"),
+            "an absolute path has to resolve the same way, or a caller that passes "
+            "one silently checks nothing",
+        )
 
 
 class TestEveryTestModuleImportsTheHarness(unittest.TestCase):
