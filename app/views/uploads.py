@@ -149,13 +149,7 @@ def _render_skip_summary(files: Any, documents: list[Any], skipped: list[str]) -
 
 
 def render_record_volume_warning(documents: list[Any], *, slot: str) -> None:
-    """Warn about a record set big enough to be slow, partial, or over the cap.
-
-    The uploader already says how many pages loaded; what it does not say is that
-    the digest is capped (``MAX_DIGEST_FACTS``) and that a very large set will take
-    a long time and may report fewer facts than the records contain. Better to say
-    so before the run than to have the report quietly be thinner than the records.
-    """
+    """Warn about a slow review or a record set over the input page limit."""
     if not documents:
         return
     text_pages = sum(len(getattr(doc, "pages", []) or []) for doc in documents)
@@ -175,9 +169,9 @@ def render_record_volume_warning(documents: list[Any], *, slot: str) -> None:
     elif total_pages > config.RECORD_SIZE_WARN_PAGES:
         st.warning(
             f"⚠️ Large record set ({total_pages:,} pages): the review will take a long time "
-            f"and the digest is capped at {config.MAX_DIGEST_FACTS:,} facts, so a record set "
-            f"this size may not be represented in full. Consider splitting it by date range "
-            "so each run can cover its pages completely."
+            "and may reach the run timeout. Extracted evidence is retained in full; "
+            "individual prompts and narrative summaries use bounded selections. "
+            "Consider splitting the records by date range to shorten each run."
         )
     logger.debug(
         "record volume slot=%s files=%d pages=%d text_pages=%d",

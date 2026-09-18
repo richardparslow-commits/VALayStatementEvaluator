@@ -55,6 +55,14 @@ def main() -> None:
         "but fully parallelized across chunks."
     )
     assert digest.duplicates_skipped == 199, digest.duplicates_skipped
+    expected = {
+        line for page in pages for line in page.text.splitlines() if line.startswith("EVT ")
+    }
+    actual = {fact.description for fact in digest.facts}
+    assert actual == expected, f"lost {len(expected - actual)} distinct facts"
+    assert len(expected) == 1801, len(expected)
+    tail = digest.relevant_facts_text("symptom assessment entry number 1999", max_facts=1)
+    assert "entry number 1999" in tail, "final record's evidence not retrieved"
     assert "entry number 1500" in sample, "specific entry not retrieved"
     print("SCALE_SIM_OK")
 

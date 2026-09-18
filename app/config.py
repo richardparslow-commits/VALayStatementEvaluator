@@ -339,7 +339,7 @@ RECORD_SIZE_WARN_PAGES = _positive_int_env("VA_LSE_RECORD_SIZE_WARN_PAGES", 800)
 # VA_LSE_RECORDS_CONCURRENCY if you move to a higher QwenCloud tier.
 RECORDS_CONCURRENCY = max(1, _int_env("VA_LSE_RECORDS_CONCURRENCY", 2))
 
-# Maximum facts kept in the digest after consolidation.
+# Maximum facts selected for a prompt, never a cap on retained evidence.
 MAX_DIGEST_FACTS = _int_env("VA_LSE_MAX_DIGEST_FACTS", 1500)
 
 # Pages whose word n-gram overlap is at least this high are treated as the same

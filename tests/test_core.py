@@ -918,16 +918,15 @@ class TestLargeRecordPipeline(unittest.TestCase):
                 description=f"fact number {i}",
                 source="chunk 1/9",
             )
-            for i in range(600)
+            for i in range(1501)
         ]
         digest = MedicalDigest(facts=facts)
         llm = FakeLLM()
         merged = _merge_facts(llm, digest)
-        # 600 facts -> at least 3 parallel merge batches of 200.
-        self.assertGreaterEqual(llm.merge_calls, 3)
+        # 1,501 facts -> at least 8 parallel merge batches of 200.
+        self.assertGreaterEqual(llm.merge_calls, 8)
         # Pass-through fake must not lose any distinct facts.
-        self.assertEqual(len(merged), 600)
-        self.assertLessEqual(len(merged), config.MAX_DIGEST_FACTS)
+        self.assertEqual(merged, facts)
 
     def test_dedupe_facts_mechanical(self):
         facts = [

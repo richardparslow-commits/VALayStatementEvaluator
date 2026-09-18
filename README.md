@@ -189,7 +189,7 @@ installs on macOS and Linux CI.
 | `VA_LSE_RUN_LOG_BACKUPS` | Rotated run logs kept | `5` |
 | `VA_LSE_DISK_MIN_FREE_BYTES` | Log-volume floor reported by `/health → disk` | `268435456` |
 | `VA_LSE_RECORDS_CONCURRENCY` | Parallel chunk-digest workers | `2` (Lite plan fits 1–2 concurrent agents) |
-| `VA_LSE_MAX_DIGEST_FACTS` | Max facts kept in the consolidated digest | `1500` |
+| `VA_LSE_MAX_DIGEST_FACTS` | Default JSON prompt-view limit and maximum relevance-selected facts per prompt; does not cap stored evidence | `1500` |
 | `VA_LSE_DIGEST_CHUNK_CHARS` | Characters per record chunk | `8000` |
 | `VA_LSE_DOCX_MAX_INTERNAL_FILE_BYTES` | Max uncompressed bytes allowed for a single DOCX internal file | `52428800` |
 | `VA_LSE_DOCX_MAX_TOTAL_UNCOMPRESSED_BYTES` | Max total uncompressed bytes allowed across all DOCX internal files | `209715200` |
@@ -433,18 +433,24 @@ The reviewer is built for full VA claim files, including bundles of 1,000–2,00
   Every skipped page is named in the coverage report ("`bundle.pdf` p.40 = `bundle.pdf` p.12").
 - **Transient-failure tolerance** — a chunk that fails (e.g. rate limit) is retried
   once; the run only aborts if it still fails, and the failing chunks are named.
-- **Hierarchical fact merging** — thousands of extracted facts are consolidated in
-  parallel batches (never one oversized call), deduplicated, and capped at
-  `VA_LSE_MAX_DIGEST_FACTS`.
-- **No evidence lost to truncation** — claim verification and draft grounding do not
-  read only the head of the digest. Each claim batch retrieves the digest facts most
-  relevant to it (IDF-weighted term matching, with stemming and a small lay↔clinical
-  synonym bridge so "my neck" reaches "cervical") plus matching raw-record excerpts,
-  ranked rather than filtered, so evidence buried on page 1,700 is found just like
-  evidence on page 2. When nothing in the records matches a claim at all, the verifier
-  is told so and a would-be contradiction is reported as a **coverage gap** instead.
-- **Full-timeline summaries** — the narrative record summary samples facts evenly across
-  the whole timeline instead of only the earliest documents.
+- **Complete extracted-evidence store** — all extracted facts are retained for
+  retrieval, saved results, citation checks, timelines, and exports. Only exact
+  repetitions are removed; differing sources, quotes, dates, and fact types remain.
+- **Separate summary view** — hierarchical model merging produces a temporary,
+  potentially lossy view for the narrative summary. It never replaces stored
+  evidence. Summaries use bounded samples, not every fact.
+- **Budgets at prompt selection** — claim verification and draft grounding rank
+  facts from the entire evidence store, including later records. Fact-count and
+  character budgets limit only the selected prompt, and its header reports the
+  selection size. `VA_LSE_MAX_DIGEST_FACTS` now limits prompt views, not retention.
+  Verification additionally retrieves matching raw-record excerpts and reports
+  weak matches as coverage gaps rather than contradictions. Draft grounding uses
+  the full extracted-fact store as its retrieval source.
+
+Retaining every extracted fact does not guarantee that the model extracted every
+fact in the source records, or that every retained fact fits an individual prompt.
+Existing saved results from capped reviews must be regenerated to recover omitted
+evidence; this change cannot reconstruct facts already discarded by an older run.
 
 ### Reading the results: what the review actually read
 

@@ -17,7 +17,7 @@ import math
 import re
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import astuple, dataclass, field, replace
 from functools import lru_cache
 from typing import Any, Callable
 
@@ -174,7 +174,11 @@ class MedicalFact:
 
 @dataclass
 class MedicalDigest:
-    """Structured result of the exhaustive record review."""
+    """Complete extracted evidence plus a separate, lossy narrative summary.
+
+    ``facts`` is authoritative for retrieval, exports, and saved results. Only
+    exact duplicates are removed; prompt budgets never truncate this store.
+    """
 
     facts: list[MedicalFact] = field(default_factory=list)
     conditions: list[str] = field(default_factory=list)
@@ -227,10 +231,14 @@ class MedicalDigest:
         return {element: counts.get(element, 0) for element in STATEMENT_ELEMENTS}
 
     def as_json_text(self, max_facts: int | None = None) -> str:
-        limit = config.MAX_DIGEST_FACTS if max_facts is None else max_facts
+        """Bounded prompt view, not the serialization used for saved results."""
+        limit = max(0, config.MAX_DIGEST_FACTS if max_facts is None else max_facts)
+        selected = self.facts[:limit]
         return json.dumps(
             {
-                "facts": [vars(f) for f in self.facts[:limit]],
+                "facts": [vars(f) for f in selected],
+                "total_facts": len(self.facts),
+                "selection_limited": len(selected) < len(self.facts),
                 "conditions_mentioned": self.conditions,
                 "providers_and_facilities": self.providers,
             },
@@ -309,25 +317,29 @@ class MedicalDigest:
         fillers = [item for item in scored if item[0] < 0.15]
         fillers.sort(key=lambda item: (-item[0], item[1]))
 
+        limit = max(0, min(max_facts, config.MAX_DIGEST_FACTS, len(self.facts)))
+
+        def selection_header(count: int) -> str:
+            return (
+                f"({count} of {len(self.facts)} retained facts selected for relevance; "
+                "this bounded selection is not the full evidence store)"
+            )
+
         lines: list[str] = []
-        used = 0
+        used = len(selection_header(limit)) + 1
         count = 0
         for _, _, fact in matches + fillers:
-            if count >= max_facts:
+            if count >= limit:
                 break
             line = f"[{fact.date}] ({fact.type}) {fact.description} — {fact.source}"
             if fact.quote:
                 line += f" | quote: \"{fact.quote}\""
-            if used + len(line) > budget_chars:
-                break
+            if used + len(line) + 1 > budget_chars:
+                continue
             lines.append(line)
             used += len(line) + 1
             count += 1
-        header = (
-            f"({len(lines)} of {len(self.facts)} extracted facts, selected for relevance "
-            f"to the items below; the full digest was reviewed during record analysis)"
-        )
-        return header + "\n" + "\n".join(lines)
+        return (selection_header(len(lines)) + "\n" + "\n".join(lines))[:max(0, budget_chars)]
 
 
 # "[clinic.pdf — page 7]" / "[clinic.pdf — block 3]" as a whole citation.
@@ -619,6 +631,19 @@ def _dedupe_pages(
         if kept.pages:
             unique_docs.append(kept)
     return unique_docs, duplicates
+
+
+def _dedupe_evidence(facts: list[MedicalFact]) -> list[MedicalFact]:
+    """Remove exact repetitions without losing different quotes or provenance."""
+    seen: set[tuple[Any, ...]] = set()
+    unique: list[MedicalFact] = []
+    for fact in facts:
+        check_pipeline_cancelled()
+        key = astuple(fact)
+        if key not in seen:
+            seen.add(key)
+            unique.append(fact)
+    return unique
 
 
 def _dedupe_facts(facts: list[MedicalFact]) -> list[MedicalFact]:
@@ -917,7 +942,7 @@ def review_medical_records(
         for name in data.get("providers_and_facilities", []) or []:
             providers[str(name).strip()] += 1
 
-    all_facts = _dedupe_facts(all_facts)
+    all_facts = _dedupe_evidence(all_facts)
 
     # Memory checkpoint: after chunk extraction + dedup (peak before merge)
     try:
@@ -948,8 +973,9 @@ def review_medical_records(
         tracing.phase_span("records:merge", facts=len(all_facts)),
         PhaseTimer(logger, "records:merge", request_id=rid, facts=len(all_facts)),
     ):
-        digest.facts = _merge_facts(llm, digest, progress)
-    # Memory checkpoint: after merge (fact list may have shrunk)
+        # Model consolidation is a lossy summary view, never the evidence store.
+        summary_facts = _merge_facts(llm, digest, progress)
+    # Both the evidence store and summary view are retained during summarization.
     try:
         _mem_cp("records:post_merge")
     except Exception:  # noqa: BLE001
@@ -957,7 +983,7 @@ def review_medical_records(
     check_pipeline_cancelled()
     digest.citation_check = verify_citations(digest.facts, documents)
     with tracing.phase_span("records:summary"), PhaseTimer(logger, "records:summary", request_id=rid):
-        digest.summary = _summarize(llm, digest)
+        digest.summary = _summarize(llm, replace(digest, facts=summary_facts))
     check_pipeline_cancelled()
     duration_ms = int((time.perf_counter() - _review_t0) * 1000)
     logger.info(
@@ -1141,7 +1167,7 @@ def _merge_facts(
             break
         current = merged
 
-    return current[: config.MAX_DIGEST_FACTS]
+    return current
 
 
 def _merge_once(llm: LLMClient, facts: list[MedicalFact]) -> list[MedicalFact]:
