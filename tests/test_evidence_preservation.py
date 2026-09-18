@@ -8,8 +8,8 @@ from app import config
 from app.documents import document_from_text
 from app.draft import run_draft
 from app.exporter import export_facts_csv
-from app.job_payload import draft_from_json, draft_to_json
-from app.medical_review import MedicalDigest, MedicalFact, review_medical_records
+from app.job_payload import digest_from_json, digest_to_json, draft_from_json, draft_to_json
+from app.medical_review import MedicalDigest, MedicalFact, _merge_facts, review_medical_records
 
 
 class _EvidenceLLM:
@@ -47,6 +47,17 @@ def _facts():
 
 
 class TestEvidencePreservation(unittest.TestCase):
+    def test_legacy_loss_warning_survives_reload_and_summary_merge(self):
+        from app.evaluate import coverage_lines
+
+        digest = MedicalDigest(facts=_facts()[:2], facts_dropped_by_cap=37)
+        restored = digest_from_json(json.loads(json.dumps(digest_to_json(digest))))
+        _merge_facts(_EvidenceLLM(restored.facts), restored)
+        self.assertEqual(restored.facts_dropped_by_cap, 37)
+        warning = " ".join(coverage_lines(restored))
+        self.assertIn("37", warning)
+        self.assertIn("saved result is incomplete", warning)
+
     def test_large_draft_retains_tail_evidence_even_when_merge_omits_it(self):
         for lossy in (False, True):
             with self.subTest(lossy_merge=lossy):
@@ -60,6 +71,7 @@ class TestEvidencePreservation(unittest.TestCase):
                         "Occupational silicosis", "Service connection (new claim)",
                     )
                 self.assertEqual(len(result.digest.facts), 1501)
+                self.assertEqual(result.digest.facts_dropped_by_cap, 0)
                 self.assertEqual(result.digest.facts[-1], facts[-1])
                 self.assertIn(facts[-1].description, llm.grounding_prompt)
                 self.assertIn(facts[-1].source, llm.grounding_prompt)

@@ -195,7 +195,14 @@ class MedicalDigest:
     unreadable_pages: int = 0
     chunks_without_facts: int = 0
     duplicate_pages: list[dict[str, Any]] = field(default_factory=list)
+    # Duplicated pages whose copy came from a *different* file. A page re-printed
+    # inside one bundle is a duplicate; the same page arriving from two sources is
+    # corroboration, and a statement can lean harder on the second.
+    corroborated_pages: list[dict[str, Any]] = field(default_factory=list)
     files: list[dict[str, Any]] = field(default_factory=list)
+    # Legacy saved results may have lost facts to the former storage cap. Keep
+    # their warning on reload; new reviews retain evidence and leave this at zero.
+    facts_dropped_by_cap: int = 0
     # Result of checking each fact's quote against the page it cites (see
     # ``verify_citations``): the one measurement that turns "the report cites
     # page 7" into "page 7 really says this".
@@ -571,6 +578,22 @@ def _shingle_similarity(left: frozenset[str], right: frozenset[str]) -> float:
 # Bound on how many same-size candidates a page is compared against, so near-dup
 # detection stays linear-ish on large bundles.
 _NEAR_DUP_CANDIDATES = 8
+
+
+def _cross_source_corroborations(
+    duplicates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Duplicates whose copy lives in a different file (see ``MedicalDigest``)."""
+    corroborations: list[dict[str, Any]] = []
+    for entry in duplicates:
+        origin = str(entry.get("duplicate_of", ""))
+        document = str(entry.get("document", ""))
+        origin_file = re.split(r"\s+[pb]\.\d+\s*$", origin)[0].strip() if origin else ""
+        if origin_file and document and origin_file != document:
+            corroborations.append(
+                {"document": document, "page": entry.get("page"), "also_in": origin_file}
+            )
+    return corroborations
 
 
 def _dedupe_pages(
@@ -966,6 +989,7 @@ def review_medical_records(
         unreadable_pages=unreadable_pages,
         chunks_without_facts=chunks_without_facts,
         duplicate_pages=duplicate_pages,
+        corroborated_pages=_cross_source_corroborations(duplicate_pages),
         files=[_file_coverage(doc) for doc in documents],
     )
 
@@ -1081,9 +1105,10 @@ def _merge_facts(
     facts = _dedupe_facts(digest.facts)
     if len(facts) <= MERGE_SINGLE_LIMIT:
         try:
-            return _restore_citations(_merge_once(llm, facts), facts) or facts
+            consolidated = _restore_citations(_merge_once(llm, facts), facts) or facts
         except LLMError:
-            return facts
+            consolidated = facts
+        return consolidated
 
     current = facts
     _merge_rid = get_request_id() or "-"

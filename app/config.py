@@ -359,6 +359,16 @@ EVIDENCE_WEAK_OVERLAP = _float_env("VA_LSE_EVIDENCE_WEAK_OVERLAP", 0.05) or 0.05
 # recall on dense pages (nothing gets truncated mid-extraction).
 DIGEST_CHUNK_CHARS = _int_env("VA_LSE_DIGEST_CHUNK_CHARS", 8000)
 
+# .zip upload expansion bounds. An uploaded archive is untrusted input and its
+# members are held in memory as soon as they are extracted, so every dimension is
+# capped; see app/documents.py:archive_members.
+ZIP_MAX_MEMBERS = _positive_int_env("VA_LSE_ZIP_MAX_MEMBERS", 200)
+ZIP_MAX_MEMBER_BYTES = _positive_int_env("VA_LSE_ZIP_MAX_MEMBER_BYTES", 50 * 1024 * 1024)
+ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES = _positive_int_env(
+    "VA_LSE_ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES", 200 * 1024 * 1024
+)
+ZIP_MAX_COMPRESSION_RATIO = _float_env("VA_LSE_ZIP_MAX_COMPRESSION_RATIO", 200.0) or 200.0
+
 # Characters per synthesized block for sources with no page numbers (.txt/.md/
 # .docx). Long text is addressed in blocks so citations resolve to somewhere in
 # the file instead of every fact claiming "p.1" of a 200-page document.

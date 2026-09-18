@@ -10,7 +10,9 @@ from __future__ import annotations
 import io
 import sys
 import unittest
+import zipfile
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -21,19 +23,26 @@ from app.documents import (  # noqa: E402
     DocumentPage,
     ExtractionError,
     ExtractedDocument,
+    archive_members,
     chunk_page_labelled_text,
     clean_text,
     document_from_text,
+    extract_uploaded_documents,
+    normalize_tabular_rows,
     paragraph_index,
+    records_from_local_path,
     strip_running_headers,
 )
+from app.evaluate import coverage_lines  # noqa: E402
 from app.medical_review import (  # noqa: E402
     MedicalDigest,
     MedicalFact,
+    _cross_source_corroborations,
     _dates_in_text,
     _dedupe_pages,
     _fact_from_raw,
     _llm_infer_undated,
+    _merge_facts,
     _parse_citation,
     _page_shingles,
     _shingle_similarity,
@@ -536,6 +545,251 @@ class TestUndatedInference(unittest.TestCase):
         llm = _StubLLM([])
         self.assertEqual(_llm_infer_undated(llm, []), {})
         self.assertEqual(llm.calls, [])
+
+
+class TestTabularRowNormalization(unittest.TestCase):
+    """Lab/vitals rows arrive as padded columns; the model must not guess which
+    value belongs to which label. Splitting on the column gaps keeps them adjacent."""
+
+    def test_padded_columns_become_delimited_fields(self) -> None:
+        row = "2020-05-14    A1c           7.2 %      H"
+        self.assertEqual(normalize_tabular_rows(row), "2020-05-14 | A1c | 7.2 % | H")
+
+    def test_prose_is_untouched(self) -> None:
+        prose = "The veteran reports left knee pain that locks when walking."
+        self.assertEqual(normalize_tabular_rows(prose), prose)
+
+    def test_a_two_field_line_is_left_alone(self) -> None:
+        line = "Medication                 Aspirin"
+        self.assertEqual(normalize_tabular_rows(line), line)
+
+    def test_a_padded_sentence_is_left_alone(self) -> None:
+        line = "Hospitalized    in 2019.    Discharged 2020."
+        self.assertEqual(normalize_tabular_rows(line), line)
+
+    def test_line_structure_is_preserved(self) -> None:
+        text = "Problem list\n2020-05-14    Knee strain     Active"
+        self.assertEqual(
+            normalize_tabular_rows(text),
+            "Problem list\n2020-05-14 | Knee strain | Active",
+        )
+
+
+def _zip_bytes(files: dict[str, bytes]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, payload in files.items():
+            archive.writestr(name, payload)
+    return buffer.getvalue()
+
+
+class _Uploaded:
+    """Minimal UploadedFile stand-in (name + bytes)."""
+
+    def __init__(self, name: str, data: bytes) -> None:
+        self.name = name
+        self.size = len(data)
+        self._data = data
+
+    def getvalue(self) -> bytes:
+        return self._data
+
+
+class TestArchiveUploads(unittest.TestCase):
+    """A folder of records handed back as a .zip is the natural upload; expansion
+    is bounded at every step because the archive is untrusted input."""
+
+    def test_a_zip_contributes_its_members_as_separate_documents(self) -> None:
+        payload = _zip_bytes(
+            {
+                "bundle/notes.txt": b"Knee pain noted during the visit.",
+                "bundle/labs.txt": b"A1c 7.2 percent in May 2020.",
+            }
+        )
+        documents, skipped = extract_uploaded_documents([_Uploaded("records.zip", payload)])
+        self.assertEqual(
+            [d.filename for d in documents],
+            ["records/bundle/notes.txt", "records/bundle/labs.txt"],
+        )
+        self.assertEqual(skipped, [])
+
+    def test_a_member_is_cited_by_its_path_inside_the_archive(self) -> None:
+        payload = _zip_bytes({"labs.txt": b"A1c 7.2 in May 2020."})
+        documents, _ = extract_uploaded_documents([_Uploaded("records.zip", payload)])
+        self.assertEqual(documents[0].filename, "records/labs.txt")
+        self.assertTrue(documents[0].pages[0].label.startswith("records/labs.txt "))
+
+    def test_unsupported_and_nested_members_are_named_not_expanded(self) -> None:
+        payload = _zip_bytes(
+            {
+                "notes.txt": b"Knee pain.",
+                "photo.jpg": b"\xff\xd8\xff",
+                "later.zip": _zip_bytes({"inner.txt": b"inner"}),
+            }
+        )
+        documents, skipped = extract_uploaded_documents([_Uploaded("records.zip", payload)])
+        self.assertEqual([d.filename for d in documents], ["records/notes.txt"])
+        self.assertEqual(len(skipped), 2)
+        self.assertTrue(any("photo.jpg" in message for message in skipped))
+        self.assertTrue(any("later.zip" in message and "nested" in message for message in skipped))
+
+    def test_editor_bookkeeping_members_are_ignored_without_a_warning(self) -> None:
+        payload = _zip_bytes(
+            {
+                "__MACOSX/._notes.txt": b"junk",
+                ".DS_Store": b"junk",
+                "notes.txt": b"Knee pain.",
+            }
+        )
+        documents, skipped = extract_uploaded_documents([_Uploaded("records.zip", payload)])
+        self.assertEqual([d.filename for d in documents], ["records/notes.txt"])
+        self.assertEqual(skipped, [])
+
+    def test_a_zip_in_a_local_folder_is_expanded_the_same_way(self) -> None:
+        with TemporaryDirectory() as tmp:
+            Path(tmp, "records.zip").write_bytes(_zip_bytes({"notes.txt": b"Knee pain."}))
+            documents, skipped = records_from_local_path(tmp)
+        self.assertEqual([d.filename for d in documents], ["records/notes.txt"])
+        self.assertEqual(skipped, [])
+
+    def test_too_many_members_is_refused_with_the_limit_named(self) -> None:
+        payload = _zip_bytes({f"f{i}.txt": b"x" for i in range(3)})
+        with patch("app.documents.config.ZIP_MAX_MEMBERS", 2):
+            with self.assertRaises(ExtractionError) as ctx:
+                archive_members("records.zip", payload)
+        self.assertIn("2", str(ctx.exception))
+
+    def test_an_oversized_member_is_skipped_and_the_rest_are_kept(self) -> None:
+        payload = _zip_bytes({"big.txt": b"a" * 5000, "small.txt": b"Knee pain."})
+        with patch("app.documents.config.ZIP_MAX_MEMBER_BYTES", 1000):
+            members, skipped = archive_members("records.zip", payload)
+        self.assertEqual([label for label, _ in members], ["records/small.txt"])
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("big.txt", skipped[0])
+
+    def test_a_high_compression_member_is_not_a_plausible_records_file(self) -> None:
+        payload = _zip_bytes({"bomb.txt": b"\x00" * 200_000})
+        with patch("app.documents.config.ZIP_MAX_COMPRESSION_RATIO", 10.0):
+            members, skipped = archive_members("records.zip", payload)
+        self.assertEqual(members, [])
+        self.assertEqual(len(skipped), 1)
+        self.assertIn("compression ratio", skipped[0])
+
+    def test_expanding_past_the_total_bound_aborts_the_whole_archive(self) -> None:
+        payload = _zip_bytes({"a.txt": b"a" * 400, "b.txt": b"b" * 400})
+        with patch("app.documents.config.ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES", 500):
+            with self.assertRaises(ExtractionError) as ctx:
+                archive_members("records.zip", payload)
+        self.assertIn("smaller batches", str(ctx.exception))
+
+    def test_a_file_that_is_not_an_archive_says_so_by_name(self) -> None:
+        with self.assertRaises(ExtractionError) as ctx:
+            archive_members("records.zip", b"not a zip at all")
+        self.assertIn("records.zip", str(ctx.exception))
+
+    def test_an_archive_with_no_files_at_all_is_refused(self) -> None:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("empty/", b"")
+        with self.assertRaises(ExtractionError) as ctx:
+            archive_members("records.zip", buffer.getvalue())
+        self.assertIn("no record files", str(ctx.exception))
+
+    def test_an_archive_of_only_unsupported_files_reports_each_one(self) -> None:
+        payload = _zip_bytes({"photo.jpg": b"\xff\xd8\xff"})
+        documents, skipped = extract_uploaded_documents([_Uploaded("records.zip", payload)])
+        self.assertEqual(documents, [])
+        self.assertEqual(len(skipped), 1)
+
+
+class TestCrossSourceCorroboration(unittest.TestCase):
+    """A page reprinted inside one bundle is a duplicate; the same page arriving
+    from two sources is corroboration, which a statement can lean harder on."""
+
+    def _doc(self, name: str, texts: list[str]) -> ExtractedDocument:
+        return ExtractedDocument(
+            filename=name,
+            pages=[
+                DocumentPage(filename=name, page=index + 1, text=text)
+                for index, text in enumerate(texts)
+            ],
+        )
+
+    def test_a_page_repeated_inside_one_file_is_only_a_duplicate(self) -> None:
+        doc = self._doc("bundle.pdf", ["Knee pain on exam.", "Knee pain on exam."])
+        _, duplicates = _dedupe_pages([doc])
+        self.assertEqual(len(duplicates), 1)
+        self.assertEqual(_cross_source_corroborations(duplicates), [])
+
+    def test_the_same_page_from_two_files_counts_as_corroboration(self) -> None:
+        page = "Knee pain on exam. Range of motion limited to 90 degrees."
+        _, duplicates = _dedupe_pages([self._doc("clinic.pdf", [page]), self._doc("va.gov.pdf", [page])])
+        self.assertEqual(len(duplicates), 1)
+        self.assertEqual(
+            _cross_source_corroborations(duplicates),
+            [{"document": "va.gov.pdf", "page": 1, "also_in": "clinic.pdf"}],
+        )
+
+    def test_a_block_addressed_origin_has_its_suffix_stripped(self) -> None:
+        same_file = [{"document": "notes.docx", "page": 3, "duplicate_of": "notes.docx b.3"}]
+        self.assertEqual(_cross_source_corroborations(same_file), [])
+        other_file = [{"document": "va.gov.pdf", "page": 3, "duplicate_of": "notes.docx b.3"}]
+        self.assertEqual(
+            _cross_source_corroborations(other_file),
+            [{"document": "va.gov.pdf", "page": 3, "also_in": "notes.docx"}],
+        )
+
+
+class TestCoverageReportAdditions(unittest.TestCase):
+    def test_corroborated_pages_are_named(self) -> None:
+        digest = MedicalDigest(
+            corroborated_pages=[{"document": "va.gov.pdf", "page": 4, "also_in": "clinic.pdf"}]
+        )
+        text = " ".join(coverage_lines(digest))
+        self.assertIn("va.gov.pdf p.4", text)
+        self.assertIn("corroborated", text)
+
+    def test_a_capped_digest_declares_what_it_could_not_keep(self) -> None:
+        digest = MedicalDigest(facts_dropped_by_cap=37)
+        text = " ".join(coverage_lines(digest))
+        self.assertIn("37", text)
+        self.assertIn("VA_LSE_MAX_DIGEST_FACTS", text)
+
+    def test_a_complete_run_declares_neither(self) -> None:
+        digest = MedicalDigest(
+            facts=[MedicalFact("2020-01-01", "symptom", "Knee pain", "a.pdf p.1")]
+        )
+        text = " ".join(coverage_lines(digest))
+        self.assertNotIn("corroborated", text)
+        self.assertNotIn("Digest capped", text)
+
+
+class TestDigestCapAccounting(unittest.TestCase):
+    def _facts(self, count: int) -> list[MedicalFact]:
+        return [
+            MedicalFact(
+                "2020-01-01", "symptom", f"distinct fact {index}", "a.pdf p.1",
+                document="a.pdf", page=1,
+            )
+            for index in range(count)
+        ]
+
+    def test_prompt_cap_does_not_drop_facts_from_a_small_merge(self) -> None:
+        facts = self._facts(3)
+        digest = MedicalDigest(facts=facts)
+        llm = _StubLLM([{"facts": [vars(fact) for fact in facts]}])
+        with patch("app.medical_review.config.MAX_DIGEST_FACTS", 2):
+            kept = _merge_facts(llm, digest)
+        self.assertEqual(kept, facts)
+        self.assertEqual(digest.facts_dropped_by_cap, 0)
+
+    def test_a_digest_within_the_cap_reports_nothing_dropped(self) -> None:
+        facts = self._facts(2)
+        digest = MedicalDigest(facts=facts)
+        llm = _StubLLM([{"facts": [vars(fact) for fact in facts]}])
+        with patch("app.medical_review.config.MAX_DIGEST_FACTS", 1500):
+            _merge_facts(llm, digest)
+        self.assertEqual(digest.facts_dropped_by_cap, 0)
 
 
 if __name__ == "__main__":

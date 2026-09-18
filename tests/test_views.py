@@ -398,7 +398,11 @@ class TestExtractUploadsCaching(unittest.TestCase):
         ):
             docs = uploads.extract_uploads([uploaded], "slot")
         self.assertEqual(docs, [])
-        st_mock.warning.assert_called_once_with("✖️ bad.pdf: unreadable")
+        # The message is shown with a reference: this warning is the only record
+        # of the file the app could not read, so it has to be quotable.
+        warning_text = st_mock.warning.call_args[0][0]
+        self.assertTrue(warning_text.startswith("✖️ bad.pdf: unreadable"))
+        self.assertIn("(reference: req_", warning_text)
         caption_text = str(st_mock.caption.call_args[0][0])
         self.assertIn("0 of 1", caption_text)
         self.assertIn("1 skipped", caption_text)
@@ -858,7 +862,10 @@ class TestGetLLM(unittest.TestCase):
             shared, "LLMClient", side_effect=LLMError("bad endpoint")
         ):
             self.assertIsNone(shared.get_llm())
-        st_mock.error.assert_called_once_with("bad endpoint")
+        st_mock.error.assert_called_once()
+        message = st_mock.error.call_args[0][0]
+        self.assertTrue(message.startswith("bad endpoint"))
+        self.assertIn("(reference: req_", message)
 
 
 # ------------------------------------------------- empty-analysis guard

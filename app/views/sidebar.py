@@ -14,12 +14,10 @@ import streamlit as st
 from .. import config
 from .. import watchdog
 from ..config import DEFAULT_BASE_URL, load_settings
+from ..error_report import report_failure
 from ..llm import check_model_availability
-from ..logging_config import get_logger, get_request_id
 from ..prompt_sanitize import validate_api_key, validate_model_name
 from .usage import load_usage_history, save_usage_history
-
-logger = get_logger("app.views.sidebar")
 
 
 def render_sidebar_settings() -> None:
@@ -82,8 +80,15 @@ def render_sidebar_settings() -> None:
                 if msg:
                     errors.append(f"{label}: {msg}")
             if errors:
+                # A rejected Apply is a failure the user may need to describe later
+                # ("it says my API key is invalid"), so each message carries an id
+                # that resolves to a log line naming which field was rejected.
                 for msg in errors:
-                    st.error(msg)
+                    st.error(
+                        report_failure(
+                            msg, phase="settings_validation", severity="warning"
+                        )
+                    )
             else:
                 settings.api_key = api_key_val
                 settings.base_url = st.session_state.base_url_input.strip() or DEFAULT_BASE_URL
@@ -144,7 +149,14 @@ def _job_queue_panel() -> None:
         try:
             backend = get_job_backend()
         except Exception as exc:  # noqa: BLE001 - this panel must never break the app
-            st.error(f"Job queue unavailable: {type(exc).__name__}: {exc}")
+            st.error(
+                report_failure(
+                    f"Job queue unavailable: {type(exc).__name__}: {exc}",
+                    phase="job_queue_panel",
+                    exc=exc,
+                    once=True,  # repainted on every rerun; log the first only
+                )
+            )
             return
 
         distributed = backend.is_distributed
@@ -189,7 +201,13 @@ def _job_queue_panel() -> None:
                 st.session_state["job_queue_depth"] = None
                 st.session_state["job_queue_reachable"] = False
                 st.session_state["job_queue_probe_at"] = time.time()
-                st.error(f"Queue probe failed: {type(exc).__name__}: {exc}")
+                st.error(
+                    report_failure(
+                        f"Queue probe failed: {type(exc).__name__}: {exc}",
+                        phase="job_queue_probe",
+                        exc=exc,
+                    )
+                )
         depth = st.session_state.get("job_queue_depth")
         if st.session_state.get("job_queue_probe_at") and depth is not None:
             # A probe that threw already reported its own cause above; reporting a
@@ -227,7 +245,14 @@ def _audit_backup_panel() -> None:
             payload = audit_backup_health()
             disk = disk_status()
         except Exception as exc:  # noqa: BLE001 - the panel must never break the app
-            st.error(f"Audit backup status unavailable: {type(exc).__name__}: {exc}")
+            st.error(
+                report_failure(
+                    f"Audit backup status unavailable: {type(exc).__name__}: {exc}",
+                    phase="audit_backup_panel",
+                    exc=exc,
+                    once=True,  # repainted on every rerun; log the first only
+                )
+            )
             return
 
         status = str(payload.get("status") or "unknown")
@@ -369,7 +394,14 @@ def _llm_failover_panel() -> None:
         try:
             status = failover_status()
         except Exception as exc:  # noqa: BLE001 - the panel must never break the app
-            st.error(f"Failover status unavailable: {type(exc).__name__}: {exc}")
+            st.error(
+                report_failure(
+                    f"Failover status unavailable: {type(exc).__name__}: {exc}",
+                    phase="llm_failover_panel",
+                    exc=exc,
+                    once=True,  # repainted on every rerun; log the first only
+                )
+            )
             return
 
         configured = bool(status.get("configured"))
@@ -565,22 +597,21 @@ def _compat_model_warning(settings: Any) -> None:
             ("Fast model", settings.model_fast),
         ):
             if model and model not in available:
+                # Reported (and given its reference) at the moment the warning is
+                # computed, then cached as shown text: the cached replay below must
+                # quote the same id, and must not log a second time.
                 warnings.append(
-                    f"⚠️ {label} `{model}` not found at `{settings.base_url.rstrip('/')}/models`. "
-                    "The provider may have deprecated it — check `COMPATIBILITY.md` and `MIGRATION.md`."
+                    report_failure(
+                        f"⚠️ {label} `{model}` not found at `{settings.base_url.rstrip('/')}/models`. "
+                        "The provider may have deprecated it — check `COMPATIBILITY.md` and `MIGRATION.md`.",
+                        phase="compat_model_availability",
+                        severity="warning",
+                        once=True,
+                    )
                 )
     st.session_state["_compat_checked_sig"] = sig
     st.session_state["_compat_warnings"] = warnings
     for msg in warnings:
-        logger.warning(
-            "model availability warning: %s",
-            msg,
-            extra={
-                "request_id": get_request_id() or "-",
-                "phase": "compat",
-                "status": "warning",
-            },
-        )
         st.warning(msg)
 
 

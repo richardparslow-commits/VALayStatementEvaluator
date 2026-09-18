@@ -165,8 +165,10 @@ def digest_to_json(digest: MedicalDigest | None) -> dict[str, Any] | None:
         "unreadable_pages": digest.unreadable_pages,
         "chunks_without_facts": digest.chunks_without_facts,
         "duplicate_pages": list(digest.duplicate_pages),
+        "corroborated_pages": list(digest.corroborated_pages),
         "files": list(digest.files),
         "citation_check": dict(digest.citation_check),
+        "facts_dropped_by_cap": digest.facts_dropped_by_cap,
     }
 
 
@@ -198,8 +200,10 @@ def digest_from_json(raw: Any) -> MedicalDigest | None:
         unreadable_pages=_as_int(raw.get("unreadable_pages")),
         chunks_without_facts=_as_int(raw.get("chunks_without_facts")),
         duplicate_pages=_dict_items(raw.get("duplicate_pages")),
+        corroborated_pages=_dict_items(raw.get("corroborated_pages")),
         files=_dict_items(raw.get("files")),
         citation_check=_as_dict(raw.get("citation_check")),
+        facts_dropped_by_cap=_as_int(raw.get("facts_dropped_by_cap")),
     )
 
 
