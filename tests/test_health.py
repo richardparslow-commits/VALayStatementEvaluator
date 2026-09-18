@@ -5,6 +5,7 @@ Covers:
   HEAD, 404, cached readiness, and pure helper contracts (payloads, port, probe).
 """
 import json
+import os
 import sys
 import time
 import unittest
@@ -112,6 +113,61 @@ class TestHealthPure(unittest.TestCase):
                 self.assertIsInstance(port, int)
                 self.assertGreaterEqual(port, 1)
                 self.assertLessEqual(port, 65535)
+
+    def test_health_host_env_is_honoured(self):
+        for value in ("127.0.0.1", "0.0.0.0", "::1", "localhost"):
+            with self.subTest(value=value):
+                with patch.dict("os.environ", {"VA_LSE_HEALTH_HOST": value}, clear=False):
+                    self.assertEqual(health._health_host(), value)
+
+    def test_health_host_defaults_to_every_interface(self):
+        """The container default: a kubelet probe arrives from outside the pod."""
+        with patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("VA_LSE_HEALTH_HOST", None)
+            self.assertEqual(health.DEFAULT_HEALTH_HOST, "0.0.0.0")
+            self.assertEqual(health._health_host(), "0.0.0.0")
+
+    def test_health_host_ignores_unusable_values(self):
+        # None of these is an interface. Falling back beats refusing to start the
+        # app over a malformed bind address.
+        for bad in ("", "   ", "0.0.0.0/24", "http://127.0.0.1", "127.0.0.1 8001", "a;b"):
+            with self.subTest(value=bad):
+                with patch.dict("os.environ", {"VA_LSE_HEALTH_HOST": bad}, clear=False):
+                    self.assertEqual(health._health_host(), "0.0.0.0")
+
+    def test_start_health_server_honours_the_host_env(self):
+        """The bind address a sandbox relies on, end to end."""
+        health.stop_health_server()
+        try:
+            with patch.dict("os.environ", {"VA_LSE_HEALTH_HOST": "127.0.0.1"}, clear=False):
+                server = health.start_health_server(port=0)
+            self.assertIsNotNone(server, "health server failed to bind on loopback")
+            assert server is not None
+            self.assertEqual(server.server_address[0], "127.0.0.1")
+        finally:
+            health.stop_health_server()
+
+    def test_an_explicit_host_beats_the_environment(self):
+        """So a test (or an embedder) cannot be moved by an exported variable.
+
+        203.0.113.0/24 is reserved for documentation, so nothing on this machine
+        can bind it: a server that came up proves the argument won.
+        """
+        health.stop_health_server()
+        try:
+            with patch.dict("os.environ", {"VA_LSE_HEALTH_HOST": "203.0.113.1"}, clear=False):
+                server = health.start_health_server(port=0, host="127.0.0.1")
+            self.assertIsNotNone(server, "explicit host did not win over the environment")
+            assert server is not None
+            self.assertEqual(server.server_address[0], "127.0.0.1")
+        finally:
+            health.stop_health_server()
+
+    def test_an_unbindable_host_is_never_fatal(self):
+        """Health is best-effort: the app starts even when the probe cannot."""
+        health.stop_health_server()
+        self.assertIsNone(health.start_health_server(port=0, host="203.0.113.1"))
+        health.stop_health_server()
 
     def test_probe_missing_api_key_not_ready(self):
         fake = Settings(

@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -33,6 +34,16 @@ logger = logging.getLogger("app.health")
 HEALTH_PATH = "/health"
 READY_PATH = "/ready"
 METRICS_PATH = "/metrics"
+
+#: Interface the sidecar binds to when nothing says otherwise. Not loopback on
+#: purpose — see :func:`_health_host`.
+DEFAULT_HEALTH_HOST = "0.0.0.0"
+
+#: What an interface address may look like: IPv4, IPv6 (bracketed or not) or a
+#: hostname. Deliberately narrow, because this string reaches the socket layer
+#: and a value carrying a scheme, a slash or a space is a typo rather than an
+#: interface.
+_HEALTH_HOST_RE = re.compile(r"^[A-Za-z0-9._:\[\]-]+$")
 
 # Keep comfortably under the 2s SLO in the spec; leave headroom for JSON
 # serialisation and TCP.
@@ -73,6 +84,43 @@ def _health_port() -> int:
     except Exception:  # noqa: BLE001
         pass
     return 8001
+
+
+def _health_host() -> str:
+    """Resolve the interface the health sidecar binds to.
+
+    ``VA_LSE_HEALTH_HOST``, defaulting to ``0.0.0.0`` because that is what every
+    *container* deployment needs: the Docker healthcheck, a kubelet probe and a
+    Prometheus scrape all connect from outside this process, and a pod's own IP
+    is not on its loopback interface.
+
+    Set it to ``127.0.0.1`` where the port is published to the *internet* rather
+    than to a private network — a Vercel Sandbox, a forwarded dev port — so
+    ``GET /health``, ``GET /ready`` and ``GET /metrics`` cannot be read by anyone
+    who guesses the URL. Those three routes are unauthenticated on purpose (a
+    kubelet cannot present a bearer token), which makes the bind address the
+    only access control they have. The ``sandbox`` image target sets it for
+    exactly this reason; see ``Dockerfile``.
+
+    An unusable value falls back to the default with a warning rather than
+    raising: a malformed bind address is not worth refusing to start the app
+    over, and ``start_health_server`` already treats a bind failure as
+    non-fatal. That second path is also what an IPv6 literal reaches: the
+    server class is ``AF_INET``, so ``::1`` is accepted here and then refused by
+    the socket layer, visibly, rather than silently bound to the wrong family.
+    """
+    raw = os.getenv("VA_LSE_HEALTH_HOST", "").strip()
+    if not raw:
+        return DEFAULT_HEALTH_HOST
+    if not _HEALTH_HOST_RE.match(raw):
+        logger.warning(
+            "ignoring unusable VA_LSE_HEALTH_HOST=%r (expected an interface "
+            "address such as 127.0.0.1 or 0.0.0.0); binding %s instead",
+            raw,
+            DEFAULT_HEALTH_HOST,
+        )
+        return DEFAULT_HEALTH_HOST
+    return raw
 
 
 def _probe_endpoint_models(
@@ -393,25 +441,32 @@ class _HealthHandler(BaseHTTPRequestHandler):
 
 # --------------------------------------------------------------- lifecycle
 
-def start_health_server(port: int | None = None, *, host: str = "0.0.0.0") -> ThreadingHTTPServer | None:
+def start_health_server(
+    port: int | None = None, *, host: str | None = None
+) -> ThreadingHTTPServer | None:
     """Start the health sidecar (idempotent). Returns the server or None on failure.
 
-    Binds to ``host:port``. If the port is already in use the function logs a
-    warning and returns None — the Streamlit app still starts (health is
-    best-effort).
+    Binds to ``host:port``, where ``None`` means "resolve from the environment"
+    (:func:`_health_port` and :func:`_health_host`) and an explicit value wins
+    over it, so a test or an embedder can pin the socket regardless of what is
+    exported in the surrounding shell.
+
+    If the address cannot be bound the function logs a warning and returns None —
+    the Streamlit app still starts (health is best-effort).
     """
     global _server, _thread
     if _server is not None:
         return _server
 
     chosen_port = int(port) if port is not None else _health_port()
+    chosen_host = host if host is not None else _health_host()
 
     try:
-        server = ThreadingHTTPServer((host, chosen_port), _HealthHandler)
+        server = ThreadingHTTPServer((chosen_host, chosen_port), _HealthHandler)
         # Allow quick restart in tests / container restarts.
         server.daemon_threads = True
     except OSError as exc:
-        logger.warning("health server could not bind %s:%d: %s", host, chosen_port, exc)
+        logger.warning("health server could not bind %s:%d: %s", chosen_host, chosen_port, exc)
         return None
 
     thread = threading.Thread(
@@ -424,7 +479,7 @@ def start_health_server(port: int | None = None, *, host: str = "0.0.0.0") -> Th
     _thread = thread
     logger.info(
         "health server listening on %s:%d (GET /health, GET /ready, GET /metrics)",
-        host,
+        chosen_host,
         chosen_port,
     )
     return server

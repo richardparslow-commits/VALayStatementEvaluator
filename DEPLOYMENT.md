@@ -609,6 +609,51 @@ CMD ["streamlit", "run", "run_app.py", \
 docker build -t va-lse:latest .
 ```
 
+### Sandbox target (agent workspace, optional)
+
+The same file has a second target, `sandbox`, for working *inside* a box rather
+than deploying one — a Vercel Sandbox, a remote dev container, anything where a
+person or an agent edits the checkout. It is built on the `runtime` stage, so it
+runs the image's interpreter and its hash-pinned lock, and adds only what a
+workspace needs:
+
+```dockerfile
+FROM runtime AS sandbox
+USER root                                        # a clone must be writable
+RUN apt-get install -y git curl ripgrep less procps
+RUN pip install -r requirements-dev.txt          # mypy, boto3, pyyaml, otel
+COPY tests/ scripts/ deploy/ nginx/ examples/ ./
+# ... plus every root page, .github/workflows, pyproject.toml, docker-compose.yml
+RUN git init && git add -A && git commit -m "baseline"   # so `git status` is usable
+ENV VA_LSE_HEALTH_HOST=127.0.0.1                 # see §7
+CMD ["streamlit", "run", "run_app.py", "--server.address=0.0.0.0"]
+```
+
+Three things about it are deliberate and easy to get wrong by hand:
+
+* **A custom image, not a managed one.** The managed sandbox images ship Python
+  3.14; this lock has no 3.14 wheel for several of its pins (`jiter==0.17.0` is
+  the first refusal), so they cannot install the set CI proves.
+* **No `--server.port`.** 8501 is already Streamlit's default, and a *set* port is
+  fatal when Streamlit resolves as a development-layout install —
+  `server.port does not work when global.developmentMode is true` — which is what
+  a `pip install -e` or a vendored Streamlit in the box would be. See
+  `.streamlit/config.toml`.
+* **`VA_LSE_HEALTH_HOST=127.0.0.1`.** Sandbox ports are published as public URLs
+  and the sidecar's routes carry no authentication (§7), so the image keeps it on
+  loopback; publish `8001` *and* override this only if you mean to.
+
+```bash
+# Build and push it to Vercel Container Registry, then boot a sandbox from it
+docker build --target sandbox -t va-lse-sandbox:latest .   # local smoke test
+vercel vcr build docker . va-lse-sandbox:latest --push
+sandbox create --name va-lse-dev --image va-lse-sandbox:latest \
+  --vcpus 4 --timeout 2h --publish-port 8501 --connect
+```
+
+`tests/test_sandbox_image.py` asserts this contract (the stage, root, the dev
+extras, git, the copied files) because no CI job builds an image.
+
 ### Multi-stage variant (smaller image, optional)
 
 ```dockerfile
@@ -657,6 +702,14 @@ port `8001`):
 |---|---|---|---|---|
 | **Liveness** | 8001 | `/health` | Is the process alive? | Always `200` once started |
 | **Readiness** | 8001 | `/ready` | Can it serve traffic? | `200` = ready, `503` = not ready |
+
+Both probes answer on the interface in `VA_LSE_HEALTH_HOST` (default `0.0.0.0`,
+which is what a kubelet probe needs since it arrives from outside the pod). None
+of the three routes authenticates — a kubelet cannot present a token — so where
+that port is published to the internet rather than to a cluster network, set
+`VA_LSE_HEALTH_HOST=127.0.0.1`: same-host probes and
+`sandbox exec curl localhost:8001/health` keep working, a remote browser gets a
+refused connection instead of your metrics.
 
 **What makes `/ready` return `503`:**
 - Missing `OPENAI_API_KEY`
@@ -761,6 +814,7 @@ All deployment-relevant variables (see `README.md` for the full list):
 | `VA_LSE_RECORDS_CONCURRENCY` | Parallel digest workers | `2` | Raise for higher-tier endpoints |
 | `VA_LSE_MAX_CONCURRENT_LLM_CALLS` | Global LLM concurrency cap | `20` | Raise if running 100 users across N pods |
 | `VA_LSE_HEALTH_PORT` | Health sidecar port | `8001` | Keep default; mount in Service |
+| `VA_LSE_HEALTH_HOST` | Interface the sidecar binds to | `0.0.0.0` | Keep the default in a cluster (probes arrive from outside the pod). Set `127.0.0.1` wherever that port is published to the internet |
 | `VA_LSE_SHUTDOWN_GRACE_SECONDS` | Drain timeout | `30` | 30–60 for large record sets |
 | `VA_LSE_LLM_CALL_TIMEOUT_SECONDS` | Per-call timeout | `300` | 300–600 depending on endpoint speed |
 | `VA_LSE_LOG_DIR` | Diagnostic log directory | (stdout only) | Set to `/app/logs` for persistent logs |

@@ -75,7 +75,10 @@ scripts/
                           in); writes a provenance manifest beside the PDF
 tests/                    Offline unit tests (no API key required)
 examples/                 Fictional sample statement + sample medical records
-Dockerfile                Production container image (non-root, hash-pinned deps)
+Dockerfile                Two targets: `runtime` (the production container image,
+                          non-root, hash-pinned deps) and `sandbox` (an agent/dev
+                          workspace as root, with tests and scripts; see
+                          DEPLOYMENT.md §6)
 docker-compose.yml        Multi-instance: 3 Streamlit replicas + nginx (Pattern A);
                           `--profile pattern-c` adds Redis, a worker, and the shared
                           blob volume
@@ -233,6 +236,7 @@ installs on macOS and Linux CI.
 | `VA_LSE_LLM_QUEUE_MAX_DEPTH` | Max queued callers waiting for a concurrency slot | `50` |
 | `VA_LSE_LLM_QUEUE_TIMEOUT_SECONDS` | Seconds a queued caller waits before `QueueFullError` | `30` |
 | `VA_LSE_HEALTH_PORT` | Sidecar health server port (`0` disables `GET /health` & `GET /ready`) | `8001` |
+| `VA_LSE_HEALTH_HOST` | Interface the sidecar binds to. Set `127.0.0.1` where that port is published to the internet (a Vercel Sandbox, a forwarded dev port) — `/health`, `/ready` and `/metrics` carry no authentication | `0.0.0.0` |
 | `VA_LSE_AUDIT_LOG_DIR` | Directory for the separate `audit.log` JSON stream (audit trail, distinct from `VA_LSE_LOG_DIR`) | `logs` (or `VA_LSE_LOG_DIR` when set) |
 | `VA_LSE_AUDIT_LOG_FILE` | Filename inside `VA_LSE_AUDIT_LOG_DIR` | `audit.log` |
 | `VA_LSE_AUDIT_LOG_MAX_BYTES` | Rotate size per audit log file (bytes) | `10485760` (10 MiB) |
@@ -800,7 +804,8 @@ record type, file type). Keep it with the PDF: it is the provenance record for a
 ## Health checks (container orchestration)
 
 A stdlib-only sidecar (`app/health.py`, started from `run_app.py` before Streamlit) exposes two
-orchestrator-friendly probes on `0.0.0.0:$VA_LSE_HEALTH_PORT` — no extra dependencies:
+orchestrator-friendly probes on `$VA_LSE_HEALTH_HOST:$VA_LSE_HEALTH_PORT` (default
+`0.0.0.0:8001`) — no extra dependencies:
 
 | Endpoint | Meaning | Status | Latency |
 |---|---|---|---|
@@ -824,6 +829,8 @@ curl -s -w "%{http_code}\n" http://localhost:8001/ready
 # Change or disable the sidecar
 VA_LSE_HEALTH_PORT=9001 streamlit run run_app.py   # different port
 VA_LSE_HEALTH_PORT=0 streamlit run run_app.py      # disable sidecar entirely
+# Keep an internet-published port from reaching the sidecar
+VA_LSE_HEALTH_HOST=127.0.0.1 streamlit run run_app.py
 ```
 
 - **Liveness** never touches the LLM gateway — it is `200` as soon as the Python process starts.
@@ -831,6 +838,13 @@ VA_LSE_HEALTH_PORT=0 streamlit run run_app.py      # disable sidecar entirely
   handler always meets the < 2 s SLO even when the LLM gateway is slow. Missing `OPENAI_API_KEY`,
   missing `OPENAI_BASE_URL`, or any network/auth/parse failure → `503` with a short `detail` (no
   key leaked). Callers should treat `503` as "not ready, keep out of the load-balancer pool."
+- **The bind address is the sidecar's only access control.** All three routes are unauthenticated by
+  design — a kubelet cannot present a bearer token — so the default `0.0.0.0` assumes the port is
+  reachable only from a private network (a Docker network, a cluster Service). Where the port is
+  instead *published to the internet* — a Vercel Sandbox, a forwarded dev port, a laptop on an
+  untrusted network — set `VA_LSE_HEALTH_HOST=127.0.0.1`: probes from the same host keep working
+  (`curl localhost:8001/health`), and anyone who finds the URL gets a connection refusal rather than
+  your metrics. The `sandbox` image target does this for you (see [DEPLOYMENT.md §6](DEPLOYMENT.md#6-dockerfile)).
 - **Kubernetes / Agiloop / Docker Swarm** — point `livenessProbe` at `httpGet: path:/health port:8001`
   and `readinessProbe` at `httpGet: path:/ready port:8001` (adjust `port` if you override
   `VA_LSE_HEALTH_PORT`). Example hints for a `Deployment` are in the docstring of `app/health.py`.

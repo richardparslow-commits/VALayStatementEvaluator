@@ -126,6 +126,10 @@ HOSTILE_ENVIRONMENT: dict[str, str] = {
     "VA_LSE_WORKER_CONCURRENCY": "3",
     "VA_LSE_WORKER_HEALTH_PORT": "0",
     "VA_LSE_HEALTH_PORT": "0",
+    # The sandbox image pins this so a published port cannot reach the sidecar;
+    # setting it here too means the whole suite is exercised with that bind
+    # address rather than only discovering it in a sandbox.
+    "VA_LSE_HEALTH_HOST": "127.0.0.1",
     "VA_LSE_PROFILE_RUNS": "1",
     "VA_LSE_TRACING": "1",
     "VA_LSE_TRACE_CHUNK_SPANS": "1",

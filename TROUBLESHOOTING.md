@@ -242,6 +242,14 @@ curl http://localhost:8001/health | jq .
 curl http://localhost:8001/metrics | grep llm
 ```
 
+If that `curl` works on the host but the same path is refused or `404`s through a
+published URL (a Vercel Sandbox, a forwarded dev port), nothing is broken: the
+sidecar is bound to loopback. `VA_LSE_HEALTH_HOST=127.0.0.1` — the default in the
+`sandbox` image target — deliberately keeps the unauthenticated routes
+(`/health`, `/ready`, `/metrics`) off any interface the internet can reach. Run
+the command inside the box, or set the variable to `0.0.0.0` *and* accept that
+you are publishing them.
+
 Key metrics:
 - `va_lse_circuit_breaker_state` — CLOSED/OPEN/HALF_OPEN
 - `va_lse_llm_failover_active` — 1 when serving from fallback
