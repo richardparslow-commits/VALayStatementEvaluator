@@ -65,6 +65,7 @@ A common cause: the API key and base URL come from **different providers/account
 
 | Provider | Base URL | Key Prefix |
 |----------|----------|------------|
+| Perplexity Router API (default) | `https://api.perplexity.ai/router/v1` | `pplx-` |
 | QwenCloud Token Plan | `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1` | `sk-sp-` |
 | OpenAI | `https://api.openai.com/v1` | `sk-proj-` |
 | Local Ollama | `http://localhost:11434/v1` | any non-empty |
@@ -81,6 +82,7 @@ fallback endpoint. This is the **recommended solution** for production use.
 
 You need a **different** LLM provider as backup. Common combinations:
 
+- **Primary:** Perplexity Router → **Fallback:** OpenAI or QwenCloud
 - **Primary:** QwenCloud → **Fallback:** OpenAI
 - **Primary:** OpenAI → **Fallback:** QwenCloud or another OpenAI-compatible endpoint
 - **Primary:** Any → **Fallback:** Local Ollama (for offline/dev)
@@ -90,9 +92,11 @@ You need a **different** LLM provider as backup. Common combinations:
 Edit your `.env` file (or Streamlit secrets for hosted deployments):
 
 ```bash
-# .env example - OpenAI as backup for QwenCloud primary
-OPENAI_BASE_URL=https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1
-OPENAI_API_KEY=sk-sp-your-primary-key
+# .env example - OpenAI as backup for the default Perplexity Router primary
+OPENAI_BASE_URL=https://api.perplexity.ai/router/v1
+OPENAI_API_KEY=pplx-your-key
+LLM_MODEL_MAIN=perplexity/kimi-k3
+LLM_MODEL_FAST=perplexity/glm-5.3-flash
 
 # Fallback to OpenAI
 OPENAI_BASE_URL_FALLBACK=https://api.openai.com/v1

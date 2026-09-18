@@ -72,8 +72,11 @@ when `VA_LSE_PROFILE_RUNS` is not set.
 
 ## 3. Benchmark results
 
-Measured on a MacBook Pro M2 (2023), 16 GB RAM, against the default
-QwenCloud Token Plan endpoint (`qwen3.7-max` + `qwen3.7-flash`).
+Measured on a MacBook Pro M2 (2023), 16 GB RAM, against the QwenCloud Token
+Plan endpoint that was the default at the time (`qwen3.7-max` + `qwen3.7-flash`).
+Absolute times are endpoint-dependent, so read these as shape-of-the-run figures:
+the shipped default is now Perplexity's Router API, whose latency was not measured
+here, and no number below has been re-derived for it.
 
 ### Evaluate benchmarks
 
@@ -121,8 +124,8 @@ Measured across 100 runs of medium (50-page) record sets:
 |---|---|---|---|
 | `VA_LSE_RECORDS_CONCURRENCY` | `2` | Raise to `3–5` for higher-tier endpoints | ~2–3× faster records:review (linear with concurrency, bounded by rate limits) |
 | `VA_LSE_DIGEST_CHUNK_CHARS` | `8000` | Raise to `12000–16000` for dense records | Fewer chunks → fewer LLM calls → faster (may miss mid-page details) |
-| Fast model choice | `qwen3.7-flash` | Use `gpt-4o-mini` or `qwen3.7-flash` | Faster digest calls, lower cost |
-| Main model choice | `qwen3.7-max` | Use `gpt-4-turbo` or `qwen3.7-max` | Faster claim/verify/rubric calls |
+| Fast model choice | `perplexity/glm-5.3-flash` | `perplexity/nemotron-3-ultra-550b-a55b`, then `perplexity/glm-5.3`, if extraction quality needs it | Faster digest calls, lower cost |
+| Main model choice | `perplexity/kimi-k3` | `perplexity/glm-5.3` for ~1/3 the output price | Faster claim/verify/rubric calls |
 
 ### For lower cost
 

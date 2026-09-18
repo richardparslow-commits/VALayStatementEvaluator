@@ -1,0 +1,23 @@
+# Optional dependency for the web-grounded "Research" tab (PERPLEXITY_API_KEY).
+#
+# Not part of requirements.txt / requirements.lock on purpose: web-grounded research is
+# an additive capability, every code path degrades to "here is how to enable it" when the
+# package is missing, and nothing in the Evaluate/Draft pipeline imports it. Adding it to
+# the hash-pinned lockfile would also drag the lock's transitive graph along with it for
+# a feature most deployments will never switch on.
+#
+#   pip install -r requirements-perplexity.txt
+#
+# Then create an API key at https://console.perplexity.ai and set it in the environment
+# or, for local development, in the git-ignored .env file:
+#
+#   PERPLEXITY_API_KEY=...
+#   PERPLEXITY_PRESET=low            # fast | low | medium | high | xhigh | wide-research
+#   # PERPLEXITY_MODEL=             # optional: freeze a model instead of the preset's
+#   # PERPLEXITY_SOURCES=va.gov,ecfr.gov,law.cornell.edu
+#
+# The Agent API is billed per model token AND per tool invocation (web_search, fetch_url),
+# so research depth is a real cost dial — see DEPLOYMENT.md → Perplexity research. The
+# panel defaults to the "low" preset for that reason. Never commit the key; scripts/hooks/
+# pre-commit, .gitignore, and tests/test_security_gitignore.py all guard it.
+perplexityai>=0.43

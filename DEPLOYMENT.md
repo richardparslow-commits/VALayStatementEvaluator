@@ -735,9 +735,9 @@ All deployment-relevant variables (see `README.md` for the full list):
 | Variable | Purpose | Default | Recommended for production |
 |---|---|---|---|
 | `OPENAI_API_KEY` | LLM API key | (required) | Store in K8s Secret or Docker secret |
-| `OPENAI_BASE_URL` | LLM endpoint | QwenCloud Token Plan | Verify against your provider |
-| `LLM_MODEL_MAIN` | Analysis model | `qwen3.7-max` | Match your plan |
-| `LLM_MODEL_FAST` | Bulk digest model | `qwen3.7-flash` | Match your plan |
+| `OPENAI_BASE_URL` | LLM endpoint | Perplexity Router API (`https://api.perplexity.ai/router/v1`) | Verify against your provider; pin it explicitly in production rather than relying on a default |
+| `LLM_MODEL_MAIN` | Analysis model | `perplexity/kimi-k3` | Match your plan |
+| `LLM_MODEL_FAST` | Bulk digest model | `perplexity/glm-5.3-flash` | Match your plan |
 | `VA_LSE_RECORDS_CONCURRENCY` | Parallel digest workers | `2` | Raise for higher-tier endpoints |
 | `VA_LSE_MAX_CONCURRENT_LLM_CALLS` | Global LLM concurrency cap | `20` | Raise if running 100 users across N pods |
 | `VA_LSE_HEALTH_PORT` | Health sidecar port | `8001` | Keep default; mount in Service |
@@ -1205,10 +1205,13 @@ environment variables above. Add your provider key there under `OPENAI_API_KEY`,
 endpoint and models as:
 
 ```toml
-OPENAI_BASE_URL = "https://your-endpoint.example.com/v1"
-LLM_MODEL_MAIN = "qwen3.7-max"
-LLM_MODEL_FAST = "qwen3.7-flash"
+OPENAI_BASE_URL = "https://api.perplexity.ai/router/v1"
+LLM_MODEL_MAIN = "perplexity/kimi-k3"
+LLM_MODEL_FAST = "perplexity/glm-5.3-flash"
 ```
+
+(Pin the endpoint and models explicitly in a deployed environment. The code defaults are the
+same values, but a pin is what makes the deployment's behaviour independent of an app upgrade.)
 
 Optional extras, same file: `FETCH_SANDBOX_API_KEY`, `FETCH_SANDBOX_BASE_URL`,
 `FETCH_SANDBOX_RECORDS_PATH`, `VA_LSE_SHARED_CACHE_URL`, `VA_LSE_SHARED_CACHE_TOKEN`.

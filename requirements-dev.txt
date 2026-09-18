@@ -22,6 +22,13 @@ boto3>=1.34
 # a broken scrape config or dashboard JSON could reach main unverified.
 pyyaml>=6.0
 
+# Perplexity SDK for the research-tab tests only. tests/test_perplexity_agent.py drives
+# the real SDK objects (a real ``Perplexity`` client pointed at a stubbed transport), so
+# installing this makes those assertions run rather than skip — the citation extraction
+# and error mapping it covers are exactly the parts that would otherwise be unverified.
+# The app itself treats the package as optional; see requirements-perplexity.txt.
+perplexityai>=0.43
+
 # NOTE: httpx is deliberately NOT listed. The app treats it as optional (see
 # app/llm.py) and, in this mirror's resolution, `openai` depends on the fork
 # distribution `httpx2` rather than `httpx`, so `import httpx` legitimately

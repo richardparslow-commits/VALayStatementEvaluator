@@ -156,10 +156,10 @@ installs on macOS and Linux CI.
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `OPENAI_API_KEY` | QwenCloud Token Plan API key (starts `sk-sp-`) | (required) |
-| `OPENAI_BASE_URL` | OpenAI-compatible base URL (Token Plan) | `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1` |
-| `LLM_MODEL_MAIN` | Low-volume heavy model (analysis/scoring/drafting) | `qwen3.7-max` |
-| `LLM_MODEL_FAST` | Cheap model for the bulk digest/merge passes | `qwen3.7-flash` |
+| `OPENAI_API_KEY` | LLM API key. By default this is a **Perplexity** key, which also serves the Research tab's grounded lookups | (required) |
+| `OPENAI_BASE_URL` | OpenAI-compatible base URL | `https://api.perplexity.ai/router/v1` — Perplexity's Router API (in **private preview**; request access from api@perplexity.ai). Any OpenAI-compatible endpoint works |
+| `LLM_MODEL_MAIN` | Low-volume heavy model (analysis/scoring/drafting) | `perplexity/kimi-k3` |
+| `LLM_MODEL_FAST` | Cheap model for the bulk digest/merge passes | `perplexity/glm-5.3-flash` |
 | `OPENAI_BASE_URL_FALLBACK` | **Optional** second endpoint used when the primary fails for a sustained period; unset = no failover | (empty) |
 | `OPENAI_API_KEY_FALLBACK` | Key for the fallback endpoint (usually a different provider) | primary key |
 | `LLM_MODEL_MAIN_FALLBACK` / `LLM_MODEL_FAST_FALLBACK` | The fallback provider's model names for the two roles | primary models |
@@ -496,6 +496,7 @@ the pipeline (no API calls) to verify orchestration at scale. Ingest quality is 
 
 ```bash
 python -m unittest discover -s tests -v        # offline unit tests (incl. health probes)
+python -m tests.hostile                        # …the same suite, with every knob hostile
 python -m mypy app                             # strict type check (see pyproject.toml)
 python scripts/smoke_test.py all               # live end-to-end (needs valid .env)
 python scripts/live_draft_e2e.py                # one real Draft run against your endpoint
@@ -509,6 +510,33 @@ or prompt change is visible before it reaches a user. `scripts/rehearse_failover
 read-only and sends no LLM traffic — see
 [`DEPLOYMENT.md` → *LLM endpoint failover*](DEPLOYMENT.md#17-llm-endpoint-failover-optional)
 for the full outage drill.
+
+The suite runs **hermetically**. `tests/hermetic.py` — imported first by every test
+module, before any `app` import — empties the app's configuration out of the process,
+so a result cannot depend on your `.env`, on a `VA_LSE_*` variable you have exported,
+or on a `.streamlit/secrets.toml` in the project or in `~` — including the values
+Streamlit would promote into the environment while parsing it. Streamlit's *config*
+files it does not empty but **pins**: the session reads the repository's committed
+`.streamlit/config.toml` and no other, so a `config.toml` in `~` cannot decide the
+options under test and the suite no longer reads different configuration depending on
+the directory it was launched from. The two `STREAMLIT_*` variables Streamlit honours
+(the options it marks "sensitive") are stripped like any other ambient name; note that
+the documented `STREAMLIT_SERVER_PORT`-style overrides are inert on 1.63.0 — see
+[Production hardening](#production-hardening-streamlit). A test that *needs* a value
+sets it itself (`patch.object(config, …)`, or `patch.dict(os.environ, …)` inside the
+test body), so the suite exercises the deployed condition (no `.env`, no secrets file,
+the committed Streamlit config) rather than your machine's. The rule exists because the
+opposite is invisible in both directions: a test can pass locally and fail in CI (or the
+reverse) for no reason the code can explain. `tests/test_hermetic.py` enforces it, and
+fails if a test module forgets the harness, imports it after the app, if the app starts
+reading a Streamlit config option, or if the suite stops ignoring a deliberately hostile
+environment, secrets file, or machine-scoped config file.
+
+CI runs the whole suite that way as its own check — the `hermetic` job, which is
+`python -m tests.hostile` above, using the same fixtures the in-suite canaries use
+(`tests/hostile.py`, so the two cannot drift apart). Ambient dependence that arrives
+with a future test therefore fails the build, instead of surfacing later as a mystery
+on somebody else's machine.
 
 ### Type checking (mypy — strict)
 
@@ -527,8 +555,10 @@ All public helpers in `app/main.py`, `app/fetch_client.py`, `app/evaluate.py` ca
 
 ## QwenCloud Individual Plan Lite tuning
 
-These defaults are tuned for a single user on the QwenCloud Individual Plan Lite subscription
-($8/month, **2,500 Credits per rolling 7-day window**, 1–2 concurrent agents):
+The shipped defaults are Perplexity's Router API (see **Environment variables** above). This
+section is the profile for the QwenCloud Individual Plan Lite subscription
+($8/month, **2,500 Credits per rolling 7-day window**, 1–2 concurrent agents), which was the
+previous default; copy the four `.env` lines at the end of this section to run on it:
 
 - **Base URL / key are paired** — the `sk-sp-` Token Plan key only works with the Token Plan
   base URL; they never work against the general MaaS gateway.
@@ -1144,6 +1174,18 @@ Streamlit's permissive defaults. It pins:
 At startup `app/main.py` emits `⚠️ Streamlit security hardening is not fully active`
 if the file is missing or those keys are absent (non-blocking warning).
 
+Environment variables cannot override these keys, despite the documentation: on
+Streamlit 1.63.0 the environment is consulted only for the two options marked
+"sensitive" (`server.cookieSecret`, `mapbox.token`), so an exported
+`STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION` — or the documented `STREAMLIT_SERVER_PORT`
+— changes nothing (measured, not assumed). A deployment therefore cannot lose the XSRF,
+toolbar, or upload caps by leaking a variable into the environment, and a local
+override for debugging is a `streamlit run` flag (`--server.maxUploadSize 500`), which
+is applied after every config file. Note where the file is resolved *from*: Streamlit
+looks in `~` and in the **working directory**, so starting the app outside the
+repository root silently drops this file — which is why the startup warning reads it by
+absolute path, and why the test session pins it (see [Tests](#tests)).
+
 Upload limits are also enforced in Python (`app/main.py:_check_upload_limits`) so the
 tight 50 MB per-file / 200 MB batch caps (`VA_LSE_MAX_UPLOAD_BYTES` /
 `VA_LSE_MAX_TOTAL_UPLOAD_BYTES`, overridable via env) produce a clear in-UI message
@@ -1169,8 +1211,9 @@ with your proxy if the stream is TLS-terminated there.
 
 ## Compatibility & migration
 
-- **Tested endpoints & models:** QwenCloud Token Plan (`qwen3.7-max`/`flash`), OpenAI (`gpt-4-turbo`/`gpt-4o-mini`), and any OpenAI-compatible proxy (Ollama via shim) — see [`COMPATIBILITY.md`](COMPATIBILITY.md) for minimum versions, model tables, and breaking-change history.
-- **Switching providers:** see [`MIGRATION.md`](MIGRATION.md) (QwenCloud ↔ OpenAI ↔ local). No code change needed — update `.env`.
+- **Default endpoint & models:** Perplexity's Router API (`perplexity/kimi-k3` for analysis, `perplexity/glm-5.3-flash` for the bulk digest passes). One Perplexity key covers both this endpoint and the Research tab.
+- **Tested endpoints & models:** Perplexity Router API (default), QwenCloud Token Plan (`qwen3.7-max`/`flash`), OpenAI (`gpt-4-turbo`/`gpt-4o-mini`), and any OpenAI-compatible proxy (Ollama via shim) — see [`COMPATIBILITY.md`](COMPATIBILITY.md) for minimum versions, model tables, and breaking-change history.
+- **Switching providers:** see [`MIGRATION.md`](MIGRATION.md) (Perplexity ↔ QwenCloud ↔ OpenAI ↔ local). No code change needed — update `.env`, which overrides every default.
 - **Deployed app outdated?** Check the startup warning: `GET {base_url}/models` is queried; missing `LLM_MODEL_*` values produce a non-blocking sidebar warning linking to `COMPATIBILITY.md`.
 
 ## Security notes

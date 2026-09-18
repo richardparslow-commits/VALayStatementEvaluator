@@ -23,6 +23,7 @@ except ImportError:  # pragma: no cover - the degradation path is covered by tes
     go = None
 
 from .. import audit as audit_log
+from .. import knowledge_currency as currency
 from ..agiloop_telemetry import (
     track_feature_error,
     track_goal,
@@ -40,6 +41,7 @@ from ..evaluate import (
 )
 from ..exporter import export_facts, filter_facts
 from ..job_payload import EvaluateJob
+from ..config import Settings, load_settings
 from ..logging_config import get_logger, get_request_id
 from ..documents import (
     EVALUATE_INTERNAL_MAX_CHARS,
@@ -1235,6 +1237,89 @@ def _render_record_coverage(eval_result: Any) -> None:
                 st.write(f"- {gap.get('claim', '')}")
 
 
+def _case_topic_letters(eval_result: Any) -> list[str]:
+    """The checklist topics this case concerns, as letters.
+
+    The condition selector's per-slot selection is authoritative — it is what the run was
+    actually scoped to. The fallback reads the result's own topic rows for a reloaded
+    result or a session that no longer holds the selector state, so the flags do not
+    silently disappear after a page reload.
+    """
+    from ..condition_selector import TOPIC_LABELS
+
+    stored = st.session_state.get("preselected_topics_eval")
+    if isinstance(stored, (list, tuple)):
+        chosen = [str(letter).strip().upper() for letter in stored]
+        known = [letter for letter in chosen if letter in TOPIC_LABELS]
+        if known:
+            return sorted(set(known))
+
+    derived: set[str] = set()
+    for row in getattr(eval_result, "topic_rows", []) or []:
+        if not row.get("applicable"):
+            continue
+        first = str(row.get("topic", "")).strip()[:1].upper()
+        if first in TOPIC_LABELS:
+            derived.add(first)
+    return sorted(derived)
+
+
+def _framework_currency_ttl_days() -> int:
+    """The freshness window for a currency verdict (sidebar settings win when present)."""
+    settings = st.session_state.get("settings")
+    if isinstance(settings, Settings):
+        return settings.framework_currency_ttl_days
+    return load_settings().framework_currency_ttl_days
+
+
+def _render_framework_currency_flags(eval_result: Any) -> None:
+    """Flag checklist topics whose committed text is known to be out of date.
+
+    Read-only by design: this renders the verdict a paid check already stored (see
+    ``app/knowledge_currency``) and never calls the API, so an evaluation never gains a
+    surprise network call or a surprise bill. When no verdict applies, it says so in a
+    caption rather than showing nothing — silence would read as "all current", which is
+    the one thing an absent verdict does not mean.
+    """
+    letters = _case_topic_letters(eval_result)
+    if not letters:
+        return
+
+    flag = currency.case_currency_flag(letters, ttl_days=_framework_currency_ttl_days())
+
+    if flag.stale:
+        st.warning(
+            "⚠️ **These checklist topics have changed under current VA law.** This run's "
+            "guidance on them rests on committed text that no longer matches the sources "
+            "the app cites, so treat it as unreliable — verify the topics in the Research "
+            "tab, and see app/knowledge/ before revising a statement from them:"
+        )
+        for verdict in flag.stale:
+            suffix = f" — {verdict.authority}" if verdict.authority else ""
+            st.markdown(f"- **{verdict.topic} — {verdict.label}:** {verdict.note}{suffix}")
+
+    if flag.unconfirmed:
+        st.info(
+            "❓ **Could not be confirmed as current** (the check found conflicting sources "
+            "or could not confirm): "
+            + ", ".join(f"{v.topic} — {v.label}" for v in flag.unconfirmed)
+        )
+
+    if flag.verified:
+        checked = flag.report.checked_at[:10] if flag.report is not None else ""
+        st.caption(
+            f"Checklist currency verified for this run's topics on {checked}. "
+            "Verification covers the committed checklist and legal framework, not the "
+            "statement's facts."
+        )
+    elif not flag.stale and not flag.unconfirmed:
+        st.caption(
+            "Checklist currency has not been verified for these topics, so nothing here "
+            "confirms the app's committed framework is still current. "
+            "See the Research tab → Framework currency."
+        )
+
+
 def _render_evaluation_results(eval_result: Any) -> None:
     render_usage_summary(st.session_state.get("eval_usage"))
 
@@ -1337,6 +1422,10 @@ def _render_evaluation_results(eval_result: Any) -> None:
                 for t in eval_result.topic_rows
             ]
             st.dataframe(topic_table, width="stretch", hide_index=True)
+            # Before the gaps, not after: a topic whose committed text is out of date can
+            # be *the reason* a gap was reported here, so the caveat has to arrive before
+            # the reader acts on the gaps rather than as a footnote.
+            _render_framework_currency_flags(eval_result)
             if eval_result.topic_critical_gaps:
                 st.warning(
                     "**Critical gaps — the highest-impact topics this statement still misses:**"

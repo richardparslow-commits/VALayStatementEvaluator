@@ -35,7 +35,14 @@ def render_sidebar_settings() -> None:
             help="Stored only in this browser session and used for LLM calls.",
         )
         st.session_state.base_url_input = st.text_input(
-            "Base URL (OpenAI-compatible)", value=settings.base_url or DEFAULT_BASE_URL
+            "Base URL (OpenAI-compatible)",
+            value=settings.base_url or DEFAULT_BASE_URL,
+            help=(
+                "Any OpenAI-compatible POST {base_url}/chat/completions endpoint. The "
+                "default is Perplexity's Router API (private preview — request access "
+                "from api@perplexity.ai). One Perplexity key covers both this endpoint "
+                "and the Research tab's grounded lookups."
+            ),
         )
         _secrets_source_note(settings)
         col1, col2 = st.columns(2)
@@ -45,8 +52,8 @@ def render_sidebar_settings() -> None:
         st.session_state.model_fast_input = col2.text_input(
             "Fast model",
             value=settings.model_fast,
-            help="Bulk record digests — use a cheap model here to preserve "
-            "QwenCloud Lite quota.",
+            help="Bulk record digests — one call per record chunk, so use the "
+            "cheapest model that extracts accurately to keep a large run cheap.",
         )
         st.divider()
         st.subheader("Fetch Sandbox")

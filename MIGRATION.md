@@ -7,6 +7,8 @@ No code change is required for endpoint or model migrations.
 
 | Move | `.env` change | Notes |
 |------|---------------|-------|
+| Anything → **Perplexity Router API** (current default) | `OPENAI_BASE_URL=https://api.perplexity.ai/router/v1` + `LLM_MODEL_MAIN=perplexity/kimi-k3` / `LLM_MODEL_FAST=perplexity/glm-5.3-flash` | OpenAI Chat Completions schema, so only the base URL and key change. **Private preview** — request access from api@perplexity.ai first; the catalog is also the allowlist, so an unlisted model id returns a 400. The same key is reused as `PERPLEXITY_API_KEY` automatically, which turns on the Research tab |
+| Perplexity Router → **QwenCloud Token Plan** | `OPENAI_BASE_URL=https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1` + `sk-sp-...` key + `LLM_MODEL_MAIN=qwen3.7-max` / `LLM_MODEL_FAST=qwen3.7-flash` | Key and URL must be paired (Token Plan keys fail against the general MaaS gateway, and vice versa). Set `PERPLEXITY_API_KEY` separately if you still want the Research tab |
 | QwenCloud Token Plan → **OpenAI** | `OPENAI_BASE_URL=https://api.openai.com/v1` + OpenAI key + `LLM_MODEL_MAIN=gpt-4-turbo` / `LLM_MODEL_FAST=gpt-4o-mini` | Also works via `OPENAI_BASE_URL=https://api.openai.azure.com`-style Azure front-doors through a proxy |
 | OpenAI → **QwenCloud Token Plan** | `OPENAI_BASE_URL=https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1` + `sk-sp-...` key + `LLM_MODEL_MAIN=qwen3.7-max` / `LLM_MODEL_FAST=qwen3.7-flash` | Key and URL must be paired; Token Plan keys fail against the general MaaS gateway (and vice versa) |
 | Any provider → **local Ollama** (OpenAI-compat shim) | `OPENAI_BASE_URL=http://localhost:11434/v1` (or your proxy) + `LLM_MODEL_MAIN`/`LLM_MODEL_FAST` to locally-served model IDs | Requires an OpenAI-compat proxy in front of Ollama (e.g. Ollama's `/v1` shim). Quality not benchmarked — prefer a ≥7B instruction model. No auth key needed |
@@ -15,6 +17,11 @@ No code change is required for endpoint or model migrations.
 > All names use the app's existing env vars (`OPENAI_*` / `LLM_MODEL_*`) even
 > when the provider is not OpenAI — they are simply the OpenAI-compat knobs.
 > The sidebar **LLM Settings → Apply settings** writes the same values.
+>
+> **Defaults vs. your configuration:** the shipped defaults are Perplexity's Router
+> API (see `COMPATIBILITY.md → Current defaults`), but any value in `.env`, Streamlit
+> secrets, or the sidebar overrides them — so an existing deployment that names its
+> endpoint and models is untouched by a defaults change.
 
 ## Recipe — QwenCloud Token Plan → OpenAI
 

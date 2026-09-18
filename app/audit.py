@@ -102,7 +102,11 @@ def _scrub_error_message(text: str) -> str:
         scrubbed = pattern.sub("[redacted]", scrubbed)
     return _safe_truncate(scrubbed, 300)
 
-Action = Literal["evaluate", "draft"]
+# ``research`` covers the Perplexity Agent API panel (app/perplexity_agent.py): a
+# web-grounded lookup against the legal framework, which shares this stream's
+# metadata-only contract (preset, source count, citation count — never the
+# question text or an answer).
+Action = Literal["evaluate", "draft", "research"]
 Status = Literal["start", "ok", "error"]
 
 
