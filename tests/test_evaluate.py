@@ -36,6 +36,7 @@ from app.evaluate import (  # noqa: E402
     compute_effectiveness_score,
     compute_score_band,
     generate_improvement_recommendations,
+    rubric_and_positive_sources,
     run_evaluation,
 )
 from app.llm import LLMError  # noqa: E402
@@ -886,6 +887,70 @@ class TestRunEvaluationScoreIntegration(unittest.TestCase):
         self.assertEqual(result.claims, [])
         self.assertIsInstance(result.effectiveness_score, int)
         self.assertGreaterEqual(len(result.recommendations), 3)
+
+
+class TestRubricAndPositiveSourcesJoin(unittest.TestCase):
+    """Fact↔verification matching: an exact (document, page) join, with the
+    original substring test kept as a union for free-form references."""
+
+    def _fact(self, source: str, document: str = "", page: int = 0):
+        from app.medical_review import MedicalFact
+
+        return MedicalFact(
+            date="2020-01-01", type="diagnosis", description="Knee strain",
+            source=source, quote="knee", document=document, page=page,
+        )
+
+    def _digest(self, facts):
+        from app.medical_review import MedicalDigest
+
+        return MedicalDigest(facts=facts)
+
+    def test_a_reference_in_another_citation_style_still_joins(self) -> None:
+        """The substring test missed a page citation written differently than the
+        fact's label; the parsed (document, page) key does not care about style."""
+        fact = self._fact("clinic.pdf p.3", document="clinic.pdf", page=3)
+        cited, positive = rubric_and_positive_sources(
+            self._digest([fact]),
+            [{"id": 1, "verdict": "SUPPORTED", "record_reference": "clinic.pdf — page 3"}],
+        )
+        self.assertEqual(cited, {"clinic.pdf p.3"})
+        self.assertEqual(positive, {"clinic.pdf p.3"})
+
+    def test_a_free_form_reference_is_still_matched_by_substring(self) -> None:
+        """A reference carrying extra information parses to nothing; the loose
+        comparison keeps that evidence usable rather than discarding it."""
+        fact = self._fact("clinic.pdf p.3")
+        cited, _ = rubric_and_positive_sources(
+            self._digest([fact]),
+            [{"id": 1, "verdict": "SUPPORTED", "record_reference": "see clinic.pdf p.3 (2020 visit)"}],
+        )
+        self.assertEqual(cited, {"clinic.pdf p.3"})
+
+    def test_a_different_page_of_the_same_file_is_not_a_match(self) -> None:
+        fact = self._fact("clinic.pdf p.3", document="clinic.pdf", page=3)
+        cited, positive = rubric_and_positive_sources(
+            self._digest([fact]),
+            [{"id": 1, "verdict": "SUPPORTED", "record_reference": "clinic.pdf — page 9"}],
+        )
+        self.assertEqual(cited, set())
+        self.assertEqual(positive, set())
+
+    def test_a_contradicting_verification_cites_without_supporting(self) -> None:
+        fact = self._fact("clinic.pdf p.3", document="clinic.pdf", page=3)
+        cited, positive = rubric_and_positive_sources(
+            self._digest([fact]),
+            [{"id": 1, "verdict": "CONTRADICTED", "record_reference": "clinic.pdf — page 3"}],
+        )
+        self.assertEqual(cited, {"clinic.pdf p.3"})
+        self.assertEqual(positive, set())
+
+    def test_nothing_to_join_returns_empty_sets(self) -> None:
+        self.assertEqual(rubric_and_positive_sources(None, []), (set(), set()))
+        self.assertEqual(
+            rubric_and_positive_sources(self._digest([]), [{"verdict": "SUPPORTED"}]),
+            (set(), set()),
+        )
 
 
 if __name__ == "__main__":

@@ -92,8 +92,8 @@ def records_uploader(slot: str) -> list:
         return _local_records(slot)
 
     files = st.file_uploader(
-        "Upload medical records (PDF, TXT, MD, DOCX — multiple allowed)",
-        type=["pdf", "txt", "md", "docx"],
+        "Upload medical records (PDF, TXT, MD, DOCX, or a ZIP of them — multiple allowed)",
+        type=["pdf", "txt", "md", "docx", "zip"],
         accept_multiple_files=True,
         key=f"files_{slot}",
     )
@@ -145,8 +145,8 @@ def _local_records(slot: str) -> list:
         st.error("Local file access is disabled on this server. Upload records instead.")
         return []
     st.caption(
-        "Reads supported record files (.pdf/.txt/.md/.docx) directly from this "
-        "machine's filesystem. Only available when the app runs locally."
+        "Reads supported record files (.pdf/.txt/.md/.docx/.zip) directly from "
+        "this machine's filesystem. Only available when the app runs locally."
     )
     path = st.text_input(
         "Folder or file path",
