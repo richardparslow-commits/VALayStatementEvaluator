@@ -125,13 +125,13 @@ class TestRedisBackendLive(unittest.TestCase):
         self.assertEqual(claimed_record.status, job_queue.STATUS_RUNNING)
         self.assertEqual(claimed_record.worker_id, "live-w1")
 
-        self.backend.set_progress(record.job_id, 0.42, "digesting")
+        self.backend.set_progress(record.job_id, 0.42, "digesting", claim_token=claimed_record.claim_token)
         running = self.backend.get(record.job_id)
         self.assertAlmostEqual(running.progress, 0.42)
         self.assertEqual(running.message, "digesting")
 
-        self.backend.store_result(record.job_id, '{"ok": true}')
-        self.backend.complete(record.job_id, message="done")
+        self.backend.store_result(record.job_id, '{"ok": true}', claim_token=claimed_record.claim_token)
+        self.backend.complete(record.job_id, claim_token=claimed_record.claim_token, message="done")
         finished = self.backend.get(record.job_id)
         self.assertEqual(finished.status, STATUS_DONE)
         self.assertEqual(self.backend.get_result(record.job_id), '{"ok": true}')
@@ -145,12 +145,12 @@ class TestRedisBackendLive(unittest.TestCase):
     def test_requeue_restores_a_running_job(self):
         record = self.backend.enqueue(KIND_EVALUATE, "{}")
         with patch.object(config, "JOB_QUEUE_CLAIM_TIMEOUT_SECONDS", FAST_CLAIM):
-            self.backend.claim([KIND_EVALUATE], worker_id="w1")
-        self.assertTrue(self.backend.requeue(record.job_id, reason="draining"))
+            claimed, _ = self.backend.claim([KIND_EVALUATE], worker_id="w1")
+        self.assertTrue(self.backend.requeue(record.job_id, claim_token=claimed.claim_token, reason="draining"))
         self.assertEqual(self.backend.get(record.job_id).status, STATUS_QUEUED)
         self.assertEqual(self.backend.depth(), 1)
         # Only a running job can be handed back.
-        self.assertFalse(self.backend.requeue(record.job_id, reason="again"))
+        self.assertFalse(self.backend.requeue(record.job_id, claim_token=claimed.claim_token, reason="again"))
 
     def test_second_client_cannot_double_claim(self):
         record = self.backend.enqueue(KIND_EVALUATE, "{}")

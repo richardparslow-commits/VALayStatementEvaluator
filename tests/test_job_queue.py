@@ -18,6 +18,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 
+import fakeredis
+
 from app import config  # noqa: E402
 from app import job_queue  # noqa: E402
 from app.job_queue import (  # noqa: E402
@@ -36,51 +38,11 @@ FAST_CLAIM = 0.05
 
 
 # ------------------------------------------------------------------ test doubles
-class _FakeRedisClient:
-    """Minimal in-memory stand-in for a redis-py client."""
+class _FakeRedisClient(fakeredis.FakeRedis):
+    """Run real Lua rather than duplicating queue behavior in Python."""
 
     def __init__(self) -> None:
-        self.store: dict[str, str] = {}
-        self.lists: dict[str, list[str]] = {}
-        self.zsets: dict[str, dict[str, float]] = {}
-
-    def set(self, key: str, value: str, ex: int | None = None) -> bool:
-        self.store[key] = value
-        return True
-
-    def get(self, key: str) -> str | None:
-        return self.store.get(key)
-
-    def lpush(self, key: str, value: str) -> int:
-        self.lists.setdefault(key, []).insert(0, value)
-        return len(self.lists[key])
-
-    def rpop(self, key: str) -> str | None:
-        items = self.lists.get(key) or []
-        return items.pop() if items else None
-
-    def llen(self, key: str) -> int:
-        return len(self.lists.get(key) or [])
-
-    def zadd(self, key: str, mapping: dict[str, float]) -> int:
-        target = self.zsets.setdefault(key, {})
-        target.update(mapping)
-        return len(mapping)
-
-    def zrem(self, key: str, member: str) -> int:
-        return 1 if self.zsets.get(key, {}).pop(member, None) is not None else 0
-
-    def zrangebyscore(self, key: str, _min: str, max_score: str) -> list[str]:
-        exclusive = str(max_score).startswith("(")
-        bound = float(str(max_score).lstrip("("))
-        out = []
-        for member, score in sorted(self.zsets.get(key, {}).items(), key=lambda kv: kv[1]):
-            if score < bound if exclusive else score <= bound:
-                out.append(member)
-        return out
-
-    def ping(self) -> bool:
-        return True
+        super().__init__(decode_responses=True)
 
 
 class _FakeRedisModule:
@@ -114,50 +76,21 @@ class _FakeUpstashTransport:
     def __init__(self) -> None:
         self.commands: list[list[object]] = []
         self.headers: list[dict] = []
-        self.store: dict[str, str] = {}
-        self.lists: dict[str, list[str]] = {}
-        self.zsets: dict[str, dict[str, float]] = {}
+        self.client = _FakeRedisClient()
 
     def urlopen(self, request, timeout=None):  # noqa: ANN001, ARG002
         body = json.loads(request.data.decode("utf-8"))
         assert isinstance(body, list)
         self.commands.append(body)
         self.headers.append(dict(request.headers))
-        return _FakeUpstashResponse(json.dumps({"result": self._run(body)}).encode("utf-8"))
+        try:
+            reply = {"result": self._run(body)}
+        except Exception as exc:
+            reply = {"error": str(exc)}
+        return _FakeUpstashResponse(json.dumps(reply).encode("utf-8"))
 
     def _run(self, body: list) -> object:
-        op = str(body[0]).upper()
-        if op == "SET":
-            self.store[str(body[1])] = str(body[2])
-            return "OK"
-        if op == "GET":
-            return self.store.get(str(body[1]))
-        if op == "LPUSH":
-            self.lists.setdefault(str(body[1]), []).insert(0, str(body[2]))
-            return len(self.lists[str(body[1])])
-        if op == "RPOP":
-            items = self.lists.get(str(body[1])) or []
-            return items.pop() if items else None
-        if op == "LLEN":
-            return len(self.lists.get(str(body[1])) or [])
-        if op == "ZADD":
-            self.zsets.setdefault(str(body[1]), {})[str(body[3])] = float(body[2])
-            return 1
-        if op == "ZREM":
-            return 1 if self.zsets.get(str(body[1]), {}).pop(str(body[2]), None) else 0
-        if op == "ZRANGEBYSCORE":
-            exclusive = str(body[3]).startswith("(")
-            bound = float(str(body[3]).lstrip("("))
-            return [
-                member
-                for member, score in sorted(
-                    self.zsets.get(str(body[1]), {}).items(), key=lambda kv: kv[1]
-                )
-                if (score < bound if exclusive else score <= bound)
-            ]
-        if op == "PING":
-            return "PONG"
-        raise AssertionError(f"unexpected command {op}")
+        return self.client.execute_command(*body)
 
 
 # --------------------------------------------------------------------- basetest
@@ -166,6 +99,52 @@ class _BackendCase:
 
     def make_backend(self):  # noqa: ANN201
         raise NotImplementedError
+
+    def test_reclaimed_attempt_rejects_every_old_worker_write(self):
+        backend = self.make_backend()
+        queued = backend.enqueue(KIND_EVALUATE, "evidence")
+        old, _ = backend.claim([KIND_EVALUATE], worker_id="same-worker-id")
+        old_token = old.claim_token
+        backend.store_result(old.job_id, "old result", claim_token=old_token)
+        with patch.object(config, "JOB_QUEUE_LEASE_SECONDS", 0):
+            self.assertEqual(backend.requeue_stale(), 1)
+        self.assertIsNone(backend.get_result(old.job_id))
+        current, _ = backend.claim([KIND_EVALUATE], worker_id="same-worker-id")
+        self.assertEqual(old.claim_token, old_token, "claim snapshots must not mutate")
+        self.assertNotEqual(current.claim_token, old_token)
+        self.assertNotEqual(queued.claim_token, current.claim_token)
+        before = backend.get(old.job_id)
+        writes = [
+            lambda token: backend.set_progress(old.job_id, 0.9, "late", claim_token=token),
+            lambda token: backend.store_result(old.job_id, "late", claim_token=token),
+            lambda token: backend.complete(old.job_id, claim_token=token),
+            lambda token: backend.fail(old.job_id, claim_token=token, error="late"),
+        ]
+        for token in (old_token, ""):
+            for write in writes:
+                with self.assertRaises(job_queue.JobLeaseLost):
+                    write(token)
+            self.assertFalse(backend.requeue(old.job_id, claim_token=token))
+        self.assertEqual(backend.get(old.job_id), before)
+        self.assertIsNone(backend.get_result(old.job_id))
+        backend.store_result(old.job_id, "new result", claim_token=current.claim_token)
+        backend.complete(old.job_id, claim_token=current.claim_token)
+        for write in writes:
+            with self.assertRaises(job_queue.JobLeaseLost):
+                write(current.claim_token)
+        self.assertEqual(backend.get_result(old.job_id), "new result")
+
+    def test_only_one_concurrent_claim_succeeds(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        backend = self.make_backend()
+        backend.enqueue(KIND_EVALUATE, "evidence")
+        with patch.object(config, "JOB_QUEUE_CLAIM_TIMEOUT_SECONDS", FAST_CLAIM):
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                results = list(pool.map(
+                    lambda i: backend.claim([KIND_EVALUATE], worker_id=str(i)), range(4)
+                ))
+        self.assertEqual(sum(result is not None for result in results), 1)
 
     def test_enqueue_then_claim_roundtrip(self):
         backend = self.make_backend()
@@ -186,14 +165,14 @@ class _BackendCase:
     def test_progress_complete_and_result(self):
         backend = self.make_backend()
         record = backend.enqueue(KIND_EVALUATE, '{"k": 1}')
-        backend.claim([KIND_EVALUATE], worker_id="w1")
-        backend.set_progress(record.job_id, 0.5, "half way")
+        claimed, _ = backend.claim([KIND_EVALUATE], worker_id="w1")
+        backend.set_progress(record.job_id, 0.5, "half way", claim_token=claimed.claim_token)
         running = backend.get(record.job_id)
         self.assertAlmostEqual(running.progress, 0.5)
         self.assertEqual(running.message, "half way")
 
-        backend.store_result(record.job_id, '{"result": true}')
-        backend.complete(record.job_id, message="completed in 3s")
+        backend.store_result(record.job_id, '{"result": true}', claim_token=claimed.claim_token)
+        backend.complete(record.job_id, claim_token=claimed.claim_token, message="completed in 3s")
         done = backend.get(record.job_id)
         self.assertEqual(done.status, job_queue.STATUS_DONE)
         self.assertTrue(done.is_terminal)
@@ -204,8 +183,8 @@ class _BackendCase:
     def test_fail_records_error(self):
         backend = self.make_backend()
         record = backend.enqueue(KIND_DRAFT, '{"k": 1}')
-        backend.claim([KIND_DRAFT], worker_id="w1")
-        backend.fail(record.job_id, error="boom", error_class="RuntimeError")
+        claimed, _ = backend.claim([KIND_DRAFT], worker_id="w1")
+        backend.fail(record.job_id, claim_token=claimed.claim_token, error="boom", error_class="RuntimeError")
         failed = backend.get(record.job_id)
         self.assertEqual(failed.status, job_queue.STATUS_ERROR)
         self.assertEqual(failed.error, "boom")
@@ -214,13 +193,13 @@ class _BackendCase:
     def test_requeue_restores_job_without_burning_attempt(self):
         backend = self.make_backend()
         record = backend.enqueue(KIND_EVALUATE, '{"k": 1}')
-        backend.claim([KIND_EVALUATE], worker_id="w1")
-        self.assertTrue(backend.requeue(record.job_id, reason="draining"))
+        claimed, _ = backend.claim([KIND_EVALUATE], worker_id="w1")
+        self.assertTrue(backend.requeue(record.job_id, claim_token=claimed.claim_token, reason="draining"))
         requeued = backend.get(record.job_id)
         self.assertEqual(requeued.status, job_queue.STATUS_QUEUED)
         self.assertEqual(requeued.attempts, 0)
         self.assertEqual(backend.depth(), 1)
-        self.assertFalse(backend.requeue(record.job_id, reason="again"))
+        self.assertFalse(backend.requeue(record.job_id, claim_token=claimed.claim_token, reason="again"))
 
     def test_requeue_stale_recovers_abandoned_job(self):
         backend = self.make_backend()
@@ -260,7 +239,8 @@ class _BackendCase:
     def test_claim_ignores_terminal_jobs(self):
         backend = self.make_backend()
         record = backend.enqueue(KIND_EVALUATE, '{"k": 1}')
-        backend.fail(record.job_id, error="pre-failed")
+        claimed, _ = backend.claim([KIND_EVALUATE], worker_id="w1")
+        backend.fail(record.job_id, claim_token=claimed.claim_token, error="pre-failed")
         # Re-queuing a terminal job must not resurrect it.
         with patch.object(config, "JOB_QUEUE_CLAIM_TIMEOUT_SECONDS", FAST_CLAIM):
             self.assertIsNone(backend.claim([KIND_EVALUATE], worker_id="w1"))
@@ -274,21 +254,18 @@ class TestInProcessBackend(_BackendCase, unittest.TestCase):
 class TestRedisBackend(_BackendCase, unittest.TestCase):
     def make_backend(self):  # noqa: ANN201
         self.client = _FakeRedisClient()
-        module = _FakeRedisModule(self.client)
-        self._patcher = patch.dict(sys.modules, {"redis": module})
-        self._patcher.start()
-        self.addCleanup(self._patcher.stop)
         self._config_patch = patch.object(config, "JOB_QUEUE_CLAIM_TIMEOUT_SECONDS", FAST_CLAIM)
         self._config_patch.start()
         self.addCleanup(self._config_patch.stop)
-        return RedisJobBackend("redis://localhost:6379/0", prefix="t", ttl_seconds=60)
+        with patch("redis.Redis.from_url", return_value=self.client):
+            return RedisJobBackend("redis://localhost:6379/0", prefix="t", ttl_seconds=60)
 
     def test_keys_use_the_configured_prefix(self):
         backend = self.make_backend()
         record = backend.enqueue(KIND_EVALUATE, "{}")
-        self.assertIn(f"t:job:{record.job_id}:meta", self.client.store)
-        self.assertIn(f"t:job:{record.job_id}:payload", self.client.store)
-        self.assertIn("t:jobs:evaluate", self.client.lists)
+        self.assertIn(f"t:job:{record.job_id}:meta", self.client.keys())
+        self.assertIn(f"t:job:{record.job_id}:payload", self.client.keys())
+        self.assertIn("t:jobs:evaluate", self.client.keys())
 
     def test_missing_redis_package_raises_unavailable(self):
         with patch.dict(sys.modules, {"redis": None}):

@@ -22,6 +22,9 @@ boto3>=1.34
 # a broken scrape config or dashboard JSON could reach main unverified.
 pyyaml>=6.0
 
+# Execute the queue's actual Lua scripts in offline transport/fault-injection tests.
+fakeredis[lua]>=2.31,<3
+
 # NOTE: the Perplexity SDK is not listed here. It used to be a dev-only addition on top
 # of the optional install, but it now arrives with `-r requirements.txt` because the
 # Research tab has to work on hosts that cannot install at runtime (Streamlit Community
