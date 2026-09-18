@@ -55,6 +55,18 @@ class _UploadedFile:
         self.name = name
         self.size = size
 
+    def getvalue(self) -> bytes:
+        return b"x" * self.size
+
+
+class _UploadWithBytes(_UploadedFile):
+    def __init__(self, name: str, data: bytes) -> None:
+        super().__init__(name, len(data))
+        self._data = data
+
+    def getvalue(self) -> bytes:
+        return self._data
+
 
 # ---------------------------------------------------------------- shared.py
 class TestFormatErrorForUser(unittest.TestCase):
@@ -213,6 +225,105 @@ class TestCheckUploadLimits(unittest.TestCase):
 
 
 class TestExtractUploadsCaching(unittest.TestCase):
+    def test_replacement_extracts_new_contents_in_each_workflow(self) -> None:
+        import app.views.uploads as uploads
+
+        for slot in ("eval", "draft", "eval_statement"):
+            with self.subTest(slot=slot):
+                st_mock, session = _fake_streamlit()
+                original = _UploadWithBytes("records.txt", b"Patient A: asthma.")
+                replacement = _UploadWithBytes("records.txt", b"Patient B: injury.")
+                self.assertEqual(original.size, replacement.size)
+                with _patch_st(uploads, st_mock):
+                    first = uploads.extract_uploads([original], slot)
+                    second = uploads.extract_uploads([replacement], slot)
+                self.assertEqual(first[0].full_text, "Patient A: asthma.")
+                self.assertEqual(second[0].full_text, "Patient B: injury.")
+                self.assertNotIn(uploads._upload_cache_key(slot, original), session)
+
+    def test_same_named_uploads_keep_their_contents_across_reruns(self) -> None:
+        import app.views.uploads as uploads
+
+        for data in (b"Patient B: injury.", b"A longer, different medical record."):
+            with self.subTest(data=data):
+                st_mock, session = _fake_streamlit()
+                files = [
+                    _UploadWithBytes("records.txt", b"Patient A: asthma."),
+                    _UploadWithBytes("records.txt", data),
+                ]
+                expected = [f.getvalue().decode() for f in files]
+                with _patch_st(uploads, st_mock), patch.object(
+                    uploads, "extract_uploaded_documents", wraps=uploads.extract_uploaded_documents
+                ) as extract:
+                    first = uploads.extract_uploads(files, "eval")
+                    self.assertEqual([d.full_text for d in first], expected)
+                    extract.reset_mock()
+                    second = uploads.extract_uploads(files, "eval")
+                    self.assertEqual([d.full_text for d in second], expected)
+                    extract.assert_not_called()
+                    remaining = uploads.extract_uploads([files[0]], "eval")
+                    self.assertEqual([d.full_text for d in remaining], expected[:1])
+                self.assertNotIn(uploads._upload_cache_key("eval", files[1]), session)
+
+    def test_same_named_unreadable_file_never_receives_another_files_extraction(self) -> None:
+        import app.views.uploads as uploads
+
+        st_mock, session = _fake_streamlit()
+        files = [
+            _UploadWithBytes("records.txt", b""),
+            _UploadWithBytes("records.txt", b"Patient B: injury."),
+        ]
+        with _patch_st(uploads, st_mock):
+            for _ in range(2):
+                st_mock.warning.reset_mock()
+                docs = uploads.extract_uploads(files, "eval")
+                self.assertEqual([d.full_text for d in docs], ["Patient B: injury."])
+                st_mock.warning.assert_called_once()
+                self.assertNotIn(uploads._upload_cache_key("eval", files[0]), session)
+
+    def test_new_and_cached_uploads_preserve_selected_order(self) -> None:
+        import app.views.uploads as uploads
+
+        st_mock, _ = _fake_streamlit()
+        files = [
+            _UploadWithBytes("new.txt", b"First medical record."),
+            _UploadWithBytes("cached.txt", b"Second medical record."),
+        ]
+        with _patch_st(uploads, st_mock):
+            uploads.extract_uploads([files[1]], "eval")
+            docs = uploads.extract_uploads(files, "eval")
+        self.assertEqual([d.full_text for d in docs], [f.getvalue().decode() for f in files])
+
+    def test_unreadable_bytes_cannot_hit_a_fallback_cache_key(self) -> None:
+        import app.views.uploads as uploads
+
+        st_mock, session = _fake_streamlit()
+        unreadable = MagicMock()
+        unreadable.name = "records.txt"
+        unreadable.size = 18
+        unreadable.getvalue.side_effect = OSError("unreadable upload")
+        session["eval:records.txt:18:nohash"] = MagicMock(filename="stale.txt")
+        with _patch_st(uploads, st_mock), patch.object(
+            uploads, "extract_uploaded_documents"
+        ) as extract:
+            self.assertEqual(uploads.extract_uploads([unreadable], "eval"), [])
+        extract.assert_not_called()
+        st_mock.warning.assert_called_once()
+        self.assertIn("records.txt", st_mock.warning.call_args.args[0])
+        self.assertNotIn("eval:records.txt:18:nohash", session)
+
+    def test_clearing_uploads_prunes_only_that_workflow(self) -> None:
+        import app.views.uploads as uploads
+
+        st_mock, session = _fake_streamlit()
+        uploaded = _UploadWithBytes("records.txt", b"Patient A: asthma.")
+        with _patch_st(uploads, st_mock):
+            uploads.extract_uploads([uploaded], "eval")
+            uploads.extract_uploads([uploaded], "draft")
+            self.assertEqual(uploads.extract_uploads([], "eval"), [])
+        self.assertNotIn(uploads._upload_cache_key("eval", uploaded), session)
+        self.assertIn(uploads._upload_cache_key("draft", uploaded), session)
+
     def test_cache_hit_skips_extraction(self) -> None:
         import app.views.uploads as uploads
 

@@ -1,4 +1,4 @@
-"""UI-level tests: unreadable uploads surface per-file warnings in the app.
+"""UI-level tests: uploaded contents stay correct and unreadable files warn.
 
 Uses Streamlit's AppTest harness to run the real app and drive the file
 uploader, so the warning behavior is locked in end-to-end (not just in the
@@ -31,6 +31,31 @@ class TestUploadWarnings(unittest.TestCase):
         from streamlit.testing.v1 import AppTest
 
         return AppTest.from_file(str(PROJECT_ROOT / "run_app.py"), default_timeout=20)
+
+    def test_same_named_records_remain_distinct_after_rerun(self):
+        for slot in ("eval", "draft"):
+            with self.subTest(slot=slot):
+                at = self._app().run()
+                expected = ["Patient A: asthma.", "Patient B: injury."]
+                at.file_uploader(key=f"files_{slot}").set_value(
+                    [("records.txt", text.encode(), "text/plain") for text in expected]
+                )
+                for _ in range(2):
+                    at.run()
+                    self.assertFalse(at.exception)
+                    docs = at.session_state[f"source_records_{slot}"]["Upload"]
+                    self.assertEqual([doc.full_text for doc in docs], expected)
+
+    def test_same_sized_replacement_updates_record_contents(self):
+        at = self._app().run()
+        for text in ("Patient A: asthma.", "Patient B: injury."):
+            at.file_uploader(key="files_eval").set_value(
+                [("records.txt", text.encode(), "text/plain")]
+            )
+            at.run()
+            self.assertFalse(at.exception)
+            docs = at.session_state["source_records_eval"]["Upload"]
+            self.assertEqual([doc.full_text for doc in docs], [text])
 
     def test_bad_pdf_upload_surfaces_warning(self):
         at = self._app()

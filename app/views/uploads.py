@@ -68,18 +68,19 @@ def check_upload_limits(files: Any) -> tuple[list[Any], list[str]]:
     return accepted, rejected_msgs
 
 
-def _upload_cache_key(slot: str, uploaded: Any) -> str:
+def _upload_cache_key(slot: str, uploaded: Any) -> str | None:
     """Cache key for one upload: slot, name, size **and content hash**.
 
     Name and size alone are not identity. A user who fixes a file locally and
     re-uploads a corrected copy with the same name and byte length would otherwise
     keep getting the old text back from ``session_state`` for the rest of the
     session — the failure looks like the app ignoring their correction.
+    Unreadable bytes have no trustworthy cache identity.
     """
     try:
-        digest = hashlib.sha1(uploaded.getvalue()).hexdigest()[:16]
-    except Exception:  # noqa: BLE001 - test fakes expose only name/size
-        digest = "nohash"
+        digest = hashlib.sha256(uploaded.getvalue()).hexdigest()
+    except Exception:  # noqa: BLE001 - never fall back to name/size identity
+        return None
     return f"{slot}:{uploaded.name}:{getattr(uploaded, 'size', 0)}:{digest}"
 
 
@@ -107,25 +108,26 @@ def extract_uploads(files: Any, slot: str) -> list[Any]:
     the bad file is removed or replaced.
     """
     documents = []
-    to_extract = []
+    skipped: list[str] = []
     live_keys: set[str] = set()
     for uploaded in files:
         cache_key = _upload_cache_key(slot, uploaded)
+        if cache_key is None:
+            skipped.append(f"✖️ {uploaded.name}: could not read uploaded file.")
+            continue
         live_keys.add(cache_key)
         if cache_key in st.session_state:
             documents.append(st.session_state[cache_key])
-        else:
-            to_extract.append(uploaded)
-    _prune_upload_cache(slot, live_keys)
+            continue
 
-    new_docs, skipped = extract_uploaded_documents(to_extract) if to_extract else ([], [])
-    for doc in new_docs:
-        # Cache each successful extraction by its (slot, name, size, content) key.
-        for uploaded in to_extract:
-            if uploaded.name == doc.filename:
-                st.session_state[_upload_cache_key(slot, uploaded)] = doc
-                break
-        documents.append(doc)
+        # Extract individually so duplicate names and skipped files cannot shift
+        # the association between an upload's content key and its document.
+        new_docs, file_skipped = extract_uploaded_documents([uploaded])
+        skipped.extend(file_skipped)
+        if new_docs:
+            st.session_state[cache_key] = new_docs[0]
+            documents.extend(new_docs)
+    _prune_upload_cache(slot, live_keys)
     # The uploader re-delivers files on every rerun, so warnings are recomputed
     # fresh each run: they persist while a bad file is still uploaded and clear
     # as soon as it is removed or replaced.
