@@ -185,6 +185,9 @@ installs on macOS and Linux CI.
 | `LLM_MODEL_MAIN_FALLBACK` / `LLM_MODEL_FAST_FALLBACK` | The fallback provider's model names for the two roles | primary models |
 | `LLM_ENDPOINT_FALLBACK_TIMEOUT_SECONDS` | How long the primary must fail before failover engages (a grace period, not an HTTP timeout) | `300` |
 | `VA_LSE_MAX_RECORD_PAGES` | Max total pages across uploaded record files | `5000` |
+| `VA_LSE_EXTRACTOR` | Where record text is read: `in-process` (this app's reader) or `sandbox` (the box, which can OCR a scan) | `in-process` |
+| `VA_LSE_EXTRACTOR_RUNNER` | Command that runs `scripts/ocr_and_extract.py` in the box, with `{work}` for the staged directory; stdout must end with its report JSON | (empty = in-process) |
+| `VA_LSE_EXTRACTOR_TIMEOUT_SECONDS` | Ceiling for one file's box work (never past the run's own budget) | `900` |
 | `VA_LSE_JOB_QUEUE` | Run Evaluate/Draft on worker pods instead of in-process (Pattern C) | `0` |
 | `VA_LSE_REDIS_URL` | Redis backend for the job queue | (empty) |
 | `VA_LSE_JOB_QUEUE_TTL_SECONDS` | How long a finished job's payload/result is kept | `86400` |

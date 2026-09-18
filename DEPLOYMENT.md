@@ -677,6 +677,23 @@ Four things about it are deliberate and easy to get wrong by hand:
   OCR tooling installed, `3` bad input or nothing extractable. Nothing here is
   installed in the `runtime` stage — `tests/test_sandbox_image.py` fails if the
   deployment image grows a PDF renderer or an OCR engine.
+* **The app can read records on the box instead (a swap, not a rewrite).**
+  `app/extractors.py` implements the same `RecordExtractor` port as the reader in
+  `app/documents.py`, so setting `VA_LSE_EXTRACTOR=sandbox` plus
+  `VA_LSE_EXTRACTOR_RUNNER` moves *where* bytes are read without changing how text
+  is shaped: the box runs the entrypoint above, this app maps the report JSON back
+  through `app/job_payload.documents_from_json`, and a document answered under a
+  name the user never uploaded is refused. Every failure — no runner, no tooling on
+  the box, a refusal, a timeout (capped by the run's own remaining budget),
+  unparseable JSON — is logged once through `app.error_report` and the file is read
+  in-process, so a misconfigured box costs a warning rather than a run.
+
+  Measured on a generated 20-file / 400-page all-scan bundle (`--no-ocr` vs. the
+  box, engine cost excluded): **0 → 20 documents read, ≈124,000 characters of record
+  text (≈31,000 tokens) reaching the digest**, at ≈4 ms per page of non-engine work.
+  On a mixed bundle (born-digital pages, scans, one part-digital file) the today-path
+  silently carries 14 of 120 pages with no text and refuses 2 of 6 files; the box
+  answers with text on every page.
 
 ```bash
 # Build and push it to Vercel Container Registry, then boot a sandbox from it
@@ -879,6 +896,9 @@ All deployment-relevant variables (see `README.md` for the full list):
 | `VA_LSE_BLOB_STORE` | Blob backend for job documents | `auto` | `filesystem` or `s3` to pin it explicitly |
 | `VA_LSE_BLOB_DIR` | Filesystem blob root | `blobs` | `/app/blobs` on the shared RWX PVC |
 | `VA_LSE_BLOB_S3_BUCKET` | S3-compatible bucket | (empty) | Only for `s3`; needs `requirements-s3.txt` |
+| `VA_LSE_EXTRACTOR` | Where record text is read: `in-process` or `sandbox` | `in-process` | Leave `in-process` on worker pods; a box is an operator choice, and `sandbox` falls back to `in-process` per file |
+| `VA_LSE_EXTRACTOR_RUNNER` | Command that runs `scripts/ocr_and_extract.py` in the box | (empty) | `{work}` is the staged directory; stdout must end with the report JSON |
+| `VA_LSE_EXTRACTOR_TIMEOUT_SECONDS` | Ceiling for one file's box work | `900` | Also capped by the run's remaining budget (`VA_LSE_PIPELINE_TIMEOUT_SECONDS`) |
 | `VA_LSE_TRACING` | Emit OpenTelemetry traces | `0` | `1` on the web tier **and** every worker; needs `requirements-otel.txt` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Collector/APM intake for spans | `http://localhost:4318` | In-cluster collector Service, or a vendor OTLP endpoint |
 | `VA_LSE_TRACE_SAMPLE_RATIO` | Fraction of runs traced | `1.0` | Lower it if the backend meters per span |

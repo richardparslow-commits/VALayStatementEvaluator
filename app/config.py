@@ -500,6 +500,36 @@ RECORD_SIZE_WARN_PAGES = _positive_int_env("VA_LSE_RECORD_SIZE_WARN_PAGES", 800)
 # VA_LSE_RECORDS_CONCURRENCY if you move to a higher QwenCloud tier.
 RECORDS_CONCURRENCY = max(1, _int_env("VA_LSE_RECORDS_CONCURRENCY", 2))
 
+# ---------------------------------------------------------------------------
+# Where record text is extracted (app/extractors.py).
+#
+# In-process (the default) is this app's own reader: no external tooling, and a
+# page that is a scan has no text to extract, so the uploader counts it and asks
+# the operator to OCR the file first. `sandbox` reads each file on the sandbox
+# image instead, which is the only image here with tesseract/poppler/ocrmypdf
+# (Dockerfile's sandbox stage) and runs scripts/ocr_and_extract.py under this
+# app's own reader, so a scanned bundle comes back with text on every page.
+#
+# Opt-in, and fail-open: with no runner configured, a box that refuses a file, a
+# timeout or an unparseable answer, the file is read in-process and the reason is
+# logged through app.error_report — never a run that fails because a VM was
+# unavailable. The runner is the operator's command (nothing here guesses at a
+# CLI): `{work}` stands for the directory the file was staged into, and stdout
+# must end with the report JSON that scripts/ocr_and_extract.py writes, e.g.
+#
+#   VA_LSE_EXTRACTOR_RUNNER="my-box-run.sh {work}"   # script wraps: sandbox → \
+#                                                    # python scripts/ocr_and_extract.py {work} \
+#                                                    #   --out {work}/bundle.json; cat that file
+# ---------------------------------------------------------------------------
+EXTRACTOR_MODE = os.getenv("VA_LSE_EXTRACTOR", "in-process").strip().lower() or "in-process"
+EXTRACTOR_RUNNER = os.getenv("VA_LSE_EXTRACTOR_RUNNER", "").strip()
+
+# Ceiling for one file's box work. The effective timeout is the smaller of this
+# and whatever is left of the run's own budget (app/pipeline_guard.py), so a box
+# can never outlive the run it belongs to. 15 minutes is generous for a
+# 500-page bundle and still well under the run's 30-minute wall clock.
+EXTRACTOR_TIMEOUT_SECONDS = _positive_int_env("VA_LSE_EXTRACTOR_TIMEOUT_SECONDS", 900)
+
 # Maximum facts selected for a prompt, never a cap on retained evidence.
 MAX_DIGEST_FACTS = _int_env("VA_LSE_MAX_DIGEST_FACTS", 1500)
 

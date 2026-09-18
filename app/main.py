@@ -18,6 +18,7 @@ import streamlit as st
 from . import audit as audit_log
 from . import telemetry
 from . import tracing
+from .extractors import install_configured_extractor
 from .logging_config import (
     configure_logging,
     get_logger,
@@ -44,6 +45,12 @@ st.set_page_config(
     page_icon="🎖️",
     layout="wide",
 )
+
+# Which extractor reads record files is a deployment choice (VA_LSE_EXTRACTOR,
+# see app/extractors.py), made once here so the uploader and the local-folder
+# reader keep calling app.documents without knowing the difference. Default is
+# this app's own reader, and the sandbox mode falls back to it per file.
+install_configured_extractor()
 
 
 def _check_streamlit_config_hardening() -> None:
