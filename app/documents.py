@@ -28,6 +28,34 @@ class UploadedFile(Protocol):
 
     def getvalue(self) -> bytes: ...
 
+
+class RecordExtractor(Protocol):
+    """How one record file's bytes become documents.
+
+    Both ingestion paths — the uploader and the local-folder reader — funnel
+    through ``_expand_and_extract``, so this port is the app's single seam
+    between "a file arrived" and "its text is in memory". Keeping the seam
+    narrow is the point: the reader in this module is the only PDF/DOCX parser
+    in the project (page markers, running-header stripping and chunk boundaries
+    all depend on it), so an adapter is allowed to change *where* the bytes are
+    read, never *how* the text is shaped.
+
+    Implementations live here (``InProcessExtractor``, the default) and in
+    ``app/extractors.py`` (a sandbox that can OCR a scan, which this process
+    deliberately cannot). Which one runs is a config choice, installed once by
+    ``install_configured_extractor()``; the views never see the difference.
+    """
+
+    def extract(self, label: str, data: bytes) -> tuple[list[ExtractedDocument], list[str]]:
+        """Return ``(documents, skipped)`` for one file, as the uploader expects.
+
+        ``label`` is the name the user uploaded (or the file's relative path),
+        and it is the name every page marker, citation and skip message must
+        carry — an adapter reading the file elsewhere still answers under the
+        label it was handed.
+        """
+        ...
+
 SUPPORTED_EXTENSIONS = (".pdf", ".txt", ".md", ".docx")
 # Uploading the folder you were given is the natural thing to do, so archives are
 # accepted and expanded (bounded — see ``archive_members``) rather than rejected.
@@ -628,25 +656,60 @@ def archive_members(
     return members, skipped
 
 
-def _expand_and_extract(label: str, data: bytes) -> tuple[list[ExtractedDocument], list[str]]:
-    """Extract one file, expanding an archive into its members.
+class InProcessExtractor:
+    """The default ``RecordExtractor``: this module's reader, nothing external.
 
-    Shared by the uploader and the local-folder reader so a zip behaves the same
-    however it arrives.
+    Unchanged behavior, deliberately: it is the body the uploader always ran, so
+    installing it (or failing back to it) cannot alter what a user sees.
     """
-    if label.lower().endswith(ARCHIVE_EXTENSIONS):
-        members, skipped = archive_members(label, data)
-        documents: list[ExtractedDocument] = []
-        for member_label, member_bytes in members:
-            try:
-                documents.append(extract_document(member_label, member_bytes))
-            except ExtractionError as exc:
-                skipped.append(str(exc))
-        return documents, skipped
-    try:
-        return [extract_document(label, data)], []
-    except ExtractionError as exc:
-        return [], [str(exc)]
+
+    def extract(self, label: str, data: bytes) -> tuple[list[ExtractedDocument], list[str]]:
+        """Extract one file, expanding an archive into its members.
+
+        Shared by the uploader and the local-folder reader so a zip behaves the
+        same however it arrives.
+        """
+        if label.lower().endswith(ARCHIVE_EXTENSIONS):
+            members, skipped = archive_members(label, data)
+            documents: list[ExtractedDocument] = []
+            for member_label, member_bytes in members:
+                try:
+                    documents.append(extract_document(member_label, member_bytes))
+                except ExtractionError as exc:
+                    skipped.append(str(exc))
+            return documents, skipped
+        try:
+            return [extract_document(label, data)], []
+        except ExtractionError as exc:
+            return [], [str(exc)]
+
+
+# The extractor every ingestion path uses. Swapped once at startup by
+# ``app.extractors.install_configured_extractor()`` (and by tests); ``None``
+# always means the in-process reader above, never "no extractor".
+_ACTIVE_EXTRACTOR: RecordExtractor = InProcessExtractor()
+
+
+def active_extractor() -> RecordExtractor:
+    """The extractor the uploader and the local-folder reader currently use."""
+    return _ACTIVE_EXTRACTOR
+
+
+def set_active_extractor(extractor: RecordExtractor | None) -> RecordExtractor:
+    """Point every ingestion path at *extractor* (``None`` restores the default).
+
+    Returns the extractor now active, so a caller can log which one it got.
+    """
+    global _ACTIVE_EXTRACTOR
+    _ACTIVE_EXTRACTOR = extractor if extractor is not None else InProcessExtractor()
+    return _ACTIVE_EXTRACTOR
+
+
+def _expand_and_extract(
+    label: str, data: bytes, extractor: RecordExtractor | None = None
+) -> tuple[list[ExtractedDocument], list[str]]:
+    """Extract one file through the active extractor (or *extractor* when given)."""
+    return (extractor or _ACTIVE_EXTRACTOR).extract(label, data)
 
 
 def extract_uploaded_documents(

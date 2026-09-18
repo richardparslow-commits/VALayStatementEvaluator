@@ -200,6 +200,32 @@ The following entries are covered and tested by `tests/test_security_gitignore.p
 If you add a new secret-bearing file pattern, add it to `.gitignore` and to
 the test helper in `tests/test_security_gitignore.py`.
 
+### The same audit for `.dockerignore`
+
+`.gitignore` keeps secrets out of git; [`.dockerignore`](.dockerignore) keeps
+them out of **images**, which matters more in one respect: the build context is
+uploaded to a builder, and the `sandbox` target's image can be pushed to a
+registry and snapshotted (see [DEPLOYMENT.md §6](DEPLOYMENT.md#6-dockerfile)).
+Neither file implies the other — docker does not read git state — so a file can
+be perfectly safe to commit and still have no business inside an image.
+
+`tests/test_dockerignore.py` asserts both directions:
+
+* **nothing sensitive can reach a stage**: `.env` and its variants, key material
+  (`.pem`, `.key`), `.streamlit/secrets.toml`, the audit trail (`logs/`), the blob
+  store (`blobs/`), exported reports (`outputs/`) and `usage_history.json` —
+  checked against the Dockerfile's own `COPY` lines *and* against a simulated
+  `COPY . .`, so the filter rather than today's instructions is what protects the
+  image;
+* **the filter is not so broad that a stage loses what it needs**, which is why
+  `.env.example` survives the `.env.*` pattern through an explicit re-include —
+  it is a template, not a credential, and the sandbox image copies it on purpose.
+
+One thing to know before editing it: `.dockerignore` patterns are anchored at the
+context root, unlike `.gitignore` patterns, so `*.pem` matches only a top-level
+file while `**/*.pem` matches any depth. The first version of this file got that
+wrong in four places and the test caught every one.
+
 ## 9. Reporting a vulnerability
 
 Do not open a public issue for security-sensitive findings. See the

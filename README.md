@@ -71,6 +71,9 @@ scripts/
                           (see TROUBLESHOOTING.md → *Split Large Record Sets*)
   ocr_records.py          Add a text layer to a scanned record PDF so the app can
                           read its pages (see *Scanned pages and OCR* below)
+  ocr_and_extract.py      OCR a whole record bundle and extract it with the app's
+                          own reader, emitting the queue's document JSON — the
+                          sandbox image's entrypoint (see DEPLOYMENT.md §6)
   va_records_download.py  Walk VA.gov's records-download wizard locally (you sign
                           in); writes a provenance manifest beside the PDF
 tests/                    Offline unit tests (no API key required)
@@ -182,6 +185,9 @@ installs on macOS and Linux CI.
 | `LLM_MODEL_MAIN_FALLBACK` / `LLM_MODEL_FAST_FALLBACK` | The fallback provider's model names for the two roles | primary models |
 | `LLM_ENDPOINT_FALLBACK_TIMEOUT_SECONDS` | How long the primary must fail before failover engages (a grace period, not an HTTP timeout) | `300` |
 | `VA_LSE_MAX_RECORD_PAGES` | Max total pages across uploaded record files | `5000` |
+| `VA_LSE_EXTRACTOR` | Where record text is read: `in-process` (this app's reader) or `sandbox` (the box, which can OCR a scan) | `in-process` |
+| `VA_LSE_EXTRACTOR_RUNNER` | Command that runs `scripts/ocr_and_extract.py` in the box, with `{work}` for the staged directory; stdout must end with its report JSON | (empty = in-process) |
+| `VA_LSE_EXTRACTOR_TIMEOUT_SECONDS` | Ceiling for one file's box work (never past the run's own budget) | `900` |
 | `VA_LSE_JOB_QUEUE` | Run Evaluate/Draft on worker pods instead of in-process (Pattern C) | `0` |
 | `VA_LSE_REDIS_URL` | Redis backend for the job queue | (empty) |
 | `VA_LSE_JOB_QUEUE_TTL_SECONDS` | How long a finished job's payload/result is kept | `86400` |
@@ -799,6 +805,15 @@ python scripts/ocr_records.py ~/Desktop/va_medical_records.pdf
 writes a **new** file (never the input) and re-reads it to confirm how many pages now carry
 text. Upload the `.ocr.pdf` and leave the original where it is. Exit codes: `0` wrote a copy,
 `1` nothing to do, `2` no OCR tooling installed, `3` bad input or refused to overwrite.
+
+If you are working in the sandbox image (`DEPLOYMENT.md` §6), none of that install is needed:
+the box ships Tesseract, Poppler, Ghostscript, qpdf and `ocrmypdf`, and
+`scripts/ocr_and_extract.py` does the whole bundle at once — OCR every scan, then extract with
+the app's own reader, under the original file names:
+
+```bash
+python scripts/ocr_and_extract.py /work/records --out /work/bundle.json
+```
 
 `scripts/va_records_download.py` also inspects what it just downloaded — page count,
 text-vs-image balance, sha256 — prints a warning when the export is implausibly small or mostly
