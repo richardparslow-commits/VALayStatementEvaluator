@@ -27,6 +27,8 @@ from .run_log import run_log_event
 from .views.about_view import render_about_tab
 from .views.draft_view import render_draft_tab
 from .views.evaluate_view import render_evaluate_tab
+from .views.ops import render_failure_detail
+from .views.research_view import render_research_tab
 from .views.shared import (
     REQUEST_ID_KEY,
     format_error_for_user,
@@ -124,14 +126,21 @@ def main() -> None:
         "Jandreau/Buchanan/Caluza line of cases."
     )
 
-    tab_eval, tab_draft, tab_about = st.tabs(
-        ["🔍 Evaluate a statement", "✍️ Draft a statement", "📖 About / Guide"]
+    tab_eval, tab_draft, tab_research, tab_about = st.tabs(
+        [
+            "🔍 Evaluate a statement",
+            "✍️ Draft a statement",
+            "🧭 Research",
+            "📖 About / Guide",
+        ]
     )
     try:
         with tab_eval:
             render_evaluate_tab()
         with tab_draft:
             render_draft_tab()
+        with tab_research:
+            render_research_tab()
         with tab_about:
             render_about_tab()
     except Exception as exc:  # noqa: BLE001 - root error boundary
@@ -156,6 +165,10 @@ def main() -> None:
         st.error(
             f"Something went wrong while rendering the app: {format_error_for_user(exc, rid)}"
         )
+        # ``rid`` here is the session's baseline id, so this detail covers the
+        # session rather than one run — still bounded, and still better than an id
+        # the user would have to paste somewhere else to get anything from.
+        render_failure_detail(rid)
 
 
 if __name__ == "__main__":

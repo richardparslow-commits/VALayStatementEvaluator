@@ -50,6 +50,7 @@ from ..job_queue import (
 )
 from ..logging_config import get_logger
 from ..run_log import run_log_event
+from .ops import render_failure_detail
 
 logger = get_logger("app.views.job_runner")
 
@@ -229,6 +230,10 @@ def _render_failure(outcome: QueueOutcome, action_label: str) -> None:
         return
     reference = f" (reference: {outcome.request_id})" if outcome.request_id else ""
     st.error(f"{action_label} failed: {outcome.error}{reference}")
+    # A queued run is executed by a worker, so its lines are not in this process's
+    # buffer — the shared run log is what makes this one resolvable at all.
+    if outcome.request_id:
+        render_failure_detail(outcome.request_id)
 
 
 def _encode_payload(kind: str, job: EvaluateJob | DraftJob) -> str:

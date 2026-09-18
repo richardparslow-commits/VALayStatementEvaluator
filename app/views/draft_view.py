@@ -38,6 +38,7 @@ from .follow_up import (
 )
 
 from . import job_runner
+from .ops import render_failure_detail
 from .shared import (
     audit_condition_for_slot,
     audit_record_meta,
@@ -417,14 +418,17 @@ def _run_draft_flow(
     except MemoryError as mem_exc:
         _handle_draft_abort(rid, "error", mem_exc, t0, _audit_condition_d, _audit_sources_d, _audit_files_d, _audit_pages_d)
         st.error(f"Draft aborted: {format_error_for_user(mem_exc, rid)}")
+        render_failure_detail(rid)
         return
     except PipelineTimeoutError as timeout_exc:
         _handle_draft_abort(rid, "timeout", timeout_exc, t0, _audit_condition_d, _audit_sources_d, _audit_files_d, _audit_pages_d)
         st.error(f"Draft aborted: {format_error_for_user(timeout_exc, rid)}")
+        render_failure_detail(rid)
         return
     except Exception as exc:  # noqa: BLE001
         _handle_draft_error(rid, exc, t0, _audit_condition_d, _audit_sources_d, _audit_files_d, _audit_pages_d)
         st.error(f"Drafting failed: {format_error_for_user(exc, rid)}")
+        render_failure_detail(rid)
         return
     finally:
         exit_run()

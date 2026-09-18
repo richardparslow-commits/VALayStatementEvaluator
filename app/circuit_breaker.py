@@ -45,6 +45,11 @@ logger = logging.getLogger("app.circuit_breaker")
 
 CircuitState = Literal["CLOSED", "OPEN", "HALF_OPEN"]
 
+# How much of the recorded failure reason is quoted back to the user. The reason
+# is a provider error string, which is already user-facing, but a long one would
+# bury the sentence that says what to do about it.
+MAX_FAILURE_REASON_CHARS = 300
+
 
 class CircuitBreakerError(RuntimeError):
     """Base for circuit-breaker rejections."""
@@ -83,6 +88,14 @@ class CircuitBreaker:
         self._failure_count: int = 0
         self._opened_at: float | None = None
         self._unhealthy_since: float | None = None
+        # Why the most recent counted failure happened, and whether retrying it
+        # could ever help. The breaker raises its own message while OPEN, and
+        # without these it can only say "the endpoint is unavailable" — a guess
+        # that is wrong for the failures that never reach the endpoint at all
+        # (a rejected key, a model id the account cannot use), which are exactly
+        # the ones a user needs named.
+        self._last_failure_reason: str = ""
+        self._last_failure_retriable: bool = True
         self._lock = threading.Lock()
 
     # ---------------------------------------------------------------- state
@@ -96,6 +109,12 @@ class CircuitBreaker:
     def failure_count(self) -> int:
         with self._lock:
             return self._failure_count
+
+    @property
+    def last_failure_reason(self) -> str:
+        """Why the most recent counted failure happened (``""`` when none)."""
+        with self._lock:
+            return self._last_failure_reason
 
     def unhealthy_for_seconds(self) -> float | None:
         """How long this endpoint has been continuously unhealthy, else ``None``.
@@ -172,6 +191,12 @@ class CircuitBreaker:
 
     def record_success(self) -> None:
         with self._lock:
+            # A success retires the recorded reason in every branch below: it
+            # describes a failure that this endpoint has since recovered from,
+            # and a stale reason would be quoted by the *next* breaker-opening
+            # message as though it were the cause of that one.
+            self._last_failure_reason = ""
+            self._last_failure_retriable = True
             if self._state == "HALF_OPEN":
                 self._failure_count = 0
                 self._opened_at = None
@@ -184,11 +209,24 @@ class CircuitBreaker:
                 self._opened_at = None
                 self._transition("CLOSED", reason="success while open (unexpected)")
 
-    def record_failure(self) -> None:
+    def record_failure(self, *, reason: str = "", retriable: bool = True) -> None:
+        """Count one failed logical call, remembering *why* it failed.
+
+        ``reason`` is what :meth:`check_or_raise` quotes afterwards, and
+        ``retriable`` says whether an identical attempt could ever succeed. Both
+        are optional so that a caller with nothing to add (and every existing
+        test) behaves exactly as before.
+        """
         with self._lock:
+            if reason:
+                self._last_failure_reason = reason.strip()[:MAX_FAILURE_REASON_CHARS]
+                self._last_failure_retriable = retriable
             if self._state == "HALF_OPEN":
                 self._opened_at = time.monotonic()
-                self._transition("OPEN", reason="probe failed")
+                self._transition(
+                    "OPEN",
+                    reason=f"probe failed: {self._last_failure_reason or 'reason not reported'}",
+                )
                 self._failure_count = self.failure_threshold
                 return
             if self._state == "OPEN":
@@ -199,7 +237,11 @@ class CircuitBreaker:
                 self._opened_at = time.monotonic()
                 self._transition(
                     "OPEN",
-                    reason=f"{self._failure_count} consecutive failures >= threshold {self.failure_threshold}",
+                    reason=(
+                        f"{self._failure_count} consecutive failures >= threshold "
+                        f"{self.failure_threshold}: "
+                        f"{self._last_failure_reason or 'reason not reported'}"
+                    ),
                 )
 
     # ---------------------------------------------------------------- helpers
@@ -211,11 +253,30 @@ class CircuitBreaker:
             with self._lock:
                 if self._opened_at is not None:
                     remaining = max(0.0, self.recovery_timeout - (time.monotonic() - self._opened_at))
+                reason = self._last_failure_reason
+                retriable = self._last_failure_retriable
+            # The reason is named, not guessed. "endpoint temporarily unavailable"
+            # was wrong for every failure that never reached the endpoint (a
+            # rejected key, a model id this account cannot use): those fail fast
+            # here exactly like an outage does, and the user was told to wait for
+            # a recovery that could never arrive.
+            detail = (
+                f" Last failure: {reason}" if reason else " The endpoint gave no reason."
+            )
+            if reason and not retriable:
+                diagnosis = (
+                    " That failure is deterministic, so retrying it unchanged will reproduce it — "
+                    "fix the request (API key, model id, or endpoint) rather than waiting."
+                )
+            else:
+                diagnosis = (
+                    f" The breaker probes again in {self.recovery_timeout:.0f}s and closes itself "
+                    "if the endpoint has recovered."
+                )
             raise CircuitBreakerOpenError(
-                f"Circuit breaker '{self.name}' is OPEN — LLM endpoint temporarily unavailable. "
-                f"Failing fast to protect the endpoint (retry in {remaining:.0f}s). "
-                f"After {self.failure_threshold} consecutive failures the breaker opened for "
-                f"{self.recovery_timeout:.0f}s."
+                f"Circuit breaker '{self.name}' is OPEN — {self.failure_threshold} consecutive "
+                f"LLM calls failed, so calls to this endpoint fail fast (no network) for another "
+                f"{remaining:.0f}s.{detail}{diagnosis}"
             )
 
     def reset(self) -> None:
@@ -225,6 +286,8 @@ class CircuitBreaker:
             self._failure_count = 0
             self._opened_at = None
             self._unhealthy_since = None
+            self._last_failure_reason = ""
+            self._last_failure_retriable = True
 
 
 # ------------------------------------------------------------------ limiter

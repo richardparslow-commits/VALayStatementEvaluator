@@ -25,7 +25,16 @@ pyyaml>=6.0
 # Execute the queue's actual Lua scripts in offline transport/fault-injection tests.
 fakeredis[lua]>=2.31,<3
 
-# NOTE: httpx is deliberately NOT listed. The app treats it as optional (see
-# app/llm.py) and, in this mirror's resolution, `openai` depends on the fork
-# distribution `httpx2` rather than `httpx`, so `import httpx` legitimately
-# fails; tests/test_shutdown.py keeps that one assertion conditional.
+# NOTE: the Perplexity SDK is not listed here. It used to be a dev-only addition on top
+# of the optional install, but it now arrives with `-r requirements.txt` because the
+# Research tab has to work on hosts that cannot install at runtime (Streamlit Community
+# Cloud). tests/test_perplexity_agent.py therefore drives the real SDK objects everywhere,
+# including CI, instead of skipping.
+
+# NOTE: httpx is not listed either — it arrives with the Perplexity SDK (see the core
+# requirements.txt). Two httpx-family distributions are now installed and that is fine:
+# `httpx` provides the ``httpx`` module and the fork `httpx2` provides ``httpx2``, the
+# latter being what `openai` resolves to in this mirror. One consequence worth knowing:
+# app/llm.py imports httpx optionally only to recognise ``httpx.TimeoutException``, so
+# that branch used to be dormant on a lock-only install and is now live — which is why
+# tests/test_shutdown.py's `test_httpx_timeout_error_message` runs rather than skips.

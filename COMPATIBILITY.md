@@ -5,16 +5,17 @@ and what breaks when you change providers or models. Keep it updated when
 defaults in `app/config.py` change or when providers deprecate APIs.
 
 > **Rule of thumb:** This app works with **any OpenAI-compatible**
-> `POST {base_url}/chat/completions` endpoint. The QwenCloud Token Plan values
-> are just the tuned defaults. See `MIGRATION.md` for how to switch.
+> `POST {base_url}/chat/completions` endpoint. The Perplexity Router values are
+> the shipped defaults; the QwenCloud Token Plan values were the previous default
+> and still work. See `MIGRATION.md` for how to switch.
 
 ## Current defaults (`app/config.py`)
 
 | Setting | Default value | Purpose |
 |---------|---------------|---------|
-| `DEFAULT_BASE_URL` | `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1` | QwenCloud Token Plan (MaaS) — paired with `sk-sp-` keys; does NOT work against the general MaaS gateway |
-| `DEFAULT_MODEL_MAIN` | `qwen3.7-max` | Low-volume heavy calls: claim extraction, verification, rubric, topic, rewrite |
-| `DEFAULT_MODEL_FAST` | `qwen3.7-flash` | High-volume bulk calls: record-chunk digest and fact-merge |
+| `DEFAULT_BASE_URL` | `https://api.perplexity.ai/router/v1` | Perplexity **Router API** — OpenAI Chat Completions schema, drop-in via base URL + key. In private preview (request access from api@perplexity.ai); the catalog is also an allowlist, so an unlisted model id is a 400 |
+| `DEFAULT_MODEL_MAIN` | `perplexity/kimi-k3` | Low-volume heavy calls: claim extraction, verification, rubric, topic, rewrite — the strongest model in the Router catalog ($3 / $15 per 1M) |
+| `DEFAULT_MODEL_FAST` | `perplexity/glm-5.3-flash` | High-volume bulk calls: record-chunk digest and fact-merge — cheapest in the catalog ($0.15 / $0.50; cache reads $0.03) |
 | `DEFAULT_FETCH_SANDBOX_BASE_URL` | `https://fetchsandbox.com` | Fetch Sandbox host allowlist — change only for your own sandbox subdomain |
 
 Override any of the above via `OPENAI_API_KEY` / `OPENAI_BASE_URL` /
@@ -24,7 +25,8 @@ Override any of the above via `OPENAI_API_KEY` / `OPENAI_BASE_URL` /
 
 | Provider / setup | Base URL pattern | Auth | Status | Min version / notes |
 |------------------|------------------|------|--------|---------------------|
-| **QwenCloud Token Plan (MaaS)** | `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1` | `sk-sp-...` (Token Plan key) | **Primary / recommended** | OpenAI API v1 compatible; key+URL must be paired (Token Plan keys fail against the general gateway) |
+| **Perplexity Router API** | `https://api.perplexity.ai/router/v1` | Perplexity key (`pplx-...`) | **Primary / recommended (default)** | OpenAI Chat Completions schema; also serves the Anthropic Messages schema at `/router/v1/messages`. **Private preview** — request access from api@perplexity.ai. The same key serves the Agent API on the Research tab (and is read automatically from `OPENAI_API_KEY` when this is the base URL) |
+| **QwenCloud Token Plan (MaaS)** | `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1` | `sk-sp-...` (Token Plan key) | Tested (previous default) | OpenAI API v1 compatible; key+URL must be paired (Token Plan keys fail against the general gateway) |
 | **OpenAI** | `https://api.openai.com/v1` | `sk-proj-...` or `sk-...` | Tested | `openai` Python SDK `>=1.0`; works with `gpt-4o`, `gpt-4-turbo`, `gpt-4o-mini`, etc. |
 | **Azure OpenAI** | `https://{resource}.openai.azure.com/openai/deployments/{deployment}/` | Azure key / Entra | Compatible when fronted with an OpenAI-compat proxy or `base_url` pointing at the proxy | Requires API version header on the proxy |
 | **Local Ollama (OpenAI-compat)** | `http://localhost:11434/v1` (Ollama proxy) | none / stub | Compatible for dev | Requires an OpenAI-compat shim (e.g. `openai` proxy mode); not benchmarked for quality |
@@ -42,7 +44,8 @@ If your provider deviates, add a compatibility shim (proxy) rather than forking 
 
 | Endpoint | Main (heavy) | Fast (bulk) | Notes |
 |----------|--------------|-------------|-------|
-| QwenCloud Token Plan | `qwen3.7-max` (default) | `qwen3.7-flash` (default) | Tuned for Individual Plan Lite (2500 credits / 7 days, 1–2 concurrent agents, `qwen3.7-flash` saves credit) |
+| Perplexity Router API | `perplexity/kimi-k3` (default) | `perplexity/glm-5.3-flash` (default) | Full catalog: `perplexity/kimi-k3`, `perplexity/glm-5.3`, `perplexity/glm-5.3-flash`, `perplexity/nemotron-3-ultra-550b-a55b`. Step the fast model up the ladder (`nemotron-3-ultra-550b-a55b`, then `glm-5.3`) if extraction quality needs it |
+| QwenCloud Token Plan | `qwen3.7-max` | `qwen3.7-flash` | Tuned for Individual Plan Lite (2500 credits / 7 days, 1–2 concurrent agents, `qwen3.7-flash` saves credit) |
 | OpenAI | `gpt-4-turbo`, `gpt-4o` | `gpt-4o-mini` | Any reasoning-capable model works for main; use a cheaper model for fast |
 | Ollama | provider-dependent | provider-dependent | Quality not evaluated; prefer at least a 7B instruction model |
 
@@ -54,7 +57,8 @@ both at the expensive model unless you accept the cost.
 
 | App version / commit | Change | Impact |
 |----------------------|--------|--------|
-| `main` @ 2026-09-14 (`DEFAULT_BASE_URL` → Token Plan, `model_{main,fast}` → `qwen3.7-*`) | Defaults moved from generic OpenAI to QwenCloud Token Plan | Existing `.env` pointing at OpenAI continues to work (env overrides defaults). New clones without `.env` now default to QwenCloud — set `OPENAI_BASE_URL` explicitly if you mean OpenAI. |
+| `main` @ 2026-09-18 (`DEFAULT_BASE_URL` → Router API, `model_{main,fast}` → `perplexity/*`) | Defaults moved from QwenCloud Token Plan to Perplexity's Router API, with the fast/main split mapped onto that catalog | **An existing `.env` is unaffected** — environment and sidebar values override every default, so a deployment that names its endpoint keeps running exactly as before. Only a fresh clone with no `.env` changes behaviour. When the base URL is Perplexity's, `OPENAI_API_KEY` is reused as the Agent API key, so one key serves both the chat endpoint and the Research tab |
+| `main` @ 2026-09-14 (`DEFAULT_BASE_URL` → Token Plan, `model_{main,fast}` → `qwen3.7-*`) | Defaults moved from generic OpenAI to QwenCloud Token Plan | Existing `.env` pointing at OpenAI continues to work (env overrides defaults). New clones without `.env` defaulted to QwenCloud — set `OPENAI_BASE_URL` explicitly if you mean OpenAI. |
 | Prompt injection hardening (`app/prompt_sanitize.py`) | User/record text is escaped before prompt interpolation; `>>>/<<</``` sanitized; guard note added | No API break; model output may be marginally different (safer). |
 | `EVALUATE_INTERNAL_MAX_CHARS` / `DRAFT_INTERNAL_MAX_CHARS` hardened to `80_000` | Long statements/observations above 80K are truncated with a warning banner | Bypass callers that previously sent >80K now see truncation; split inputs. |
 
@@ -112,7 +116,13 @@ On every app launch the sidebar runs a best-effort **model availability check**:
 - If `model_main` or `model_fast` is missing from the provider's model list, the UI shows a non-blocking warning linking to this file and `MIGRATION.md`
 - Network/permission failures are ignored — the app always remains usable (warnings only).
 
-See `app/llm.py` (`check_model_availability`) and `app/main.py:_sidebar_settings`.
+The sidebar's **Test connection** button runs the same `GET {base_url}/models` request but
+reports *why* it failed, because it is the screen where the user can still fix it: the HTTP
+status and the provider's response body distinguish a rejected key (`401`/`403`) from a wrong
+path in the base URL (`404`) from a host that does not answer.
+
+See `app/llm.py` (`app.llm.probe_models`, and `check_model_availability` for the advisory
+model-list-only form) and `app/main.py:_sidebar_settings`.
 
 ## What to do when QwenCloud (or any provider) changes their API
 

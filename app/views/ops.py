@@ -1,9 +1,12 @@
-"""Ops view helpers: in-browser tail of the persistent run log.
+"""Ops view helpers: in-browser answers about what a run did.
 
-Renders the most recent ``logs/runs.jsonl`` events in the About tab so an
-operator (or the user) can confirm a ``req_…`` reference without shelling
-into the machine. Read-only, best-effort: any I/O problem collapses to a
-quiet "run log unavailable" note.
+Two renderers, for two moments. ``render_run_log_tail`` shows the most recent
+``logs/runs.jsonl`` events in the About tab, so an operator (or the user) can see
+recent activity without shelling into the machine. ``render_failure_detail``
+resolves one ``req_…`` reference to its lines and is placed directly under the
+error that quoted it, so the reason is one click from the failure instead of a
+second navigation. Read-only and best-effort: any I/O problem collapses to a
+quiet note rather than an exception.
 """
 from __future__ import annotations
 
@@ -13,6 +16,7 @@ from typing import Any
 
 import streamlit as st
 
+from ..diagnostics import ReferenceDetail, is_reference, lookup
 from ..run_log import _resolve_log_path
 
 _RUN_LOG_LIMIT = 30
@@ -90,4 +94,60 @@ def render_run_log_tail(limit: int = _RUN_LOG_LIMIT) -> None:
     )
 
 
-__all__ = ["render_run_log_tail"]
+# One lookup per reference per session: see _cached_detail.
+_FAILURE_CACHE_KEY = "diagnostics_failure_detail_cache"
+_FAILURE_CACHE_LIMIT = 12
+
+
+def _cached_detail(reference: str) -> ReferenceDetail:
+    """Look a reference up once, then remember the answer for the session.
+
+    An expander's body runs on every rerun even while it stays collapsed, and a
+    lookup reads the run log — so without this, a failure left on screen would
+    re-read the log on every unrelated widget interaction anywhere in the app. The
+    record of a finished run does not change, and the cache is bounded.
+    """
+    cache = st.session_state.get(_FAILURE_CACHE_KEY)
+    if not isinstance(cache, dict):
+        cache = {}
+    cached = cache.get(reference)
+    if isinstance(cached, ReferenceDetail):
+        return cached
+    detail = lookup(reference)
+    cache[reference] = detail
+    while len(cache) > _FAILURE_CACHE_LIMIT:
+        cache.pop(next(iter(cache)))
+    st.session_state[_FAILURE_CACHE_KEY] = cache
+    return detail
+
+
+def render_failure_detail(reference: str, *, label: str = "What happened?") -> None:
+    """Resolve a failure that was just shown to the user, in place.
+
+    The moment a user reads "Drafting failed … (reference: req_…)" is the moment
+    they want the reason; sending them to another tab to paste an id asks for a
+    step they should not have to take. A run executed by a worker is covered too,
+    because the lookup reads the shared run log as well as this process's buffer.
+    """
+    if not is_reference(reference):
+        return
+    detail = _cached_detail(reference)
+    with st.expander(label, expanded=False):
+        if detail.lines:
+            st.code("\n".join(detail.lines), language=None)
+        if detail.events:
+            st.dataframe(
+                [_event_row(e) for e in detail.events],
+                width="stretch",
+                hide_index=True,
+            )
+        if detail.note:
+            st.caption(detail.note)
+        st.caption(
+            f"Reference `{detail.reference}` — secrets are redacted above, and "
+            "**About → 🔎 Look up a reference** searches the shared run log for any "
+            "other reference."
+        )
+
+
+__all__ = ["render_failure_detail", "render_run_log_tail"]

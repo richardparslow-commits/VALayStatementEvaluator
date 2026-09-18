@@ -6,6 +6,7 @@ at runtime from the Streamlit sidebar.
 """
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,6 +47,7 @@ SECRET_FIELD_LABELS: dict[str, str] = {
     "FETCH_SANDBOX_RECORDS_PATH": "Fetch records path",
     "VA_LSE_SHARED_CACHE_URL": "shared cache URL",
     "VA_LSE_SHARED_CACHE_TOKEN": "shared cache token",
+    "PERPLEXITY_API_KEY": "Perplexity API key",
 }
 
 _SECRETS_CACHE: dict[str, Any] | None = None
@@ -120,25 +122,93 @@ def _setting(
     return env or default
 
 
-# Default endpoint tuned for the QwenCloud Individual Plan Lite subscription
-# but the app speaks to ANY OpenAI-compatible POST {base_url}/chat/completions
-# endpoint (see COMPATIBILITY.md / MIGRATION.md). Token Plan uses a dedicated
-# sk-sp- API key that MUST be paired with this base URL (they do not work
-# against the general MaaS gateway).
-DEFAULT_BASE_URL = (
-    "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
-)
-# Low-volume, high-value calls (claim extraction, verification, rubric scoring,
-# topic audit, rewrite) use the strong reasoning model. Override via
-# LLM_MODEL_MAIN for another provider (e.g. gpt-4-turbo — see COMPATIBILITY.md).
-DEFAULT_MODEL_MAIN = "qwen3.7-max"
-# The bulk digest/merge passes (one call per record chunk — by far the most
-# calls) use the cheap model to preserve the Lite plan's limited credit quota.
-# Override via LLM_MODEL_FAST (e.g. gpt-4o-mini for OpenAI).
-DEFAULT_MODEL_FAST = "qwen3.7-flash"
+# Default endpoint: Perplexity's **Router API**, which serves the OpenAI Chat
+# Completions schema at POST {base_url}/chat/completions — the documented drop-in
+# for an existing OpenAI integration, where "only the base URL and API key need to
+# change" (https://docs.perplexity.ai/docs/router/quickstart). Nothing in
+# ``app/llm.py`` is Perplexity-specific: it sends model/temperature/max_tokens/
+# messages and parses text, so the same one Perplexity key also serves the
+# web-grounded Agent API on the Research tab.
+#
+# The same API key must be in OPENAI_API_KEY (this endpoint) and, for the Research
+# tab, PERPLEXITY_API_KEY — both are the same credential, read under the names the
+# two integrations use. The app still speaks to ANY OpenAI-compatible endpoint;
+# see COMPATIBILITY.md / MIGRATION.md for the other providers.
+#
+# CAVEAT: the Router API is in *private preview* — request access from
+# api@perplexity.ai before relying on this default. The catalog is also an
+# allowlist: an unknown model id returns 400 naming it, which is why the two
+# defaults below are ids from the published catalog rather than guesses.
+DEFAULT_BASE_URL = "https://api.perplexity.ai/router/v1"
+# Host check for the credential aliasing in ``_perplexity_api_key_setting``.
+PERPLEXITY_HOST = "api.perplexity.ai"
+
+# Model split, tuned to how this app actually spends tokens.
+#
+# Main — claim extraction, verification, rubric scoring, topic audit, rewrite:
+# low-volume and quality-critical, so it gets the strongest model in the Router
+# catalog. Kimi K3 is the flagship there ($3 in / $15 out per 1M; cache reads
+# $0.30). Override with LLM_MODEL_MAIN.
+DEFAULT_MODEL_MAIN = "perplexity/kimi-k3"
+
+# Fast — record digest and merge batches, one call per 8k-char chunk: hundreds of
+# calls on a large bundle, and the reason this split exists. GLM-5.3 Flash is the
+# cheapest model in the catalog ($0.15 in / $0.50 out; cache reads $0.03, and this
+# app re-sends the same rubric/legal-framework preamble every call, so cache reads
+# are a real share of the input). On a ~2,000-page bundle the fast tier is roughly
+# an order of magnitude cheaper than running the digests on the main model.
+#
+# Tuning ladder if extraction quality needs it, in catalog order:
+#   perplexity/glm-5.3-flash        $0.15 / $0.50   (default)
+#   perplexity/nemotron-3-ultra-550b-a55b  $0.25 / $2.50
+#   perplexity/glm-5.3              $1.40 / $4.40
+# and for a cheaper main model, perplexity/glm-5.3 at ~1/3 the output price.
+DEFAULT_MODEL_FAST = "perplexity/glm-5.3-flash"
 DEFAULT_FETCH_SANDBOX_BASE_URL = "https://fetchsandbox.com"
 DEFAULT_FETCH_SANDBOX_RECORDS_PATH = "/medical_records/{patient_id}"
 DEFAULT_FETCH_SANDBOX_MAX_RESPONSE_BYTES = 100 * 1024 * 1024
+
+# ------------------------------------------------------- Perplexity Agent API
+#
+# OPTIONAL web-grounded research (the "Research" tab). This is a second provider
+# used for a *different job* than the adjudication pipeline, not a replacement for
+# it: the bulk digest/merge passes read records the user uploaded, so web grounding
+# would be dead weight on hundreds of calls per run (see ARCHITECTURE.md §4). The
+# Agent API is used where the app genuinely needs the live web — checking whether
+# the committed legal framework is still current — which is a handful of calls.
+#
+# Unset PERPLEXITY_API_KEY (the default) leaves the tab explaining how to enable
+# it; nothing else in the app changes, exactly like the Fetch Sandbox and VA.gov
+# integrations.
+#
+# Presets bundle model + tools + limits (https://docs.perplexity.ai/docs/agent-api/presets).
+# "low" is the everyday-research tier: current information, light multi-step
+# lookups, inline citations — the right cost/latency band for a panel a user
+# clicks, unlike "high"/"xhigh" (institutional-grade depth, much slower).
+DEFAULT_PERPLEXITY_PRESET = "low"
+# Preset names accepted by the Agent API. Validated here so a typo in an env var
+# surfaces as a clear configuration error instead of an opaque 400 from the API.
+PERPLEXITY_PRESETS = ("fast", "low", "medium", "high", "xhigh", "wide-research")
+# Output cap per research call. Research answers are prose plus a small findings
+# object, so this is well under the preset's own ceiling.
+DEFAULT_PERPLEXITY_MAX_OUTPUT_TOKENS = 4096
+# Domains the *opt-in* "official sources" filter restricts web_search to. These
+# are the primary sources the legal framework cites, so restricting to them keeps
+# an answer checkable rather than merely plausible. Override with
+# PERPLEXITY_SOURCES (comma-separated).
+DEFAULT_PERPLEXITY_SOURCES = (
+    "va.gov,benefits.va.gov,ecfr.gov,law.cornell.edu,uscourts.gov,congress.gov"
+)
+# How long a grounded "the committed checklist still matches current VA law" verdict
+# stays valid (app/knowledge_currency.py). This bounds the *second* half of the
+# currency feature: the Evaluate tab reads the cached verdict and flags stale topics
+# without ever calling the API, so this is the window in which a verdict still counts
+# as evidence. 30 days is a deliberate middle: VA law changes on the scale of months
+# (Federal Register updates, rating-schedule amendments), while a shorter window would
+# nag, and a longer one would let a year-old verdict flag as if it were fresh. Expiry
+# only ever downgrades a verdict to "unverified" — it never suppresses a stale flag on
+# the topics that were checked.
+DEFAULT_FRAMEWORK_CURRENCY_TTL_DAYS = 30
 
 # -------------------------------------------------------------- fallback endpoint
 #
@@ -186,6 +256,20 @@ class Settings:
     fallback_model_main: str = ""
     fallback_model_fast: str = ""
     fetch_max_response_bytes: int = DEFAULT_FETCH_SANDBOX_MAX_RESPONSE_BYTES
+    # Optional Perplexity Agent API (web-grounded research tab). Empty key = the
+    # tab explains how to enable it and nothing else changes.
+    perplexity_api_key: str = ""
+    perplexity_preset: str = DEFAULT_PERPLEXITY_PRESET
+    # Blank = let the preset choose the model, which is what makes a preset worth
+    # using (Perplexity ships improvements under the same preset name). Set this
+    # only to freeze a specific model.
+    perplexity_model: str = ""
+    perplexity_max_output_tokens: int = DEFAULT_PERPLEXITY_MAX_OUTPUT_TOKENS
+    perplexity_sources: str = DEFAULT_PERPLEXITY_SOURCES
+    # Freshness window for the framework-currency verdict (see
+    # DEFAULT_FRAMEWORK_CURRENCY_TTL_DAYS). Affects only *flagging*, never spend: an
+    # expired verdict reads as unverified rather than triggering a call.
+    framework_currency_ttl_days: int = DEFAULT_FRAMEWORK_CURRENCY_TTL_DAYS
     # Env-var names that were satisfied by Streamlit secrets rather than the
     # environment/.env — surfaced in the sidebar so a pre-filled value is not
     # mistaken for one the user typed.  See SECRET_FIELD_LABELS.
@@ -218,13 +302,31 @@ class Settings:
     def fetch_configured(self) -> bool:
         return bool(self.fetch_base_url.strip() and self.fetch_records_path.strip())
 
+    @property
+    def perplexity_configured(self) -> bool:
+        """Whether the Perplexity Agent API key is present.
+
+        Presence only — the value is never read, logged, or compared. The SDK is a
+        separate check (it is an optional install), so a configured key with the
+        package missing still reports not-usable; see
+        ``app.perplexity_agent.unavailable_reason``.
+        """
+        return bool(self.perplexity_api_key.strip())
+
+    def perplexity_source_domains(self) -> list[str]:
+        """The parsed ``PERPLEXITY_SOURCES`` list (empty when unset)."""
+        return [part.strip() for part in self.perplexity_sources.split(",") if part.strip()]
+
 
 def load_settings() -> Settings:
     """Build settings from the environment, then Streamlit secrets, then defaults."""
     from_secrets: set[str] = set()
+    # Resolved first because the Perplexity key decision below depends on which
+    # endpoint the app is actually pointed at.
+    base_url = _setting("OPENAI_BASE_URL", DEFAULT_BASE_URL, from_secrets)
     return Settings(
         api_key=_setting("OPENAI_API_KEY", "", from_secrets),
-        base_url=_setting("OPENAI_BASE_URL", DEFAULT_BASE_URL, from_secrets),
+        base_url=base_url,
         model_main=_setting("LLM_MODEL_MAIN", DEFAULT_MODEL_MAIN, from_secrets),
         model_fast=_setting("LLM_MODEL_FAST", DEFAULT_MODEL_FAST, from_secrets),
         fetch_api_key=_setting("FETCH_SANDBOX_API_KEY", "", from_secrets),
@@ -243,8 +345,67 @@ def load_settings() -> Settings:
             "FETCH_SANDBOX_MAX_RESPONSE_BYTES",
             DEFAULT_FETCH_SANDBOX_MAX_RESPONSE_BYTES,
         ),
+        # Perplexity Agent API (optional). An empty key leaves the research tab
+        # in its "how to enable" state rather than failing at call time.
+        perplexity_api_key=_perplexity_api_key_setting(base_url, from_secrets),
+        perplexity_preset=_perplexity_preset_setting(from_secrets),
+        perplexity_model=_setting("PERPLEXITY_MODEL", "", from_secrets),
+        perplexity_max_output_tokens=_positive_int_env(
+            "PERPLEXITY_MAX_OUTPUT_TOKENS",
+            DEFAULT_PERPLEXITY_MAX_OUTPUT_TOKENS,
+        ),
+        perplexity_sources=_setting(
+            "PERPLEXITY_SOURCES", DEFAULT_PERPLEXITY_SOURCES, from_secrets
+        ),
+        framework_currency_ttl_days=_positive_int_env(
+            "FRAMEWORK_CURRENCY_TTL_DAYS",
+            DEFAULT_FRAMEWORK_CURRENCY_TTL_DAYS,
+        ),
         from_secrets=frozenset(from_secrets),
     )
+
+
+def _perplexity_api_key_setting(base_url: str, from_secrets: set[str]) -> str:
+    """Resolve the Agent API key, aliasing ``OPENAI_API_KEY`` when the primary is Perplexity.
+
+    One Perplexity API key serves both the Router endpoint (Chat Completions, set as
+    ``OPENAI_API_KEY``) and the Agent API (web-grounded research), and the default base URL
+    is now Perplexity's. Requiring the *same* string under a second variable would leave a
+    correctly configured install reporting "research is not configured" — so when, and only
+    when, the configured endpoint is Perplexity's, the primary key is reused.
+
+    The condition is the point. Under any other primary (QwenCloud, OpenAI, Ollama) the
+    primary key is a credential for a *different* provider, and forwarding it to
+    api.perplexity.ai would replace a clear "set PERPLEXITY_API_KEY" message with an opaque
+    401 from a third party.
+    """
+    explicit = _setting("PERPLEXITY_API_KEY", "", from_secrets)
+    if explicit.strip():
+        return explicit
+    if PERPLEXITY_HOST not in base_url:
+        return ""
+    return _setting("OPENAI_API_KEY", "", from_secrets)
+
+
+def _perplexity_preset_setting(from_secrets: set[str]) -> str:
+    """Read and validate ``PERPLEXITY_PRESET`` against the known preset names.
+
+    Falls back to the default with a warning rather than raising: a bad preset
+    name is a configuration mistake for one optional tab, and the project's rule
+    is that partial configuration never blocks the app (ARCHITECTURE.md §10). A
+    clearly-labelled fallback is also easier to act on than a stack trace at
+    import time.
+    """
+    raw = _setting("PERPLEXITY_PRESET", DEFAULT_PERPLEXITY_PRESET, from_secrets).strip()
+    if raw in PERPLEXITY_PRESETS:
+        return raw
+    logging.getLogger("app.config").warning(
+        "PERPLEXITY_PRESET=%r is not one of %s — using %r instead",
+        raw,
+        "/".join(PERPLEXITY_PRESETS),
+        DEFAULT_PERPLEXITY_PRESET,
+    )
+    return DEFAULT_PERPLEXITY_PRESET
 
 
 def load_knowledge(name: str) -> str:

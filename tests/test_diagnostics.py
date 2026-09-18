@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from app import diagnostics  # noqa: E402
+from app.config import load_settings  # noqa: E402
 from app.diagnostics import (  # noqa: E402
     MAX_FIELD_CHARS,
     CaptureHandler,
@@ -397,6 +398,83 @@ class TestThePanelInTheRealApp(unittest.TestCase):
         self.assertTrue(
             any("buffer holds only the most recent" in i for i in infos), msg=f"infos: {infos}"
         )
+
+
+class TestFailureDetailNextToTheError(unittest.TestCase):
+    """The expander is beside the failure, and reaches it through the real pipeline.
+
+    The unit tests below prove the renderer works; this proves it is *wired* — that
+    a run which fails inside the Draft tab shows the reference and, in the same
+    breath, the lines behind it. A missed call site is exactly the defect that
+    survives every helper-level test.
+    """
+
+    def setUp(self) -> None:
+        isolate_app_logs(self)
+        configure_logging()
+        install_capture().clear()
+        clear_request_id()
+        self.addCleanup(clear_request_id)
+
+    def test_a_failed_draft_resolves_itself_under_the_error(self):
+        from streamlit.testing.v1 import AppTest
+
+        import app.views.draft_view as draft_view
+
+        at = AppTest.from_file(str(PROJECT_ROOT / "run_app.py"), default_timeout=30)
+        at.run()
+        at.file_uploader(key="files_draft").set_value(
+            [("records.txt", b"Knee pain noted during visit.", "text/plain")]
+        )
+        at.run()
+        at.text_input(key="draft_condition").set_value("knee strain")
+        at.text_area(key="draft_observations").set_value("Observed limping on stairs.")
+        at.run()
+
+        # Arm the key the way the sidebar does — on the settings object the app
+        # reads — so the flow reaches the patched pipeline in every environment.
+        # Config reads a local .env when one exists, so without this the run stops
+        # at the "enter your API key" gate in CI and this test would pass or fail
+        # on ambient configuration instead of on the code.
+        #
+        # Seeding ``api_key_input`` does not work and is worth recording: the
+        # sidebar re-renders that widget with ``value=settings.api_key``, so an
+        # empty setting wipes the seeded value on the next rerun — which is how
+        # this test passed locally against a developer's .env and failed in CI.
+        settings = load_settings()
+        settings.api_key = "test-key-unused-because-the-run-is-patched"
+        at.session_state["settings"] = settings
+
+        # Fail the run the way a provider failure would, and leave the rest real.
+        with mock.patch.object(
+            draft_view, "run_draft", side_effect=RuntimeError("model returned nothing usable")
+        ):
+            at.button(key="draft_run").click().run()
+
+        self.assertFalse(at.exception, msg=str(at.exception))
+        errors = [e.value for e in at.error]
+        shown = next((e for e in errors if "Drafting failed" in e), "")
+        self.assertIn("reference: req_", shown, msg=f"errors: {errors}")
+        reference = extract_reference(shown)
+
+        self.assertIn(
+            "What happened?",
+            [e.label for e in at.expander],
+            msg="no detail expander was rendered beside the failure",
+        )
+        rendered = "\n".join(code.value for code in at.code)
+        self.assertIn("model returned nothing usable", rendered)
+        # The id shown in the error is the id the detail was resolved against.
+        captions = "\n".join(c.value for c in at.caption)
+        self.assertIn(reference, captions)
+
+    def test_a_successful_run_renders_no_such_expander(self):
+        """The expander is attached to failures, not to every run."""
+        from streamlit.testing.v1 import AppTest
+
+        at = AppTest.from_file(str(PROJECT_ROOT / "run_app.py"), default_timeout=30)
+        at.run()
+        self.assertNotIn("What happened?", [e.label for e in at.expander])
 
 
 class TestRedaction(unittest.TestCase):

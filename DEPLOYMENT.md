@@ -755,9 +755,9 @@ All deployment-relevant variables (see `README.md` for the full list):
 | Variable | Purpose | Default | Recommended for production |
 |---|---|---|---|
 | `OPENAI_API_KEY` | LLM API key | (required) | Store in K8s Secret or Docker secret |
-| `OPENAI_BASE_URL` | LLM endpoint | QwenCloud Token Plan | Verify against your provider |
-| `LLM_MODEL_MAIN` | Analysis model | `qwen3.7-max` | Match your plan |
-| `LLM_MODEL_FAST` | Bulk digest model | `qwen3.7-flash` | Match your plan |
+| `OPENAI_BASE_URL` | LLM endpoint | Perplexity Router API (`https://api.perplexity.ai/router/v1`) | Verify against your provider; pin it explicitly in production rather than relying on a default |
+| `LLM_MODEL_MAIN` | Analysis model | `perplexity/kimi-k3` | Match your plan |
+| `LLM_MODEL_FAST` | Bulk digest model | `perplexity/glm-5.3-flash` | Match your plan |
 | `VA_LSE_RECORDS_CONCURRENCY` | Parallel digest workers | `2` | Raise for higher-tier endpoints |
 | `VA_LSE_MAX_CONCURRENT_LLM_CALLS` | Global LLM concurrency cap | `20` | Raise if running 100 users across N pods |
 | `VA_LSE_HEALTH_PORT` | Health sidecar port | `8001` | Keep default; mount in Service |
@@ -1225,16 +1225,43 @@ environment variables above. Add your provider key there under `OPENAI_API_KEY`,
 endpoint and models as:
 
 ```toml
-OPENAI_BASE_URL = "https://your-endpoint.example.com/v1"
-LLM_MODEL_MAIN = "qwen3.7-max"
-LLM_MODEL_FAST = "qwen3.7-flash"
+OPENAI_BASE_URL = "https://api.perplexity.ai/router/v1"
+LLM_MODEL_MAIN = "perplexity/kimi-k3"
+LLM_MODEL_FAST = "perplexity/glm-5.3-flash"
 ```
+
+(Pin the endpoint and models explicitly in a deployed environment. The code defaults are the
+same values, but a pin is what makes the deployment's behaviour independent of an app upgrade.)
 
 Optional extras, same file: `FETCH_SANDBOX_API_KEY`, `FETCH_SANDBOX_BASE_URL`,
 `FETCH_SANDBOX_RECORDS_PATH`, `VA_LSE_SHARED_CACHE_URL`, `VA_LSE_SHARED_CACHE_TOKEN`.
 
 Then **reboot the app** — the running process reads its configuration at startup, so secret
 edits do not affect it until it restarts.
+
+### Dependencies on a host with no shell
+
+Community Cloud installs **`requirements.txt`** from the repository when it builds the app.
+There is no shell on the platform, so a package that is not in that file cannot be added at
+runtime — a deploy-time gap that surfaces as a *feature* politely refusing to run, never as an
+error anyone can act on from the dashboard.
+
+That is why the Perplexity SDK is listed in the **core** `requirements.txt` even though the
+integration treats it as optional in code: with it as an optional `requirements-*.txt`, the
+Research tab and the framework-currency check could only ever render "install this package"
+here. Nothing else needs it, and every import of it stays function-local, so a partial install
+elsewhere still degrades to an explanatory message rather than an `ImportError`.
+
+Two consequences for a hosted deployment:
+
+* **Docker, CI, and K8s use `requirements.lock`** (`pip install --require-hashes -r
+  requirements.lock`, §5), so the SDK must be in both files — keep them in step with
+  `pip-compile` (see `README.md → Dependency locking`). Community Cloud ignores the lockfile
+  and resolves `requirements.txt` unpinned, so a deployed upgrade can pick up a newer SDK than
+  CI tested.
+* **The key is still required.** The package ships the *ability* to research; the features
+  stay off until `PERPLEXITY_API_KEY` is set (auto-derived from `OPENAI_API_KEY` when the base
+  URL is Perplexity's, see the resolution order below). Reboot after adding it.
 
 ### Resolution order
 
@@ -1266,6 +1293,9 @@ names only take effect after clicking it (the sidebar warns while a change is pe
 
 - [ ] `OPENAI_API_KEY` + `OPENAI_BASE_URL` set together in **Settings → Secrets** (same account)
 - [ ] `LLM_MODEL_MAIN` / `LLM_MODEL_FAST` name models the endpoint actually serves
+- [ ] Perplexity SDK present in `requirements.txt` (makes the Research tab and the
+      framework-currency check loadable on the platform); no `pip install` step is possible here
+- [ ] `PERPLEXITY_API_KEY` set if the base URL is *not* Perplexity's, or the Research tab is off
 - [ ] App rebooted after editing secrets
 - [ ] Sidebar **Test connection** reports "Endpoint reachable" on the deployed URL
 - [ ] Sidebar captions the values as `🔐 From Streamlit secrets:`

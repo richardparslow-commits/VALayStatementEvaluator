@@ -121,6 +121,13 @@ runs the identical tested dependency set. `requirements.txt` stays the human-edi
 > (Pattern C only). It is deliberately not part of `requirements.lock`: the default
 > filesystem blob store needs no extra dependency, and nothing else in the app uses boto3.
 
+> 🌐 The **Perplexity SDK is in the core set**, not an optional file, and that is a
+> deliberate exception to the pattern above. The Research tab and the framework-currency
+> check need it, and Streamlit Community Cloud installs from `requirements.txt` with no
+> shell — as an optional install the tab could render nothing but "install this package"
+> there. It is the last line of `requirements.txt`; `requirements-perplexity.txt` remains
+> as the standalone installer. The app still degrades cleanly if the package is absent.
+
 > This app is tested with QwenCloud Token Plan but works with **any
 > OpenAI-compatible API** (OpenAI, Azure OpenAI via proxy, local Ollama with an
 > OpenAI-compat shim). See [`COMPATIBILITY.md`](COMPATIBILITY.md) for supported
@@ -152,14 +159,21 @@ Use `pip-compile --upgrade` (optionally with `-P <package>`) for a deliberate bu
 single-package bump; pip-compile pins hashes for every platform wheel, so the same lockfile
 installs on macOS and Linux CI.
 
+> The header line records the Python version `pip-compile` ran under, which depends on the
+> contributor's machine (3.13 locally, while CI and Docker are 3.12). That is cosmetic: the
+> lockfile carries **no environment markers**, so the same pins and hashes install on every
+> supported interpreter — CI installs this lock under both 3.12 and 3.13. Don't "fix" the
+> header, and don't hand-edit pins: a hand-written entry that no wheel hash matches fails the
+> `--require-hashes` install on every path.
+
 ### Environment variables (`.env`)
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `OPENAI_API_KEY` | QwenCloud Token Plan API key (starts `sk-sp-`) | (required) |
-| `OPENAI_BASE_URL` | OpenAI-compatible base URL (Token Plan) | `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1` |
-| `LLM_MODEL_MAIN` | Low-volume heavy model (analysis/scoring/drafting) | `qwen3.7-max` |
-| `LLM_MODEL_FAST` | Cheap model for the bulk digest/merge passes | `qwen3.7-flash` |
+| `OPENAI_API_KEY` | LLM API key. By default this is a **Perplexity** key, which also serves the Research tab's grounded lookups | (required) |
+| `OPENAI_BASE_URL` | OpenAI-compatible base URL | `https://api.perplexity.ai/router/v1` — Perplexity's Router API (in **private preview**; request access from api@perplexity.ai). Any OpenAI-compatible endpoint works |
+| `LLM_MODEL_MAIN` | Low-volume heavy model (analysis/scoring/drafting) | `perplexity/kimi-k3` |
+| `LLM_MODEL_FAST` | Cheap model for the bulk digest/merge passes | `perplexity/glm-5.3-flash` |
 | `OPENAI_BASE_URL_FALLBACK` | **Optional** second endpoint used when the primary fails for a sustained period; unset = no failover | (empty) |
 | `OPENAI_API_KEY_FALLBACK` | Key for the fallback endpoint (usually a different provider) | primary key |
 | `LLM_MODEL_MAIN_FALLBACK` / `LLM_MODEL_FAST_FALLBACK` | The fallback provider's model names for the two roles | primary models |
@@ -256,8 +270,11 @@ provider: the app checks `GET {base_url}/models` at startup and warns if `LLM_MO
 > Use **Test connection** (next to *Apply settings*) before a long run: it calls
 > `GET {base_url}/models` with the on-screen key/URL, reports the model count, and flags model
 > names the endpoint does not offer — a two-second check instead of a failed multi-minute run.
-> With no key in the environment, enter the key **and** the matching base URL, then click
-> *Apply settings*.
+> When the check fails it quotes the HTTP status and the provider's response body, and names
+> what that status means for this app: a `401`/`403` is the key and the endpoint belonging to
+> different providers, a `404` is a wrong path in the base URL, and no response at all is the
+> host or the network. With no key in the environment, enter the key **and** the matching base
+> URL, then click *Apply settings*.
 
 **Configuration can also come from Streamlit secrets.** Each value above is resolved
 **process environment → `.env` → `.streamlit/secrets.toml` → code default**, so a hosted
@@ -496,6 +513,8 @@ the pipeline (no API calls) to verify orchestration at scale. Ingest quality is 
 
 ```bash
 python -m unittest discover -s tests -v        # offline unit tests (incl. health probes)
+python -m tests.hostile                        # …the same suite, with every knob hostile
+pip install -U streamlit && python -m unittest discover -s tests    # …on the newest Streamlit
 python -m mypy app                             # strict type check (see pyproject.toml)
 python scripts/smoke_test.py all               # live end-to-end (needs valid .env)
 python scripts/live_draft_e2e.py                # one real Draft run against your endpoint
@@ -509,6 +528,56 @@ or prompt change is visible before it reaches a user. `scripts/rehearse_failover
 read-only and sends no LLM traffic — see
 [`DEPLOYMENT.md` → *LLM endpoint failover*](DEPLOYMENT.md#17-llm-endpoint-failover-optional)
 for the full outage drill.
+
+The suite runs **hermetically**. `tests/hermetic.py` — imported first by every test
+module, before any `app` import — empties the app's configuration out of the process,
+so a result cannot depend on your `.env`, on a `VA_LSE_*` variable you have exported,
+or on a `.streamlit/secrets.toml` in the project or in `~` — including the values
+Streamlit would promote into the environment while parsing it. Streamlit's *config*
+files it does not empty but **pins**: the session reads the repository's committed
+`.streamlit/config.toml` and no other, so a `config.toml` in `~` cannot decide the
+options under test and the suite no longer reads different configuration depending on
+the directory it was launched from. It also runs with `global.developmentMode` **false**,
+which Streamlit derives from the install *layout* rather than from anything configured:
+true whenever its package is not under a `site-packages` directory, so a source checkout,
+an editable install, or a vendored one reports true. That changes logger defaults — and
+with a port configured in any file it makes parsing raise, which under AppTest arrives as
+a dead runner thread rather than as the message: a `KeyError` about
+`$$STREAMLIT_INTERNAL_KEY_SCRIPT_RUN_WITHOUT_ERRORS`, or a bare `AppTest script run timed
+out`, with the real error only on stderr. Since the view tests are almost all
+AppTest-driven, that is the difference between the deployment's behaviour and a dozen
+view tests failing for no visible reason. The two `STREAMLIT_*` variables Streamlit honours
+(the options it marks "sensitive") are stripped like any other ambient name; note that
+the documented `STREAMLIT_SERVER_PORT`-style overrides are inert on 1.63.0 — see
+[Production hardening](#production-hardening-streamlit). A test that *needs* a value
+sets it itself (`patch.object(config, …)`, or `patch.dict(os.environ, …)` inside the
+test body), so the suite exercises the deployed condition (no `.env`, no secrets file,
+the committed Streamlit config) rather than your machine's. The rule exists because the
+opposite is invisible in both directions: a test can pass locally and fail in CI (or the
+reverse) for no reason the code can explain. `tests/test_hermetic.py` enforces it, and
+fails if a test module forgets the harness, imports it after the app, if the app starts
+reading a Streamlit config option, or if the suite stops ignoring a deliberately hostile
+environment, secrets file, or machine-scoped config file.
+
+CI runs the whole suite that way as its own check — the `hermetic` job, which is
+`python -m tests.hostile` above, using the same fixtures the in-suite canaries use
+(`tests/hostile.py`, so the two cannot drift apart). Ambient dependence that arrives
+with a future test therefore fails the build, instead of surfacing later as a mystery
+on somebody else's machine.
+
+A second scheduled job watches the *dependency* rather than the diff: `streamlit-latest`
+(weekly Monday, plus manual dispatch) installs the newest Streamlit on top of
+`requirements.lock` — upgrading only what the new release requires, so the lock still
+pins the rest — and runs the same offline suite. The lock is what makes it necessary: a
+release can change option resolution, or rename one of the private hooks the harness
+reaches into (`get_config_files`, `secrets.files`), while every other check stays green.
+`tests/test_hermetic.py` pins the measurement the harness's *scope* rests on — the
+environment is honoured for `sensitive` options only, 2 of 343 on 1.63.0, though
+Streamlit's own documentation claims the wider behaviour — so if upstream ever makes that
+route general, the guard fails and names what to update instead of the harness quietly
+under-protecting. It is scheduled rather than per-PR because the news arrives weekly
+("a release is not a commit"), and it is left able to fail: the job exists to *surface*
+the change, and a canary that reports green while its assertions fail would defeat that.
 
 ### Type checking (mypy — strict)
 
@@ -527,8 +596,10 @@ All public helpers in `app/main.py`, `app/fetch_client.py`, `app/evaluate.py` ca
 
 ## QwenCloud Individual Plan Lite tuning
 
-These defaults are tuned for a single user on the QwenCloud Individual Plan Lite subscription
-($8/month, **2,500 Credits per rolling 7-day window**, 1–2 concurrent agents):
+The shipped defaults are Perplexity's Router API (see **Environment variables** above). This
+section is the profile for the QwenCloud Individual Plan Lite subscription
+($8/month, **2,500 Credits per rolling 7-day window**, 1–2 concurrent agents), which was the
+previous default; copy the four `.env` lines at the end of this section to run on it:
 
 - **Base URL / key are paired** — the `sk-sp-` Token Plan key only works with the Token Plan
   base URL; they never work against the general MaaS gateway.
@@ -734,7 +805,7 @@ VA_LSE_HEALTH_PORT=0 streamlit run run_app.py      # disable sidecar entirely
 
 | Guard | What it does | Defaults | Tuning |
 |---|---|---|---|
-| **Circuit breaker** | Counts *logical* LLM failures (a call that exhausts its 3 retries is one). After `VA_LSE_CB_FAILURE_THRESHOLD` consecutive failures it **opens**: every new `chat` fails fast with `CircuitBreakerOpenError` in <50 ms (no network, no retries), protecting the endpoint. After `VA_LSE_CB_RECOVERY_SECONDS` it enters `HALF_OPEN` and lets one probe through — success closes it, failure re-opens it. | `threshold=3`, `recovery=60s` | Lower the threshold for faster fail-fast; raise `recovery` on flaky gateways |
+| **Circuit breaker** | Counts *logical* LLM failures (a call that exhausts its 3 retries is one). After `VA_LSE_CB_FAILURE_THRESHOLD` consecutive failures it **opens**: every new `chat` fails fast with `CircuitBreakerOpenError` in <50 ms (no network, no retries), protecting the endpoint. After `VA_LSE_CB_RECOVERY_SECONDS` it enters `HALF_OPEN` and lets one probe through — success closes it, failure re-opens it. **The OPEN error quotes the failure that opened it** (via `record_failure(reason=…, retriable=…)`), and says whether retrying can help: a rejected key or an unusable model id is reported as a deterministic rejection rather than as "endpoint unavailable", because waiting cannot fix it. | `threshold=3`, `recovery=60s` | Lower the threshold for faster fail-fast; raise `recovery` on flaky gateways |
 | **Concurrency limiter** | Global semaphore (`VA_LSE_MAX_CONCURRENT_LLM_CALLS`, default `20`) caps simultaneous LLM calls across all threads/users. Extras queue; up to `VA_LSE_LLM_QUEUE_MAX_DEPTH=50` are queued and block up to `VA_LSE_LLM_QUEUE_TIMEOUT_SECONDS=30s`. Beyond either limit the call is rejected with `QueueFullError` (no retry). | `concurrent=20`, `queue=50`, `timeout=30s` | Raise `MAX_CONCURRENT` on higher-tier endpoints; raise `MAX_DEPTH` on bursty multi-user hosts |
 
 * Queue + breaker interact correctly: the breaker is checked **before** queuing (immediate fail-fast when open) and **again** after queuing (in case it opened while waiting). Queue-full or breaker rejections are **not** counted as endpoint failures. All breaker state changes (`CLOSED → OPEN`, `OPEN → HALF_OPEN`, `HALF_OPEN → CLOSED/OPEN`) log at `WARNING` with `phase=circuit_breaker`; queue-full/timeout log at `WARNING` with `phase=concurrency` — wire these to your alerting. `CircuitBreakerOpenError`/`QueueFullError` are re-exported from `app/llm.py` so callers can distinguish them from `LLMError`. Tests in `tests/test_circuit_breaker.py` cover the full state machine, the fail-fast <50 ms SLO, and the limiter queue off offline (no network).
@@ -1037,6 +1108,10 @@ record (`request_id`), appended to every user-facing error as `reference: req_�
 correlation, and never carries PII — logs emit only phases, timings, counts, and classifications
 (prompt/response bodies, statements, observations, and record text are excluded).
 
+- **`app/views/ops.py`** — `render_failure_detail()` puts that lookup beside the failure that quoted
+  the reference (the draft, evaluate and queued-run failure paths, plus the root render boundary and
+  the empty-analysis guard), remembering each answer for the session so a repainting expander does
+  not re-read the run log.
 - **`app/diagnostics.py`** — resolves a reference to the lines behind it, so "what happened to my run?"
   is answerable without a shell on the pod: `About → Look up a reference` takes the id (or the whole
   error message) and returns the run-log events plus the log lines, with secrets scrubbed. It reads
@@ -1080,7 +1155,10 @@ Configure via env (see `.env.example`): `VA_LSE_LOG_LEVEL`, `VA_LSE_LOG_JSON` (J
 When the Draft tab shows `Drafting failed: ... (reference: req_...)`, keep the reference id and
 look it up in the structured logs:
 
-- **In the app:** `About → 🔎 Look up a reference`, which resolves the id (or the whole error
+- **Under the error:** every failed run renders a **What happened?** expander right beneath it,
+  already resolved to that reference's lines — including a queued run, whose lines were written by a
+  worker in another process. Nothing to paste, nothing to look up.
+- **In the app:** `About → 🔎 Look up a reference`, which resolves any id (or a whole error
   message) to its run-log events and log lines. Needs no shell on the server.
 - Diagnostic log: `${VA_LSE_LOG_DIR:-stdout}/app.log`
 - Audit trail: `${VA_LSE_AUDIT_LOG_DIR:-logs}/audit.log`
@@ -1137,6 +1215,47 @@ Streamlit's permissive defaults. It pins:
 At startup `app/main.py` emits `⚠️ Streamlit security hardening is not fully active`
 if the file is missing or those keys are absent (non-blocking warning).
 
+Environment variables cannot override these keys, despite the documentation: on
+Streamlit 1.63.0 the environment is consulted only for the two options marked
+"sensitive" (`server.cookieSecret`, `mapbox.token`), so an exported
+`STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION` — or the documented `STREAMLIT_SERVER_PORT`
+— changes nothing (measured, not assumed). A deployment therefore cannot lose the XSRF,
+toolbar, or upload caps by leaking a variable into the environment, and a local
+override for debugging is a `streamlit run` flag (`--server.maxUploadSize 500`), which
+is applied after every config file. Note where the file is resolved *from*: Streamlit
+looks in `~` and in the **working directory**, so starting the app outside the
+repository root silently drops this file — which is why the startup warning reads it by
+absolute path, and why the test session pins it (see [Tests](#tests)).
+
+One failure mode is worth knowing before anyone adds a port to this file. `server.port`
+cannot be set on an install Streamlit considers a *development* one — its own test is
+whether the package lives under a `site-packages` directory, so a source checkout,
+`pip install -e`, or a vendored/`--target` install qualifies — and it does not warn, it
+raises:
+
+```
+RuntimeError: server.port does not work when global.developmentMode is true.
+```
+
+The raise comes out of `get_config_options()`, so it stops the CLI (`streamlit config
+show`, `streamlit run`) and any library use before app code runs, and the *source* of the
+value makes no difference: a project config, a machine config, or the documented
+`--server.port` flag all trigger it. Reproduced on Streamlit 1.63.0 and 1.64.0 and
+reported upstream as [streamlit/streamlit#17031](https://github.com/streamlit/streamlit/issues/17031).
+This file pins no port for that reason, and `tests/test_hermetic.py` fails if one ever
+appears in it. The container's `--server.port=8501` (see
+[`DEPLOYMENT.md`](DEPLOYMENT.md)) is safe *only* because `requirements.lock` installs
+Streamlit into a `site-packages` directory — an image that vendored the package somewhere
+else would fail to start rather than ignore the flag. Locally, `--global.developmentMode
+false` gets past it, as does `[global] developmentMode = false` in a config file, though
+that option is hidden and it also turns off dev-mode conveniences such as `logger.level`
+defaulting to `debug`. In the **test suite** it does not look like that at all: AppTest's
+runner thread dies, so a run reports `KeyError: 'st.session_state has no key
+"$$STREAMLIT_INTERNAL_KEY_SCRIPT_RUN_WITHOUT_ERRORS"'` or a bare `AppTest script run timed
+out`, with the real cause only on stderr. `tests/hermetic.py` runs the session with the
+mode pinned to the deployment's and the config files pinned to this repository's, so
+neither a machine config nor an install layout can reach it (see [Tests](#tests)).
+
 Upload limits are also enforced in Python (`app/main.py:_check_upload_limits`) so the
 tight 50 MB per-file / 200 MB batch caps (`VA_LSE_MAX_UPLOAD_BYTES` /
 `VA_LSE_MAX_TOTAL_UPLOAD_BYTES`, overridable via env) produce a clear in-UI message
@@ -1162,8 +1281,9 @@ with your proxy if the stream is TLS-terminated there.
 
 ## Compatibility & migration
 
-- **Tested endpoints & models:** QwenCloud Token Plan (`qwen3.7-max`/`flash`), OpenAI (`gpt-4-turbo`/`gpt-4o-mini`), and any OpenAI-compatible proxy (Ollama via shim) — see [`COMPATIBILITY.md`](COMPATIBILITY.md) for minimum versions, model tables, and breaking-change history.
-- **Switching providers:** see [`MIGRATION.md`](MIGRATION.md) (QwenCloud ↔ OpenAI ↔ local). No code change needed — update `.env`.
+- **Default endpoint & models:** Perplexity's Router API (`perplexity/kimi-k3` for analysis, `perplexity/glm-5.3-flash` for the bulk digest passes). One Perplexity key covers both this endpoint and the Research tab.
+- **Tested endpoints & models:** Perplexity Router API (default), QwenCloud Token Plan (`qwen3.7-max`/`flash`), OpenAI (`gpt-4-turbo`/`gpt-4o-mini`), and any OpenAI-compatible proxy (Ollama via shim) — see [`COMPATIBILITY.md`](COMPATIBILITY.md) for minimum versions, model tables, and breaking-change history.
+- **Switching providers:** see [`MIGRATION.md`](MIGRATION.md) (Perplexity ↔ QwenCloud ↔ OpenAI ↔ local). No code change needed — update `.env`, which overrides every default.
 - **Deployed app outdated?** Check the startup warning: `GET {base_url}/models` is queried; missing `LLM_MODEL_*` values produce a non-blocking sidebar warning linking to `COMPATIBILITY.md`.
 
 ## Security notes

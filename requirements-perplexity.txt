@@ -1,0 +1,30 @@
+# Perplexity SDK for the web-grounded "Research" tab and the framework-currency check
+# (PERPLEXITY_API_KEY).
+#
+# THIS PACKAGE IS ALSO IN THE CORE SET: requirements.txt and the hash-pinned
+# requirements.lock include it, because the two features it serves are unreachable on a
+# host that cannot install at runtime — Streamlit Community Cloud builds from
+# requirements.txt and offers no shell, so an optional-only dependency meant the tab could
+# never be switched on there. This file is kept as the *standalone* installer for an image
+# or venv that deliberately does not take the core set, and as where the Agent API's cost
+# controls are documented.
+#
+#   pip install -r requirements-perplexity.txt   # just this SDK
+#
+# Nothing else needs it: the Evaluate/Draft pipeline never imports it, and the SDK's
+# absence is reported as a configuration problem (app/perplexity_agent.unavailable_reason)
+# rather than raised at import time.
+#
+# Then create an API key at https://console.perplexity.ai and set it in the environment
+# or, for local development, in the git-ignored .env file:
+#
+#   PERPLEXITY_API_KEY=...
+#   PERPLEXITY_PRESET=low            # fast | low | medium | high | xhigh | wide-research
+#   # PERPLEXITY_MODEL=             # optional: freeze a model instead of the preset's
+#   # PERPLEXITY_SOURCES=va.gov,ecfr.gov,law.cornell.edu
+#
+# The Agent API is billed per model token AND per tool invocation (web_search, fetch_url),
+# so research depth is a real cost dial — see DEPLOYMENT.md → Perplexity research. The
+# panel defaults to the "low" preset for that reason. Never commit the key; scripts/hooks/
+# pre-commit, .gitignore, and tests/test_security_gitignore.py all guard it.
+perplexityai>=0.43

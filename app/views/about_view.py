@@ -71,6 +71,8 @@ specific cause can be found in the logs — no run fails without a trace.
 **Reading a reference:** search any of these files for the id, e.g.
 ``grep req_4f8a2b1c9d0e logs/runs.jsonl`` — or use **Look up a reference**
 below, which does the search for you and needs no shell access to the server.
+A failed run also carries its own **What happened?** expander, so the lines for
+that particular failure are usually one click from the error itself.
 Each event line includes a UTC timestamp, the action (``draft``/``evaluate``/
 ``app``), the status, and — for failures — the exact error and a short traceback.
 The logs never contain statement text, observations, or medical-record content;
