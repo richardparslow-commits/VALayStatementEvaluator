@@ -146,7 +146,8 @@ def _local_records(slot: str) -> list:
         return []
     st.caption(
         "Reads supported record files (.pdf/.txt/.md/.docx/.zip) directly from "
-        "this machine's filesystem. Only available when the app runs locally."
+        "this machine's filesystem. Available only when "
+        "VA_LSE_ALLOW_LOCAL_PATHS=1 is set, for trusted single-user use."
     )
     path = st.text_input(
         "Folder or file path",
