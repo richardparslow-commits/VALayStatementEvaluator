@@ -22,11 +22,9 @@ from ..documents import (
     records_from_local_path,
     search_records,
 )
+from ..error_report import report_failure
 from ..fetch_client import FetchClient, FetchSandboxError
-from ..logging_config import get_logger
 from .uploads import check_upload_limits, extract_uploads, render_record_volume_warning
-
-logger = get_logger("app.views.records")
 
 # Feature: Medical Record Search & Citation Index
 SEARCH_FEATURE_ID = "22bc7e10-dcda-431e-b3fb-4e8ff9b532cb"  # medical-record-search-citation-index
@@ -102,7 +100,11 @@ def records_uploader(slot: str) -> list:
     if files:
         accepted, rejections = check_upload_limits(files)
         for msg in rejections:
-            st.warning(msg)
+            st.warning(
+                report_failure(
+                    msg, phase="upload_limits", severity="warning", once=True
+                )
+            )
         files = accepted if rejections else files
     documents = extract_uploads(files, slot)
     # Pages the files contain, not pages that yielded text: a scan-only bundle has
@@ -162,13 +164,23 @@ def _local_records(slot: str) -> list:
         try:
             records, skipped = records_from_local_path(path)
         except ExtractionError as exc:
-            st.warning(str(exc))
+            st.warning(
+                report_failure(
+                    str(exc), phase="local_records_load", exc=exc, severity="warning"
+                )
+            )
         else:
             st.session_state[import_key] = records
             if skipped:
                 st.session_state[skipped_key] = skipped
+    # Replayed from session state on every rerun; ``once`` keeps a file that keeps
+    # failing from rewriting the same log line on each interaction.
     for message in st.session_state.get(skipped_key, []):
-        st.warning(message)
+        st.warning(
+            report_failure(
+                message, phase="local_records_extract", severity="warning", once=True
+            )
+        )
     cached_any: Any = st.session_state.get(import_key, [])
     cached_records: list[Any] = cached_any if isinstance(cached_any, list) else []
     remember_source_records(slot, "Local folder / file", cached_records)
@@ -191,7 +203,11 @@ def _fetch_records(slot: str) -> list[Any]:
         try:
             records = FetchClient(settings).fetch_documents(patient_id)
         except FetchSandboxError as exc:
-            st.warning(str(exc))
+            st.warning(
+                report_failure(
+                    str(exc), phase="fetch_records_import", exc=exc, severity="warning"
+                )
+            )
         else:
             st.session_state[import_key] = records
     records_any2: Any = st.session_state.get(import_key, [])
@@ -270,7 +286,7 @@ def _va_gov_records(slot: str) -> list[Any]:
             try:
                 session = va_gov_client.authenticate_va_gov(username, password)
             except va_gov_client.VaGovError as exc:
-                st.error(str(exc))
+                st.error(report_failure(str(exc), phase="va_gov_auth", exc=exc))
             else:
                 st.session_state[f"va_gov_session_{slot}"] = session
                 st.session_state[f"va_gov_authed_{slot}"] = True
@@ -372,12 +388,13 @@ def render_record_search(slot: str, documents: list[Any]) -> None:
                     provider=provider or None,
                 )
             except Exception as exc:  # noqa: BLE001 - search must never crash the UI
-                logger.error("record search failed: %s", exc, exc_info=exc)
                 try:
                     track_feature_error(SEARCH_FEATURE_ID, exc, stage="search")
                 except Exception:  # noqa: BLE001
                     pass
-                st.error(f"Search failed: {exc}")
+                st.error(
+                    report_failure(f"Search failed: {exc}", phase="record_search", exc=exc)
+                )
                 results = []
             st.session_state[results_key] = results
             try:

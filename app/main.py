@@ -31,6 +31,7 @@ from .views.shared import (
     REQUEST_ID_KEY,
     format_error_for_user,
     get_or_create_request_id,
+    report_failure,
 )
 from .views.sidebar import render_sidebar_settings
 
@@ -66,22 +67,18 @@ def _check_streamlit_config_hardening() -> None:
         if "maxUploadSize" not in text:
             missing.append("server.maxUploadSize")
         if missing:
-            msg = (
-                "⚠️ Streamlit security hardening is not fully active (missing from .streamlit/config.toml: "
-                + ", ".join(missing)
-                + "). The app still works, but XSRF protection, toolbar hardening, and upload caps "
-                "depend on that file — see README → Production hardening."
+            st.warning(
+                report_failure(
+                    "⚠️ Streamlit security hardening is not fully active (missing from "
+                    ".streamlit/config.toml: "
+                    + ", ".join(missing)
+                    + "). The app still works, but XSRF protection, toolbar hardening, and "
+                    "upload caps depend on that file — see README → Production hardening.",
+                    phase="security_hardening",
+                    severity="warning",
+                    once=True,  # main() paints on every rerun
+                )
             )
-            logger.warning(
-                "streamlit hardening incomplete: %s",
-                ", ".join(missing),
-                extra={
-                    "request_id": get_request_id() or "-",
-                    "phase": "app",
-                    "status": "warning",
-                },
-            )
-            st.warning(msg)
     except Exception:  # noqa: BLE001 - hardening check must never break the app
         pass
 

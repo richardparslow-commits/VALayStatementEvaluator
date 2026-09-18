@@ -27,6 +27,7 @@ import streamlit as st
 from .. import config
 from .. import tracing
 from ..blob_store import BlobStoreError, get_blob_store
+from ..error_report import report_failure
 from ..job_payload import (
     KIND_DRAFT,
     KIND_EVALUATE,
@@ -310,7 +311,14 @@ def submit_job(
             payload = _encode_payload(kind, job)
         except (PayloadError, BlobStoreError) as exc:
             run_log_event(kind, "rejected", request_id=request_id, error=str(exc), reason="payload")
-            st.error(f"{action_label} could not be queued: {exc}")
+            st.error(
+                report_failure(
+                    f"{action_label} could not be queued: {exc}",
+                    phase=f"{kind}_queue_payload",
+                    exc=exc,
+                    request_id=request_id,
+                )
+            )
             return None
         try:
             record = backend.enqueue(kind, payload, request_id=request_id)
@@ -319,15 +327,14 @@ def submit_job(
                 kind, "rejected", request_id=request_id,
                 error=f"{type(exc).__name__}: {exc}", reason="enqueue_failed",
             )
-            logger.error(
-                "could not enqueue %s job: %s",
-                kind,
-                f"{type(exc).__name__}: {exc}",
-                extra={"request_id": request_id, "phase": kind, "status": "error"},
-            )
             st.error(
-                f"{action_label} could not be queued: {type(exc).__name__}: {exc}. "
-                "Check the job-queue backend (see /health) and try again."
+                report_failure(
+                    f"{action_label} could not be queued: {type(exc).__name__}: {exc}. "
+                    "Check the job-queue backend (see /health) and try again.",
+                    phase=f"{kind}_enqueue",
+                    exc=exc,
+                    request_id=request_id,
+                )
             )
             return None
 

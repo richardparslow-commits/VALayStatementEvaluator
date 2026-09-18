@@ -19,6 +19,12 @@ from typing import Any
 import streamlit as st
 
 from .. import telemetry
+from ..error_report import (  # noqa: F401 - re-exported for tab modules and tests
+    ensure_request_id,
+    format_error_for_user,
+    reference_suffix,
+    report_failure,
+)
 from ..logging_config import get_logger, get_request_id, new_request_id, set_request_id
 from ..llm import LLMClient, LLMError
 from ..run_log import run_log_event
@@ -72,12 +78,6 @@ def new_run_request_id() -> str:
     st.session_state[REQUEST_ID_KEY] = rid
     set_request_id(rid)
     return rid
-
-
-def format_error_for_user(exc: Exception, request_id: str) -> str:
-    """User-facing error string that carries the correlation id without PII."""
-    rid_suffix = f" (reference: {request_id})" if request_id and request_id != "-" else ""
-    return f"{exc}{rid_suffix}"
 
 
 # Fallback locations tried (in order) when no file logging is configured, so
@@ -155,7 +155,7 @@ def get_llm() -> LLMClient | None:
                 "error_class": type(exc).__name__,
             },
         )
-        st.error(str(exc))
+        st.error(report_failure(str(exc), phase="llm_config", exc=exc))
         return None
 
 
