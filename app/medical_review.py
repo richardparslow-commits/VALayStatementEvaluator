@@ -191,7 +191,15 @@ class MedicalDigest:
     unreadable_pages: int = 0
     chunks_without_facts: int = 0
     duplicate_pages: list[dict[str, Any]] = field(default_factory=list)
+    # Duplicated pages whose copy came from a *different* file. A page re-printed
+    # inside one bundle is a duplicate; the same page arriving from two sources is
+    # corroboration, and a statement can lean harder on the second.
+    corroborated_pages: list[dict[str, Any]] = field(default_factory=list)
     files: list[dict[str, Any]] = field(default_factory=list)
+    # Facts consolidated away by the MAX_DIGEST_FACTS cap. Reported rather than
+    # silently dropped: the digest being thinner than the records is exactly the
+    # kind of gap that should not need to be inferred from a page count.
+    facts_dropped_by_cap: int = 0
     # Result of checking each fact's quote against the page it cites (see
     # ``verify_citations``): the one measurement that turns "the report cites
     # page 7" into "page 7 really says this".
@@ -559,6 +567,22 @@ def _shingle_similarity(left: frozenset[str], right: frozenset[str]) -> float:
 # Bound on how many same-size candidates a page is compared against, so near-dup
 # detection stays linear-ish on large bundles.
 _NEAR_DUP_CANDIDATES = 8
+
+
+def _cross_source_corroborations(
+    duplicates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Duplicates whose copy lives in a different file (see ``MedicalDigest``)."""
+    corroborations: list[dict[str, Any]] = []
+    for entry in duplicates:
+        origin = str(entry.get("duplicate_of", ""))
+        document = str(entry.get("document", ""))
+        origin_file = re.split(r"\s+[pb]\.\d+\s*$", origin)[0].strip() if origin else ""
+        if origin_file and document and origin_file != document:
+            corroborations.append(
+                {"document": document, "page": entry.get("page"), "also_in": origin_file}
+            )
+    return corroborations
 
 
 def _dedupe_pages(
@@ -941,6 +965,7 @@ def review_medical_records(
         unreadable_pages=unreadable_pages,
         chunks_without_facts=chunks_without_facts,
         duplicate_pages=duplicate_pages,
+        corroborated_pages=_cross_source_corroborations(duplicate_pages),
         files=[_file_coverage(doc) for doc in documents],
     )
 
@@ -1053,11 +1078,15 @@ def _merge_facts(
     """
     check_pipeline_cancelled()
     facts = _dedupe_facts(digest.facts)
+    digest.facts_dropped_by_cap = 0
     if len(facts) <= MERGE_SINGLE_LIMIT:
         try:
-            return _restore_citations(_merge_once(llm, facts), facts) or facts
+            consolidated = _restore_citations(_merge_once(llm, facts), facts) or facts
         except LLMError:
-            return facts
+            consolidated = facts
+        # The cap applies here too: with a small VA_LSE_MAX_DIGEST_FACTS an
+        # ordinary run would otherwise exceed it without saying so.
+        return _apply_digest_cap(digest, consolidated)
 
     current = facts
     _merge_rid = get_request_id() or "-"
@@ -1141,7 +1170,19 @@ def _merge_facts(
             break
         current = merged
 
-    return current[: config.MAX_DIGEST_FACTS]
+    return _apply_digest_cap(digest, current)
+
+
+def _apply_digest_cap(digest: MedicalDigest, facts: list[MedicalFact]) -> list[MedicalFact]:
+    """Trim the fact list to ``MAX_DIGEST_FACTS`` and record what was dropped.
+
+    Recorded on the digest rather than just logged: the coverage report is where a
+    user finds out that the record set held more than the digest could keep, and a
+    silently thinner digest reads exactly like a thin set of records.
+    """
+    capped = facts[: config.MAX_DIGEST_FACTS]
+    digest.facts_dropped_by_cap = max(0, len(facts) - len(capped))
+    return capped
 
 
 def _merge_once(llm: LLMClient, facts: list[MedicalFact]) -> list[MedicalFact]:

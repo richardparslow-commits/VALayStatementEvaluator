@@ -431,6 +431,9 @@ The reviewer is built for full VA claim files, including bundles of 1,000–2,00
   VA bundles) are detected and skipped. Matching is by content, not bytes: a page
   re-printed with a different footer, or scanned twice, is recognised as the same page.
   Every skipped page is named in the coverage report ("`bundle.pdf` p.40 = `bundle.pdf` p.12").
+- **Lab and vitals rows kept intact** — padded table columns are rewritten as
+  `date | name | value` lines, so the model reads a row's fields in order instead of
+  guessing which value belongs to which label.
 - **Transient-failure tolerance** — a chunk that fails (e.g. rate limit) is retried
   once; the run only aborts if it still fails, and the failing chunks are named.
 - **Hierarchical fact merging** — thousands of extracted facts are consolidated in
@@ -458,6 +461,8 @@ questions a plausible-looking report otherwise hides:
 | Per-file rows | Pages in the file, pages read, unreadable count, whether the source was page-numbered (`.txt`/`.docx` long files are cited by block, e.g. `notes.docx b.3`) |
 | Chunks without facts | Analyzed chunks that yielded nothing — a page the model found genuinely empty, or one it skimmed |
 | Skipped duplicate pages | Named, with the page each one duplicated |
+| Corroborated pages | Duplicates that arrived from a *different* file — the same page in two sources, so a statement can lean harder on it |
+| Digest cap | Facts consolidated away because the digest holds at most `VA_LSE_MAX_DIGEST_FACTS` — the records held more than this report covers |
 | Citation self-check | How many facts' quotes were found on the page they cite, with examples of any that were not |
 | Coverage gaps | Claims with no matching record text anywhere — reported instead of being called contradictions |
 
@@ -465,13 +470,21 @@ The same summary is written into the report (`## Record Coverage Gaps`), so a re
 with a VSO carries the caveat rather than losing it. An ordinary small run with nothing to
 declare shows no panel at all.
 
+Records that arrive as a **`.zip`** (provider portals and My HealtheVet hand back
+folders) can be uploaded as they came: members are extracted like standalone uploads, and
+every bound — member count, per-member and total uncompressed size, compression ratio — is
+enforced because an archive is untrusted input. Members that break a bound are skipped with
+a named warning; nested archives are never expanded. Same for a local path, which walks the
+folder or the archive.
+
 Tuning: raise `VA_LSE_RECORDS_CONCURRENCY` if your endpoint allows more parallel
 requests; lower `VA_LSE_DIGEST_CHUNK_CHARS` for extra recall on very dense pages (at the
 cost of more LLM calls). `scripts/scale_sim.py` runs an offline 2,000-page simulation of
 the pipeline (no API calls) to verify orchestration at scale. Ingest quality is tunable too:
 `VA_LSE_DOCUMENT_BLOCK_CHARS`, `VA_LSE_PARAGRAPH_MAX_CHARS`, `VA_LSE_PDF_LAYOUT_EXTRACTION`,
-`VA_LSE_DUPLICATE_PAGE_SIMILARITY`, `VA_LSE_EVIDENCE_WEAK_OVERLAP` and
-`VA_LSE_RECORD_SIZE_WARN_PAGES` (all documented in `.env.example`).
+`VA_LSE_DUPLICATE_PAGE_SIMILARITY`, `VA_LSE_EVIDENCE_WEAK_OVERLAP`,
+`VA_LSE_RECORD_SIZE_WARN_PAGES` and the `VA_LSE_ZIP_*` archive bounds (all documented in
+`.env.example`).
 
 ## Tests
 

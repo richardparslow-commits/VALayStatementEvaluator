@@ -29,6 +29,9 @@ class UploadedFile(Protocol):
     def getvalue(self) -> bytes: ...
 
 SUPPORTED_EXTENSIONS = (".pdf", ".txt", ".md", ".docx")
+# Uploading the folder you were given is the natural thing to do, so archives are
+# accepted and expanded (bounded — see ``archive_members``) rather than rejected.
+ARCHIVE_EXTENSIONS = (".zip",)
 
 # How a document's text is addressed in citations. "page" is a real PDF page
 # (or a single-page file); "block" means the source has no page numbers at all
@@ -270,17 +273,17 @@ def _page_text(page: Any) -> str:
     except Exception:  # noqa: BLE001 - unreadable page, keep going
         default = ""
     if not config.PDF_LAYOUT_EXTRACTION:
-        return _dehyphenate(default)
+        return normalize_tabular_rows(_dehyphenate(default))
     if default and len(default) >= _WEAK_PAGE_CHARS and _extraction_score(default)[0] > 0:
-        return _dehyphenate(default)
+        return normalize_tabular_rows(_dehyphenate(default))
     try:
         layout = (page.extract_text(extraction_mode="layout") or "").strip()
     except TypeError:  # pypdf too old for layout mode
-        return _dehyphenate(default)
+        return normalize_tabular_rows(_dehyphenate(default))
     except Exception:  # noqa: BLE001 - layout pass failed, keep the default read
-        return _dehyphenate(default)
+        return normalize_tabular_rows(_dehyphenate(default))
     best = layout if _extraction_score(layout) > _extraction_score(default) else default
-    return _dehyphenate(best)
+    return normalize_tabular_rows(_dehyphenate(best))
 
 
 def _page_lines(text: str) -> list[str]:
@@ -301,6 +304,40 @@ def _dehyphenate(text: str) -> str:
     still matches on the shared tokens, while a split one matches neither.
     """
     return _HYPHEN_BREAK_RE.sub("", text)
+
+
+# Column gaps inside a table row. Two or more spaces is what print-to-PDF output
+# pads between columns; a single space is ordinary prose.
+_TABLE_GAP_RE = re.compile(r"\s{2,}")
+_TABLE_MAX_FIELDS = 8
+_TABLE_MAX_LINE_CHARS = 200
+
+
+def normalize_tabular_rows(text: str) -> str:
+    """Rewrite column-aligned table rows as ``field | field | value`` lines.
+
+    Lab and vitals tables arrive as padded columns, so the model sees a line of
+    loosely related tokens and has to guess which value belongs to which label —
+    the failure mode behind a fact carrying the wrong date or dose. Splitting on
+    the column gaps and joining with ``|`` keeps a row's fields adjacent and in
+    order. Nothing is added or reordered, and only lines with at least three
+    non-empty fields, a digit, and no sentence-ending period are touched, so prose
+    (which does not survive those tests) is left alone.
+    """
+    out: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        fields = [field.strip() for field in _TABLE_GAP_RE.split(stripped) if field.strip()]
+        if (
+            3 <= len(fields) <= _TABLE_MAX_FIELDS
+            and len(stripped) <= _TABLE_MAX_LINE_CHARS
+            and not stripped.endswith(".")
+            and any(any(ch.isdigit() for ch in field) for field in fields)
+        ):
+            out.append(" | ".join(fields))
+        else:
+            out.append(line)
+    return "\n".join(out)
 
 
 def strip_running_headers(pages: list[DocumentPage]) -> list[DocumentPage]:
@@ -507,6 +544,111 @@ def _read_docx_member_limited(
     return bytes(output)
 
 
+def archive_members(
+    filename: str, data: bytes
+) -> tuple[list[tuple[str, bytes]], list[str]]:
+    """Expand a ``.zip`` upload into ``(member label, bytes)`` pairs, plus skips.
+
+    Provider portals and My HealtheVet hand back folders as archives, and the
+    natural thing to do with one is upload it as it came. Expansion is bounded at
+    every step — member count, per-member uncompressed size, per-member compression
+    ratio, and total uncompressed size — because the archive is untrusted input and
+    the extracted text is held in memory. Members that exceed a *per-member* bound
+    are skipped with a message; exceeding the total is a hard stop. Nested archives
+    are skipped rather than expanded recursively, which would reintroduce the
+    amplification this protects against.
+    """
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(data))
+    except Exception as exc:  # noqa: BLE001 - named, not a bare zip traceback
+        raise ExtractionError(f"{filename}: could not read the archive ({exc})") from exc
+
+    # The archive stays open for the whole function: reading a member after the
+    # ``with`` block closes it raises "ZIP archive that was already closed", which
+    # would leave every archive uploading as a list of skips.
+    with archive:
+        infos = [info for info in archive.infolist() if not info.is_dir()]
+        if len(infos) > config.ZIP_MAX_MEMBERS:
+            raise ExtractionError(
+                f"{filename}: archive holds {len(infos):,} files, over the "
+                f"{config.ZIP_MAX_MEMBERS:,} supported. Extract it yourself and upload "
+                "the records files directly."
+            )
+
+        label_prefix = Path(filename).stem or "archive"
+        selected: list[tuple[str, str, zipfile.ZipInfo]] = []
+        skipped: list[str] = []
+        for info in infos:
+            relative = info.filename.replace("\\", "/")
+            base = Path(relative).name
+            # Editor/OS bookkeeping that ends up in most zips; never record content.
+            if not base or base.startswith(".") or "__MACOSX/" in f"{relative}/":
+                continue
+            label = f"{label_prefix}/{relative.lstrip('./')}"
+            if not relative.lower().endswith(SUPPORTED_EXTENSIONS):
+                nested = relative.lower().endswith(ARCHIVE_EXTENSIONS)
+                reason = "nested archive, not expanded" if nested else "unsupported file type"
+                skipped.append(f"✖️ {filename}: skipped {relative} ({reason})")
+                continue
+            if info.file_size > config.ZIP_MAX_MEMBER_BYTES:
+                skipped.append(
+                    f"✖️ {filename}: skipped {relative} "
+                    f"({info.file_size // 1_048_576} MB member exceeds the "
+                    f"{config.ZIP_MAX_MEMBER_BYTES // 1_048_576} MB limit)"
+                )
+                continue
+            ratio = info.file_size / max(info.compress_size, 1)
+            if ratio > config.ZIP_MAX_COMPRESSION_RATIO:
+                skipped.append(
+                    f"✖️ {filename}: skipped {relative} (compression ratio {ratio:.0f}:1 is "
+                    "not a plausible records file)"
+                )
+                continue
+            selected.append((label, relative, info))
+
+        # The total bound is checked before anything is read, so an archive that
+        # expands past the limit never has its members held in memory at all.
+        expands_to = sum(info.file_size for _, _, info in selected)
+        if expands_to > config.ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES:
+            raise ExtractionError(
+                f"{filename}: archive expands to more than "
+                f"{config.ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES // 1_048_576} MB, which is "
+                "more than one run can review. Upload the files it contains in smaller "
+                "batches."
+            )
+
+        members: list[tuple[str, bytes]] = []
+        for label, relative, info in selected:
+            try:
+                members.append((label, archive.read(info)))
+            except Exception as exc:  # noqa: BLE001 - one bad member must not lose the rest
+                skipped.append(f"✖️ {filename}: could not read {relative} ({exc})")
+        if not members and not skipped:
+            raise ExtractionError(f"{filename}: archive contains no record files.")
+    return members, skipped
+
+
+def _expand_and_extract(label: str, data: bytes) -> tuple[list[ExtractedDocument], list[str]]:
+    """Extract one file, expanding an archive into its members.
+
+    Shared by the uploader and the local-folder reader so a zip behaves the same
+    however it arrives.
+    """
+    if label.lower().endswith(ARCHIVE_EXTENSIONS):
+        members, skipped = archive_members(label, data)
+        documents: list[ExtractedDocument] = []
+        for member_label, member_bytes in members:
+            try:
+                documents.append(extract_document(member_label, member_bytes))
+            except ExtractionError as exc:
+                skipped.append(str(exc))
+        return documents, skipped
+    try:
+        return [extract_document(label, data)], []
+    except ExtractionError as exc:
+        return [], [str(exc)]
+
+
 def extract_uploaded_documents(
     files: "list[UploadedFile]",
 ) -> tuple[list[ExtractedDocument], list[str]]:
@@ -514,15 +656,15 @@ def extract_uploaded_documents(
 
     ``skipped`` holds one message per file that could not be extracted (e.g.
     an image-only PDF), so callers can surface them as warnings instead of
-    letting unreadable uploads silently vanish.
+    letting unreadable uploads silently vanish. A ``.zip`` upload contributes its
+    members as separate documents, each extracted like a standalone upload.
     """
     documents: list[ExtractedDocument] = []
     skipped: list[str] = []
     for uploaded in files:
-        try:
-            documents.append(extract_document(uploaded.name, uploaded.getvalue()))
-        except ExtractionError as exc:
-            skipped.append(str(exc))
+        extracted, problems = _expand_and_extract(uploaded.name, uploaded.getvalue())
+        documents.extend(extracted)
+        skipped.extend(problems)
     return documents, skipped
 
 
@@ -549,21 +691,20 @@ def records_from_local_path(path: str) -> tuple[list[ExtractedDocument], list[st
         files = sorted(
             p
             for p in root.rglob("*")
-            if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
+            if p.is_file() and p.suffix.lower() in (*SUPPORTED_EXTENSIONS, *ARCHIVE_EXTENSIONS)
         )
         label_for = lambda file: str(file.relative_to(root))  # noqa: E731
     if not files:
         raise ExtractionError(
-            f"No supported record files (.pdf/.txt/.md/.docx) found in: {root}"
+            f"No supported record files (.pdf/.txt/.md/.docx/.zip) found in: {root}"
         )
 
     documents: list[ExtractedDocument] = []
     skipped: list[str] = []
     for file in files:
-        try:
-            documents.append(extract_document(label_for(file), file.read_bytes()))
-        except ExtractionError as exc:
-            skipped.append(str(exc))
+        extracted, problems = _expand_and_extract(label_for(file), file.read_bytes())
+        documents.extend(extracted)
+        skipped.extend(problems)
     if not documents:
         detail = f" ({'; '.join(skipped)}) " if skipped else " "
         raise ExtractionError(f"Could not load any records from {root}{detail}")

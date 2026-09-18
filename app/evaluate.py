@@ -12,12 +12,14 @@ from typing import Any
 import streamlit as st
 
 from .agiloop_telemetry import track_feature_error, track_goal
+from . import config
 from .config import load_knowledge
 from .documents import (
     EVALUATE_INTERNAL_MAX_CHARS,
     ExtractedDocument,
     MAX_STATEMENT_CHARS,
 )
+from .exporter import parse_source
 from .llm import LLMClient, LLMError
 from . import tracing
 from .logging_config import PhaseTimer, get_request_id
@@ -1223,6 +1225,73 @@ _VERDICT_EMOJI = {
 }
 
 
+# Verdicts in which the record set backs the statement rather than contradicting it.
+_SUPPORTIVE_VERDICTS = ("SUPPORTED", "PARTIALLY SUPPORTED")
+
+
+def rubric_and_positive_sources(
+    digest: MedicalDigest | None,
+    verifications: list[dict] | None,
+) -> tuple[set[str], set[str]]:
+    """Cross-reference digest facts against the verification results.
+
+    ``MedicalFact`` now carries the ``document``/``page`` it was read from, and a
+    verification's ``record_reference`` names its source too, so the link the fact
+    export filters need can be an **exact join** instead of a substring guess: both
+    sides are parsed to ``(document, page)`` and matched. The original
+    case-insensitive substring test is kept as a union (not a fallback), because a
+    free-form reference such as ``"records.pdf p.7, 2020-01-01"`` carries real
+    information that a strict parse would throw away.
+
+    Returns ``(cited, positive)``: sets of ``fact.source`` strings that appear in
+    any verification, and in a verification whose verdict is supportive (the record
+    corroborates the statement rather than contradicting it).
+    """
+    cited: set[str] = set()
+    positive: set[str] = set()
+    facts = getattr(digest, "facts", None) or []
+    if not facts or not verifications:
+        return cited, positive
+
+    def _page_key(pages: str) -> str:
+        match = re.match(r"\d+", pages or "")
+        return match.group(0) if match else ""
+
+    exact: dict[tuple[str, str], set[str]] = {}
+    loose: list[tuple[str, str]] = []
+    for verification in verifications:
+        reference = str(verification.get("record_reference", "") or "").strip()
+        if not reference:
+            continue
+        verdict = str(verification.get("verdict", "") or "")
+        document, pages = parse_source(reference)
+        page = _page_key(pages)
+        if document and page:
+            exact.setdefault((document.strip().casefold(), page), set()).add(verdict)
+        loose.append((reference.casefold(), verdict))
+
+    for fact in facts:
+        source = (fact.source or "").strip()
+        if not source:
+            continue
+        verdicts: set[str] = set()
+        document, page = fact.document, str(fact.page or "")
+        if not (document and page):
+            document, pages = parse_source(source)
+            page = _page_key(pages)
+        if document and page:
+            verdicts |= exact.get((document.strip().casefold(), page), set())
+        source_lower = source.casefold()
+        verdicts |= {
+            verdict for reference, verdict in loose if source_lower in reference
+        }
+        if verdicts:
+            cited.add(fact.source)
+            if verdicts & set(_SUPPORTIVE_VERDICTS):
+                positive.add(fact.source)
+    return cited, positive
+
+
 def coverage_lines(digest: MedicalDigest) -> list[str]:
     """Markdown lines describing what was read, what was not, and how citations held.
 
@@ -1245,6 +1314,22 @@ def coverage_lines(digest: MedicalDigest) -> list[str]:
         lines.append(
             f"- {digest.chunks_without_facts} of {digest.chunks_reviewed} analyzed chunks "
             "contained no extractable facts."
+        )
+    if digest.facts_dropped_by_cap:
+        lines.append(
+            f"> ⚠️ **Digest capped:** {digest.facts_dropped_by_cap:,} consolidated fact(s) "
+            f"were dropped because the digest holds at most {config.MAX_DIGEST_FACTS:,} "
+            "(VA_LSE_MAX_DIGEST_FACTS). The records contained more than this report "
+            "covers — split the record set by date range and re-run for full coverage."
+        )
+    if digest.corroborated_pages:
+        names = ", ".join(
+            f"{row.get('document')} p.{row.get('page')}" for row in digest.corroborated_pages[:5]
+        )
+        more = " …" if len(digest.corroborated_pages) > 5 else ""
+        lines.append(
+            f"- {len(digest.corroborated_pages):,} page(s) appear in more than one source "
+            f"(corroborated): {names}{more}"
         )
     check = digest.citation_check or {}
     if check.get("checked"):

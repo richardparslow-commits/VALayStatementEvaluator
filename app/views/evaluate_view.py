@@ -35,6 +35,7 @@ from ..evaluate import (
     build_evidence_dashboard,
     compute_score_band,
     coverage_lines,
+    rubric_and_positive_sources,
     run_evaluation,
 )
 from ..exporter import export_facts, filter_facts
@@ -730,53 +731,21 @@ def _render_evidence_dashboard(eval_result: Any) -> None:
 
 
 # --------------------------------------------------------- fact citation export
-_SUPPORTIVE_VERDICTS = ("SUPPORTED", "PARTIALLY SUPPORTED")
+
 
 
 def _rubric_and_positive_sources(eval_result: Any) -> tuple[set[str], set[str]]:
-    """Cross-reference digest facts against rubric verification results.
+    """View-side wrapper over ``app.evaluate.rubric_and_positive_sources``.
 
-    `MedicalFact` carries no `rubric_verified`/`positive_outcome` flag (no
-    schema changes — see `.implement/technical-spec.md`), and
-    `EvaluationResult.verifications` carries no direct fact id either — each
-    verification's `record_reference` is free text ("source label + date of
-    the supporting/conflicting record fact", see `app/evaluate.py`). This
-    does a best-effort substring match of each fact's `source` label against
-    every verification's `record_reference` (case-insensitive) to recover the
-    link the acceptance criteria calls for:
-
-    - "cited in rubric verification": the fact's source appears in *any*
-      verification's `record_reference` (regardless of verdict).
-    - "supporting positive outcomes": the fact's source appears in a
-      verification whose verdict is SUPPORTED or PARTIALLY SUPPORTED — i.e.
-      the record corroborates the lay statement rather than contradicting it.
+    The link between a digest fact and a verification used to be a substring guess
+    over free text; it is now an exact ``(document, page)`` join, computed in
+    ``app.evaluate`` so the pipeline module owns the rule and this module only
+    supplies the result object.
     """
-    digest = getattr(eval_result, "digest", None)
-    verifications = getattr(eval_result, "verifications", None) or []
-    cited: set[str] = set()
-    positive: set[str] = set()
-    if not digest or not digest.facts:
-        return cited, positive
-
-    references = [
-        (str(v.get("record_reference", "") or "").lower(), str(v.get("verdict", "") or ""))
-        for v in verifications
-    ]
-    references = [(ref, verdict) for ref, verdict in references if ref]
-    if not references:
-        return cited, positive
-
-    for fact in digest.facts:
-        source_lower = fact.source.lower().strip()
-        if not source_lower:
-            continue
-        for ref, verdict in references:
-            if source_lower in ref:
-                cited.add(fact.source)
-                if verdict in _SUPPORTIVE_VERDICTS:
-                    positive.add(fact.source)
-                    break
-    return cited, positive
+    return rubric_and_positive_sources(
+        getattr(eval_result, "digest", None),
+        getattr(eval_result, "verifications", None) or [],
+    )
 
 
 def _render_fact_export_section(eval_result: Any) -> None:
