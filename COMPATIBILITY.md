@@ -116,7 +116,13 @@ On every app launch the sidebar runs a best-effort **model availability check**:
 - If `model_main` or `model_fast` is missing from the provider's model list, the UI shows a non-blocking warning linking to this file and `MIGRATION.md`
 - Network/permission failures are ignored — the app always remains usable (warnings only).
 
-See `app/llm.py` (`check_model_availability`) and `app/main.py:_sidebar_settings`.
+The sidebar's **Test connection** button runs the same `GET {base_url}/models` request but
+reports *why* it failed, because it is the screen where the user can still fix it: the HTTP
+status and the provider's response body distinguish a rejected key (`401`/`403`) from a wrong
+path in the base URL (`404`) from a host that does not answer.
+
+See `app/llm.py` (`app.llm.probe_models`, and `check_model_availability` for the advisory
+model-list-only form) and `app/main.py:_sidebar_settings`.
 
 ## What to do when QwenCloud (or any provider) changes their API
 

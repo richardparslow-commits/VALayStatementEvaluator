@@ -16,6 +16,7 @@ import json
 import math
 import re
 from collections import Counter
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import astuple, dataclass, field, replace
 from functools import lru_cache
@@ -28,7 +29,14 @@ import time
 from . import config, tracing
 from .agiloop_telemetry import track_feature_error, track_goal
 from .documents import Chunk, ExtractedDocument, chunk_page_labelled_text, paragraph_index
-from .llm import LLMClient, LLMError
+from .llm import (
+    CircuitBreakerOpenError,
+    LLMClient,
+    LLMError,
+    LLMTimeoutError,
+    LLMUpstreamError,
+    QueueFullError,
+)
 from .logging_config import PhaseTimer, get_request_id
 from .pipeline_guard import check_pipeline_cancelled, pipeline_as_completed
 from .profiler import get_current_run_profiler, worker_timer
@@ -844,7 +852,13 @@ def review_medical_records(
 
     # -------------------------------------------- parallel chunk extraction
     results: dict[int, dict] = {}
-    failed: dict[int, str] = {}
+    failed: dict[int, BaseException] = {}
+    # The first failure that carried a *reason*, kept across the retry round below.
+    # That round clears `failed` and refills it, and once the breaker is OPEN every
+    # refilled entry is its fail-fast rejection — a symptom shared by all the
+    # chunks, which says nothing about what to fix. This is the error that does.
+    cause: BaseException | None = None
+    fail_fast_chunks = 0
     completed = 0
     _review_t0 = time.perf_counter()
     rid = get_request_id() or "-"
@@ -864,7 +878,7 @@ def review_medical_records(
     )
 
     def run_round(pending: list[Chunk]) -> None:
-        nonlocal completed
+        nonlocal completed, cause, fail_fast_chunks
         pool = ThreadPoolExecutor(max_workers=config.RECORDS_CONCURRENCY)
         try:
             future_map = {
@@ -877,7 +891,14 @@ def review_medical_records(
                 try:
                     results[chunk.index] = future.result()
                 except Exception as exc:  # noqa: BLE001 - record and retry later
-                    failed[chunk.index] = str(exc)
+                    failed[chunk.index] = exc
+                    if isinstance(exc, (CircuitBreakerOpenError, QueueFullError)):
+                        # Not an endpoint fault: the call was refused before it was
+                        # made. Counted separately so the summary can say how much
+                        # of the failure is cascade, and never reported as the cause.
+                        fail_fast_chunks += 1
+                    elif cause is None:
+                        cause = exc
                 if progress:
                     progress(
                         0.05 + 0.55 * completed / max(total_units, 1),
@@ -912,24 +933,30 @@ def review_medical_records(
             run_round(retry_targets)
 
     if failed:
-        labels = ", ".join(f"chunk {i}" for i in sorted(failed))
-        first_error = failed[sorted(failed)[0]][:200]
+        reason_exc = cause if cause is not None else failed[sorted(failed)[0]]
+        first_error = _failure_summary(reason_exc)
         logger.error(
-            "records review failed chunks=%s error=%s",
+            "records review failed chunks=%s error=%s fail_fast_chunks=%d",
             sorted(failed.keys()),
             first_error,
+            fail_fast_chunks,
             extra={
                 "request_id": rid,
                 "phase": "records:review",
                 "status": "error",
                 "chunks": len(failed),
-                "error_class": "LLMError",
+                "fail_fast_chunks": fail_fast_chunks,
+                "error_class": type(reason_exc).__name__,
             },
         )
+        # Cause first, then the advice for it, then the scale. The order is the
+        # whole point: this string is what the user reads in the red box, and a
+        # 2,000-page bundle fails as 300+ chunks, so leading with the labels pushed
+        # the actual error and its fix past the end of a ~2,300-character wall.
         raise LLMError(
-            f"Record review failed: could not digest {labels} after a retry "
-            f"({first_error}). Re-run the review; if it persists, split the record "
-            "set into smaller files."
+            f"Record review failed: {first_error}. "
+            f"{_digest_failure_advice(reason_exc, fail_fast_chunks=fail_fast_chunks)} "
+            f"{_failed_chunk_summary(failed, total_units)}"
         )
 
     # -------------------------------------------- collect facts in doc order
@@ -1047,6 +1074,91 @@ def review_medical_records(
             f"{pages:,} pages ({digest.chunks_reviewed} chunks).{unreadable_note}",
         )
     return digest
+
+
+# --------------------------------------------------- digest failure reporting
+
+# How many failed chunk indices the digest error names before eliding the rest.
+# Twelve is enough to show the spread across a multi-file bundle (the labels read
+# "chunk 7, chunk 88, chunk 143") while keeping the whole message readable.
+MAX_FAILED_CHUNK_LABELS = 12
+
+
+def _failed_chunk_summary(failed: Mapping[int, BaseException], total_units: int) -> str:
+    """How much of the record set failed, without letting the list dominate.
+
+    The count answers the question the label list used to: "is this one chunk or
+    the whole bundle?" The labels stay, capped, because they say *where* to look.
+    Chunks are listed by index across the whole run, so an ellipsis is not hiding
+    anything the user would act on differently.
+    """
+    indexes = sorted(failed)
+    shown = ", ".join(f"chunk {i}" for i in indexes[:MAX_FAILED_CHUNK_LABELS])
+    if len(indexes) > MAX_FAILED_CHUNK_LABELS:
+        shown += f", … (+{len(indexes) - MAX_FAILED_CHUNK_LABELS} more)"
+    return f"Chunks affected: {len(indexes)} of {total_units} ({shown})."
+
+
+def _failure_summary(exc: BaseException) -> str:
+    """One bounded line naming a failure: class first, then its message.
+
+    The class name leads because it is the token that appears in the log, in this
+    file, and in `TROUBLESHOOTING.md`, so a user quoting the message can be matched
+    to a documented cause. The length cap is the message's, not ours: a provider
+    error can be long, and the advice that follows it has to stay reachable.
+    """
+    return f"{type(exc).__name__}: {exc}"[:200]
+
+
+def _digest_failure_advice(exc: BaseException, *, fail_fast_chunks: int = 0) -> str:
+    """What the user should do about a failed digest, chosen from its cause.
+
+    The unconditional "split the record set into smaller files" was wrong for every
+    failure that size had nothing to do with, which is most of them: a rejected key
+    or an unusable model id fails identically on a one-page record. Worse, following
+    it costs the user real work (chopping a bundle) and changes nothing.
+    """
+    if isinstance(exc, CircuitBreakerOpenError):
+        return (
+            "The endpoint was already marked unhealthy when these chunks ran, so they were "
+            "refused without a request being sent — the real error is the one quoted above. "
+            "Resolve that and re-run; the record set does not need to be smaller."
+        )
+    if isinstance(exc, QueueFullError):
+        return (
+            "This app's own concurrent-call cap was reached, not the provider's. Re-run when "
+            "the queue is idle, or raise VA_LSE_MAX_CONCURRENT_LLM_CALLS / "
+            "VA_LSE_LLM_QUEUE_MAX_DEPTH for the load you are running."
+        )
+    status = getattr(exc, "status_code", None)
+    if isinstance(exc, LLMUpstreamError) and isinstance(status, int):
+        if 400 <= status < 500 and status != 429:
+            return (
+                f"The endpoint rejected the request (HTTP {status}), which retrying cannot fix: "
+                "check the base URL, API key and model names in the sidebar (use Test connection), "
+                "then re-run."
+            )
+        if status == 429:
+            return (
+                "The endpoint rate-limited these calls (HTTP 429) after their retries were spent. "
+                "Re-run shortly; if it recurs, lower VA_LSE_MAX_CONCURRENT_LLM_CALLS or split the "
+                "record set into smaller files."
+            )
+        return (
+            f"The endpoint returned HTTP {status}. Re-run; if it persists, split the record set "
+            "into smaller files."
+        )
+    if isinstance(exc, LLMTimeoutError):
+        return (
+            "These calls timed out. Re-run; if it recurs, raise "
+            "VA_LSE_LLM_CALL_TIMEOUT_SECONDS or split the record set into smaller files."
+        )
+    if fail_fast_chunks:
+        return (
+            "Some chunks were refused while the endpoint was marked unhealthy. Re-run; if it "
+            "persists, split the record set into smaller files."
+        )
+    return "Re-run the review; if it persists, split the record set into smaller files."
 
 
 def _file_coverage(doc: ExtractedDocument) -> dict[str, Any]:

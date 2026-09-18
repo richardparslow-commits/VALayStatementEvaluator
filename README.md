@@ -270,8 +270,11 @@ provider: the app checks `GET {base_url}/models` at startup and warns if `LLM_MO
 > Use **Test connection** (next to *Apply settings*) before a long run: it calls
 > `GET {base_url}/models` with the on-screen key/URL, reports the model count, and flags model
 > names the endpoint does not offer — a two-second check instead of a failed multi-minute run.
-> With no key in the environment, enter the key **and** the matching base URL, then click
-> *Apply settings*.
+> When the check fails it quotes the HTTP status and the provider's response body, and names
+> what that status means for this app: a `401`/`403` is the key and the endpoint belonging to
+> different providers, a `404` is a wrong path in the base URL, and no response at all is the
+> host or the network. With no key in the environment, enter the key **and** the matching base
+> URL, then click *Apply settings*.
 
 **Configuration can also come from Streamlit secrets.** Each value above is resolved
 **process environment → `.env` → `.streamlit/secrets.toml` → code default**, so a hosted
@@ -534,7 +537,16 @@ Streamlit would promote into the environment while parsing it. Streamlit's *conf
 files it does not empty but **pins**: the session reads the repository's committed
 `.streamlit/config.toml` and no other, so a `config.toml` in `~` cannot decide the
 options under test and the suite no longer reads different configuration depending on
-the directory it was launched from. The two `STREAMLIT_*` variables Streamlit honours
+the directory it was launched from. It also runs with `global.developmentMode` **false**,
+which Streamlit derives from the install *layout* rather than from anything configured:
+true whenever its package is not under a `site-packages` directory, so a source checkout,
+an editable install, or a vendored one reports true. That changes logger defaults — and
+with a port configured in any file it makes parsing raise, which under AppTest arrives as
+a dead runner thread rather than as the message: a `KeyError` about
+`$$STREAMLIT_INTERNAL_KEY_SCRIPT_RUN_WITHOUT_ERRORS`, or a bare `AppTest script run timed
+out`, with the real error only on stderr. Since the view tests are almost all
+AppTest-driven, that is the difference between the deployment's behaviour and a dozen
+view tests failing for no visible reason. The two `STREAMLIT_*` variables Streamlit honours
 (the options it marks "sensitive") are stripped like any other ambient name; note that
 the documented `STREAMLIT_SERVER_PORT`-style overrides are inert on 1.63.0 — see
 [Production hardening](#production-hardening-streamlit). A test that *needs* a value
@@ -793,7 +805,7 @@ VA_LSE_HEALTH_PORT=0 streamlit run run_app.py      # disable sidecar entirely
 
 | Guard | What it does | Defaults | Tuning |
 |---|---|---|---|
-| **Circuit breaker** | Counts *logical* LLM failures (a call that exhausts its 3 retries is one). After `VA_LSE_CB_FAILURE_THRESHOLD` consecutive failures it **opens**: every new `chat` fails fast with `CircuitBreakerOpenError` in <50 ms (no network, no retries), protecting the endpoint. After `VA_LSE_CB_RECOVERY_SECONDS` it enters `HALF_OPEN` and lets one probe through — success closes it, failure re-opens it. | `threshold=3`, `recovery=60s` | Lower the threshold for faster fail-fast; raise `recovery` on flaky gateways |
+| **Circuit breaker** | Counts *logical* LLM failures (a call that exhausts its 3 retries is one). After `VA_LSE_CB_FAILURE_THRESHOLD` consecutive failures it **opens**: every new `chat` fails fast with `CircuitBreakerOpenError` in <50 ms (no network, no retries), protecting the endpoint. After `VA_LSE_CB_RECOVERY_SECONDS` it enters `HALF_OPEN` and lets one probe through — success closes it, failure re-opens it. **The OPEN error quotes the failure that opened it** (via `record_failure(reason=…, retriable=…)`), and says whether retrying can help: a rejected key or an unusable model id is reported as a deterministic rejection rather than as "endpoint unavailable", because waiting cannot fix it. | `threshold=3`, `recovery=60s` | Lower the threshold for faster fail-fast; raise `recovery` on flaky gateways |
 | **Concurrency limiter** | Global semaphore (`VA_LSE_MAX_CONCURRENT_LLM_CALLS`, default `20`) caps simultaneous LLM calls across all threads/users. Extras queue; up to `VA_LSE_LLM_QUEUE_MAX_DEPTH=50` are queued and block up to `VA_LSE_LLM_QUEUE_TIMEOUT_SECONDS=30s`. Beyond either limit the call is rejected with `QueueFullError` (no retry). | `concurrent=20`, `queue=50`, `timeout=30s` | Raise `MAX_CONCURRENT` on higher-tier endpoints; raise `MAX_DEPTH` on bursty multi-user hosts |
 
 * Queue + breaker interact correctly: the breaker is checked **before** queuing (immediate fail-fast when open) and **again** after queuing (in case it opened while waiting). Queue-full or breaker rejections are **not** counted as endpoint failures. All breaker state changes (`CLOSED → OPEN`, `OPEN → HALF_OPEN`, `HALF_OPEN → CLOSED/OPEN`) log at `WARNING` with `phase=circuit_breaker`; queue-full/timeout log at `WARNING` with `phase=concurrency` — wire these to your alerting. `CircuitBreakerOpenError`/`QueueFullError` are re-exported from `app/llm.py` so callers can distinguish them from `LLMError`. Tests in `tests/test_circuit_breaker.py` cover the full state machine, the fail-fast <50 ms SLO, and the limiter queue off offline (no network).
@@ -1214,6 +1226,35 @@ is applied after every config file. Note where the file is resolved *from*: Stre
 looks in `~` and in the **working directory**, so starting the app outside the
 repository root silently drops this file — which is why the startup warning reads it by
 absolute path, and why the test session pins it (see [Tests](#tests)).
+
+One failure mode is worth knowing before anyone adds a port to this file. `server.port`
+cannot be set on an install Streamlit considers a *development* one — its own test is
+whether the package lives under a `site-packages` directory, so a source checkout,
+`pip install -e`, or a vendored/`--target` install qualifies — and it does not warn, it
+raises:
+
+```
+RuntimeError: server.port does not work when global.developmentMode is true.
+```
+
+The raise comes out of `get_config_options()`, so it stops the CLI (`streamlit config
+show`, `streamlit run`) and any library use before app code runs, and the *source* of the
+value makes no difference: a project config, a machine config, or the documented
+`--server.port` flag all trigger it. Reproduced on Streamlit 1.63.0 and 1.64.0 and
+reported upstream as [streamlit/streamlit#17031](https://github.com/streamlit/streamlit/issues/17031).
+This file pins no port for that reason, and `tests/test_hermetic.py` fails if one ever
+appears in it. The container's `--server.port=8501` (see
+[`DEPLOYMENT.md`](DEPLOYMENT.md)) is safe *only* because `requirements.lock` installs
+Streamlit into a `site-packages` directory — an image that vendored the package somewhere
+else would fail to start rather than ignore the flag. Locally, `--global.developmentMode
+false` gets past it, as does `[global] developmentMode = false` in a config file, though
+that option is hidden and it also turns off dev-mode conveniences such as `logger.level`
+defaulting to `debug`. In the **test suite** it does not look like that at all: AppTest's
+runner thread dies, so a run reports `KeyError: 'st.session_state has no key
+"$$STREAMLIT_INTERNAL_KEY_SCRIPT_RUN_WITHOUT_ERRORS"'` or a bare `AppTest script run timed
+out`, with the real cause only on stderr. `tests/hermetic.py` runs the session with the
+mode pinned to the deployment's and the config files pinned to this repository's, so
+neither a machine config nor an install layout can reach it (see [Tests](#tests)).
 
 Upload limits are also enforced in Python (`app/main.py:_check_upload_limits`) so the
 tight 50 MB per-file / 200 MB batch caps (`VA_LSE_MAX_UPLOAD_BYTES` /

@@ -2,12 +2,31 @@
 
 ## Error Message
 
+The message names the failure that *caused* the run to fail, which is not always
+the failure the breaker reported. A rejected request looks like this:
+
 ```
-Drafting failed: records:review: LLMError: Record review failed: could not digest
-chunk 1, chunk 2, ... chunk N after a retry (Circuit breaker 'llm' is OPEN — LLM
-endpoint temporarily unavailable. Failing fast to protect the endpoint (retry in 60s).
-After 3 consecutive failures the breaker opened for 60s.). Re-run the review; if it
-persists, split the record set into smaller files. (reference: req_xxxxx)
+Drafting failed: records:review: LLMError: Record review failed: LLMUpstreamError: LLM
+provider rejected the request — check model, endpoint, and payload settings.
+(AuthenticationError: Invalid API key; status=401). The endpoint rejected the request
+(HTTP 401), which retrying cannot fix: check the base URL, API key and model names in
+the sidebar (use Test connection), then re-run. Chunks affected: 328 of 328 (chunk 1,
+chunk 2, chunk 3, ...). (reference: req_xxxxx)
+```
+
+The message is ordered so the part that decides what you do comes first. The cause
+leads, its fix follows, and the affected chunks are summarised last — an earlier
+version listed every index up front, which on a large bundle pushed the real error
+past the end of the visible box.
+
+When the provider was failing for a reason of its own, the cause is quoted instead,
+and the advice asks you to wait rather than to change anything:
+
+```
+...LLMUpstreamError: Transient LLM provider error — retry may succeed.
+(status=503). The endpoint returned HTTP 503. Re-run; if it persists, split the
+record set into smaller files. Chunks affected: 12 of 328 (chunk 4, chunk 19, ...).
+(reference: req_xxxxx)
 ```
 
 The failure itself carries a **What happened?** expander holding the lines for that
@@ -34,14 +53,23 @@ aggressive retries during an outage.
 
 ## Immediate Actions
 
-### 1. Wait and Retry (Simplest)
+### 1. Act on the Cause the Message Names
 
-The circuit breaker auto-recovers after the recovery timeout (default 60s). Wait a
-minute and re-run your review.
+Read the quoted error before doing anything else. The breaker opening is usually a
+*consequence*: it counts consecutive failures and then refuses calls fast, so when a
+request is rejected every chunk after the first three reports the breaker instead of
+the rejection. Two kinds of cause behave differently:
 
-```bash
-# No action needed - just wait ~60 seconds and re-run
-```
+| Cause in the message | What it means | What to do |
+|---|---|---|
+| `status=401` / `403`, "rejected the request" | The endpoint refused the request — key, model id, or endpoint. No number of retries changes this | Fix the settings, then re-run. Waiting will not help |
+| `status=400` naming a model, against Perplexity's Router API | The model is not in the account's catalog. Router API is in **private preview** and the published catalog *is* the allowlist, so a correct-looking `perplexity/…` id can still be refused | Request Router access (api@perplexity.ai), or point the sidebar fields at a provider the key already serves. See `COMPATIBILITY.md` |
+| `status=429` | Rate-limited, and the call's own retries were already spent | Wait a little, lower `VA_LSE_MAX_CONCURRENT_LLM_CALLS`, then re-run |
+| `status=5xx`, timeouts, connection errors | A provider-side problem | Wait for the recovery timeout and re-run |
+| Nothing quoted — `fail_fast` only | The endpoint never answered during this run, and the breaker was already open when the first chunk ran | Wait for the recovery timeout, then re-run |
+
+Waiting a minute and re-running is correct for the transient causes and useless for
+the deterministic ones, so let the message decide rather than trying it first.
 
 ### 2. Check LLM Endpoint Health
 

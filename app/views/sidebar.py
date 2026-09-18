@@ -15,7 +15,7 @@ from .. import config
 from .. import watchdog
 from ..config import DEFAULT_BASE_URL, load_settings
 from ..error_report import report_failure
-from ..llm import check_model_availability
+from ..llm import ModelProbe, check_model_availability, probe_models
 from ..prompt_sanitize import validate_api_key, validate_model_name
 from .usage import load_usage_history, save_usage_history
 
@@ -553,17 +553,17 @@ def _test_connection_report(settings: Any) -> None:
         return
 
     with st.spinner("Checking the endpoint…"):
-        available = check_model_availability(base_url, api_key)
+        probe = probe_models(base_url, api_key)
 
-    if available is None:
+    if not probe.ok:
         st.error(
-            "Could not list models from "
-            f"`{base_url.rstrip('/')}/models`. Either the host is unreachable or it "
-            "rejected this key — the base URL and the API key must belong to the same "
-            "provider account, and to the same plan family: a Token Plan-issued key "
-            "only works against the Token Plan base URL)."
+            f"Could not list models from `{base_url.rstrip('/')}/models` — "
+            f"{probe.error}. "
+            f"{_probe_failure_advice(probe, base_url)}"
         )
         return
+
+    available = probe.models or set()
 
     missing = [
         m for m in (model_main, model_fast)
@@ -580,6 +580,44 @@ def _test_connection_report(settings: Any) -> None:
             f"Endpoint reachable — {len(available)} model(s) available, including "
             f"`{model_main}` and `{model_fast}`."
         )
+
+
+def _probe_failure_advice(probe: ModelProbe, base_url: str) -> str:
+    """What a failed model listing most likely means, chosen by its status.
+
+    The old message offered both possibilities at once ("unreachable *or* it
+    rejected this key"), which leaves the user to guess between two fixes that
+    have nothing to do with each other. The status picks one.
+
+    This is worth the words: it is the only screen where the user can fix a bad
+    key or endpoint in seconds, and every branch here exists because a real
+    deployment failed in that way.
+    """
+    if probe.status in {401, 403}:
+        return (
+            "The endpoint rejected this key. The API key and the base URL must belong "
+            "to the same provider account — a key issued by one provider (QwenCloud, "
+            "Perplexity, OpenAI) is rejected by another's endpoint. If the key is a "
+            "Perplexity key and the base URL ends in `/router/v1`, Router API is in "
+            "private preview and this account may not have access yet "
+            "(api@perplexity.ai to request it); a platform key that works on the "
+            "Agent API can still be refused here."
+        )
+    if probe.status == 404:
+        return (
+            f"`{base_url.rstrip('/')}/models` does not exist on that host. Check the "
+            "base URL *path* — Perplexity's Router API is "
+            "`https://api.perplexity.ai/router/v1`, and an OpenAI-compatible provider "
+            "usually ends in `/v1`."
+        )
+    if probe.status is not None and probe.status >= 500:
+        return "The provider is failing on its own side; try again shortly."
+    if probe.status is None:
+        return (
+            "No HTTP response arrived, so the host or the network is the problem rather "
+            "than the key: check the URL for typos and that this machine can reach it."
+        )
+    return "Check the base URL and the API key, then test again."
 
 
 def _compat_model_warning(settings: Any) -> None:

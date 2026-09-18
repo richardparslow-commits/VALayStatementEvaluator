@@ -40,7 +40,9 @@ __all__ = [
     "LLMParseError",
     "CircuitBreakerOpenError",
     "QueueFullError",
+    "ModelProbe",
     "check_model_availability",
+    "probe_models",
 ]
 
 MAX_RETRIES = 3
@@ -241,15 +243,37 @@ def _moderation_nudge_user(user: str) -> str | None:
     return user + _MODERATION_NUDGE_SUFFIX
 
 
-def check_model_availability(base_url: str, api_key: str) -> set[str] | None:
-    """GET {base_url}/models and return the set of model ids, or None on failure.
+class ModelProbe(NamedTuple):
+    """Outcome of a best-effort ``GET {base_url}/models`` check.
 
-    Best-effort only: any network, auth, or parse failure returns None so
-    callers can silently skip the availability warning. Without an API key
-    the check is not attempted. Uses only stdlib (urllib) so no extra deps.
+    ``models`` is ``None`` whenever the check did not produce a list, and
+    ``status``/``error`` say why. The status is the whole point: a rejected key
+    (401), a path that does not exist (404), and a host that does not resolve are
+    three different problems with three different fixes, and the previous
+    ``set | None`` collapsed them into one sentence that named none of them.
+
+    ``ok`` is defined on the presence of a model list, not on an HTTP status: a
+    host that answers 200 with something that is not a model list has still
+    failed this check.
+    """
+
+    models: set[str] | None
+    status: int | None
+    error: str
+
+    @property
+    def ok(self) -> bool:
+        return self.models is not None
+
+
+def probe_models(base_url: str, api_key: str) -> ModelProbe:
+    """GET {base_url}/models, reporting the model ids *or* why there are none.
+
+    Best-effort and never raises: callers decide how loud to be. Without an API
+    key the check is not attempted. Uses only stdlib (urllib) so no extra deps.
     """
     if not api_key or not api_key.strip():
-        return None
+        return ModelProbe(None, None, "no API key was supplied")
     url = base_url.rstrip("/") + "/models"
     try:
         import urllib.error
@@ -258,15 +282,53 @@ def check_model_availability(base_url: str, api_key: str) -> set[str] | None:
         req = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_key.strip()}"})
         with urllib.request.urlopen(req, timeout=MODELS_ENDPOINT_TIMEOUT_SECONDS) as resp:  # noqa: S310
             data = json.loads(resp.read().decode("utf-8"))
-        rows = data.get("data", []) if isinstance(data, dict) else []
-        ids: set[str] = set()
-        for row in rows:
-            mid = row.get("id") if isinstance(row, dict) else None
-            if isinstance(mid, str) and mid.strip():
-                ids.add(mid.strip())
-        return ids
-    except Exception:  # noqa: BLE001 - availability check is advisory only
-        return None
+    except Exception as exc:  # noqa: BLE001 - availability check is advisory only
+        return ModelProbe(None, _http_status(exc), _probe_error_text(exc))
+    rows = data.get("data", []) if isinstance(data, dict) else []
+    ids = {
+        row["id"].strip()
+        for row in rows
+        if isinstance(row, dict) and isinstance(row.get("id"), str) and row["id"].strip()
+    }
+    if not ids:
+        return ModelProbe(None, 200, f"{url} answered but published no model ids")
+    return ModelProbe(ids, 200, "")
+
+
+def _http_status(exc: BaseException) -> int | None:
+    """The HTTP status carried by a urllib failure, if it has one."""
+    code = getattr(exc, "code", None)
+    return code if isinstance(code, int) else None
+
+
+def _probe_error_text(exc: BaseException) -> str:
+    """One short line naming why the model listing failed."""
+    status = _http_status(exc)
+    reason = getattr(exc, "reason", None)
+    detail = str(reason if reason is not None else exc).strip()
+    if status is not None:
+        # HTTPError's own str() is just the status line, which says nothing the
+        # status does not; the *body* is where a provider explains itself, and it
+        # is what tells a rejected key apart from a path that does not exist.
+        body = ""
+        read = getattr(exc, "read", None)
+        if callable(read):
+            try:
+                body = read().decode("utf-8", "replace").strip()
+            except Exception:  # noqa: BLE001 - the body is a bonus, not the diagnosis
+                body = ""
+        return f"HTTP {status}: {(body or detail)[:200]}"
+    return f"{type(exc).__name__}: {detail}"[:200]
+
+
+def check_model_availability(base_url: str, api_key: str) -> set[str] | None:
+    """The model ids at ``GET {base_url}/models``, or ``None`` on any failure.
+
+    Advisory-only wrapper over :func:`probe_models`, kept because callers that
+    only want the warning-suppression behaviour should not have to unpack a
+    reason they are not going to show anyone.
+    """
+    return probe_models(base_url, api_key).models
 
 
 def _validate_fallback_settings(settings: Settings) -> None:
@@ -518,6 +580,18 @@ def _normalize_provider_error(exc: Exception) -> LLMError:
 
 def _retry_backoff_seconds(attempt: int) -> float:
     return min(MAX_RETRY_BACKOFF_SECONDS, RETRY_BACKOFF_SECONDS * (2.0 ** attempt))
+
+
+def _failure_reason(error: BaseException | None) -> str:
+    """One bounded line naming a failure for the breaker's OPEN message.
+
+    The class name is kept because it is the part that survives grepping the docs
+    and the log (``LLMUpstreamError`` vs ``LLMTimeoutError``), and the message is
+    already user-facing, so nothing here is withheld from it.
+    """
+    if error is None:
+        return ""
+    return f"{type(error).__name__}: {error}"
 
 
 class LLMClient:
@@ -911,7 +985,13 @@ class LLMClient:
                         },
                     )
                     if is_last and not nudge_next:
-                        breaker.record_failure()
+                        # Hand the breaker the *reason*, not just the count: while
+                        # OPEN it raises its own message, and a generic "endpoint
+                        # unavailable" misreports a rejected key or an unusable
+                        # model id — failures that never reach the model at all.
+                        breaker.record_failure(
+                            reason=_failure_reason(normalized), retriable=retriable
+                        )
                         # The logical failed call is recorded *here* as well as after
                         # the loop. A deterministic failure (bad key, moderation
                         # filter) raises from inside the loop, so recording only at
@@ -930,7 +1010,10 @@ class LLMClient:
                         if not nudge_next:
                             wait_with_cancellation(_retry_backoff_seconds(attempt))
             # Exhausted retries — counts as one logical failure for the breaker.
-            breaker.record_failure()
+            breaker.record_failure(
+                reason=_failure_reason(last_error),
+                retriable=bool(getattr(last_error, "retriable", True)),
+            )
             metrics.observe_llm_call(
                 phase, "error", int((time.perf_counter() - t0) * 1000), endpoint=endpoint
             )
