@@ -1031,6 +1031,14 @@ record (`request_id`), appended to every user-facing error as `reference: req_�
 correlation, and never carries PII — logs emit only phases, timings, counts, and classifications
 (prompt/response bodies, statements, observations, and record text are excluded).
 
+- **`app/diagnostics.py`** — resolves a reference to the lines behind it, so "what happened to my run?"
+  is answerable without a shell on the pod: `About → Look up a reference` takes the id (or the whole
+  error message) and returns the run-log events plus the log lines, with secrets scrubbed. It reads
+  two sources because one run can span two processes — a bounded in-process capture buffer installed
+  by `configure_logging()` (the only source when the app is stdout-only) and the shared `runs.jsonl`
+  written by workers too. Deliberately **not** an HTTP route: the health sidecar binds `0.0.0.0`
+  without authentication, so a lookup there would publish log content to anything that can reach the
+  port. The user's own session is the authorization.
 - **`app/error_report.py`** — the one path a failure takes to become text a user reads:
   `report_failure()` logs it (with a traceback when there is one) and returns the message with
   `reference: req_…` appended, minting an id when none is active so the reference always resolves to
@@ -1066,6 +1074,8 @@ Configure via env (see `.env.example`): `VA_LSE_LOG_LEVEL`, `VA_LSE_LOG_JSON` (J
 When the Draft tab shows `Drafting failed: ... (reference: req_...)`, keep the reference id and
 look it up in the structured logs:
 
+- **In the app:** `About → 🔎 Look up a reference`, which resolves the id (or the whole error
+  message) to its run-log events and log lines. Needs no shell on the server.
 - Diagnostic log: `${VA_LSE_LOG_DIR:-stdout}/app.log`
 - Audit trail: `${VA_LSE_AUDIT_LOG_DIR:-logs}/audit.log`
 
