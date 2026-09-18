@@ -104,11 +104,37 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends git curl ripgrep less procps && \
     rm -rf /var/lib/apt/lists/*
 
+# OCR, because this box is the only image in this project that may have it. The
+# app has no OCR dependency and never shells out (scripts/ocr_records.py says
+# why): a page that is a scan has no text to extract, so the app counts it and
+# asks the operator to OCR the file and upload it again. Records from a portal
+# are routinely image-only pages, so that is a real gap, and it is closed here —
+# in the box that already exists to run untrusted documents — instead of in the
+# deployment image, which must not grow a PDF renderer and an OCR engine.
+#   tesseract-ocr, tesseract-ocr-eng  the engine, and the language data it needs
+#                                    (--no-install-recommends would otherwise
+#                                    install Tesseract with no language at all)
+#   poppler-utils                    `pdftoppm`, the fallback backend's rasteriser
+#   ghostscript, qpdf                what ocrmypdf requires at runtime
+# scripts/ocr_and_extract.py is the entrypoint that uses them, and
+# `python -m tests.test_sandbox_image` checks this list from inside the image.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        tesseract-ocr tesseract-ocr-eng poppler-utils ghostscript qpdf && \
+    rm -rf /var/lib/apt/lists/*
+
 # The dev extras, in the same order CI installs them (lock first, then these —
 # see .github/workflows/test.yml). Additive: the lock's pins already satisfy
 # requirements.txt's floors, so this brings in mypy/boto3/pyyaml/OpenTelemetry
 # and moves nothing that CI proved.
 RUN pip install --no-cache-dir -r requirements-dev.txt
+
+# `ocrmypdf` — the preferred backend, because it adds a text layer and leaves the
+# original pages looking like the records — at the floor requirements-local.txt
+# sets for it. Deliberately *not* that whole file: its other entry is Playwright
+# for the VA.gov download, which needs a browser and a human for the ID.me SMS
+# code, so it is not something a box can finish without someone at the keyboard.
+RUN pip install --no-cache-dir "ocrmypdf>=16.0"
 
 # Everything the offline suite reads off the filesystem, so
 # `python -m unittest discover -s tests` is green in a fresh sandbox: the tests

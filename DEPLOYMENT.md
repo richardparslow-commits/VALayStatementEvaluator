@@ -628,7 +628,10 @@ workspace needs:
 FROM runtime AS sandbox
 USER root                                        # a clone must be writable
 RUN apt-get install -y git curl ripgrep less procps
+RUN apt-get install -y tesseract-ocr tesseract-ocr-eng poppler-utils \
+                       ghostscript qpdf          # the OCR toolchain (below)
 RUN pip install -r requirements-dev.txt          # mypy, boto3, pyyaml, otel
+RUN pip install "ocrmypdf>=16.0"                 # requirements-local.txt's floor
 COPY tests/ scripts/ deploy/ nginx/ examples/ ./
 # ... plus every root page, .github/workflows, pyproject.toml, docker-compose.yml
 RUN git init && git add -A && git commit -m "baseline"   # so `git status` is usable
@@ -636,11 +639,17 @@ ENV VA_LSE_HEALTH_HOST=127.0.0.1                 # see §7
 CMD ["streamlit", "run", "run_app.py", "--server.address=0.0.0.0"]
 ```
 
-Three things about it are deliberate and easy to get wrong by hand:
+Four things about it are deliberate and easy to get wrong by hand:
 
 * **A custom image, not a managed one.** The managed sandbox images ship Python
-  3.14; this lock has no 3.14 wheel for several of its pins (`jiter==0.17.0` is
-  the first refusal), so they cannot install the set CI proves.
+  3.14, and this lock's hash-pinned set does not install there: resolution stops
+  at `httptools==0.8.0`, whose cp314 wheel exists on PyPI but is not among the
+  hashes the lock carries (measured with `pip install --dry-run
+  --require-hashes --only-binary=:all: --python-version 3.14 --platform
+  manylinux_2_39_x86_64 --implementation cp --abi cp314 -r requirements.lock`).
+  `jiter==0.17.0`, which this note used to name as the first refusal, carries a
+  cp314 wheel hash and resolves on 3.14 — so the pin named here has to be the one
+  that actually refuses, or the next reader checks the wrong package.
 * **No `--server.port`.** 8501 is already Streamlit's default, and a *set* port is
   fatal when Streamlit resolves as a development-layout install —
   `server.port does not work when global.developmentMode is true` — which is what
@@ -649,6 +658,25 @@ Three things about it are deliberate and easy to get wrong by hand:
 * **`VA_LSE_HEALTH_HOST=127.0.0.1`.** Sandbox ports are published as public URLs
   and the sidecar's routes carry no authentication (§7), so the image keeps it on
   loopback; publish `8001` *and* override this only if you mean to.
+* **OCR tooling, and only here.** The app deliberately has no OCR dependency and
+  never shells out (`scripts/ocr_records.py`), so a page that is a scan is counted
+  and reported, never read — records from a portal are routinely half scans, so
+  that is a real gap, and the box is where it closes. `scripts/ocr_and_extract.py`
+  is the entrypoint: it OCRs every image-only page in a bundle, then extracts with
+  the app's own reader **under the original file names** (citations have to point
+  at the record the user has, not at `.ocr.pdf`) and writes the queue's document
+  JSON for the app to consume:
+
+  ```bash
+  python scripts/ocr_and_extract.py /work/records --out /work/bundle.json
+  # --report-only        say which pages need OCR, change nothing
+  # --no-ocr             reproduce what the app sees today (all scans unreadable)
+  ```
+
+  Exit codes: `0` extracted, `1` no record files found, `2` scans present and no
+  OCR tooling installed, `3` bad input or nothing extractable. Nothing here is
+  installed in the `runtime` stage — `tests/test_sandbox_image.py` fails if the
+  deployment image grows a PDF renderer or an OCR engine.
 
 ```bash
 # Build and push it to Vercel Container Registry, then boot a sandbox from it
@@ -659,7 +687,9 @@ sandbox create --name va-lse-dev --image va-lse-sandbox:latest \
 ```
 
 `tests/test_sandbox_image.py` asserts this contract (the stage, root, the dev
-extras, git, the copied files) because no CI job builds an image.
+extras, OCR tooling, git, the copied files) because no CI job builds an image,
+and `tests/test_ocr_and_extract.py` covers the entrypoint's decisions with the OCR
+engine faked — the binaries are not installed in CI and must not be required.
 
 ### Multi-stage variant (smaller image, optional)
 

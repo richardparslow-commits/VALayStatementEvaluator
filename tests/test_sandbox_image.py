@@ -77,12 +77,22 @@ class TestSandboxStageIsAnAgentWorkspace(SandboxImageTestCase):
         """A workspace that cannot be written to is not a workspace."""
         self.assertEqual(self.last_user(self.sandbox), "root")
 
-    def test_it_installs_the_dev_extras_after_the_lock(self) -> None:
+    def test_its_pip_installs_are_additive_to_the_lock(self) -> None:
+        """Every install here adds to the lock, and none of them move it.
+
+        The lock is installed by the inherited stage *before* anything below runs,
+        which is what makes the extras additive instead of an unpinned upgrade: a
+        `--require-hashes` line here would re-pin the runtime's set, and an
+        `--upgrade` would change the packages CI proved. A second install is
+        expected — the OCR engine is not a test tool, so it gets its own line (and
+        its own cache layer) rather than riding along with ``requirements-dev.txt``.
+        """
         installs = [i for i in self.sandbox if i.startswith("RUN pip install")]
-        self.assertEqual(len(installs), 1)
-        self.assertIn("requirements-dev.txt", installs[0])
-        # The lock is installed by the inherited stage *before* this runs, which is
-        # what makes the extras additive instead of an unpinned upgrade.
+        self.assertTrue(installs, "this stage installs nothing at all")
+        joined = " ".join(installs)
+        self.assertIn("requirements-dev.txt", joined)
+        self.assertNotIn("--require-hashes", joined)
+        self.assertNotIn("--upgrade", joined)
         self.assertTrue(
             any("requirements.lock" in i and "--require-hashes" in i for i in self.runtime)
         )
@@ -153,6 +163,9 @@ class TestSandboxCarriesWhatTheSuiteReads(SandboxImageTestCase):
         ".dockerignore",
         # sample inputs for a manual run
         "examples",
+        # the OCR floor the sandbox stage installs by hand is this file's, so the
+        # box can be compared against the local instructions without a network
+        "requirements-local.txt",
     )
 
     def test_every_required_path_is_in_the_image(self) -> None:
@@ -201,6 +214,44 @@ class TestSandboxCarriesWhatTheSuiteReads(SandboxImageTestCase):
         self.assertEqual(stale, [], "these COPY sources match nothing on disk: " + ", ".join(stale))
 
 
+class TestTheSandboxCanReadAScan(SandboxImageTestCase):
+    """OCR is the reason this stage has a job the app cannot do.
+
+    The app has no OCR dependency and never shells out, so an image-only page is
+    counted and reported, never read (``scripts/ocr_records.py``). The sandbox is
+    the machine that can read it, which makes the tooling and the entrypoint part
+    of the image's contract rather than a convenience — and the *deployment* image
+    must not gain either (see ``TestTheDeploymentImageIsUnchanged``).
+    """
+
+    BINARIES = ("tesseract-ocr", "tesseract-ocr-eng", "poppler-utils", "ghostscript", "qpdf")
+
+    def test_the_ocr_binaries_are_installed(self) -> None:
+        apt = " ".join(i for i in self.sandbox if i.startswith("RUN apt-get"))
+        missing = [tool for tool in self.BINARIES if tool not in apt]
+        self.assertEqual(
+            missing,
+            [],
+            "scripts/ocr_records.py calls these: " + ", ".join(missing),
+        )
+
+    def test_ocrmypdf_is_installed_and_the_preferred_backend_survives(self) -> None:
+        """The fallback (poppler + tesseract) works without it, but ocrmypdf is the
+        one that keeps the original pages, so its absence must be a choice."""
+        installs = " ".join(i for i in self.sandbox if i.startswith("RUN pip install"))
+        self.assertIn("ocrmypdf", installs)
+
+    def test_the_entrypoint_is_carried(self) -> None:
+        self.assertTrue(
+            self.carries("scripts/ocr_and_extract.py"),
+            "the box installs OCR tooling but carries nothing that uses it",
+        )
+
+    def test_the_entrypoint_exists_and_names_that_file(self) -> None:
+        """A renamed entrypoint must fail here, not inside a sandbox."""
+        self.assertTrue((PROJECT_ROOT / "scripts" / "ocr_and_extract.py").is_file())
+
+
 class TestTheDeploymentImageIsUnchanged(SandboxImageTestCase):
     def test_it_stays_non_root(self) -> None:
         self.assertEqual(self.last_user(self.runtime), "nobody")
@@ -210,6 +261,16 @@ class TestTheDeploymentImageIsUnchanged(SandboxImageTestCase):
             any("requirements-dev" in i for i in self.runtime),
             "the deployed image carries no test tooling — that is a deliberate choice",
         )
+
+    def test_it_does_not_grow_an_ocr_engine(self) -> None:
+        """The deployment must not carry a PDF renderer and an OCR engine: it has
+        no code path that would call them, and the app's own docs say OCR happens
+        before the upload. The sandbox stage is where they belong."""
+        apt = " ".join(i for i in self.runtime if i.startswith("RUN apt-get"))
+        for tool in ("tesseract", "poppler", "ghostscript", "qpdf"):
+            self.assertNotIn(tool, apt, f"the deployed image now installs {tool}")
+        installs = " ".join(i for i in self.runtime if i.startswith("RUN pip install"))
+        self.assertNotIn("ocrmypdf", installs)
 
     def test_it_does_not_carry_the_tests_or_scripts(self) -> None:
         for path in ("tests", "scripts"):
