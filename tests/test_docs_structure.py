@@ -19,6 +19,7 @@ from __future__ import annotations
 import re
 import unittest
 from pathlib import Path
+from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 

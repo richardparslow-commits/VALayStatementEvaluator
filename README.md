@@ -71,11 +71,17 @@ scripts/
                           (see TROUBLESHOOTING.md → *Split Large Record Sets*)
   ocr_records.py          Add a text layer to a scanned record PDF so the app can
                           read its pages (see *Scanned pages and OCR* below)
+  ocr_and_extract.py      OCR a whole record bundle and extract it with the app's
+                          own reader, emitting the queue's document JSON — the
+                          sandbox image's entrypoint (see DEPLOYMENT.md §6)
   va_records_download.py  Walk VA.gov's records-download wizard locally (you sign
                           in); writes a provenance manifest beside the PDF
 tests/                    Offline unit tests (no API key required)
 examples/                 Fictional sample statement + sample medical records
-Dockerfile                Production container image (non-root, hash-pinned deps)
+Dockerfile                Two targets: `runtime` (the production container image,
+                          non-root, hash-pinned deps) and `sandbox` (an agent/dev
+                          workspace as root, with tests and scripts; see
+                          DEPLOYMENT.md §6)
 docker-compose.yml        Multi-instance: 3 Streamlit replicas + nginx (Pattern A);
                           `--profile pattern-c` adds Redis, a worker, and the shared
                           blob volume
@@ -179,6 +185,9 @@ installs on macOS and Linux CI.
 | `LLM_MODEL_MAIN_FALLBACK` / `LLM_MODEL_FAST_FALLBACK` | The fallback provider's model names for the two roles | primary models |
 | `LLM_ENDPOINT_FALLBACK_TIMEOUT_SECONDS` | How long the primary must fail before failover engages (a grace period, not an HTTP timeout) | `300` |
 | `VA_LSE_MAX_RECORD_PAGES` | Max total pages across uploaded record files | `5000` |
+| `VA_LSE_EXTRACTOR` | Where record text is read: `in-process` (this app's reader) or `sandbox` (the box, which can OCR a scan) | `in-process` |
+| `VA_LSE_EXTRACTOR_RUNNER` | Command that runs `scripts/ocr_and_extract.py` in the box, with `{work}` for the staged directory; stdout must end with its report JSON | (empty = in-process) |
+| `VA_LSE_EXTRACTOR_TIMEOUT_SECONDS` | Ceiling for one file's box work (never past the run's own budget) | `900` |
 | `VA_LSE_JOB_QUEUE` | Run Evaluate/Draft on worker pods instead of in-process (Pattern C) | `0` |
 | `VA_LSE_REDIS_URL` | Redis backend for the job queue | (empty) |
 | `VA_LSE_JOB_QUEUE_TTL_SECONDS` | How long a finished job's payload/result is kept | `86400` |
@@ -215,7 +224,7 @@ installs on macOS and Linux CI.
 | `VA_LSE_ALLOW_LOCAL_PATHS` | Explicitly enable local folder/file imports (`1`) for trusted single-user use only; keep unset or `0` on hosted/shared deployments | `0` (disabled) |
 | `VA_LSE_CREDITS_PER_1M_MAIN` | Approx credits per 1M tokens for the main model (enables the credit-burn gauge) | (unset — gauge shows tokens/calls only) |
 | `VA_LSE_CREDITS_PER_1M_FAST` | Approx credits per 1M tokens for the fast model (enables the credit-burn gauge) | (unset — gauge shows tokens/calls only) |
-| `VA_LSE_CREDIT_QUOTA` | Your plan's weekly credit quota, used to render %-of-quota burn | `2500` |
+| `VA_LSE_CREDIT_QUOTA` | Your plan's weekly allowance (in whatever unit the rates above use), to render %-of-quota burn | (unset — burn renders without a percentage) |
 | `VA_GOV_API_BASE_URL` | HTTPS base URL for the VA.gov record-retrieval API. Leave unset to run VA.gov auth/fetch in mock mode. | empty (mock mode) |
 | `FRONTEND_URL` | App origin for CORS allowlisting. Unused today (single-origin Streamlit app); documented for deploy-harness forward compatibility. | empty |
 | `AGILOOP_INSPECT_API_KEY` | Server-side Agiloop Inspect telemetry API key. Leave unset (with `AGILOOP_PROJECT_ID`) to run telemetry in mock/no-op mode. | empty (mock mode) |
@@ -233,6 +242,7 @@ installs on macOS and Linux CI.
 | `VA_LSE_LLM_QUEUE_MAX_DEPTH` | Max queued callers waiting for a concurrency slot | `50` |
 | `VA_LSE_LLM_QUEUE_TIMEOUT_SECONDS` | Seconds a queued caller waits before `QueueFullError` | `30` |
 | `VA_LSE_HEALTH_PORT` | Sidecar health server port (`0` disables `GET /health` & `GET /ready`) | `8001` |
+| `VA_LSE_HEALTH_HOST` | Interface the sidecar binds to. Set `127.0.0.1` where that port is published to the internet (a Vercel Sandbox, a forwarded dev port) — `/health`, `/ready` and `/metrics` carry no authentication | `0.0.0.0` |
 | `VA_LSE_AUDIT_LOG_DIR` | Directory for the separate `audit.log` JSON stream (audit trail, distinct from `VA_LSE_LOG_DIR`) | `logs` (or `VA_LSE_LOG_DIR` when set) |
 | `VA_LSE_AUDIT_LOG_FILE` | Filename inside `VA_LSE_AUDIT_LOG_DIR` | `audit.log` |
 | `VA_LSE_AUDIT_LOG_MAX_BYTES` | Rotate size per audit log file (bytes) | `10485760` (10 MiB) |
@@ -276,6 +286,28 @@ provider: the app checks `GET {base_url}/models` at startup and warns if `LLM_MO
 > host or the network. With no key in the environment, enter the key **and** the matching base
 > URL, then click *Apply settings*.
 
+### Before a run starts: the endpoint preflight
+
+Pressing **Draft the statement** or **Run exhaustive evaluation** first checks that the
+configured endpoint can serve the configured models — one `GET {base_url}/models` request, no
+model call. A run that cannot possibly work therefore costs a second instead of the first
+minutes of a bundle, which is the failure this was built for: a rejected key or an unusable
+model id fails *every* chunk identically, and the run only says so after the chunks have been
+paid for.
+
+It stops the run in two cases, both unambiguous: the endpoint lists models and one of the
+configured names is not among them, or the endpoint rejects the key (`401`/`403`). Everything
+else is **reported but allowed** — a host that does not answer, a provider that serves
+completions without listing models (`404`), a provider-side `5xx`. Refusing to start a working
+run is worse than the failure this prevents, so an inconclusive check never blocks.
+
+The block appears above the run button with the reason and the fix, plus an expander to run
+anyway: some OpenAI-compatible servers answer `/models` differently than they serve
+completions, and a catalog can lag what a provider actually serves. A waiver applies to that
+exact endpoint + key + model set; changing any of them asks you again. The decision is logged
+(`phase=endpoint_preflight`) and the refusal is a `rejected` run-log event, so the failure
+detail panel resolves it like any other.
+
 **Configuration can also come from Streamlit secrets.** Each value above is resolved
 **process environment → `.env` → `.streamlit/secrets.toml` → code default**, so a hosted
 deployment — where `.env` is git-ignored and never ships — is configured entirely from the
@@ -302,18 +334,19 @@ Every run shows a live usage line in the progress caption and, after completion,
 draft/review on the Draft tab). Token counts are estimates based on prompt length and model
 output, using the provider's reported usage when the endpoint supplies it.
 
-Because QwenCloud Token Plan doesn't publish a fixed credits-per-1M-token rate, you can provide
-it two ways:
+Because providers don't publish a fixed credits-per-1M-token rate (QwenCloud Token Plan's
+changes; Perplexity bills per token in USD), you can provide one two ways:
 
 1. **Set explicit rates** — `VA_LSE_CREDITS_PER_1M_MAIN` and `VA_LSE_CREDITS_PER_1M_FAST` to
-   your plan's effective rates (explicit values always win), plus `VA_LSE_CREDIT_QUOTA` if your
-   quota differs from the 2,500-credit Lite default.
+   your plan's effective rates (explicit values always win), plus `VA_LSE_CREDIT_QUOTA` for
+   your plan's weekly allowance if you want a percentage rather than a raw estimate.
 2. **Let the watchdog learn it** (default). Every finished run persists its per-role token totals
    (main vs fast model) to a git-ignored `usage_history.json`. In the sidebar's **Usage watchdog**
-   panel, enter the plan's cumulative "credits used" reading from the QwenCloud console each time
-   after a run. With readings separated by new runs, the app fits a **separate credits-per-1M rate
-   per model** by least squares over the calibration intervals (falling back to one blended rate
-   when the data can't separate them), and uses those rates for the credit-burn estimate.
+   panel, enter your provider console's cumulative units-used reading (QwenCloud Token Plan
+   credits, a pay-per-token provider's spend) each time after a run. With readings separated by
+   new runs, the app fits a **separate units-per-1M rate per model** by least squares over the
+   calibration intervals (falling back to one blended rate when the data can't separate them), and
+   uses those rates for the credit-burn estimate.
 
 The estimator is purely informational — it never limits or throttles a run.
 
@@ -514,6 +547,8 @@ the pipeline (no API calls) to verify orchestration at scale. Ingest quality is 
 ```bash
 python -m unittest discover -s tests -v        # offline unit tests (incl. health probes)
 python -m tests.hostile                        # …the same suite, with every knob hostile
+pip install --target /tmp/sl-dev --no-deps -U streamlit   # a developer's install layout (no site-packages)
+PYTHONPATH=/tmp/sl-dev python -m tests.devlayout          # …the same suite, run in it
 pip install -U streamlit && python -m unittest discover -s tests    # …on the newest Streamlit
 python -m mypy app                             # strict type check (see pyproject.toml)
 python scripts/smoke_test.py all               # live end-to-end (needs valid .env)
@@ -546,7 +581,10 @@ a dead runner thread rather than as the message: a `KeyError` about
 `$$STREAMLIT_INTERNAL_KEY_SCRIPT_RUN_WITHOUT_ERRORS`, or a bare `AppTest script run timed
 out`, with the real error only on stderr. Since the view tests are almost all
 AppTest-driven, that is the difference between the deployment's behaviour and a dozen
-view tests failing for no visible reason. The two `STREAMLIT_*` variables Streamlit honours
+view tests failing for no visible reason. The pin is exercised in CI against a real
+non-`site-packages` install — the `dev-layout` job below — rather than only against the
+simulation the in-suite guard can build, because a simulation that has drifted from what
+it simulates passes while testing nothing. The two `STREAMLIT_*` variables Streamlit honours
 (the options it marks "sensitive") are stripped like any other ambient name; note that
 the documented `STREAMLIT_SERVER_PORT`-style overrides are inert on 1.63.0 — see
 [Production hardening](#production-hardening-streamlit). A test that *needs* a value
@@ -557,7 +595,11 @@ opposite is invisible in both directions: a test can pass locally and fail in CI
 reverse) for no reason the code can explain. `tests/test_hermetic.py` enforces it, and
 fails if a test module forgets the harness, imports it after the app, if the app starts
 reading a Streamlit config option, or if the suite stops ignoring a deliberately hostile
-environment, secrets file, or machine-scoped config file.
+environment, secrets file, or machine-scoped config file. The commit hook runs the same
+harness rule over the *staged* modules (`tests/harness_imports.py`, so the two cannot
+disagree), because the scan can only see a branch that is already merged: a new test module
+that forgets the harness reached `main` once and failed in CI, on a merge result, one module
+late and unreproducible locally. See [Preventing accidental commits](SECURITY.md#6-preventing-accidental-commits).
 
 CI runs the whole suite that way as its own check — the `hermetic` job, which is
 `python -m tests.hostile` above, using the same fixtures the in-suite canaries use
@@ -565,7 +607,20 @@ CI runs the whole suite that way as its own check — the `hermetic` job, which 
 with a future test therefore fails the build, instead of surfacing later as a mystery
 on somebody else's machine.
 
-A second scheduled job watches the *dependency* rather than the diff: `streamlit-latest`
+A second job exercises the *install layout* rather than the diff: `dev-layout` installs the
+version `requirements.lock` pins **outside** `site-packages` — `pip install --target`, with
+`PYTHONPATH` pointing at it — and runs the whole suite there. The in-suite guard for that pin
+has to simulate the layout (it writes the option's value before anything parses, because a
+test process cannot reinstall Streamlit), and this is the other half: `tests/devlayout.py`
+refuses to continue unless the install really is a development layout and the pin really
+holds in it, printing the install it measured as it goes. That refusal is also the sensor for
+drift — if Streamlit ever derives the mode from something else, the job says so instead of
+the simulated guard quietly asserting about a layout that no longer exists. It pins the locked
+version deliberately (`--no-deps`, so the lock still supplies Streamlit's dependencies): the
+variable is the layout, so a red run has one explanation. It gates on every push and PR,
+because it is the pin's only exercise against a real install.
+
+A third job watches the *dependency* rather than the diff: `streamlit-latest`
 (weekly Monday, plus manual dispatch) installs the newest Streamlit on top of
 `requirements.lock` — upgrading only what the new release requires, so the lock still
 pins the rest — and runs the same offline suite. The lock is what makes it necessary: a
@@ -752,6 +807,15 @@ writes a **new** file (never the input) and re-reads it to confirm how many page
 text. Upload the `.ocr.pdf` and leave the original where it is. Exit codes: `0` wrote a copy,
 `1` nothing to do, `2` no OCR tooling installed, `3` bad input or refused to overwrite.
 
+If you are working in the sandbox image (`DEPLOYMENT.md` §6), none of that install is needed:
+the box ships Tesseract, Poppler, Ghostscript, qpdf and `ocrmypdf`, and
+`scripts/ocr_and_extract.py` does the whole bundle at once — OCR every scan, then extract with
+the app's own reader, under the original file names:
+
+```bash
+python scripts/ocr_and_extract.py /work/records --out /work/bundle.json
+```
+
 `scripts/va_records_download.py` also inspects what it just downloaded — page count,
 text-vs-image balance, sha256 — prints a warning when the export is implausibly small or mostly
 scans, and writes `<file>.pdf.manifest.json` recording the selections it clicked (date range,
@@ -760,7 +824,8 @@ record type, file type). Keep it with the PDF: it is the provenance record for a
 ## Health checks (container orchestration)
 
 A stdlib-only sidecar (`app/health.py`, started from `run_app.py` before Streamlit) exposes two
-orchestrator-friendly probes on `0.0.0.0:$VA_LSE_HEALTH_PORT` — no extra dependencies:
+orchestrator-friendly probes on `$VA_LSE_HEALTH_HOST:$VA_LSE_HEALTH_PORT` (default
+`0.0.0.0:8001`) — no extra dependencies:
 
 | Endpoint | Meaning | Status | Latency |
 |---|---|---|---|
@@ -784,6 +849,8 @@ curl -s -w "%{http_code}\n" http://localhost:8001/ready
 # Change or disable the sidecar
 VA_LSE_HEALTH_PORT=9001 streamlit run run_app.py   # different port
 VA_LSE_HEALTH_PORT=0 streamlit run run_app.py      # disable sidecar entirely
+# Keep an internet-published port from reaching the sidecar
+VA_LSE_HEALTH_HOST=127.0.0.1 streamlit run run_app.py
 ```
 
 - **Liveness** never touches the LLM gateway — it is `200` as soon as the Python process starts.
@@ -791,6 +858,13 @@ VA_LSE_HEALTH_PORT=0 streamlit run run_app.py      # disable sidecar entirely
   handler always meets the < 2 s SLO even when the LLM gateway is slow. Missing `OPENAI_API_KEY`,
   missing `OPENAI_BASE_URL`, or any network/auth/parse failure → `503` with a short `detail` (no
   key leaked). Callers should treat `503` as "not ready, keep out of the load-balancer pool."
+- **The bind address is the sidecar's only access control.** All three routes are unauthenticated by
+  design — a kubelet cannot present a bearer token — so the default `0.0.0.0` assumes the port is
+  reachable only from a private network (a Docker network, a cluster Service). Where the port is
+  instead *published to the internet* — a Vercel Sandbox, a forwarded dev port, a laptop on an
+  untrusted network — set `VA_LSE_HEALTH_HOST=127.0.0.1`: probes from the same host keep working
+  (`curl localhost:8001/health`), and anyone who finds the URL gets a connection refusal rather than
+  your metrics. The `sandbox` image target does this for you (see [DEPLOYMENT.md §6](DEPLOYMENT.md#6-dockerfile)).
 - **Kubernetes / Agiloop / Docker Swarm** — point `livenessProbe` at `httpGet: path:/health port:8001`
   and `readinessProbe` at `httpGet: path:/ready port:8001` (adjust `port` if you override
   `VA_LSE_HEALTH_PORT`). Example hints for a `Deployment` are in the docstring of `app/health.py`.
@@ -1290,6 +1364,6 @@ with your proxy if the stream is TLS-terminated there.
 
 - **Streamlit hardening:** `.streamlit/config.toml` (committed) sets XSRF, toolbar, and `maxUploadSize`; missed config triggers a startup warning (see Production hardening above).
 - **Secrets are never committed.** `.env`, `.env.local`, `.env.*.local`, and `.streamlit/secrets.toml` are git-ignored (see `SECURITY.md`). Rotate keys after any leak. On a hosted deployment without `.env`, inject secrets through the platform (Streamlit *Settings → Secrets*, K8s/Docker secret, or a cloud secret manager) — never in code or `secrets.toml` in git.
-- **Pre-commit guard.** `scripts/hooks/pre-commit` rejects staged `.env` files, `*.pem`/`*.key`, and key assignments (`OPENAI_API_KEY=`, `sk-*`). Install with `cp scripts/hooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit`.
+- **Pre-commit guard.** `scripts/hooks/pre-commit` rejects staged `.env` files, `*.pem`/`*.key`, and key assignments (`OPENAI_API_KEY=`, `sk-*`), and refuses test modules that are not wired into the hermetic harness (`tests/harness_imports.py` — the same rule the suite scans with). Install with `cp scripts/hooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit`.
 - Medical records stay local: they are only sent to the configured LLM endpoint. VA.gov credentials and session tokens are never written to disk, `.env`, or logs.
 - See [`SECURITY.md`](SECURITY.md) for full secrets management guidance (local `.env.local` overrides, CI/CD with GitHub Secrets, managed secret stores in production).

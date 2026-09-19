@@ -560,6 +560,13 @@ The production Dockerfile is optimized for the smallest possible image and
 fastest startup. It installs from the hash-pinned lockfile and runs as a
 non-root user.
 
+What can reach either stage is decided by [`.dockerignore`](.dockerignore) as
+well as by the `COPY` lines: it excludes credentials, the audit trail, the blob
+store and exported reports from the build context entirely, so a later
+`COPY . .` cannot pick them up either. See
+[SECURITY.md §8](SECURITY.md#the-same-audit-for-dockerignore) for the guard that
+keeps it that way.
+
 ```dockerfile
 # Dockerfile
 FROM python:3.12-slim AS runtime
@@ -609,6 +616,98 @@ CMD ["streamlit", "run", "run_app.py", \
 docker build -t va-lse:latest .
 ```
 
+### Sandbox target (agent workspace, optional)
+
+The same file has a second target, `sandbox`, for working *inside* a box rather
+than deploying one — a Vercel Sandbox, a remote dev container, anything where a
+person or an agent edits the checkout. It is built on the `runtime` stage, so it
+runs the image's interpreter and its hash-pinned lock, and adds only what a
+workspace needs:
+
+```dockerfile
+FROM runtime AS sandbox
+USER root                                        # a clone must be writable
+RUN apt-get install -y git curl ripgrep less procps
+RUN apt-get install -y tesseract-ocr tesseract-ocr-eng poppler-utils \
+                       ghostscript qpdf          # the OCR toolchain (below)
+RUN pip install -r requirements-dev.txt          # mypy, boto3, pyyaml, otel
+RUN pip install "ocrmypdf>=16.0"                 # requirements-local.txt's floor
+COPY tests/ scripts/ deploy/ nginx/ examples/ ./
+# ... plus every root page, .github/workflows, pyproject.toml, docker-compose.yml
+RUN git init && git add -A && git commit -m "baseline"   # so `git status` is usable
+ENV VA_LSE_HEALTH_HOST=127.0.0.1                 # see §7
+CMD ["streamlit", "run", "run_app.py", "--server.address=0.0.0.0"]
+```
+
+Four things about it are deliberate and easy to get wrong by hand:
+
+* **A custom image, not a managed one.** The managed sandbox images ship Python
+  3.14, and this lock's hash-pinned set does not install there: resolution stops
+  at `httptools==0.8.0`, whose cp314 wheel exists on PyPI but is not among the
+  hashes the lock carries (measured with `pip install --dry-run
+  --require-hashes --only-binary=:all: --python-version 3.14 --platform
+  manylinux_2_39_x86_64 --implementation cp --abi cp314 -r requirements.lock`).
+  `jiter==0.17.0`, which this note used to name as the first refusal, carries a
+  cp314 wheel hash and resolves on 3.14 — so the pin named here has to be the one
+  that actually refuses, or the next reader checks the wrong package.
+* **No `--server.port`.** 8501 is already Streamlit's default, and a *set* port is
+  fatal when Streamlit resolves as a development-layout install —
+  `server.port does not work when global.developmentMode is true` — which is what
+  a `pip install -e` or a vendored Streamlit in the box would be. See
+  `.streamlit/config.toml`.
+* **`VA_LSE_HEALTH_HOST=127.0.0.1`.** Sandbox ports are published as public URLs
+  and the sidecar's routes carry no authentication (§7), so the image keeps it on
+  loopback; publish `8001` *and* override this only if you mean to.
+* **OCR tooling, and only here.** The app deliberately has no OCR dependency and
+  never shells out (`scripts/ocr_records.py`), so a page that is a scan is counted
+  and reported, never read — records from a portal are routinely half scans, so
+  that is a real gap, and the box is where it closes. `scripts/ocr_and_extract.py`
+  is the entrypoint: it OCRs every image-only page in a bundle, then extracts with
+  the app's own reader **under the original file names** (citations have to point
+  at the record the user has, not at `.ocr.pdf`) and writes the queue's document
+  JSON for the app to consume:
+
+  ```bash
+  python scripts/ocr_and_extract.py /work/records --out /work/bundle.json
+  # --report-only        say which pages need OCR, change nothing
+  # --no-ocr             reproduce what the app sees today (all scans unreadable)
+  ```
+
+  Exit codes: `0` extracted, `1` no record files found, `2` scans present and no
+  OCR tooling installed, `3` bad input or nothing extractable. Nothing here is
+  installed in the `runtime` stage — `tests/test_sandbox_image.py` fails if the
+  deployment image grows a PDF renderer or an OCR engine.
+* **The app can read records on the box instead (a swap, not a rewrite).**
+  `app/extractors.py` implements the same `RecordExtractor` port as the reader in
+  `app/documents.py`, so setting `VA_LSE_EXTRACTOR=sandbox` plus
+  `VA_LSE_EXTRACTOR_RUNNER` moves *where* bytes are read without changing how text
+  is shaped: the box runs the entrypoint above, this app maps the report JSON back
+  through `app/job_payload.documents_from_json`, and a document answered under a
+  name the user never uploaded is refused. Every failure — no runner, no tooling on
+  the box, a refusal, a timeout (capped by the run's own remaining budget),
+  unparseable JSON — is logged once through `app.error_report` and the file is read
+  in-process, so a misconfigured box costs a warning rather than a run.
+
+  Measured on a generated 20-file / 400-page all-scan bundle (`--no-ocr` vs. the
+  box, engine cost excluded): **0 → 20 documents read, ≈124,000 characters of record
+  text (≈31,000 tokens) reaching the digest**, at ≈4 ms per page of non-engine work.
+  On a mixed bundle (born-digital pages, scans, one part-digital file) the today-path
+  silently carries 14 of 120 pages with no text and refuses 2 of 6 files; the box
+  answers with text on every page.
+
+```bash
+# Build and push it to Vercel Container Registry, then boot a sandbox from it
+docker build --target sandbox -t va-lse-sandbox:latest .   # local smoke test
+vercel vcr build docker . va-lse-sandbox:latest --push
+sandbox create --name va-lse-dev --image va-lse-sandbox:latest \
+  --vcpus 4 --timeout 2h --publish-port 8501 --connect
+```
+
+`tests/test_sandbox_image.py` asserts this contract (the stage, root, the dev
+extras, OCR tooling, git, the copied files) because no CI job builds an image,
+and `tests/test_ocr_and_extract.py` covers the entrypoint's decisions with the OCR
+engine faked — the binaries are not installed in CI and must not be required.
+
 ### Multi-stage variant (smaller image, optional)
 
 ```dockerfile
@@ -657,6 +756,14 @@ port `8001`):
 |---|---|---|---|---|
 | **Liveness** | 8001 | `/health` | Is the process alive? | Always `200` once started |
 | **Readiness** | 8001 | `/ready` | Can it serve traffic? | `200` = ready, `503` = not ready |
+
+Both probes answer on the interface in `VA_LSE_HEALTH_HOST` (default `0.0.0.0`,
+which is what a kubelet probe needs since it arrives from outside the pod). None
+of the three routes authenticates — a kubelet cannot present a token — so where
+that port is published to the internet rather than to a cluster network, set
+`VA_LSE_HEALTH_HOST=127.0.0.1`: same-host probes and
+`sandbox exec curl localhost:8001/health` keep working, a remote browser gets a
+refused connection instead of your metrics.
 
 **What makes `/ready` return `503`:**
 - Missing `OPENAI_API_KEY`
@@ -761,6 +868,7 @@ All deployment-relevant variables (see `README.md` for the full list):
 | `VA_LSE_RECORDS_CONCURRENCY` | Parallel digest workers | `2` | Raise for higher-tier endpoints |
 | `VA_LSE_MAX_CONCURRENT_LLM_CALLS` | Global LLM concurrency cap | `20` | Raise if running 100 users across N pods |
 | `VA_LSE_HEALTH_PORT` | Health sidecar port | `8001` | Keep default; mount in Service |
+| `VA_LSE_HEALTH_HOST` | Interface the sidecar binds to | `0.0.0.0` | Keep the default in a cluster (probes arrive from outside the pod). Set `127.0.0.1` wherever that port is published to the internet |
 | `VA_LSE_SHUTDOWN_GRACE_SECONDS` | Drain timeout | `30` | 30–60 for large record sets |
 | `VA_LSE_LLM_CALL_TIMEOUT_SECONDS` | Per-call timeout | `300` | 300–600 depending on endpoint speed |
 | `VA_LSE_LOG_DIR` | Diagnostic log directory | (stdout only) | Set to `/app/logs` for persistent logs |
@@ -788,6 +896,9 @@ All deployment-relevant variables (see `README.md` for the full list):
 | `VA_LSE_BLOB_STORE` | Blob backend for job documents | `auto` | `filesystem` or `s3` to pin it explicitly |
 | `VA_LSE_BLOB_DIR` | Filesystem blob root | `blobs` | `/app/blobs` on the shared RWX PVC |
 | `VA_LSE_BLOB_S3_BUCKET` | S3-compatible bucket | (empty) | Only for `s3`; needs `requirements-s3.txt` |
+| `VA_LSE_EXTRACTOR` | Where record text is read: `in-process` or `sandbox` | `in-process` | Leave `in-process` on worker pods; a box is an operator choice, and `sandbox` falls back to `in-process` per file |
+| `VA_LSE_EXTRACTOR_RUNNER` | Command that runs `scripts/ocr_and_extract.py` in the box | (empty) | `{work}` is the staged directory; stdout must end with the report JSON |
+| `VA_LSE_EXTRACTOR_TIMEOUT_SECONDS` | Ceiling for one file's box work | `900` | Also capped by the run's remaining budget (`VA_LSE_PIPELINE_TIMEOUT_SECONDS`) |
 | `VA_LSE_TRACING` | Emit OpenTelemetry traces | `0` | `1` on the web tier **and** every worker; needs `requirements-otel.txt` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Collector/APM intake for spans | `http://localhost:4318` | In-cluster collector Service, or a vendor OTLP endpoint |
 | `VA_LSE_TRACE_SAMPLE_RATIO` | Fraction of runs traced | `1.0` | Lower it if the backend meters per span |

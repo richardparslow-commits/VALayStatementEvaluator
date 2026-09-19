@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 from app import circuit_breaker, config, medical_review
 from app.documents import Chunk, document_from_text
 from app.llm import LLMClient, LLMUpstreamError

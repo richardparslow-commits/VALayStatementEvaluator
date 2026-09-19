@@ -18,6 +18,7 @@ from typing import Any
 
 import streamlit as st
 
+from .. import preflight
 from .. import telemetry
 from ..error_report import (  # noqa: F401 - re-exported for tab modules and tests
     ensure_request_id,
@@ -123,9 +124,14 @@ def log_unhandled_render_error(exc: Exception, rid: str, phase: str = "app") -> 
 
 
 # ---------------------------------------------------------------- LLM handle
-def get_llm() -> LLMClient | None:
-    """Build the session's LLMClient, or show the reason and return None."""
-    rid = st.session_state.get(REQUEST_ID_KEY, "") or get_request_id() or "-"
+def session_settings() -> Any:
+    """The settings a run will actually use, on-screen API key included.
+
+    One definition, because two callers must agree on it: :func:`get_llm` builds the
+    client from these, and the endpoint preflight judges whether that client can
+    work. A preflight that checked the *saved* key while the run used the typed one
+    would clear a configuration that then fails.
+    """
     try:
         settings = st.session_state.settings
     except AttributeError:
@@ -134,6 +140,13 @@ def get_llm() -> LLMClient | None:
 
         settings = st.session_state.settings = load_settings()
     settings.api_key = st.session_state.get("api_key_input", settings.api_key).strip()
+    return settings
+
+
+def get_llm() -> LLMClient | None:
+    """Build the session's LLMClient, or show the reason and return None."""
+    rid = st.session_state.get(REQUEST_ID_KEY, "") or get_request_id() or "-"
+    settings = session_settings()
     if not settings.configured:
         logger.warning(
             "LLM not configured — missing API key",
@@ -171,6 +184,105 @@ def check_shutdown_gate(action: str) -> bool:
         )
         return False
     return True
+
+
+# ------------------------------------------------------- endpoint preflight
+def endpoint_waiver_key(action: str, signature: str) -> str:
+    """Session key for "I know this check is wrong for my endpoint".
+
+    Keyed by the configuration's signature, not just the tab: a waiver is a
+    statement about one endpoint + key + model set, so changing any of them has to
+    ask again. A per-tab key would silently carry a waiver onto a configuration the
+    user never saw a complaint about.
+    """
+    return f"endpoint_preflight_waiver_{action}_{signature}"
+
+
+def _endpoint_block_key(action: str) -> str:
+    return f"endpoint_preflight_block_{action}"
+
+
+def _clear_endpoint_block(action: str) -> None:
+    st.session_state.pop(_endpoint_block_key(action), None)
+    st.session_state.pop(_endpoint_block_key(action) + "_sig", None)
+
+
+def check_endpoint_gate(action: str, *, log_action: str, request_id: str = "") -> bool:
+    """Return True when the endpoint can serve the configured models.
+
+    One cheap request per attempt, and only when a run is actually being attempted,
+    so ordinary reruns cost nothing. A block is stored so
+    :func:`render_endpoint_preflight_notice` can keep it on screen with the waiver
+    beside it — a user must be able to overrule a check that is wrong about their
+    endpoint, because refusing to start a working run is worse than the failure the
+    check prevents.
+    """
+    settings = session_settings()
+    signature = preflight.signature(settings)
+    verdict = preflight.check_endpoint(settings)
+    logger.info(
+        "endpoint preflight action=%s kind=%s status=%s missing=%s",
+        action,
+        verdict.kind,
+        verdict.status,
+        list(verdict.missing),
+        extra={"request_id": request_id or "-", "phase": "endpoint_preflight", "status": verdict.kind},
+    )
+    if not verdict.blocks:
+        _clear_endpoint_block(action)
+        return True
+
+    waived = bool(st.session_state.get(endpoint_waiver_key(action, signature), False))
+    if waived:
+        logger.warning(
+            "endpoint preflight overruled by the user action=%s status=%s missing=%s",
+            action,
+            verdict.status,
+            list(verdict.missing),
+            extra={"request_id": request_id or "-", "phase": "endpoint_preflight", "status": "waived"},
+        )
+        _clear_endpoint_block(action)
+        return True
+
+    st.session_state[_endpoint_block_key(action)] = verdict
+    st.session_state[_endpoint_block_key(action) + "_sig"] = signature
+    run_log_event(
+        log_action,
+        "rejected",
+        request_id=request_id,
+        error=verdict.headline,
+        reason="endpoint_preflight",
+    )
+    # Put the notice above the button the user just pressed. This raises in real
+    # Streamlit; the caller returns on False either way, so nothing depends on it.
+    st.rerun()
+    return False
+
+
+def render_endpoint_preflight_notice(action: str) -> None:
+    """Show a stored endpoint block above the run button, waiver included.
+
+    Rendered from session state rather than probed here: this runs on every rerun of
+    the tab, and a network request per rerun is not a price a preflight may charge.
+    """
+    verdict = preflight.verdict_from_session(st.session_state.get(_endpoint_block_key(action)))
+    if verdict is None or not verdict.blocks:
+        return
+    signature = preflight.signature(session_settings())
+    if st.session_state.get(_endpoint_block_key(action) + "_sig") != signature:
+        # The endpoint, key, or models changed since the check, so this block is about
+        # a configuration that is no longer in force and must not be shown.
+        _clear_endpoint_block(action)
+        return
+    st.error(f"⛔ Run not started — {verdict.headline}\n\n{verdict.fix}")
+    with st.expander("The check can be wrong — start the run anyway"):
+        st.caption(
+            "Some OpenAI-compatible servers answer `/models` differently than they serve "
+            "completions, and a provider's catalog can lag what it actually serves. Tick this "
+            "to skip the check for this endpoint, key and model set; changing any of them asks "
+            "you again."
+        )
+        st.checkbox("Ignore the endpoint check and run anyway", key=endpoint_waiver_key(action, signature))
 
 
 # ------------------------------------------------------------- progress + audit

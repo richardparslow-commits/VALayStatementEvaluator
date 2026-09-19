@@ -16,6 +16,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 
 from app.llm import ModelProbe  # noqa: E402
 from app.usage import UsageTracker  # noqa: E402
@@ -856,6 +857,37 @@ class TestRenderUsageSummary(unittest.TestCase):
         caption_text = " ".join(str(c.args[0]) for c in st_mock.caption.call_args_list)
         self.assertIn("Total:", caption_text)
 
+    def test_usage_renders_burn_without_a_quota(self) -> None:
+        """A fresh clone has no quota set; the burn line must not divide by it."""
+        import app.config as config
+        import app.views.usage as usage_view
+
+        st_mock, _ = _fake_streamlit()
+        expander_ctx = MagicMock()
+        st_mock.expander.return_value = expander_ctx
+        expander_ctx.__enter__ = MagicMock(return_value=None)
+        expander_ctx.__exit__ = MagicMock(return_value=False)
+
+        tracker = MagicMock()
+        tracker.totals.return_value = MagicMock(
+            calls=1, prompt_tokens=10, completion_tokens=5, total_tokens=15
+        )
+        tracker.per_phase.return_value = {}
+        tracker.used_fallback = False
+        tracker.credit_estimate.return_value = 1234.0
+        with _patch_st(usage_view, st_mock), patch.object(
+            usage_view.config, "CREDIT_QUOTA", None
+        ), patch.object(
+            usage_view,
+            "effective_credit_rates",
+            return_value=({config.DEFAULT_MODEL_MAIN: 1.0}, "configured in .env"),
+        ):
+            usage_view.render_usage_summary(tracker)
+
+        caption_text = " ".join(str(c.args[0]) for c in st_mock.caption.call_args_list)
+        self.assertIn("Estimated credit burn", caption_text)
+        self.assertIn("VA_LSE_CREDIT_QUOTA", caption_text)
+
 
 # ------------------------------------------------------------------ get_llm
 class TestGetLLM(unittest.TestCase):
@@ -1279,6 +1311,12 @@ class TestEvaluateRunBookkeeping(unittest.TestCase):
             evaluate_view, "new_run_request_id", return_value="req_84ab42a65e24"
         ), patch.object(evaluate_view, "get_llm", return_value=llm), patch.object(
             evaluate_view, "check_shutdown_gate", return_value=True
+        ), patch.object(
+            # The gate itself makes a network request and is covered in
+            # tests/test_preflight.py; here it must simply not reach out.
+            evaluate_view,
+            "check_endpoint_gate",
+            return_value=True,
         ), patch.object(evaluate_view, "enter_run", return_value=True), patch.object(
             evaluate_view, "exit_run"
         ), patch.object(

@@ -1,10 +1,11 @@
 """Watchdog: learn the plan's effective credits-per-1M-token rate.
 
-The usage estimator can't convert tokens into credits until it knows the plan's
-effective burn rate, and QwenCloud Token Plan doesn't publish one. The watchdog
-keeps every run's token totals on disk alongside the user's own readings of
-"credits consumed" from the QwenCloud console, then fits an effective
-credits-per-1M-token rate by matching observed credit burn to token counts.
+The usage estimator can't convert tokens into a plan figure until it knows the
+effective burn rate, and providers do not publish one (QwenCloud Token Plan's
+changes; Perplexity bills per token in USD). The watchdog keeps every run's
+token totals on disk alongside the user's own readings of cumulative units used
+from their provider console, then fits an effective units-per-1M-token rate by
+matching observed burn to token counts.
 
 Because main and fast models are billed differently, we fit two rates (one per
 model) via least squares over as many calibration intervals as we have, falling
@@ -217,8 +218,8 @@ def fit_effective_rate(history: UsageHistory) -> FitResult:
 
     if not intervals:
         result.multiline_note = (
-            "Record at least two 'credits used' readings from the QwenCloud "
-            "console across a few runs to estimate your plan's rate."
+            "Record at least two cumulative 'units used' readings from your "
+            "provider's console across a few runs to estimate your plan's rate."
         )
         return result
 

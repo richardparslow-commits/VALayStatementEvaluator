@@ -665,10 +665,14 @@ def _credit_calibration_widget() -> None:
     with st.expander("🎚️ Usage watchdog (credit rate)"):
         history = load_usage_history()
         fit = watchdog.fit_effective_rate(history)
+        st.caption(
+            "Record the cumulative figure your provider console shows — the unit is "
+            "yours (credits, spend), and the app fits a rate in it."
+        )
 
         last_credits = st.session_state.get("watchdog_last_credits", "")
         credits = st.text_input(
-            "Total credits used (from QwenCloud console)",
+            "Total credits used (from your provider console)",
             value=last_credits,
             key="watchdog_credits_input",
         )

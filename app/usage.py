@@ -3,9 +3,9 @@
 Each LLM call is recorded with the model it used and the pipeline phase that
 made it. Token counts are *estimates*: when the provider reports usage metadata
 we trust those figures, otherwise we fall back to a characters/4 heuristic.
-Credit burn (QwenCloud Token Plan credits, etc.) is converted only when a
-per-model rate is configured — Token Plan does not publish fixed rates, so we
-never guess one by default.
+Credit burn (plan units such as QwenCloud Token Plan credits) is converted only
+when a per-model rate is configured — providers do not publish fixed rates, so
+we never guess one by default.
 """
 from __future__ import annotations
 

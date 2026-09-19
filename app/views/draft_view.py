@@ -42,6 +42,7 @@ from .ops import render_failure_detail
 from .shared import (
     audit_condition_for_slot,
     audit_record_meta,
+    check_endpoint_gate,
     check_shutdown_gate,
     format_error_for_user,
     get_llm,
@@ -49,6 +50,7 @@ from .shared import (
     progress_widgets,
     records_uploader,
     render_condition_selector_for_slot,
+    render_endpoint_preflight_notice,
     render_usage_summary,
     record_watchdog_run,
     reference_suffix,
@@ -138,6 +140,10 @@ def render_draft_tab() -> None:
             f"⚙️ This run is processed by a background worker ({job_runner.queue_status_line()}). "
             "You can close this tab — the results will be waiting when you come back."
         )
+
+    # A blocked preflight is kept on screen (with its waiver) from here, above the
+    # button that would start the run — see app/views/shared.py.
+    render_endpoint_preflight_notice("draft")
 
     run = st.button("✍️ Draft the statement", type="primary", key="draft_run")
     if run:
@@ -331,6 +337,11 @@ def _run_draft_flow(
     observations: str,
 ) -> None:
     """Run the pipeline with the pre-minted run id; persist the result."""
+    # Before anything is spent: a configuration whose every call is rejected is
+    # detectable in one request. Covers the queued path too — this is the only
+    # entry point, and the worker never re-checks inside its own session-less run.
+    if not check_endpoint_gate("draft", log_action="draft", request_id=rid):
+        return
     if job_runner.queue_mode_active():
         _run_draft_queued(
             rid=rid,

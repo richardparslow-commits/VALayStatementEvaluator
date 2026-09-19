@@ -12,6 +12,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 
 from app.documents import DocumentPage, ExtractedDocument  # noqa: E402
 from app.va_gov_export import is_va_gov_records_export, split_va_gov_exports  # noqa: E402

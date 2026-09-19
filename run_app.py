@@ -3,9 +3,11 @@
 Run from the project root with:
     streamlit run run_app.py
 
-The health sidecar (GET /health, GET /ready) is started before Streamlit
-takes over so liveness/readiness probes work even during Streamlit startup.
-Set VA_LSE_HEALTH_PORT=0 to disable the sidecar.
+The health sidecar (GET /health, GET /ready, GET /metrics) is started before
+Streamlit takes over so liveness/readiness probes work even during Streamlit
+startup. Set VA_LSE_HEALTH_PORT=0 to disable the sidecar, and
+VA_LSE_HEALTH_HOST=127.0.0.1 to keep it off an interface that is published to
+the internet (see app/health.py:_health_host).
 
 Graceful shutdown handlers (SIGTERM/SIGINT) are installed in the main thread
 so Kubernetes pod termination (SIGTERM → grace → SIGKILL) allows in-flight
