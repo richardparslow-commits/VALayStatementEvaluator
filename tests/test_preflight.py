@@ -369,5 +369,62 @@ class TestRunFlowsAreStopped(unittest.TestCase):
         queued.assert_not_called()
 
 
+class TestVercelCredentials(unittest.TestCase):
+    """Vercel's credentials are not interchangeable, and a rejection says which is which.
+
+    An AI Gateway key is not a provider key, a provider key is not a gateway key, and
+    neither is the access token the *Sandbox* product takes — which is the third
+    thing carrying Vercel's name and must not be suggested as an LLM credential.
+    """
+
+    GATEWAY = preflight.VERCEL_GATEWAY_BASE_URL
+
+    def test_a_gateway_key_against_another_endpoint_names_the_gateway(self) -> None:
+        verdict = _check(
+            _probe(None, 401, "HTTP 401: unauthorized"),
+            _settings(api_key="vck_example", base_url="https://api.perplexity.ai/router/v1"),
+        )
+        self.assertTrue(verdict.blocks)
+        self.assertIn("AI Gateway", verdict.fix)
+        self.assertIn(self.GATEWAY, verdict.fix)
+        self.assertIn("OPENAI_BASE_URL", verdict.fix)
+
+    def test_the_gateway_url_with_a_provider_key_names_the_key_to_create(self) -> None:
+        verdict = _check(
+            _probe(None, 401, "HTTP 401: unauthorized"),
+            _settings(api_key="pplx-example", base_url=self.GATEWAY),
+        )
+        self.assertTrue(verdict.blocks)
+        self.assertIn("AI Gateway API key", verdict.fix)
+        self.assertIn("Sandbox", verdict.fix)
+
+    def test_the_shape_never_decides_a_verdict_on_its_own(self) -> None:
+        """A proxy can front the gateway with the same key, so an answered probe wins."""
+        verdict = _check(
+            _probe({"model-main", "model-fast"}, 200),
+            _settings(api_key="vck_example", base_url="https://llm.internal.test/v1"),
+        )
+        self.assertEqual(verdict.kind, preflight.OK)
+
+    def test_a_missing_gateway_model_id_gets_the_catalog_note(self) -> None:
+        verdict = _check(
+            _probe({"moonshotai/kimi-k3", "alibaba/qwen3.7-flash"}, 200),
+            _settings(
+                base_url=self.GATEWAY,
+                api_key="vck_example",
+                model_main="perplexity/kimi-k3",
+                model_fast="alibaba/qwen3.7-flash",
+            ),
+        )
+        self.assertTrue(verdict.blocks)
+        self.assertEqual(verdict.missing, ("perplexity/kimi-k3",))
+        self.assertIn("its own catalog", verdict.fix)
+        self.assertIn("moonshotai/kimi-k3", verdict.fix)
+
+    def test_an_unrelated_rejection_keeps_the_generic_fix(self) -> None:
+        verdict = _check(_probe(None, 401, "HTTP 401: unauthorized"))
+        self.assertNotIn("AI Gateway", verdict.fix)
+
+
 if __name__ == "__main__":
     unittest.main()

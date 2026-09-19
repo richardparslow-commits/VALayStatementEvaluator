@@ -176,6 +176,23 @@ class TestSandboxCarriesWhatTheSuiteReads(SandboxImageTestCase):
             "the sandbox image would not carry: " + ", ".join(missing),
         )
 
+    def test_every_run_can_read_the_files_it_names(self) -> None:
+        """A RUN cannot read what a later COPY brings in.
+
+        `pip install -r requirements-dev.txt` named its file while nothing in the
+        stage ever copied it in, and `test_every_required_path_is_in_the_image`
+        passed anyway: a question about mentions is satisfied by a RUN line that
+        mentions it. The build failed at that step the first time the stage was
+        built — which is what the sandbox-image CI job is for — so this asks the
+        ordering question instead.
+        """
+        missing = dockerfile.files_read_before_being_carried(self.sandbox, self.runtime)
+        self.assertEqual(
+            missing,
+            [],
+            "a RUN reads these before anything copies them in: " + ", ".join(missing),
+        )
+
     def test_the_required_paths_still_exist(self) -> None:
         """A renamed directory must fail here, not silently stop being checked."""
         missing = [p for p in self.REQUIRED if not (PROJECT_ROOT / p).exists()]
@@ -250,6 +267,33 @@ class TestTheSandboxCanReadAScan(SandboxImageTestCase):
     def test_the_entrypoint_exists_and_names_that_file(self) -> None:
         """A renamed entrypoint must fail here, not inside a sandbox."""
         self.assertTrue((PROJECT_ROOT / "scripts" / "ocr_and_extract.py").is_file())
+
+
+class TestWhatARequirementLineNames(unittest.TestCase):
+    """The reader behind the ordering guard, whose job is to be neither blind nor
+    gullible: it has to see all three spellings pip accepts, and it must not read an
+    option cluster as a filename."""
+
+    def test_all_three_spellings_are_read(self) -> None:
+        for line in (
+            "pip install -r requirements.txt",
+            "pip install -rrequirements.txt",
+            "pip install --requirement=requirements.txt",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(dockerfile.requirement_files_named(line), ["requirements.txt"])
+
+    def test_an_option_cluster_is_not_a_filename(self) -> None:
+        """`rm -rf …` used to be reported as reading a file named `f`."""
+        self.assertEqual(dockerfile.requirement_files_named("rm -rf /var/lib/apt/lists/*"), [])
+
+    def test_includes_are_followed_through_a_requirement_file(self) -> None:
+        """requirements-dev.txt begins with `-r requirements.txt`, so a stage that
+        carries only the first one cannot install."""
+        self.assertEqual(
+            dockerfile._requirement_closure(["requirements-dev.txt"]),
+            ["requirements-dev.txt", "requirements.txt"],
+        )
 
 
 class TestTheDeploymentImageIsUnchanged(SandboxImageTestCase):

@@ -20,6 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from hashlib import sha256
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 from .config import Settings
 from .llm import ModelProbe, probe_models
@@ -34,6 +35,69 @@ BLOCKED = "blocked"
 UNVERIFIED = "unverified"
 
 ProbeFn = Callable[[str, str], ModelProbe]
+
+# ----------------------------------------------------------- Vercel credentials
+#
+# Three unrelated credentials carry Vercel's name, and handing one to the other's
+# endpoint is precisely the "a key belonging to another provider" failure this
+# module exists to name before a run starts:
+#
+# * an **AI Gateway API key** (``vck_…``) authenticates the gateway's own
+#   OpenAI-compatible API, and nothing else;
+# * a Vercel **access token** (or the OIDC token a Function gets) is what the
+#   Sandbox product takes — see DEPLOYMENT.md section 6 — and no LLM endpoint
+#   wants it;
+# * a provider key (``pplx-…``, ``sk-…``) is what the endpoint in ``base_url``
+#   wants.
+#
+# The gateway also serves ids from *its own* catalog — ``owner/model``, e.g.
+# ``moonshotai/kimi-k3``, ``alibaba/qwen3.7-flash``, ``perplexity/sonar-pro`` — so
+# another provider's model names are not in it, which the missing-model verdict
+# below says out loud when that is the endpoint in question.
+VERCEL_GATEWAY_HOST = "ai-gateway.vercel.sh"
+VERCEL_GATEWAY_BASE_URL = "https://ai-gateway.vercel.sh/v1"
+VERCEL_GATEWAY_KEY_PREFIX = "vck_"
+GATEWAY_ID_NOTE = (
+    "On the AI Gateway the ids come from its own catalog (`moonshotai/kimi-k3`, "
+    "`alibaba/qwen3.7-flash`, `perplexity/sonar-pro`, …), not from another provider's "
+    "model names."
+)
+
+
+def _is_vercel_gateway_url(base_url: str) -> bool:
+    """Whether *base_url* addresses Vercel's AI Gateway."""
+    host = (urlparse(base_url or "").hostname or "").lower()
+    return host == VERCEL_GATEWAY_HOST or host.endswith(f".{VERCEL_GATEWAY_HOST}")
+
+
+def _looks_like_vercel_gateway_key(api_key: str) -> bool:
+    return (api_key or "").strip().startswith(VERCEL_GATEWAY_KEY_PREFIX)
+
+
+def _credential_mismatch(settings: Settings) -> str:
+    """A sentence naming a Vercel-credential mix-up, or "" when there is none.
+
+    Shape only, never a substitute for the probe: a key and a URL can still be
+    paired through a proxy that fronts the gateway, so this is used to make a
+    *rejection* specific rather than to decide the verdict itself.
+    """
+    if _looks_like_vercel_gateway_key(settings.api_key) and not _is_vercel_gateway_url(
+        settings.base_url
+    ):
+        return (
+            f"This looks like a Vercel **AI Gateway** key (`{VERCEL_GATEWAY_KEY_PREFIX}…`), which is "
+            f"only valid against the gateway (`{VERCEL_GATEWAY_BASE_URL}`) with that catalog's model "
+            "ids. Either set `OPENAI_BASE_URL` there, or use the key this endpoint needs."
+        )
+    if _is_vercel_gateway_url(settings.base_url) and not _looks_like_vercel_gateway_key(
+        settings.api_key
+    ):
+        return (
+            "`OPENAI_BASE_URL` is Vercel's AI Gateway, which needs an **AI Gateway API key** "
+            f"(`{VERCEL_GATEWAY_KEY_PREFIX}…`, from the project's AI Gateway → API Keys; a Vercel "
+            "*access token*, which the Sandbox product takes, is a different credential again)."
+        )
+    return ""
 
 
 @dataclass(frozen=True)
@@ -131,14 +195,17 @@ def check_endpoint(settings: Settings, *, probe: ProbeFn = probe_models) -> Verd
         available = result.models or set()
         missing = tuple(m for m in models if not _model_present(m, available))
         if missing:
+            fix = (
+                "Every call would be rejected, so the run was not started. "
+                "`COMPATIBILITY.md` lists the ids each provider serves — or click "
+                "**Test connection** in the sidebar to see the whole list."
+            )
+            if _is_vercel_gateway_url(settings.base_url):
+                fix = f"{fix} {GATEWAY_ID_NOTE}"
             return Verdict(
                 BLOCKED,
                 headline=f"The endpoint does not offer {_quoted(missing)}.",
-                fix=(
-                    "Every call would be rejected, so the run was not started. "
-                    "`COMPATIBILITY.md` lists the ids each provider serves — or click "
-                    "**Test connection** in the sidebar to see the whole list."
-                ),
+                fix=fix,
                 status=result.status,
                 missing=missing,
                 checked=checked,
@@ -153,16 +220,20 @@ def check_endpoint(settings: Settings, *, probe: ProbeFn = probe_models) -> Verd
         )
 
     if result.status in (401, 403):
+        fix = (
+            "A rejected key fails every call, so the run was not started. The key and "
+            "the base URL must come from the same provider account — and on Perplexity's "
+            "Router API the account also needs Router access (private preview). "
+            "**Test connection** in the sidebar names the status and the provider's own "
+            "message."
+        )
+        mismatch = _credential_mismatch(settings)
+        if mismatch:
+            fix = f"{mismatch} {fix}"
         return Verdict(
             BLOCKED,
             headline=f"The endpoint rejected this API key (HTTP {result.status}).",
-            fix=(
-                "A rejected key fails every call, so the run was not started. The key and "
-                "the base URL must come from the same provider account — and on Perplexity's "
-                "Router API the account also needs Router access (private preview). "
-                "**Test connection** in the sidebar names the status and the provider's own "
-                "message."
-            ),
+            fix=fix,
             status=result.status,
             checked=checked,
         )

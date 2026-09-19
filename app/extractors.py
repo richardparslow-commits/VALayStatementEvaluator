@@ -304,14 +304,18 @@ class SandboxExtractor:
     def _check_labels(self, staged: StagedFile, document: ExtractedDocument) -> ExtractedDocument:
         """Refuse a document the box answers under a name the user never had.
 
-        ``extract_document`` keeps the name it is given (``.zip`` members keep the
-        archive's name and a separator), so every legitimate label here either is
-        the staged label or extends it. Anything else means the box invented a
-        name — usually a staging path or an ``.ocr.pdf`` copy — and those must not
-        reach citations.
+        ``extract_document`` keeps the name it is given, so every legitimate label
+        here either is the staged label or extends it — and *how* it extends it is
+        the archive shape: ``app.documents.archive_members`` names a ``.zip``'s
+        members ``<archive stem>/<member>``, so ``records.zip`` legitimately answers
+        as ``records/visit.pdf``. (``<label>:`` is also accepted because a runner
+        may pass an explicit separator through.) Anything else means the box
+        invented a name — usually a staging path or an ``.ocr.pdf`` copy — and those
+        must not reach citations.
         """
         name = document.filename
-        if name == staged.label or name.startswith(f"{staged.label}:"):
+        archive_prefix = f"{Path(staged.label).stem or 'archive'}/"
+        if name == staged.label or name.startswith((f"{staged.label}:", archive_prefix)):
             return document
         raise SandboxUnavailable(
             f"the box answered for {staged.label} under the name {name!r}. Citations must "

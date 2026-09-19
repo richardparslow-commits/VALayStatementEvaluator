@@ -74,6 +74,10 @@ scripts/
   ocr_and_extract.py      OCR a whole record bundle and extract it with the app's
                           own reader, emitting the queue's document JSON — the
                           sandbox image's entrypoint (see DEPLOYMENT.md §6)
+  vercel_sandbox_runner.py
+                          Read one staged file on a Vercel Sandbox and print the
+                          report JSON — the VA_LSE_EXTRACTOR_RUNNER command for
+                          VA_LSE_EXTRACTOR=sandbox (see *Scanned pages and OCR*)
   va_records_download.py  Walk VA.gov's records-download wizard locally (you sign
                           in); writes a provenance manifest beside the PDF
 tests/                    Offline unit tests (no API key required)
@@ -177,7 +181,7 @@ installs on macOS and Linux CI.
 | Variable | Meaning | Default |
 |---|---|---|
 | `OPENAI_API_KEY` | LLM API key. By default this is a **Perplexity** key, which also serves the Research tab's grounded lookups | (required) |
-| `OPENAI_BASE_URL` | OpenAI-compatible base URL | `https://api.perplexity.ai/router/v1` — Perplexity's Router API (in **private preview**; request access from api@perplexity.ai). Any OpenAI-compatible endpoint works |
+| `OPENAI_BASE_URL` | OpenAI-compatible base URL | `https://api.perplexity.ai/router/v1` — Perplexity's Router API (in **private preview**; request access from api@perplexity.ai). Any OpenAI-compatible endpoint works, including Vercel's AI Gateway (`https://ai-gateway.vercel.sh/v1`, with gateway catalog ids) — see COMPATIBILITY.md → *Tested endpoints* |
 | `LLM_MODEL_MAIN` | Low-volume heavy model (analysis/scoring/drafting) | `perplexity/kimi-k3` |
 | `LLM_MODEL_FAST` | Cheap model for the bulk digest/merge passes | `perplexity/glm-5.3-flash` |
 | `OPENAI_BASE_URL_FALLBACK` | **Optional** second endpoint used when the primary fails for a sustained period; unset = no failover | (empty) |
@@ -186,7 +190,7 @@ installs on macOS and Linux CI.
 | `LLM_ENDPOINT_FALLBACK_TIMEOUT_SECONDS` | How long the primary must fail before failover engages (a grace period, not an HTTP timeout) | `300` |
 | `VA_LSE_MAX_RECORD_PAGES` | Max total pages across uploaded record files | `5000` |
 | `VA_LSE_EXTRACTOR` | Where record text is read: `in-process` (this app's reader) or `sandbox` (the box, which can OCR a scan) | `in-process` |
-| `VA_LSE_EXTRACTOR_RUNNER` | Command that runs `scripts/ocr_and_extract.py` in the box, with `{work}` for the staged directory; stdout must end with its report JSON | (empty = in-process) |
+| `VA_LSE_EXTRACTOR_RUNNER` | Command that runs `scripts/ocr_and_extract.py` in the box, with `{work}` for the staged directory; stdout must end with its report JSON. `python scripts/vercel_sandbox_runner.py {work}` drives a Vercel Sandbox (see *Scanned pages and OCR*) | (empty = in-process) |
 | `VA_LSE_EXTRACTOR_TIMEOUT_SECONDS` | Ceiling for one file's box work (never past the run's own budget) | `900` |
 | `VA_LSE_JOB_QUEUE` | Run Evaluate/Draft on worker pods instead of in-process (Pattern C) | `0` |
 | `VA_LSE_REDIS_URL` | Redis backend for the job queue | (empty) |
@@ -647,7 +651,10 @@ All public helpers in `app/main.py`, `app/fetch_client.py`, `app/evaluate.py` ca
 > pull requests). The live smoke test is triggered **manually** from the
 > Actions tab and only runs when an `OPENAI_API_KEY` secret is configured; the optional
 > `OPENAI_BASE_URL`, `LLM_MODEL_MAIN`, and `LLM_MODEL_FAST` secrets override the endpoint and
-> models in that job if set (see `.env.example`).
+> models in that job if set (see `.env.example`). The sandbox image is built on every event
+> (nothing pushed), and a manual dispatch builds and pushes it to Vercel Container Registry and
+> then reads a record on a real box — that job needs a `VERCEL_TOKEN` secret and skips itself
+> without one, exactly like the smoke test (`DEPLOYMENT.md` §6).
 
 ## QwenCloud Individual Plan Lite tuning
 
@@ -815,6 +822,38 @@ the app's own reader, under the original file names:
 ```bash
 python scripts/ocr_and_extract.py /work/records --out /work/bundle.json
 ```
+
+Or let the app do per file what that command does for a whole folder. Point the extractor at
+a Vercel Sandbox and each uploaded file is staged, copied into a fresh ephemeral microVM
+booted from the pushed `va-lse-sandbox` image, read there by the same entrypoint, and mapped
+back through `app/extractors.py` — a file the box cannot read is read in-process instead,
+with one warning that names the reason:
+
+```bash
+export VA_LSE_EXTRACTOR=sandbox
+export VA_LSE_EXTRACTOR_RUNNER="python scripts/vercel_sandbox_runner.py {work}"
+export VA_LSE_SANDBOX_TOKEN=vcp_...   # a Vercel access token, or run `sandbox login` once
+```
+
+The runner command is a subprocess, so its first word has to exist: on macOS there is
+`python3` and no `python`, and a virtualenv is not on `PATH` unless it is activated — use an
+absolute interpreter path there, or every file falls back in-process with one warning.
+`scripts/vercel_sandbox_runner.py` also needs the Sandbox CLI (`npm i -g sandbox`) and the image
+pushed (`DEPLOYMENT.md` §6 has that build line, the image/timeout/team/project knobs, and what
+happens when a box is killed mid-file). Its credential is a Vercel **access token** (or a
+Function's OIDC token) — not the AI Gateway key, which is this app's LLM credential; Vercel
+issues both and they are not interchangeable (`COMPATIBILITY.md` → *Vercel credentials are not
+interchangeable*). `VA_LSE_SANDBOX_TOKEN` is this app's own name for it; bare CLI use wants the
+CLI's own `VERCEL_AUTH_TOKEN`, and `VERCEL_TOKEN` (the REST API's convention, which the CLI
+ignores) is passed through as `--token` — the runner reads all four, in that order. The image
+itself can come from CI: on manual dispatch a job builds, pushes and then reads a real record
+on a real box, so nothing has to be built locally. Failure is fail-open by design: records are
+still read and the run still finishes.
+
+Two opt-in live tests cover the halves a fake cannot: `tests/test_ai_gateway_live.py` for the
+LLM endpoint (`VA_LSE_TEST_AI_GATEWAY_KEY`) and `tests/test_vercel_sandbox_live.py` for the box
+(`VA_LSE_TEST_VERCEL_SANDBOX_TOKEN`, plus the team/project and `VA_LSE_TEST_VERCEL_SANDBOX_CLI`
+if the CLI is not on `PATH`). Both skip without their variable, so CI is unaffected.
 
 `scripts/va_records_download.py` also inspects what it just downloaded — page count,
 text-vs-image balance, sha256 — prints a warning when the export is implausibly small or mostly
