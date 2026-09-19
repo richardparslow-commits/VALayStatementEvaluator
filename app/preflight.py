@@ -13,17 +13,26 @@ probe could not tell: an unreachable host, a provider that serves completions
 without listing models, a 5xx from someone else's outage. A gate that refuses to
 start a working run is a worse failure than the one it prevents, so the ambiguous
 outcomes are reported and the run proceeds.
+
+Two probes, and the second one is the reason this module has a second probe at all:
+``GET /models`` is a *listing*, and a listing is not a promise. Perplexity's Router API
+answers it with its ids and then refuses every completion — ``403 The Router API is
+currently in limited preview`` (measured on an account without preview access), which
+looks exactly like a healthy endpoint until something calls it. So once the listing has
+not already blocked the run, the preflight asks for one token from each configured model
+and judges that: a refusal blocks, an answer confirms, and anything ambiguous (no
+response, a rate limit, a 5xx) leaves the listing's verdict alone.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from hashlib import sha256
 from typing import Any, Callable
 from urllib.parse import urlparse
 
 from .config import Settings
-from .llm import ModelProbe, probe_models
+from .llm import ChatProbe, ModelProbe, probe_chat, probe_models
 
 # A run may start. The endpoint answered and lists every configured model.
 OK = "ok"
@@ -35,6 +44,14 @@ BLOCKED = "blocked"
 UNVERIFIED = "unverified"
 
 ProbeFn = Callable[[str, str], ModelProbe]
+#: ``(base_url, api_key, model) -> ChatProbe`` — the one-token call.
+ChatProbeFn = Callable[[str, str, str], ChatProbe]
+
+#: Statuses that mean *every* call will be refused as configured. A model listing that
+#: came back with ids does not rule them out: that is the whole reason the chat probe
+#: exists (see the module docstring), and a 404 on the completions path is just as
+#: deterministic as a rejected key.
+REFUSAL_STATUSES = (401, 403, 404)
 
 # ----------------------------------------------------------- Vercel credentials
 #
@@ -166,11 +183,94 @@ def _model_present(model: str, available: set[str]) -> bool:
     return any(candidate == model or candidate.startswith(model) for candidate in available)
 
 
-def check_endpoint(settings: Settings, *, probe: ProbeFn = probe_models) -> Verdict:
+def _router_note(settings: Settings) -> str:
+    """The Router-API hint, when that is the endpoint being refused.
+
+    This is the case the models probe cannot see: Perplexity's Router API publishes its
+    ids and refuses completions until the account is granted preview access, so the
+    provider's message is the actionable part and the remedy belongs beside it.
+    """
+    if "router" not in (settings.base_url or "").lower():
+        return ""
+    return (
+        "Perplexity's **Router API** is a private preview: the models route answers, but "
+        "calls are refused until the account is granted access (request it from "
+        "api@perplexity.ai). Their standard API (`https://api.perplexity.ai`, `sonar` "
+        "models) is a different endpoint that serves normal plans."
+    )
+
+
+def _verified_by_a_call(
+    settings: Settings,
+    models: tuple[str, ...],
+    chat_probe: ChatProbeFn,
+    allowed: Verdict,
+) -> Verdict:
+    """Strengthen a would-be-allowed verdict with one real call to each model.
+
+    Only ever called when the models probe has *not* blocked the run, because that is
+    the case a listing cannot settle: ids are published, and every completion is then
+    refused. A refusal blocks (with the provider's own words, which is where the
+    remedy is), an answer confirms, and anything ambiguous — no response, a rate limit,
+    a 5xx — leaves *allowed* exactly as the listing left it.
+    """
+    outcomes = [
+        (model, chat_probe(settings.base_url, settings.api_key, model))
+        for model in dict.fromkeys(models)
+    ]
+    refused = [(model, probe) for model, probe in outcomes if probe.status in REFUSAL_STATUSES]
+    answered = tuple(model for model, probe in outcomes if probe.ok)
+
+    if refused:
+        model, probe = refused[0]
+        # Which sentence is true depends on whether a listing came back at all: with one,
+        # the point is that a listing is not a promise; without one, the call is the only
+        # evidence there was and it says the endpoint does not serve this model.
+        lede = (
+            "A listing is not a promise: the models route answered, and a real call is "
+            "refused in the same way every call would be, so the run was not started."
+            if allowed.listed
+            else "A real call is refused in the same way every call in the run would be, "
+            "so the run was not started."
+        )
+        fix = f"{lede} The provider's own words: {probe.error}"
+        note = _router_note(settings) or _credential_mismatch(settings)
+        if note:
+            fix = f"{note} {fix}"
+        return Verdict(
+            BLOCKED,
+            headline=f"The endpoint refused a real call to `{model}` (HTTP {probe.status}).",
+            fix=fix,
+            status=probe.status,
+            checked=allowed.checked,
+            listed=allowed.listed,
+        )
+
+    if answered:
+        return replace(
+            allowed,
+            kind=OK,
+            headline=(
+                f"{allowed.headline} A real call to {_quoted(answered)} answered, so the "
+                "configured key, endpoint and ids all work."
+            ),
+        )
+
+    return allowed
+
+
+def check_endpoint(
+    settings: Settings,
+    *,
+    probe: ProbeFn = probe_models,
+    chat_probe: ChatProbeFn = probe_chat,
+) -> Verdict:
     """Probe the configured endpoint and judge whether a run can start.
 
-    ``probe`` is a parameter so the policy can be tested without a socket, and so
-    a caller can reuse a result it already has.
+    ``probe`` and ``chat_probe`` are parameters so the policy can be tested without a
+    socket, and so a caller can reuse a result it already has. The chat probe is the
+    second half of the check because the first half is only a listing; see the module
+    docstring for the endpoint that makes that difference matter.
     """
     models = tuple(
         m.strip() for m in (settings.model_main, settings.model_fast) if m and m.strip()
@@ -211,12 +311,17 @@ def check_endpoint(settings: Settings, *, probe: ProbeFn = probe_models) -> Verd
                 checked=checked,
                 listed=len(available),
             )
-        return Verdict(
-            OK,
-            headline=f"The endpoint offers every configured model ({len(available)} listed).",
-            status=result.status,
-            checked=checked,
-            listed=len(available),
+        return _verified_by_a_call(
+            settings,
+            checked,
+            chat_probe,
+            Verdict(
+                OK,
+                headline=f"The endpoint offers every configured model ({len(available)} listed).",
+                status=result.status,
+                checked=checked,
+                listed=len(available),
+            ),
         )
 
     if result.status in (401, 403):
@@ -239,16 +344,23 @@ def check_endpoint(settings: Settings, *, probe: ProbeFn = probe_models) -> Verd
         )
 
     if result.status == 404:
-        return Verdict(
-            UNVERIFIED,
-            headline=f"The endpoint has no `/models` route at this base URL (HTTP 404).",
-            fix=(
-                "Some OpenAI-compatible servers serve completions without listing models, so "
-                "the run is allowed — but the model names cannot be checked. If the base URL "
-                "is wrong, calls will fail for that reason instead."
+        # No listing route, so the one-token call is the only thing that can tell a
+        # working endpoint from a wrong base URL — exactly what it is for.
+        return _verified_by_a_call(
+            settings,
+            checked,
+            chat_probe,
+            Verdict(
+                UNVERIFIED,
+                headline=f"The endpoint has no `/models` route at this base URL (HTTP 404).",
+                fix=(
+                    "Some OpenAI-compatible servers serve completions without listing models, so "
+                    "the run is allowed — but the model names cannot be checked. If the base URL "
+                    "is wrong, calls will fail for that reason instead."
+                ),
+                status=result.status,
+                checked=checked,
             ),
-            status=result.status,
-            checked=checked,
         )
 
     if result.status is None:
@@ -265,12 +377,17 @@ def check_endpoint(settings: Settings, *, probe: ProbeFn = probe_models) -> Verd
         )
 
     if result.status == 200:
-        return Verdict(
-            UNVERIFIED,
-            headline="The endpoint answered but published no model ids.",
-            fix="Nothing could be compared, so the run is allowed.",
-            status=200,
-            checked=checked,
+        return _verified_by_a_call(
+            settings,
+            checked,
+            chat_probe,
+            Verdict(
+                UNVERIFIED,
+                headline="The endpoint answered but published no model ids.",
+                fix="Nothing could be compared, so the run is allowed.",
+                status=200,
+                checked=checked,
+            ),
         )
 
     return Verdict(
