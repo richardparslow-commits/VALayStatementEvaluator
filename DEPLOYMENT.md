@@ -704,6 +704,13 @@ Four things about it are deliberate and easy to get wrong by hand:
   VA_LSE_EXTRACTOR_RUNNER="python scripts/vercel_sandbox_runner.py {work}"
   ```
 
+  Use an interpreter that actually exists. The runner is spawned as a subprocess, so
+  the command is only as good as its first word: macOS ships `python3` and no `python`,
+  and Streamlit started from a virtualenv does not put `python` on `PATH` either — the
+  file then fails open with "the runner command does not exist (python)" and every
+  record is read in-process, which is a warning per run rather than an error. Point it
+  at an absolute interpreter path (`…/venv/bin/python`) or at `python3`.
+
   Per file it runs `sandbox create --name va-lse-ocr-<id> --image va-lse-sandbox:latest
   --timeout 20m --non-persistent --silent`, then `exec … mkdir -p
   /work/bundle/<the label's directory>`, `copy <work>/<file> <name>:/work/bundle/<label>`,

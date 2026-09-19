@@ -835,7 +835,10 @@ export VA_LSE_EXTRACTOR_RUNNER="python scripts/vercel_sandbox_runner.py {work}"
 export VA_LSE_SANDBOX_TOKEN=vcp_...   # a Vercel access token, or run `sandbox login` once
 ```
 
-`scripts/vercel_sandbox_runner.py` needs the Sandbox CLI (`npm i -g sandbox`) and the image
+The runner command is a subprocess, so its first word has to exist: on macOS there is
+`python3` and no `python`, and a virtualenv is not on `PATH` unless it is activated — use an
+absolute interpreter path there, or every file falls back in-process with one warning.
+`scripts/vercel_sandbox_runner.py` also needs the Sandbox CLI (`npm i -g sandbox`) and the image
 pushed (`DEPLOYMENT.md` §6 has that build line, the image/timeout/team/project knobs, and what
 happens when a box is killed mid-file). Its credential is a Vercel **access token** (or a
 Function's OIDC token) — not the AI Gateway key, which is this app's LLM credential; Vercel
