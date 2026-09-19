@@ -215,6 +215,16 @@ class TestResultRoundtrip(unittest.TestCase):
         self.assertEqual(restored.review_issues, original.review_issues)
         self.assertEqual(restored.output_statement, original.output_statement)
 
+    def test_unreviewed_full_draft_and_warning_survive_queue_roundtrip(self):
+        original = _draft()
+        original.draft = "Observation. " * 1600 + "CERTIFICATION END"
+        original.final_statement = ""
+        original.review_issues = ["Self-review skipped; complete original draft preserved."]
+        restored = draft_from_json(draft_to_json(original))
+        self.assertEqual(restored.output_statement, original.draft)
+        self.assertTrue(restored.output_statement.endswith("CERTIFICATION END"))
+        self.assertEqual(restored.review_issues, original.review_issues)
+
     def test_usage_survives(self):
         tracker = usage_from_json(usage_to_json(_tracker()))
         self.assertEqual(len(tracker.entries), 2)

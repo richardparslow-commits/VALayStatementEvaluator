@@ -670,7 +670,9 @@ def _render_draft_results(draft_result: Any) -> None:
     )
 
     if draft_result.review_issues:
-        with st.expander("Self-review findings (fixed in the final version)"):
+        if not draft_result.final_statement:
+            st.warning("Self-review was not applied. The full original draft is shown; review it before signing.")
+        with st.expander("Self-review findings", expanded=not bool(draft_result.final_statement)):
             for issue in draft_result.review_issues:
                 st.write(f"- {issue}")
 

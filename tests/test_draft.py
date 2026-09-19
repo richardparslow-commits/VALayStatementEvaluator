@@ -18,7 +18,7 @@ from app.drafting_service import (  # noqa: E402
     format_error_for_user,
 )
 from app.documents import DRAFT_INTERNAL_MAX_CHARS, document_from_text  # noqa: E402
-from app.draft import DraftResult, _truncate_for_prompt, grounding_markdown, run_draft  # noqa: E402
+from app.draft import DraftResult, REVIEW_MAX_CHARS, _truncate_for_prompt, grounding_markdown, run_draft  # noqa: E402
 from app.llm import LLMError, LLMTimeoutError, LLMUpstreamError  # noqa: E402
 from app.logging_config import clear_request_id, set_request_id  # noqa: E402
 from app.medical_review import MedicalDigest, MedicalFact  # noqa: E402
@@ -74,7 +74,7 @@ class _FakeLLM:
                 ],
             }
         if phase == "review":
-            return {"issues_found": ["Add frequency."], "improved_statement": "Improved statement with frequency daily observed. [Confirm: brace use] " * 5 + "Final expanded statement with all required elements and certification."}
+            return {"issues_found": ["Add frequency."], "improved_statement": "Improved statement with frequency daily observed. [Confirm: brace date] " * 5 + "Final expanded statement with all required elements and certification."}
         if phase == "records:digest":
             return {"facts": [{"date": "2020-01", "type": "symptom", "description": "Knee pain after lifting.", "source": "a.txt p.1", "quote": "knee pain"}], "conditions_mentioned": ["knee pain"], "providers_and_facilities": ["Dr. Smith"], "notes": ""}
         if phase == "records:merge":
@@ -164,13 +164,11 @@ class TestRunDraftHappyPath(unittest.TestCase):
     def test_full_pipeline(self, _mk, mock_review):
         mock_review.return_value = _fake_digest()
         llm = _FakeLLM()
-        # Use longer draft so 40% threshold passes: draft will be ~70 chars, improved ~55 => passes
         result = run_draft(llm, [_doc()], WITNESS, "Daily knee pain observed. Limping.", "knee pain", "Increased rating", progress=lambda f, m: None)
         self.assertTrue(result.grounding)
         self.assertIn("supported_observations", result.grounding)
         self.assertTrue(result.draft)
         self.assertIn("[Confirm:", result.draft)
-        # improved is 55 chars vs draft ~63 => ratio ~0.87 > 0.4, so final_statement set
         self.assertTrue(result.final_statement)
         self.assertIn("Improved statement", result.final_statement)
         self.assertTrue(result.review_issues)
@@ -355,6 +353,123 @@ class TestRunDraftEdgeCases(unittest.TestCase):
         self.assertEqual(getattr(captured[-1], "request_id", ""), "req_testref1234")
         self.assertEqual(getattr(captured[-1], "error_kind", ""), "upstream_timeout")
         self.assertIn("reference: req_testref1234", format_error_for_user(ctx.exception, "req_testref1234"))
+
+
+class TestSelfReviewPreservation(unittest.TestCase):
+    CLOSING = (
+        "I certify that this statement is true and correct to the best of my knowledge and belief.\n"
+        "Signature: [Signature]\nPrinted name: Jane Doe\nDate: [Date]\nEmail: [Email]"
+    )
+    STATEMENT = (
+        "# Statement in Support of Claim\nVA Form 21-10210\n"
+        "## Introduction\nI am Jane Doe, the veteran's spouse. We live together.\n"
+        "## Observed symptoms\nI see him limp daily. [Confirm: brace date]\n"
+        "## Functional impact\nHe cannot stand long enough to prepare dinner. "
+        "[Witness to add: describe assistance]\n"
+        "## Continuity statement\nI have observed these limits continuously since 2020.\n"
+        "## Closing & certification\n" + CLOSING
+    )
+
+    def _run(self, draft, review, observations="Daily knee pain."):
+        llm = _FakeLLM(overrides={"draft": draft, "review": review})
+        with patch("app.draft.review_medical_records", return_value=_fake_digest()), patch(
+            "app.draft.load_knowledge", return_value="guide"
+        ):
+            result = run_draft(llm, [_doc()], WITNESS, observations, "knee pain", "Service connection")
+        return result, llm
+
+    def assert_preserved(self, result, draft):
+        self.assertEqual(result.output_statement, draft)
+        self.assertEqual(result.final_statement, "")
+        self.assertTrue(any("original" in issue.lower() for issue in result.review_issues))
+
+    def test_19831_character_statement_keeps_ending_without_partial_review(self):
+        ending = "\nLate observation: help is also needed at night. [Confirm: night assistance]\n" + self.CLOSING
+        draft = ("Observed pain. " * 1600)[:19831 - len(ending)] + ending
+        self.assertEqual(len(draft), 19831)
+        result, llm = self._run(draft, {"issues_found": [], "improved_statement": draft[:16000]})
+        self.assert_preserved(result, draft)
+        self.assertNotIn(("chat_json", "review"), llm.calls)
+        self.assertTrue(any("16,000" in issue for issue in result.review_issues))
+        self.assertEqual(result.truncated_chars, 0)
+
+    def test_exact_limit_is_reviewed_in_full(self):
+        ending = "\n[Confirm: final observation]\n" + self.CLOSING
+        draft = "x" * (REVIEW_MAX_CHARS - len(ending)) + ending
+
+        def review(_system, user, _kwargs):
+            self.assertIn("<<<\n" + draft + "\n>>>", user)
+            return {"issues_found": [], "improved_statement": draft}
+
+        result, llm = self._run(draft, review)
+        self.assertEqual(result.final_statement, draft)
+        self.assertIn(("chat_json", "review"), llm.calls)
+
+    def test_one_over_limit_keeps_original(self):
+        draft = "x" * (REVIEW_MAX_CHARS + 1)
+        result, llm = self._run(draft, {})
+        self.assert_preserved(result, draft)
+        self.assertNotIn(("chat_json", "review"), llm.calls)
+
+    def test_sanitizer_expansion_cannot_create_partial_review(self):
+        draft = "x" * (REVIEW_MAX_CHARS - 3) + "```"
+        result, llm = self._run(draft, {})
+        self.assert_preserved(result, draft)
+        self.assertNotIn(("chat_json", "review"), llm.calls)
+
+    def test_incomplete_rewrites_are_rejected_even_above_length_threshold(self):
+        replacements = {
+            "confirmation": self.STATEMENT.replace("[Confirm: brace date]", "Brace used since 2020."),
+            "question": self.STATEMENT.replace("[Witness to add: describe assistance]", ""),
+            "section": self.STATEMENT.replace("## Functional impact\n", ""),
+            "empty_section": self.STATEMENT.replace("I have observed these limits continuously since 2020.\n", ""),
+            "closing": self.STATEMENT.replace(self.CLOSING, ""),
+            "certification": self.STATEMENT.replace("I certify that this statement is true and correct", "I certify this is not correct"),
+            "contact": self.STATEMENT.replace("Printed name: Jane Doe\n", ""),
+        }
+        for name, improved in replacements.items():
+            with self.subTest(name=name):
+                self.assertGreater(len(improved), max(200, int(len(self.STATEMENT) * 0.4)))
+                result, _ = self._run(self.STATEMENT, {"issues_found": ["Wording."], "improved_statement": improved})
+                self.assert_preserved(result, self.STATEMENT)
+                self.assertIn("Wording.", result.review_issues)
+
+    def test_plain_and_numbered_sections_cannot_disappear(self):
+        for heading in ("Functional impact:", "5. Functional impact", "**Functional impact**:"):
+            with self.subTest(heading=heading):
+                original = self.STATEMENT.replace("## Functional impact", heading)
+                improved = original.replace(heading, "")
+                result, _ = self._run(original, {"improved_statement": improved})
+                self.assert_preserved(result, original)
+
+    def test_duplicate_confirmation_cannot_be_deduplicated(self):
+        original = self.STATEMENT.replace("I see him limp daily.", "[Confirm: brace date] I see him limp daily.")
+        result, _ = self._run(original, {"improved_statement": self.STATEMENT})
+        self.assert_preserved(result, original)
+
+    def test_complete_rewrite_can_improve_wording(self):
+        improved = self.STATEMENT.replace("I see him limp daily.", "I observe him limping every day.")
+        result, _ = self._run(self.STATEMENT, {"issues_found": ["Wording."], "improved_statement": improved})
+        self.assertEqual(result.final_statement, improved)
+        self.assertEqual(result.review_issues, ["Wording."])
+
+    def test_malformed_review_falls_back_without_losing_draft(self):
+        for review in ([], None, "text", {"improved_statement": [self.STATEMENT]}, {"improved_statement": " " * 1000}, {}):
+            with self.subTest(review=type(review).__name__):
+                result, _ = self._run(self.STATEMENT, review)
+                self.assert_preserved(result, self.STATEMENT)
+
+    def test_invalid_findings_do_not_prevent_valid_rewrite(self):
+        result, _ = self._run(self.STATEMENT, {"issues_found": None, "improved_statement": self.STATEMENT})
+        self.assertEqual(result.final_statement, self.STATEMENT)
+        self.assertEqual(result.review_issues, [])
+
+    def test_input_truncation_warning_survives_skipped_review(self):
+        draft = "x" * (REVIEW_MAX_CHARS + 1)
+        result, _ = self._run(draft, {}, observations="x" * (DRAFT_INTERNAL_MAX_CHARS + 1))
+        self.assert_preserved(result, draft)
+        self.assertEqual(result.truncated_chars, 1)
+        self.assertTrue(result.truncation_warning)
 
 
 class TestRunDraftReviewFailure(unittest.TestCase):

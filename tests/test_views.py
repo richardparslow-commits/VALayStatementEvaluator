@@ -69,6 +69,36 @@ class _UploadWithBytes(_UploadedFile):
         return self._data
 
 
+class TestDraftReviewWarning(unittest.TestCase):
+    def test_unapplied_review_is_visible_and_not_claimed_fixed(self):
+        from app.draft import DraftResult
+        from app.views import draft_view
+
+        for applied in (False, True):
+            with self.subTest(applied=applied):
+                st_mock, _ = _fake_streamlit()
+                st_mock.columns.return_value = [MagicMock(), MagicMock()]
+                st_mock.text_area.return_value = "Complete statement."
+                result = DraftResult(
+                    draft="Complete original statement.",
+                    final_statement="Improved complete statement." if applied else "",
+                    review_issues=["Review finding." if applied else "Self-review skipped; original preserved."],
+                )
+                with _patch_st(draft_view, st_mock), patch.object(
+                    draft_view, "render_usage_summary"
+                ), patch.object(draft_view, "render_follow_up_questions"), patch.object(
+                    draft_view, "_render_pdf_export"
+                ):
+                    draft_view._render_draft_results(result)
+                st_mock.expander.assert_any_call("Self-review findings", expanded=not applied)
+                self.assertFalse(any("fixed in the final" in str(call) for call in st_mock.expander.call_args_list))
+                self.assertEqual(st_mock.text_area.call_args.kwargs["value"], result.output_statement)
+                if applied:
+                    st_mock.warning.assert_not_called()
+                else:
+                    self.assertIn("full original draft", st_mock.warning.call_args.args[0])
+
+
 # ---------------------------------------------------------------- shared.py
 class TestFormatErrorForUser(unittest.TestCase):
     def test_includes_reference_when_present(self) -> None:
