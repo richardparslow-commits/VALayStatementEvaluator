@@ -1,6 +1,7 @@
 """Verify .gitignore actually ignores secret-bearing paths and hook is present."""
 import fnmatch
 import os
+import re
 import shutil
 import stat
 import sys
@@ -12,6 +13,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
+from tests import harness_imports, streamlit_option_reads  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 GITIGNORE = PROJECT_ROOT / ".gitignore"
@@ -638,6 +640,167 @@ class TestTheHookRefusesASecretUnderARename(HookRepository):
         self.rename("guide.md", "moved-guide.md")
         result = self.run_hook()
         self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class TestTheHookAndTheRulesStayInStep(HookRepository):
+    """The hook lists staged files itself, so its filters can drift from the reader's.
+
+    ``tests/staged_sources.py`` owns the decision about which change kinds travel —
+    renames included, because a file must not be able to escape a rule by moving —
+    and both rule modules read the index through it. The hook cannot import that
+    decision for its own name and content scans, so it states the filter a second
+    time, and the two have drifted once already: the reader read ``ACMR`` while the
+    hook's listing read ``ACM``, and only the reader saw renames. Nothing failed in
+    either direction, which is the point — the side left behind keeps reporting
+    green while checking less than it claims.
+    """
+
+    READER = PROJECT_ROOT / "tests" / "staged_sources.py"
+    WIRED = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "\n"
+        "sys.path.insert(0, str(Path(__file__).resolve().parent.parent))\n"
+        "from tests import hermetic  # noqa: E402,F401\n"
+        "\n"
+        "from app import config  # noqa: E402\n"
+    )
+    FILE_READ = (
+        "from pathlib import Path\n"
+        "\n"
+        "CONFIG = Path(__file__).parent.parent / '.streamlit' / 'config.toml'\n"
+        "TEXT = CONFIG.read_text(encoding='utf-8')\n"
+    )
+
+    def commit(self, relative: str, text: str) -> None:
+        self.stage(relative, text)
+        subprocess.run(
+            ["git", "config", "user.name", "Test User"],
+            cwd=str(self.repo),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.invalid"],
+            cwd=str(self.repo),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-qm", f"add {relative}"],
+            cwd=str(self.repo),
+            check=True,
+            capture_output=True,
+        )
+
+    def rename(self, source: str, destination: str) -> None:
+        subprocess.run(
+            ["git", "mv", source, destination],
+            cwd=str(self.repo),
+            check=True,
+            capture_output=True,
+        )
+
+    def stage_edit(self, relative: str, text: str) -> None:
+        (self.repo / relative).write_text(text, encoding="utf-8")
+        subprocess.run(
+            ["git", "add", relative],
+            cwd=str(self.repo),
+            check=True,
+            capture_output=True,
+        )
+
+    def test_the_hook_listing_reads_the_kinds_the_reader_reads(self) -> None:
+        """One decision about change kinds, stated twice — so compare the statements.
+
+        The common shapes (an add, a modify) exercise neither filter's edge; a kind
+        dropped on one side is exactly the drift this test exists to stop, and it is
+        invisible until someone stages that kind of change.
+        """
+        hook_filters = set(
+            re.findall(r"--diff-filter=([A-Z]+)", HOOK.read_text(encoding="utf-8"))
+        )
+        reader_filters = set(
+            re.findall(
+                r"--diff-filter=([A-Z]+)", self.READER.read_text(encoding="utf-8")
+            )
+        )
+        self.assertTrue(reader_filters, "the reader states no filter to compare")
+        self.assertTrue(hook_filters, "the hook states no filter to compare")
+        for stated in sorted(reader_filters):
+            self.assertIn(
+                stated,
+                hook_filters,
+                "the hook's own scans must read the same kinds of change as the "
+                "shared reader; changed on one side only, that side checks less "
+                "without failing anything",
+            )
+        self.assertIn(
+            "R",
+            set("".join(reader_filters)),
+            "the reader must carry renames, or a rule can be escaped by moving",
+        )
+        self.assertIn(
+            "R",
+            set("".join(hook_filters)),
+            "the hook must carry renames, or a staged rename is never scanned",
+        )
+
+    def test_the_rule_gates_are_the_scopes_the_modules_judge(self) -> None:
+        """The hook's gates decide which rules run; the modules decide what they judge.
+
+        The gates are deliberately coarser than the rules — a directory each, not the
+        module's own glob — so that *which* files count has one answer, in the
+        modules. A gate narrower than its module skips files the rule meant to judge;
+        a missing gate skips the rule entirely.
+        """
+        gates = set(
+            re.findall(r"grep -q '\^([^/']+)/'", HOOK.read_text(encoding="utf-8"))
+        )
+        scopes = {harness_imports.TESTS_DIR.name, streamlit_option_reads.APP_DIR.name}
+        self.assertEqual(
+            gates,
+            scopes,
+            "every rule's scope needs its gate, and every gate a rule — what a "
+            "commit is checked against is whatever the two agree on",
+        )
+
+    def test_a_renamed_test_module_is_still_judged(self) -> None:
+        """A rename with a small edit — the shape where a dropped filter goes unseen.
+
+        A pure move of a wired module passes even when a filter has lost ``R``,
+        because nothing was added for a rule to object to; the inserted line is what
+        the modules are entitled to see.
+        """
+        filler = "".join(f"VALUE_{number} = {number}\n" for number in range(15))
+        self.commit("tests/test_original.py", self.WIRED + filler)
+        self.rename("tests/test_original.py", "tests/test_moved.py")
+        self.stage_edit(
+            "tests/test_moved.py",
+            "from app import config\n" + self.WIRED + filler,
+        )
+        result = self.run_hook()
+        self.assertNotEqual(
+            result.returncode, 0, "a moved module is still a staged module"
+        )
+        self.assertIn("test_moved.py", result.stderr)
+        self.assertIn("lands after the import on line", result.stderr)
+
+    def test_a_renamed_app_module_is_still_judged(self) -> None:
+        filler = "".join(f"VALUE_{number} = {number}\n" for number in range(15))
+        self.commit("app/views/original.py", self.FILE_READ + filler)
+        self.rename("app/views/original.py", "app/views/moved.py")
+        self.stage_edit(
+            "app/views/moved.py",
+            "import streamlit as st\n"
+            "PORT = st.get_option('server.port')\n" + self.FILE_READ + filler,
+        )
+        result = self.run_hook()
+        self.assertNotEqual(
+            result.returncode, 0, "a moved module is still a staged module"
+        )
+        self.assertIn("app/views/moved.py", result.stderr)
+        self.assertIn("get_option", result.stderr)
 
 
 if __name__ == "__main__":
