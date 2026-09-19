@@ -184,6 +184,17 @@ class TestOneFileThroughTheBox(RunnerTestCase):
         self.assertTrue(self.call_for("copy-in")["remote"].endswith(f"/bundle/{label}"))
         self.assertTrue(self.call_for("mkdir")["directory"].endswith("/bundle/records/2024"))
 
+    def test_the_default_runtime_can_be_asked_for_by_name(self) -> None:
+        """``VA_LSE_SANDBOX_IMAGE=none`` drops ``--image`` so the CLI boots its own
+        runtime — the only way to prove a credential and the create/exec/copy/remove
+        cycle when no VCR image has been pushed yet (see the live test)."""
+        self.stage("note.pdf", _pdf_bytes([TYPED]))
+
+        code, _out, err = self.run_runner({"VA_LSE_SANDBOX_IMAGE": "none"})
+
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("--image", self.call_for("create")["argv"])
+
     def test_the_box_is_created_from_the_documented_image_and_removed_last(self) -> None:
         self.stage("progress_note.pdf", _pdf_bytes([TYPED]))
 
@@ -215,8 +226,13 @@ class TestOneFileThroughTheBox(RunnerTestCase):
         self.assertEqual(create[create.index("--project") + 1], "my-project")
         self.assertEqual(create[create.index("--token") + 1], "fake-token-value-9173")
         self.assertEqual(create[create.index("--timeout") + 1], "45m")
-        # remove takes a name and no options, per the CLI reference.
-        self.assertEqual(self.calls()[-1]["argv"], [self.calls()[-1]["name"]])
+        # Cleanup authenticates too: Vercel's reference lists no options for
+        # `remove`, but the CLI takes them, and without them a token-authenticated
+        # deployment could never remove its own box.
+        remove = self.calls()[-1]["argv"]
+        self.assertIn("--token", remove)
+        self.assertIn("--scope", remove)
+        self.assertIn("--project", remove)
 
     def test_cleanup_that_fails_does_not_fail_the_file(self) -> None:
         """A box nobody removed stops itself at --timeout; the report is already
@@ -284,6 +300,16 @@ class TestTheAppReadsThroughTheRunner(RunnerTestCase):
 
 
 class TestRefusals(RunnerTestCase):
+    def test_the_boxes_own_sentence_is_forwarded_even_when_the_read_fails(self) -> None:
+        """The diagnosis of a failed read *is* the box's output, so it has to reach
+        stderr before the exit code is judged."""
+        self.stage("scan.pdf", _pdf_bytes([TYPED]))
+
+        code, _out, err = self.run_runner({"FAKE_SANDBOX_FAIL": "entrypoint"})
+
+        self.assertEqual(code, 1)
+        self.assertIn("  | ✖ Scans are present and no OCR tooling is installed", err)
+
     def test_a_box_that_cannot_be_created_never_fails_the_file_itself(self) -> None:
         self.stage("progress_note.pdf", _pdf_bytes([TYPED]))
 
@@ -396,6 +422,149 @@ class TestATerminatedRunnerStillRemovesTheBox(RunnerTestCase):
             os.killpg(proc.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
+
+
+class TestTheFailureDetail(unittest.TestCase):
+    """What an operator reads when the box says no.
+
+    The real CLI appends noise after the reason — a failed ``create`` ends with
+    ``╰▶ hint: the full response buffer is stored in /tmp/…`` — so the last line is
+    not the reason, and a runner that quotes it hides the actual error (measured
+    against 4.4.0: an unpushed image reported a temp path instead of "Image not
+    found").
+    """
+
+    def _detail(self, stdout: str = "", stderr: str = "") -> str:
+        return runner._detail(
+            subprocess.CompletedProcess(args=["sandbox"], returncode=1, stdout=stdout, stderr=stderr)
+        )
+
+    def test_a_trailing_hint_does_not_hide_the_reason(self) -> None:
+        stderr = (
+            '{"error":{"message":"Image not found"}}\n'
+            "╰▶ hint: the full response buffer is stored in /tmp/sandbox-cli-response-x.http\n"
+        )
+
+        self.assertIn("Image not found", self._detail(stderr=stderr))
+
+    def test_stderr_is_read_before_stdout(self) -> None:
+        self.assertIn("the reason", self._detail(stdout="stdout noise", stderr="the reason"))
+
+    def test_a_quiet_failure_still_says_something(self) -> None:
+        self.assertEqual(self._detail(), "no output")
+
+    def test_a_404_names_the_step_that_fixes_it(self) -> None:
+        """The image is built by hand, so this is the likeliest first failure — and the
+        CLI reports it as a bare status, which says nothing about what to do."""
+        settings = runner.Settings(
+            cli=("sandbox",), image="va-lse-sandbox:latest", timeout="20m", scope="", project="", token=""
+        )
+        cli = runner.SandboxCli(settings)
+
+        advice = cli._image_advice(runner.SandboxError("create x failed (exit 1): status 404"))
+
+        self.assertIn("not in the registry", advice)
+        self.assertIn("DEPLOYMENT.md", advice)
+        self.assertIn("VA_LSE_SANDBOX_IMAGE=none", advice)
+
+    def test_advice_is_silent_for_other_failures_and_for_the_default_runtime(self) -> None:
+        settings = runner.Settings(
+            cli=("sandbox",), image="va-lse-sandbox:latest", timeout="20m", scope="", project="", token=""
+        )
+        probe = runner.Settings(
+            cli=("sandbox",), image="none", timeout="20m", scope="", project="", token=""
+        )
+
+        self.assertEqual(runner.SandboxCli(settings)._image_advice(runner.SandboxError("boom")), "")
+        self.assertEqual(
+            runner.SandboxCli(probe)._image_advice(runner.SandboxError("404 not found")), ""
+        )
+
+    def test_noise_with_nothing_else_falls_back_to_it(self) -> None:
+        """Better to show the hint than to show nothing at all."""
+        self.assertIn("hint:", self._detail(stderr="╰▶ hint: the buffer is in /tmp/x.http"))
+
+
+class TestVercelSandboxCredentials(RunnerTestCase):
+    """Sandbox auth is a Vercel access token or a Function's OIDC token — never the
+    AI Gateway key, which is the app's LLM credential for a different product."""
+
+    def token_env(self, **values: str) -> dict[str, str]:
+        """Every credential name, explicitly: an ambient VERCEL_* must not decide a test.
+
+        The precedence here is measured against the CLI rather than guessed from
+        the docs — ``VERCEL_AUTH_TOKEN`` is the name the Sandbox CLI itself reads,
+        and it does not read ``VERCEL_TOKEN`` at all.
+        """
+        env = {
+            name: ""
+            for name in (
+                "VA_LSE_SANDBOX_TOKEN",
+                "VERCEL_AUTH_TOKEN",
+                "VERCEL_OIDC_TOKEN",
+                "VERCEL_TOKEN",
+            )
+        }
+        env.update(values)
+        return env
+
+    def token_used(self) -> str | None:
+        argv = self.call_for("create")["argv"]
+        return argv[argv.index("--token") + 1] if "--token" in argv else None
+
+    def test_a_gateway_key_in_the_token_slot_is_refused_by_name(self) -> None:
+        self.stage("progress_note.pdf", _pdf_bytes([TYPED]))
+
+        code, out, err = self.run_runner(
+            self.token_env(VERCEL_TOKEN="vck_example-not-a-sandbox-token")
+        )
+
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("Vercel AI Gateway key", err)
+        self.assertIn("Account Settings", err)
+        self.assertEqual(self.calls(), [], "a refused credential must not reach the CLI")
+
+    def test_the_clis_own_variable_name_is_read(self) -> None:
+        self.stage("progress_note.pdf", _pdf_bytes([TYPED]))
+
+        code, _, err = self.run_runner(self.token_env(VERCEL_AUTH_TOKEN="auth-token-example"))
+
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.token_used(), "auth-token-example")
+
+    def test_the_oidc_token_stands_in_for_an_access_token(self) -> None:
+        """Inside a Function the OIDC token is already there, so a deployment needs no
+        long-lived secret."""
+        self.stage("progress_note.pdf", _pdf_bytes([TYPED]))
+
+        code, _, err = self.run_runner(self.token_env(VERCEL_OIDC_TOKEN="oidc-example"))
+
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.token_used(), "oidc-example")
+
+    def test_this_apps_own_variable_wins_the_precedence(self) -> None:
+        self.stage("progress_note.pdf", _pdf_bytes([TYPED]))
+
+        code, _, err = self.run_runner(
+            self.token_env(
+                VA_LSE_SANDBOX_TOKEN="explicit-example",
+                VERCEL_AUTH_TOKEN="auth-token-example",
+                VERCEL_OIDC_TOKEN="oidc-example",
+                VERCEL_TOKEN="access-example",
+            )
+        )
+
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.token_used(), "explicit-example")
+
+    def test_no_credential_leaves_the_clis_own_login_in_charge(self) -> None:
+        self.stage("progress_note.pdf", _pdf_bytes([TYPED]))
+
+        code, _, err = self.run_runner(self.token_env())
+
+        self.assertEqual(code, 0, err)
+        self.assertIsNone(self.token_used())
 
 
 if __name__ == "__main__":

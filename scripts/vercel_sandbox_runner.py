@@ -25,7 +25,7 @@ What one invocation does — one file, one box, removed in a ``finally``:
     sandbox copy <name>:/work/report.json <work>/report.json
     sandbox remove <name>
 
-Four decisions worth knowing, because each is a way this goes wrong:
+Five decisions worth knowing, because each is a way this goes wrong:
 
 * **The report comes back as a file, not as exec output.** ``sandbox exec`` is a
   session, not a pipe — its stdout can carry connection and progress lines — and
@@ -46,6 +46,15 @@ Four decisions worth knowing, because each is a way this goes wrong:
   script turns into an exception so the cleanup runs. SIGKILL cannot be caught,
   and that is exactly what the app's own per-file timeout sends, so the box also
   carries a ``--timeout`` backstop: a box nobody removed stops itself.
+* **Vercel's two credentials are not interchangeable, and this says so.** A sandbox
+  takes a Vercel *access token* (dashboard → Account Settings → Tokens, scoped to
+  the team) or the ``VERCEL_OIDC_TOKEN`` a Function is handed — read here from
+  ``VA_LSE_SANDBOX_TOKEN``, then ``VERCEL_AUTH_TOKEN`` (the name the Sandbox CLI
+  itself reads), then ``VERCEL_OIDC_TOKEN``, then ``VERCEL_TOKEN``. The
+  **AI Gateway** key (``vck_…``) that drives the app's own LLM calls is a different
+  product and never authenticates a sandbox, so a gateway-shaped value in one of
+  those slots is refused by name instead of being handed to the CLI for an opaque
+  401.
 * **The app is not imported and Vercel is not baked in.** This is operator
   tooling: stdlib only, no ``app`` import, and the CLI is invoked as a command
   line (``VA_LSE_SANDBOX_CLI``) so a stored ``sandbox login``, a team scope, or a
@@ -95,6 +104,28 @@ BOX_ENTRYPOINT = "/app/scripts/ocr_and_extract.py"
 MANIFEST_NAME = "manifest.json"
 REPORT_NAME = "report.json"
 
+#: Where a sandbox credential is read from, in order. ``VA_LSE_SANDBOX_TOKEN`` is
+#: this repository's own name for it; ``VERCEL_AUTH_TOKEN`` is the name the Sandbox
+#: CLI itself reads (its help: "the token stored in your system from
+#: VERCEL_AUTH_TOKEN"); ``VERCEL_OIDC_TOKEN`` is what a Vercel Function can use
+#: instead, Vercel's recommendation because nothing long-lived has to be stored;
+#: ``VERCEL_TOKEN`` is the Vercel REST API's convention, which the Sandbox CLI does
+#: *not* read — the runner passes it as ``--token``, which every subcommand takes
+#: (verified against `sandbox <subcommand> --help`, 4.4.0). Unset everywhere means
+#: the CLI's stored ``sandbox login`` session is used.
+TOKEN_ENV_NAMES = (
+    "VA_LSE_SANDBOX_TOKEN",
+    "VERCEL_AUTH_TOKEN",
+    "VERCEL_OIDC_TOKEN",
+    "VERCEL_TOKEN",
+)
+
+#: Vercel AI Gateway keys. They carry Vercel's name and nothing else: they
+#: authenticate the gateway's OpenAI-compatible LLM API (the app's
+#: ``OPENAI_API_KEY``), never a sandbox. Recognised here so the mistake is refused
+#: with the remedy rather than surfacing as an opaque 401 from the CLI.
+GATEWAY_KEY_PREFIXES = ("vck_", "vcg_")
+
 
 class SandboxError(RuntimeError):
     """Anything that means this file must be read in-process instead."""
@@ -136,8 +167,32 @@ class Settings:
             or DEFAULT_TIMEOUT,
             scope=os.getenv("VA_LSE_SANDBOX_SCOPE", "").strip(),
             project=os.getenv("VA_LSE_SANDBOX_PROJECT", "").strip(),
-            token=os.getenv("VERCEL_TOKEN", "").strip(),
+            token=sandbox_token_from_env(),
         )
+
+
+def sandbox_token_from_env() -> str:
+    """The sandbox credential, or "" to let the CLI use its stored session.
+
+    OIDC first among the Vercel names because that is the recommended path: inside a
+    Function or a Vercel-wired CI job the token is already provisioned, so a
+    deployment needs no long-lived secret. A gateway key in any of these slots is
+    refused here, by name, rather than passed to a CLI that can only answer 401.
+    """
+    for name in TOKEN_ENV_NAMES:
+        value = os.getenv(name, "").strip()
+        if not value:
+            continue
+        if value.startswith(GATEWAY_KEY_PREFIXES):
+            raise SandboxError(
+                f"{name} holds what looks like a Vercel AI Gateway key ({value[:4]}…) — that "
+                "authenticates the gateway's LLM API (set it as the app's OPENAI_API_KEY), not a "
+                "sandbox. Vercel Sandbox takes an access token (dashboard → Account Settings → "
+                "Tokens, scoped to the team) or a Function's VERCEL_OIDC_TOKEN; unset this "
+                "variable to fall back to the CLI's `sandbox login` session"
+            )
+        return value
+    return ""
 
 
 def _log(text: str) -> None:
@@ -146,13 +201,32 @@ def _log(text: str) -> None:
     print(text, file=sys.stderr)
 
 
+#: Lines the CLI appends *after* the reason. Measured against 4.4.0: a failed
+#: ``create`` ends with ``╰▶ hint: the full response buffer is stored in /tmp/…``,
+#: so taking the last line verbatim reports a temp-file path instead of the reason
+#: ("Image not found"). These are skipped, and never chosen over a real message.
+_NOISE_MARKERS = ("hint:", "response buffer")
+
 def _detail(proc: subprocess.CompletedProcess[str]) -> str:
-    """The one line an operator needs: the CLI's own last word, not a wall."""
+    """The one line an operator needs: the CLI's own reason, not a wall or a hint.
+
+    The *last* line is not it. A failed ``create`` ends with
+    ``╰▶ hint: the full response buffer is stored in /tmp/…``, so quoting the last line
+    hides the reason (measured: an unpushed image reported a temp path instead of
+    "Image not found"). Hints are dropped and the last line that remains is the CLI's
+    final word — which is the box's own sentence where there is one.
+    """
+    fallback = ""
     for stream in (proc.stderr, proc.stdout):
         lines = [line.strip() for line in (stream or "").splitlines() if line.strip()]
-        if lines:
-            return lines[-1][:300]
-    return "no output"
+        if not lines:
+            continue
+        reasons = [line for line in lines if not any(m in line.lower() for m in _NOISE_MARKERS)]
+        if reasons:
+            return reasons[-1][:300]
+        if not fallback:  # nothing but hints: a hint beats silence
+            fallback = lines[-1][:300]
+    return fallback or "no output"
 
 
 def _masked(argv: Sequence[str]) -> str:
@@ -192,7 +266,14 @@ class SandboxCli:
             flags += ["--project", self.settings.project]
         return flags
 
-    def _run(self, argv: list[str], purpose: str) -> subprocess.CompletedProcess[str]:
+    def _run(
+        self, argv: list[str], purpose: str, *, forward: bool = False
+    ) -> subprocess.CompletedProcess[str]:
+        """One CLI invocation. ``forward`` echoes the box's own output to our stderr
+        *before* the return code is judged, so a step that fails still shows what the
+        box said — for the entrypoint that output is the diagnosis ("Scans are present
+        and no OCR tooling is installed"), and dropping it on failure was leaving the
+        operator with a single line instead of the reason."""
         full = [*self.settings.cli, *argv]
         _log(f"  $ {_masked(full)}")
         try:
@@ -208,6 +289,10 @@ class SandboxCli:
                 "Install it with `npm i -g sandbox` and log in, or point "
                 "VA_LSE_SANDBOX_CLI at it"
             ) from exc
+        if forward:
+            for line in f"{proc.stdout or ''}{proc.stderr or ''}".splitlines():
+                if line.strip():
+                    _log(f"  | {line.strip()}")
         if proc.returncode != 0:
             raise SandboxError(f"{purpose} failed (exit {proc.returncode}): {_detail(proc)}")
         return proc
@@ -219,21 +304,39 @@ class SandboxCli:
         ``--silent`` because the name is ours, not the CLI's, and
         ``--non-persistent`` because this box has exactly one job and no state
         worth snapshotting.
+
+        ``VA_LSE_SANDBOX_IMAGE=none`` boots the CLI's *default runtime* instead of a
+        VCR image — the escape hatch for probing a credential and the create/exec/
+        copy/remove cycle without an image in the registry (measured: 4.4.0's
+        default runtime is Python 3.14, which this app's hash-pinned lock refuses,
+        so it is a probe and not a way to read records).
         """
-        self._run(
-            [
-                "create",
-                *self.common(),
-                "--name",
-                name,
-                "--image",
-                self.settings.image,
-                "--timeout",
-                self.settings.timeout,
-                "--non-persistent",
-                "--silent",
-            ],
-            f"create {name}",
+        argv = ["create", *self.common(), "--name", name]
+        if self.settings.image.lower() not in ("", "none"):
+            argv += ["--image", self.settings.image]
+        argv += ["--timeout", self.settings.timeout, "--non-persistent", "--silent"]
+        try:
+            self._run(argv, f"create {name}")
+        except SandboxError as exc:
+            raise SandboxError(f"{exc}{self._image_advice(exc)}") from exc
+
+    def _image_advice(self, exc: SandboxError) -> str:
+        """Turn a 404 into the step that fixes it.
+
+        The image is built by hand (DEPLOYMENT.md §6), so "not in the registry" is the
+        likely first failure for a fresh clone, and the CLI reports it as a bare status
+        — the "Image not found" message itself stays in its response buffer (measured
+        against 4.4.0). Naming the remedy here beats an operator decoding a 404.
+        """
+        if self.settings.image.lower() in ("", "none"):
+            return ""
+        if not any(marker in str(exc).lower() for marker in ("404", "not found")):
+            return ""
+        return (
+            f"\n  if that is about the image: {self.settings.image} is not in the "
+            "registry yet. Build and push it (DEPLOYMENT.md §6), or set "
+            "VA_LSE_SANDBOX_IMAGE=none to boot the CLI's default runtime and check "
+            "the credential on its own"
         )
 
     def mkdir(self, name: str, directory: PurePosixPath) -> None:
@@ -254,7 +357,7 @@ class SandboxCli:
         resumed one (a future reuse mode, or a name that collided) must not make
         this step fail on the entrypoint's overwrite refusal.
         """
-        proc = self._run(
+        self._run(
             [
                 "exec",
                 *self.common(),
@@ -268,10 +371,8 @@ class SandboxCli:
                 "--force",
             ],
             f"read {bundle} on {name}",
+            forward=True,
         )
-        for line in f"{proc.stdout or ''}{proc.stderr or ''}".splitlines():
-            if line.strip():
-                _log(f"  | {line.strip()}")
 
     def remove(self, name: str) -> None:
         """Best effort: a box that will not die is the box's own problem.
@@ -279,9 +380,15 @@ class SandboxCli:
         It cannot outlive its ``--timeout``, and ``--non-persistent`` means it
         leaves no snapshot behind, so a failed cleanup is a warning rather than a
         failed file.
+
+        The auth flags go here too. Vercel's CLI reference lists no options for
+        ``remove``, but the CLI itself takes them (``--token``/``--scope``/
+        ``--project``; measured against 4.4.0) — and without them a cleanup would
+        fail for every deployment that authenticates with a token rather than a
+        stored ``sandbox login``, which is every deployment there is.
         """
         try:
-            self._run(["remove", name], f"remove {name}")
+            self._run(["remove", *self.common(), name], f"remove {name}")
         except SandboxError as exc:
             _log(f"! {exc} — the box stops itself at its --timeout ({self.settings.timeout})")
 

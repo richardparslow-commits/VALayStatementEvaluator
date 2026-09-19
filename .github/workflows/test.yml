@@ -415,3 +415,116 @@ jobs:
 
       - name: Run live smoke test (Evaluate + Draft)
         run: python scripts/smoke_test.py all
+
+  # The sandbox stage is the one build artifact nothing else here exercises.
+  # tests/test_sandbox_image.py asserts the Dockerfile as *text* and the offline suite
+  # fakes the Sandbox CLI, so a base image — or an apt/pip resolution the stage can no
+  # longer install into — reaches an operator mid-deploy. `docker` is on every runner,
+  # so this builds the stage and nothing else: no registry credentials, nothing pushed,
+  # safe on every event. A weekly tick included, because what it catches is a release
+  # (python:3.12-slim and tesseract-ocr move) rather than a commit.
+  sandbox-image:
+    name: Build the sandbox image stage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build the sandbox stage
+        run: docker build --target sandbox -t va-lse-sandbox:latest .
+
+  # Gate for the push below. Same shape and same reason as live-credentials above: a
+  # job-level `if` cannot read the secrets context, and reading it there invalidates
+  # the whole workflow file.
+  sandbox-credentials:
+    name: Check if Vercel credentials are configured
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    outputs:
+      present: ${{ steps.check.outputs.present }}
+    steps:
+      - name: Is VERCEL_TOKEN configured?
+        id: check
+        env:
+          HAS_TOKEN: ${{ secrets.VERCEL_TOKEN != '' }}
+        run: |
+          echo "present=$HAS_TOKEN" >> "$GITHUB_OUTPUT"
+          if [ "$HAS_TOKEN" != "true" ]; then
+            echo "VERCEL_TOKEN is not set — skipping the sandbox image push."
+          fi
+
+  # Pushes the image `scripts/vercel_sandbox_runner.py` boots
+  # (`VA_LSE_SANDBOX_IMAGE`, DEPLOYMENT.md §6) and then proves it end to end: the live
+  # test creates a real box from that image and reads a real staged record through the
+  # entrypoint, comparing the answer against the in-process reader. That is the only
+  # coverage of the CLI's own half of the contract — every offline test fakes the CLI —
+  # and it needs credentials, so it is dispatch-only.
+  #
+  # Repository secrets: VERCEL_TOKEN (an access token scoped to the team),
+  # VERCEL_TEAM_ID (the team that owns the project — the username in the registry
+  # login) and VERCEL_SANDBOX_PROJECT (the project that owns the registry repository,
+  # e.g. va_draft), optionally VERCEL_SANDBOX_SCOPE (the team slug). VCR creates the
+  # repository on the first push, so nothing has to exist beforehand. The Vercel and
+  # Sandbox CLIs are installed here because neither is on a runner.
+  sandbox-image-push:
+    name: Push the sandbox image and read a record on a real box
+    needs: [sandbox-credentials, sandbox-image]
+    if: ${{ needs.sandbox-credentials.outputs.present == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_TEAM_ID: ${{ secrets.VERCEL_TEAM_ID }}
+      VERCEL_SANDBOX_PROJECT: ${{ secrets.VERCEL_SANDBOX_PROJECT }}
+      VERCEL_SANDBOX_SCOPE: ${{ secrets.VERCEL_SANDBOX_SCOPE || '' }}
+      VA_LSE_SANDBOX_PROJECT: ${{ secrets.VERCEL_SANDBOX_PROJECT }}
+      VA_LSE_SANDBOX_SCOPE: ${{ secrets.VERCEL_SANDBOX_SCOPE || '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements.lock
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --require-hashes -r requirements.lock
+
+      - name: Install the Vercel and Sandbox CLIs
+        run: npm i -g vercel@latest sandbox@latest
+
+      # The container tool needs its own login to vcr.vercel.com — VERCEL_TOKEN
+      # authenticates the *Vercel CLI*, not docker. Without this the build succeeds and
+      # the push dies with "no basic auth credentials", which is what the first run of
+      # this job did. The password is the access token and the username is the team ID
+      # that owns the project (Vercel's own `vercel vcr login docker` mints a 12-hour
+      # OIDC credential instead; this is the non-interactive token path).
+      - name: Authenticate the container tool with Vercel Container Registry
+        run: |
+          printf '%s' "$VERCEL_TOKEN" | docker login vcr.vercel.com \
+            --username "$VERCEL_TEAM_ID" --password-stdin
+
+      # `vercel vcr build` runs the container tool itself, so the stage has to be
+      # selected through the `--` passthrough; `[name]` is the *repository* name
+      # (`va-lse-sandbox:latest`), and Vercel adds the registry, team and project
+      # segments itself — which is also exactly what `sandbox create --image` takes.
+      - name: Build and push the sandbox image to Vercel Container Registry
+        run: |
+          scope=()
+          if [ -n "$VERCEL_SANDBOX_SCOPE" ]; then scope=(--scope "$VERCEL_SANDBOX_SCOPE"); fi
+          vercel vcr build docker . va-lse-sandbox:latest \
+            --project "$VERCEL_SANDBOX_PROJECT" "${scope[@]}" \
+            --push -- --target sandbox
+
+      - name: Read a staged record on a real box (live)
+        env:
+          VA_LSE_TEST_VERCEL_SANDBOX_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VA_LSE_TEST_VERCEL_SANDBOX_PROJECT: ${{ secrets.VERCEL_SANDBOX_PROJECT }}
+          VA_LSE_TEST_VERCEL_SANDBOX_SCOPE: ${{ secrets.VERCEL_SANDBOX_SCOPE || '' }}
+        run: python -m unittest tests.test_vercel_sandbox_live -v

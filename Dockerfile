@@ -86,9 +86,10 @@ CMD ["streamlit", "run", "run_app.py", \
 # means a sandbox and a deployment run the same interpreter and the same
 # packages.
 #
-# Verifying what this stage produces is `tests/test_sandbox_image.py`'s job: no
-# CI job builds an image, so without that test a missing COPY would surface only
-# as a confusing failure inside a sandbox.
+# Verifying what this stage produces is `tests/test_sandbox_image.py`'s job, and
+# building it is the `sandbox-image` job's: the tests read the file, so a stage
+# that cannot build is caught by CI rather than inside a sandbox (it was not
+# always — the stage could not build at all until that job was added and failed).
 FROM runtime AS sandbox
 
 # Root, because a workspace that cannot be written to is not a workspace: a
@@ -122,6 +123,18 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         tesseract-ocr tesseract-ocr-eng poppler-utils ghostscript qpdf && \
     rm -rf /var/lib/apt/lists/*
+
+# The two files the pip lines below read, copied on their own and before any
+# code, so editing app/ does not invalidate the pip layers.
+#
+# They have to be copied *at all*, and before the RUNs that read them: a RUN cannot
+# read what a later COPY brings in, and this stage named requirements-dev.txt in a
+# pip line while nothing ever put it in the image. Nothing caught it because a text
+# check for "the image carries this path" is satisfied by the mention —
+# `pip install -r requirements-dev.txt` reads as carried. The CI job that builds
+# this stage failed on it the first time it ran; `files_read_before_being_carried`
+# in tests/dockerfile.py now asks the ordering question instead.
+COPY requirements.txt requirements-dev.txt requirements-local.txt ./
 
 # The dev extras, in the same order CI installs them (lock first, then these —
 # see .github/workflows/test.yml). Additive: the lock's pins already satisfy

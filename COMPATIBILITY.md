@@ -26,6 +26,7 @@ Override any of the above via `OPENAI_API_KEY` / `OPENAI_BASE_URL` /
 | Provider / setup | Base URL pattern | Auth | Status | Min version / notes |
 |------------------|------------------|------|--------|---------------------|
 | **Perplexity Router API** | `https://api.perplexity.ai/router/v1` | Perplexity key (`pplx-...`) | **Primary / recommended (default)** | OpenAI Chat Completions schema; also serves the Anthropic Messages schema at `/router/v1/messages`. **Private preview** — request access from api@perplexity.ai. The same key serves the Agent API on the Research tab (and is read automatically from `OPENAI_API_KEY` when this is the base URL) |
+| **Vercel AI Gateway** | `https://ai-gateway.vercel.sh/v1` | AI Gateway key (`vck_...`) | Tested (`tests/test_ai_gateway_live.py`, opt-in; see *Vercel credentials are not interchangeable*) | OpenAI Chat Completions schema, so nothing in `app/llm.py` changes. Model ids come from the gateway's **own catalog** (`owner/model`): the Router ids are not in it. One gateway key can serve the whole pipeline, but the Research tab still needs `PERPLEXITY_API_KEY` — it uses the Agent API, which the gateway does not serve |
 | **QwenCloud Token Plan (MaaS)** | `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1` | `sk-sp-...` (Token Plan key) | Tested (previous default) | OpenAI API v1 compatible; key+URL must be paired (Token Plan keys fail against the general gateway) |
 | **OpenAI** | `https://api.openai.com/v1` | `sk-proj-...` or `sk-...` | Tested | `openai` Python SDK `>=1.0`; works with `gpt-4o`, `gpt-4-turbo`, `gpt-4o-mini`, etc. |
 | **Azure OpenAI** | `https://{resource}.openai.azure.com/openai/deployments/{deployment}/` | Azure key / Entra | Compatible when fronted with an OpenAI-compat proxy or `base_url` pointing at the proxy | Requires API version header on the proxy |
@@ -40,11 +41,25 @@ Override any of the above via `OPENAI_API_KEY` / `OPENAI_BASE_URL` /
 
 If your provider deviates, add a compatibility shim (proxy) rather than forking the app.
 
+### Vercel credentials are not interchangeable
+
+Three different things carry Vercel's name, and only the first one is an LLM key. Mixing
+them up produces a 401/403 that looks like a provider outage, which is why the preflight
+(`app/preflight.py`) names the mix-up and `scripts/vercel_sandbox_runner.py` refuses the
+wrong one by name:
+
+| Credential | Where it comes from | What it authenticates |
+|---|---|---|
+| **AI Gateway API key** (`vck_...`) | Vercel project → AI Gateway → API Keys | This app's LLM calls: `OPENAI_API_KEY` with `OPENAI_BASE_URL=https://ai-gateway.vercel.sh/v1`. Never a sandbox |
+| **Access token** | Vercel Account Settings → Tokens (scoped to the team) | Vercel **Sandbox** (`VERCEL_TOKEN`, and the OCR runner in `DEPLOYMENT.md` §6). No LLM endpoint accepts it |
+| **OIDC token** (`VERCEL_OIDC_TOKEN`) | Provisioned automatically inside a Vercel Function | Vercel **Sandbox** as well — Vercel's recommendation, because nothing long-lived has to be stored |
+
 ## Tested models per endpoint
 
 | Endpoint | Main (heavy) | Fast (bulk) | Notes |
 |----------|--------------|-------------|-------|
 | Perplexity Router API | `perplexity/kimi-k3` (default) | `perplexity/glm-5.3-flash` (default) | Full catalog: `perplexity/kimi-k3`, `perplexity/glm-5.3`, `perplexity/glm-5.3-flash`, `perplexity/nemotron-3-ultra-550b-a55b`. Step the fast model up the ladder (`nemotron-3-ultra-550b-a55b`, then `glm-5.3`) if extraction quality needs it |
+| Vercel AI Gateway | `moonshotai/kimi-k3`, `openai/gpt-4.1-nano` | `alibaba/qwen3.7-flash` | Measured against the live gateway: `GET /v1/models` lists 372 ids, and a chat plus a JSON-mode call complete through `app/llm.py`. Catalog ids are `owner/model`, so the Router ids are **not** listed. The account's tier decides what a key may call — a free-tier key is refused `moonshotai/kimi-k3` with `403 Free tier users do not have access to this model`, which is entitlement rather than incompatibility; check `GET /models` (or **Test connection**) before a run. A free-tier key is also **rate-limited per model**: measured, `openai/gpt-4.1-nano` answered four calls and then returned `429 Free tier requests on this model are rate-limited` through all three of the app's retries in under a second, so a run of hundreds of calls needs paid credits on that key — the wiring is fine, the tier is not |
 | QwenCloud Token Plan | `qwen3.7-max` | `qwen3.7-flash` | Tuned for Individual Plan Lite (2500 credits / 7 days, 1–2 concurrent agents, `qwen3.7-flash` saves credit) |
 | OpenAI | `gpt-4-turbo`, `gpt-4o` | `gpt-4o-mini` | Any reasoning-capable model works for main; use a cheaper model for fast |
 | Ollama | provider-dependent | provider-dependent | Quality not evaluated; prefer at least a 7B instruction model |

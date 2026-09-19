@@ -704,6 +704,13 @@ Four things about it are deliberate and easy to get wrong by hand:
   VA_LSE_EXTRACTOR_RUNNER="python scripts/vercel_sandbox_runner.py {work}"
   ```
 
+  Use an interpreter that actually exists. The runner is spawned as a subprocess, so
+  the command is only as good as its first word: macOS ships `python3` and no `python`,
+  and Streamlit started from a virtualenv does not put `python` on `PATH` either — the
+  file then fails open with "the runner command does not exist (python)" and every
+  record is read in-process, which is a warning per run rather than an error. Point it
+  at an absolute interpreter path (`…/venv/bin/python`) or at `python3`.
+
   Per file it runs `sandbox create --name va-lse-ocr-<id> --image va-lse-sandbox:latest
   --timeout 20m --non-persistent --silent`, then `exec … mkdir -p
   /work/bundle/<the label's directory>`, `copy <work>/<file> <name>:/work/bundle/<label>`,
@@ -721,10 +728,29 @@ Four things about it are deliberate and easy to get wrong by hand:
   | Knob | Default | Notes |
   |---|---|---|
   | `VA_LSE_SANDBOX_CLI` | `sandbox` | Split like a shell command, so `sbx`, `npx sandbox` or a wrapper of your own works. Install with `npm i -g sandbox` |
-  | `VA_LSE_SANDBOX_IMAGE` | `va-lse-sandbox:latest` | The VCR image from the block below |
+  | `VA_LSE_SANDBOX_IMAGE` | `va-lse-sandbox:latest` | The VCR image from the block below. Set it to `none` to drop `--image` and boot the CLI's *default runtime* — the way to prove a credential and the create/exec/copy/remove cycle before anything is pushed (measured: 4.4.0's default runtime is Python 3.14, which this lock refuses, so `none` is a probe and not a way to read records). A `create` that answers 404 says so and names this option |
   | `VA_LSE_SANDBOX_TIMEOUT` | `20m` | Box session timeout. It is also the backstop for a box whose runner was SIGKILLed, so keep it above `VA_LSE_EXTRACTOR_TIMEOUT_SECONDS` — and raise both together for large bundles |
   | `VA_LSE_SANDBOX_SCOPE` / `VA_LSE_SANDBOX_PROJECT` | (empty) | Passed as `--scope` / `--project` on every call that takes them |
-  | `VERCEL_TOKEN` | (empty) | Passed as `--token`; unset means the CLI's stored `sandbox login` session. The value is never logged |
+  | `VA_LSE_SANDBOX_TOKEN` / `VERCEL_AUTH_TOKEN` / `VERCEL_OIDC_TOKEN` / `VERCEL_TOKEN` | (empty) | Read in that order and passed as `--token`; unset everywhere means the CLI's stored `sandbox login` session. Only the first is this app's own name: `VERCEL_AUTH_TOKEN` is the variable the **CLI itself** reads (measured against 4.4.0 — exporting `VERCEL_TOKEN` does *not* authenticate it, it waits for an interactive login), `VERCEL_OIDC_TOKEN` is what a Function is handed, and `VERCEL_TOKEN` is the REST API's convention, which the CLI ignores — so the runner passes it explicitly. The value is never logged |
+
+  Sandbox takes a Vercel **access token** (Account Settings → Tokens, scoped to the team)
+  or the **OIDC token** a Function is handed — Vercel's recommendation, because nothing
+  long-lived has to be stored. One Vercel credential is not on that list: an **AI Gateway
+  API key** (`vck_…`) authenticates the LLM gateway, not compute
+  (`COMPATIBILITY.md` → *Vercel credentials are not interchangeable*), and the runner
+  refuses it in the token slot by name rather than letting the CLI answer 401.
+
+  One prerequisite is not about this repository at all. **The project that owns the image
+  needs a slug-safe name.** The registry path is
+  `vcr.vercel.com/<team-slug>/<project-slug>/<repository>`, and Vercel slugifies the
+  *team* (`Secondary_Condition_Finder` → `secondary-condition-finder`) but not a
+  project: pushing from a project named `va_draft` uploads every layer and then fails
+  with `NAME_INVALID: invalid project slug` (measured — the same request against
+  `…/secondary-condition-finder/va_draft/…` answers `NAME_INVALID` while
+  `…/va-lse-sandbox/…` answers `not_found`, which is a valid path with no tags in it
+  yet). The image and the boxes therefore live in one dedicated, dash-safe project,
+  which is what `VA_LSE_SANDBOX_PROJECT` names; the app's own Vercel project is
+  unrelated to it.
 
   Two things to expect. **One microVM per file** — that is the port's shape (one file
   in, documents out) — and `--non-persistent` plus the `finally` mean each one leaves
@@ -741,18 +767,61 @@ Four things about it are deliberate and easy to get wrong by hand:
   asserted, and one test goes through `CommandBoxRunner` + `SandboxExtractor` so the
   contract the app parses is the contract the script prints.
 
+  `tests/test_vercel_sandbox_live.py` is the other half — the CLI's own behavior, which
+  no fake can pin. It needs a credential and skips without one, so CI is unaffected:
+
+  ```bash
+  VA_LSE_TEST_VERCEL_SANDBOX_TOKEN=vcp_... \
+  VA_LSE_TEST_VERCEL_SANDBOX_SCOPE=<team> \
+  VA_LSE_TEST_VERCEL_SANDBOX_PROJECT=<project> \
+  VA_LSE_TEST_VERCEL_SANDBOX_CLI='npx -y sandbox' \
+    python -m unittest tests.test_vercel_sandbox_live
+  ```
+
+  The knobs arrive under the `VA_LSE_TEST_*` prefix because `tests/hermetic.py` strips
+  ambient `VA_LSE_*` configuration; the first test creates a box on the default
+  runtime, copies a file in and back out and removes the box (the credential, the
+  transport and the lifecycle, for a fraction of a cent and no registry write), and the
+  second runs the whole runner so the entrypoint reads a real staged record — skipping,
+  with the build command, while the image is not in the registry. Four assumptions in
+  this section were corrected by running it against a real account: `remove` does take
+  the auth flags, the CLI's credential variable is `VERCEL_AUTH_TOKEN`, a failed `create`
+  reports a bare status rather than "Image not found" (the message stays in its response
+  buffer, which is why the last output line is a `hint:`), and a failure inside `exec`
+  still has to forward the box's output or the diagnosis is lost.
+
 ```bash
 # Build and push it to Vercel Container Registry, then boot a sandbox from it
 docker build --target sandbox -t va-lse-sandbox:latest .   # local smoke test
+vercel vcr login docker             # docker needs its own login to vcr.vercel.com
 vercel vcr build docker . va-lse-sandbox:latest --push
 sandbox create --name va-lse-dev --image va-lse-sandbox:latest \
   --vcpus 4 --timeout 2h --publish-port 8501 --connect
 ```
 
+Two things about the middle line. The stage has to be named, because `vercel vcr
+build` runs the container tool and the Dockerfile's default target is the
+deployment image — that is the `-- --target sandbox` the CI job passes. And
+`VERCEL_TOKEN` authenticates the Vercel *CLI*, not docker: without a registry
+login for the container tool the build succeeds and the push fails with "no basic
+auth credentials". `vercel vcr login docker` mints a 12-hour project-scoped OIDC
+credential for it; a long-lived token works instead, with the token as the
+password and the **team ID** that owns the project as the username
+(`--username <team ID> --password-stdin`).
+
 `tests/test_sandbox_image.py` asserts this contract (the stage, root, the dev
-extras, OCR tooling, git, the copied files) because no CI job builds an image,
-and `tests/test_ocr_and_extract.py` covers the entrypoint's decisions with the OCR
-engine faked — the binaries are not installed in CI and must not be required.
+extras, OCR tooling, git, the copied files) as *text*, and
+`tests/test_ocr_and_extract.py` covers the entrypoint's decisions with the OCR engine
+faked — the binaries are not installed in CI and must not be required. Two CI jobs
+build the stage as a whole: **Build the sandbox image stage** runs `docker build
+--target sandbox` on every event (nothing is pushed, no credentials are needed), and
+on manual dispatch **Push the sandbox image and read a record on a real box** builds,
+publishes it to Vercel Container Registry and then runs the live test below — which
+is also how a machine without Docker gets an image. It is dispatch-only and skips
+itself unless `VERCEL_TOKEN` is set, in the same shape as the live smoke job
+(`VERCEL_SANDBOX_PROJECT` names the project that owns the registry repository,
+`VERCEL_TEAM_ID` is the registry login's username, `VERCEL_SANDBOX_SCOPE` the team;
+VCR creates the repository on the first push).
 
 ### Multi-stage variant (smaller image, optional)
 
@@ -950,7 +1019,9 @@ All deployment-relevant variables (see `README.md` for the full list):
 | `VA_LSE_SANDBOX_TIMEOUT` | Box session timeout, and the backstop when a killed runner cannot remove the box | `20m` | Keep above `VA_LSE_EXTRACTOR_TIMEOUT_SECONDS` |
 | `VA_LSE_SANDBOX_SCOPE` | Team scope passed to every Sandbox CLI call | (empty) | Only when the token spans teams |
 | `VA_LSE_SANDBOX_PROJECT` | Vercel project the sandbox belongs to | (empty) | Only when it is not the token's default project |
-| `VERCEL_TOKEN` | Token passed to the CLI as `--token` | (empty) | Unset means the stored `sandbox login` session; never logged, never commit it |
+| `VA_LSE_SANDBOX_TOKEN` | Sandbox credential, read before the Vercel-named ones below | (empty) | Use it when the token should not live in a `VERCEL_*` variable |
+| `VERCEL_OIDC_TOKEN` | Sandbox credential a Function is provisioned with automatically | (empty) | Vercel's recommendation: nothing long-lived to store |
+| `VERCEL_TOKEN` | Sandbox credential passed to the CLI as `--token` | (empty) | A team-scoped **access token** (Account Settings → Tokens) — never an AI Gateway key; unset means the CLI's stored `sandbox login` |
 | `VA_LSE_TRACING` | Emit OpenTelemetry traces | `0` | `1` on the web tier **and** every worker; needs `requirements-otel.txt` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Collector/APM intake for spans | `http://localhost:4318` | In-cluster collector Service, or a vendor OTLP endpoint |
 | `VA_LSE_TRACE_SAMPLE_RATIO` | Fraction of runs traced | `1.0` | Lower it if the backend meters per span |
