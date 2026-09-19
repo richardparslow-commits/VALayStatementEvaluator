@@ -74,6 +74,10 @@ scripts/
   ocr_and_extract.py      OCR a whole record bundle and extract it with the app's
                           own reader, emitting the queue's document JSON — the
                           sandbox image's entrypoint (see DEPLOYMENT.md §6)
+  vercel_sandbox_runner.py
+                          Read one staged file on a Vercel Sandbox and print the
+                          report JSON — the VA_LSE_EXTRACTOR_RUNNER command for
+                          VA_LSE_EXTRACTOR=sandbox (see *Scanned pages and OCR*)
   va_records_download.py  Walk VA.gov's records-download wizard locally (you sign
                           in); writes a provenance manifest beside the PDF
 tests/                    Offline unit tests (no API key required)
@@ -186,7 +190,7 @@ installs on macOS and Linux CI.
 | `LLM_ENDPOINT_FALLBACK_TIMEOUT_SECONDS` | How long the primary must fail before failover engages (a grace period, not an HTTP timeout) | `300` |
 | `VA_LSE_MAX_RECORD_PAGES` | Max total pages across uploaded record files | `5000` |
 | `VA_LSE_EXTRACTOR` | Where record text is read: `in-process` (this app's reader) or `sandbox` (the box, which can OCR a scan) | `in-process` |
-| `VA_LSE_EXTRACTOR_RUNNER` | Command that runs `scripts/ocr_and_extract.py` in the box, with `{work}` for the staged directory; stdout must end with its report JSON | (empty = in-process) |
+| `VA_LSE_EXTRACTOR_RUNNER` | Command that runs `scripts/ocr_and_extract.py` in the box, with `{work}` for the staged directory; stdout must end with its report JSON. `python scripts/vercel_sandbox_runner.py {work}` drives a Vercel Sandbox (see *Scanned pages and OCR*) | (empty = in-process) |
 | `VA_LSE_EXTRACTOR_TIMEOUT_SECONDS` | Ceiling for one file's box work (never past the run's own budget) | `900` |
 | `VA_LSE_JOB_QUEUE` | Run Evaluate/Draft on worker pods instead of in-process (Pattern C) | `0` |
 | `VA_LSE_REDIS_URL` | Redis backend for the job queue | (empty) |
@@ -815,6 +819,23 @@ the app's own reader, under the original file names:
 ```bash
 python scripts/ocr_and_extract.py /work/records --out /work/bundle.json
 ```
+
+Or let the app do per file what that command does for a whole folder. Point the extractor at
+a Vercel Sandbox and each uploaded file is staged, copied into a fresh ephemeral microVM
+booted from the pushed `va-lse-sandbox` image, read there by the same entrypoint, and mapped
+back through `app/extractors.py` — a file the box cannot read is read in-process instead,
+with one warning that names the reason:
+
+```bash
+export VA_LSE_EXTRACTOR=sandbox
+export VA_LSE_EXTRACTOR_RUNNER="python scripts/vercel_sandbox_runner.py {work}"
+export VERCEL_TOKEN=...        # or run `sandbox login` once on this machine
+```
+
+`scripts/vercel_sandbox_runner.py` needs the Sandbox CLI (`npm i -g sandbox`) and the image
+pushed (`DEPLOYMENT.md` §6 has that build line, the image/timeout/team/project knobs, and what
+happens when a box is killed mid-file). Failure is fail-open by design: records are still
+read and the run still finishes.
 
 `scripts/va_records_download.py` also inspects what it just downloaded — page count,
 text-vs-image balance, sha256 — prints a warning when the export is implausibly small or mostly

@@ -694,6 +694,52 @@ Four things about it are deliberate and easy to get wrong by hand:
   On a mixed bundle (born-digital pages, scans, one part-digital file) the today-path
   silently carries 14 of 120 pages with no text and refuses 2 of 6 files; the box
   answers with text on every page.
+* **Vercel Sandbox is one script away, and it ships here.**
+  `scripts/vercel_sandbox_runner.py` is the `VA_LSE_EXTRACTOR_RUNNER` command for a
+  Vercel box — one staged file in, the box's report JSON out — so a deployment turns
+  the swap on with two variables:
+
+  ```bash
+  VA_LSE_EXTRACTOR=sandbox
+  VA_LSE_EXTRACTOR_RUNNER="python scripts/vercel_sandbox_runner.py {work}"
+  ```
+
+  Per file it runs `sandbox create --name va-lse-ocr-<id> --image va-lse-sandbox:latest
+  --timeout 20m --non-persistent --silent`, then `exec … mkdir -p
+  /work/bundle/<the label's directory>`, `copy <work>/<file> <name>:/work/bundle/<label>`,
+  `exec … python3 /app/scripts/ocr_and_extract.py /work/bundle --out
+  /work/report.json --force`, `copy <name>:/work/report.json <work>/report.json`, and
+  `sandbox remove <name>` in a `finally`. Three details are the load-bearing ones:
+  the report comes back as a **file**, because `app/extractors.py` parses the runner's
+  whole stdout as that JSON and `sandbox exec`'s stdout carries more than the command's;
+  the **label is copied to its own path** (`records/2024/visit note.pdf` lands at that
+  path under `/work/bundle`, so the entrypoint answers under the name the citation
+  needs, and a label that climbs out of the bundle is refused rather than rewritten);
+  and the staged bytes are checked against the manifest's **sha256** before a box is
+  booted.
+
+  | Knob | Default | Notes |
+  |---|---|---|
+  | `VA_LSE_SANDBOX_CLI` | `sandbox` | Split like a shell command, so `sbx`, `npx sandbox` or a wrapper of your own works. Install with `npm i -g sandbox` |
+  | `VA_LSE_SANDBOX_IMAGE` | `va-lse-sandbox:latest` | The VCR image from the block below |
+  | `VA_LSE_SANDBOX_TIMEOUT` | `20m` | Box session timeout. It is also the backstop for a box whose runner was SIGKILLed, so keep it above `VA_LSE_EXTRACTOR_TIMEOUT_SECONDS` — and raise both together for large bundles |
+  | `VA_LSE_SANDBOX_SCOPE` / `VA_LSE_SANDBOX_PROJECT` | (empty) | Passed as `--scope` / `--project` on every call that takes them |
+  | `VERCEL_TOKEN` | (empty) | Passed as `--token`; unset means the CLI's stored `sandbox login` session. The value is never logged |
+
+  Two things to expect. **One microVM per file** — that is the port's shape (one file
+  in, documents out) — and `--non-persistent` plus the `finally` mean each one leaves
+  nothing behind. **A SIGKILLed runner cannot clean up**: the app's own per-file
+  timeout kills the runner in a way it cannot catch, which is exactly why the box
+  carries its own `--timeout`. A box nobody removed stops itself; an unreachable
+  `sandbox remove` is a warning, not a failed file. SIGTERM — what a Cancel or a
+  container stop sends first — does run the cleanup.
+
+  `tests/test_vercel_sandbox_runner.py` drives all of it with the CLI faked:
+  `tests/fake_sandbox_cli.py` stands in for the microVMs and runs the real entrypoint
+  over the file the runner really copied in, so the manifest, the label-to-path
+  mapping, the argv shapes, the copy-back, the JSON on stdout and the `finally` are
+  asserted, and one test goes through `CommandBoxRunner` + `SandboxExtractor` so the
+  contract the app parses is the contract the script prints.
 
 ```bash
 # Build and push it to Vercel Container Registry, then boot a sandbox from it
@@ -897,8 +943,14 @@ All deployment-relevant variables (see `README.md` for the full list):
 | `VA_LSE_BLOB_DIR` | Filesystem blob root | `blobs` | `/app/blobs` on the shared RWX PVC |
 | `VA_LSE_BLOB_S3_BUCKET` | S3-compatible bucket | (empty) | Only for `s3`; needs `requirements-s3.txt` |
 | `VA_LSE_EXTRACTOR` | Where record text is read: `in-process` or `sandbox` | `in-process` | Leave `in-process` on worker pods; a box is an operator choice, and `sandbox` falls back to `in-process` per file |
-| `VA_LSE_EXTRACTOR_RUNNER` | Command that runs `scripts/ocr_and_extract.py` in the box | (empty) | `{work}` is the staged directory; stdout must end with the report JSON |
+| `VA_LSE_EXTRACTOR_RUNNER` | Command that runs `scripts/ocr_and_extract.py` in the box | (empty) | `{work}` is the staged directory; stdout must end with the report JSON. `python scripts/vercel_sandbox_runner.py {work}` drives a Vercel Sandbox |
 | `VA_LSE_EXTRACTOR_TIMEOUT_SECONDS` | Ceiling for one file's box work | `900` | Also capped by the run's remaining budget (`VA_LSE_PIPELINE_TIMEOUT_SECONDS`) |
+| `VA_LSE_SANDBOX_CLI` | The Sandbox CLI `scripts/vercel_sandbox_runner.py` invokes | `sandbox` | Split like a shell command (`sbx`, `npx sandbox`, a wrapper); needs `npm i -g sandbox` |
+| `VA_LSE_SANDBOX_IMAGE` | VCR image one file's box boots from | `va-lse-sandbox:latest` | The image `vercel vcr build docker …` pushes (see §6) |
+| `VA_LSE_SANDBOX_TIMEOUT` | Box session timeout, and the backstop when a killed runner cannot remove the box | `20m` | Keep above `VA_LSE_EXTRACTOR_TIMEOUT_SECONDS` |
+| `VA_LSE_SANDBOX_SCOPE` | Team scope passed to every Sandbox CLI call | (empty) | Only when the token spans teams |
+| `VA_LSE_SANDBOX_PROJECT` | Vercel project the sandbox belongs to | (empty) | Only when it is not the token's default project |
+| `VERCEL_TOKEN` | Token passed to the CLI as `--token` | (empty) | Unset means the stored `sandbox login` session; never logged, never commit it |
 | `VA_LSE_TRACING` | Emit OpenTelemetry traces | `0` | `1` on the web tier **and** every worker; needs `requirements-otel.txt` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Collector/APM intake for spans | `http://localhost:4318` | In-cluster collector Service, or a vendor OTLP endpoint |
 | `VA_LSE_TRACE_SAMPLE_RATIO` | Fraction of runs traced | `1.0` | Lower it if the backend meters per span |
