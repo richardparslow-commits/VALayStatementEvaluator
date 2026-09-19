@@ -198,6 +198,9 @@ def render_evaluate_tab() -> None:
     # A queued run outlives this browser session, so re-attach to one started
     # earlier (a reload mid-digest would otherwise look like nothing happened).
     job_runner.resume_pending_job("eval", action_label="Evaluation")
+    # If the session state was lost entirely (browser restart, pod failover),
+    # offer a recovery form so the user can paste their reference to recover.
+    job_runner.render_recovery_form("eval", action_label="Evaluation")
 
     cached_eval: Any = st.session_state.get("eval_result")
     if cached_eval is None:

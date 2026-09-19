@@ -57,6 +57,7 @@ logger = get_logger("app.views.job_runner")
 # Session keys for the job a tab is waiting on, and the result keys each tab's
 # results renderer reads (kept in sync with evaluate_view/draft_view).
 _PENDING_KEY = "va_lse_pending_job_{slot}"
+_REQUEST_ID_KEY = "va_lse_pending_request_{slot}"
 _RESULT_KEYS: dict[str, tuple[str, str, str]] = {
     "eval": ("eval_result", "eval_usage", "eval_request_id"),
     "draft": ("draft_result", "draft_usage", "draft_request_id"),
@@ -83,6 +84,10 @@ class QueueOutcome:
 
 def _pending_key(slot: str) -> str:
     return _PENDING_KEY.format(slot=slot)
+
+
+def _pending_request_key(slot: str) -> str:
+    return _REQUEST_ID_KEY.format(slot=slot)
 
 
 def queue_mode_active() -> bool:
@@ -344,6 +349,13 @@ def submit_job(
             return None
 
     st.session_state[_pending_key(slot)] = record.job_id
+    st.session_state[_pending_request_key(slot)] = request_id
+    # Persist the request_id → job_id mapping in the job backend so a fresh
+    # session (or a different web pod) can recover the result by request_id.
+    try:
+        backend.set_recovery_index(request_id, record.job_id)
+    except Exception:  # noqa: BLE001 - recovery is best-effort; the session copy above is fine
+        pass
     # The worker writes the audit start/ok/error pair, so the web pod records
     # only that the work was handed off — one audit record per run either way.
     run_log_event(
@@ -371,13 +383,32 @@ def submit_job(
 def resume_pending_job(slot: str, *, action_label: str) -> None:
     """Re-attach to a run queued earlier in this session, if any.
 
-    Called on every render of a tab. A queued run outlives the browser session,
-    so without this a user who reloads mid-run sees an empty tab and re-submits
-    work that is already 20 minutes into the digest.
+    Called on every render of a tab. When queue mode is active a pending job is
+    recovered from one of three locations, in order:
+
+    1. The pending job_id stored in ``st.session_state`` (present across reruns
+       within the same browser session).
+    2. The request_id stored in ``st.session_state`` (survives the same way,
+       and is backed by the recovery index in Redis so step 3 applies).
+    3. A recovery token entered by the user into the recovery input field
+       rendered below this call.
+
+    Without steps 2 and 3, a queued run outlives the browser session but the UI
+    cannot find it — so a user who reloads mid-run sees an empty tab and
+    re-submits work that is already 20 minutes into the digest.
     """
     if not queue_mode_active():
         return
     job_id = st.session_state.get(_pending_key(slot))
+    if not isinstance(job_id, str) or not job_id:
+        # No direct job_id, but maybe we still have the request_id from this
+        # session — try to look it up in the recovery index.
+        request_id = st.session_state.get(_pending_request_key(slot))
+        if isinstance(request_id, str) and request_id:
+            job_id = _resolve_job_by_request_id(request_id)
+            if job_id is not None:
+                # Found it: re-hydrate the session so the normal path proceeds.
+                st.session_state[_pending_key(slot)] = job_id
     if not isinstance(job_id, str) or not job_id:
         return
     try:
@@ -386,6 +417,7 @@ def resume_pending_job(slot: str, *, action_label: str) -> None:
         return
     if record is None:
         st.session_state.pop(_pending_key(slot), None)
+        st.session_state.pop(_pending_request_key(slot), None)
         return
     if record.is_terminal:
         outcome = _fetch_outcome(get_job_backend(), record, slot)
@@ -411,6 +443,97 @@ def resume_pending_job(slot: str, *, action_label: str) -> None:
             _render_failure(outcome, action_label)
         else:
             st.rerun()
+
+
+def _resolve_job_by_request_id(request_id: str) -> str | None:
+    """Look up a job_id from the recovery index in the job backend."""
+    try:
+        return get_job_backend().lookup_by_request_id(request_id)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def recover_job_by_request_id(
+    slot: str, request_id: str, *, action_label: str
+) -> QueueOutcome | None:
+    """Recover a queued job by its request_id when the session state is lost.
+
+    Called from the recovery form (``render_recovery_form``) and by
+    ``resume_pending_job`` when the pending-key is missing but the pending-request
+    key is still present in session state. Performs the same lookup, poll, and
+    hydrate steps that ``resume_pending_job`` does for a direct job_id.
+    """
+    if not queue_mode_active() or not request_id:
+        return None
+    job_id = _resolve_job_by_request_id(request_id)
+    if job_id is None:
+        st.warning(
+            f"No queued job found for reference `{request_id}` — it may have expired "
+            f"(results live for {config.JOB_QUEUE_TTL_SECONDS // 3600}h) or the reference "
+            f"may be from a different deployment."
+        )
+        return None
+    st.session_state[_pending_key(slot)] = job_id
+    st.session_state[_pending_request_key(slot)] = request_id
+    try:
+        record = get_job_backend().get(job_id)
+    except Exception:  # noqa: BLE001
+        return None
+    if record is None:
+        st.session_state.pop(_pending_key(slot), None)
+        return None
+    if record.is_terminal:
+        outcome = _fetch_outcome(get_job_backend(), record, slot)
+        st.session_state.pop(_pending_key(slot), None)
+        if not outcome.ok:
+            _render_failure(outcome, action_label)
+        return outcome
+    # Still running — re-poll.
+    outcome = _poll(
+        get_job_backend(),
+        job_id,
+        slot,
+        wait_seconds=float(config.PIPELINE_TIMEOUT_SECONDS) + UI_WAIT_SLACK_SECONDS,
+    )
+    if outcome.ok or not outcome.still_running:
+        st.session_state.pop(_pending_key(slot), None)
+    if not outcome.ok:
+        _render_failure(outcome, action_label)
+    return outcome
+
+
+def render_recovery_form(slot: str, *, action_label: str) -> None:
+    """Render a text input that lets a user recover a previous run by its reference.
+
+    Displayed when no cached result is present AND no pending job is attached to
+    this session — exactly the case where a browser restart or pod failover lost
+    the session state that normally routes the UI back to the backend.
+    """
+    if not queue_mode_active():
+        return
+    # Only show the recovery form when there is no result to display and no
+    # pending job is already attached.
+    result_key, _, _ = _RESULT_KEYS[slot]
+    if st.session_state.get(result_key) is not None:
+        return
+    if st.session_state.get(_pending_key(slot)):
+        return
+
+    with st.expander("🔍 Recover a previous run", expanded=False):
+        st.caption(
+            "Lost your browser tab or restarted? Paste the reference you saved "
+            "(it looks like `req_abc123…`) to recover your completed run."
+        )
+        ref = st.text_input(
+            "Run reference (req_…)",
+            key=f"recover_{slot}_ref",
+            placeholder="req_…",
+        )
+        if st.button("Recover", key=f"recover_{slot}_btn") and ref:
+            with st.spinner("Looking up your run …"):
+                outcome = recover_job_by_request_id(slot, ref.strip(), action_label=action_label)
+            if outcome is not None and outcome.ok:
+                st.rerun()
 
 
 def queue_status_line() -> str:

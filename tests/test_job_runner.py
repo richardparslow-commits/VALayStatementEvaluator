@@ -424,5 +424,189 @@ class TestResume(unittest.TestCase):
             job_runner.resume_pending_job("eval", action_label="Evaluation")
 
 
+class TestRecovery(unittest.TestCase):
+    """Tests for session-loss recovery via request_id → job_id index."""
+
+    def setUp(self) -> None:
+        self._saved = dict(st.session_state)
+        self.addCleanup(self._restore)
+
+    def _restore(self) -> None:
+        for key in list(st.session_state.keys()):
+            if key not in self._saved:
+                del st.session_state[key]
+        for key, value in self._saved.items():
+            st.session_state[key] = value
+
+    def _fresh_session(self) -> None:
+        """Simulate a completely fresh browser / web session."""
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+
+    def test_recovery_index_is_set_during_submit(self):
+        """The request_id → job_id mapping is persisted in the backend."""
+        backend = InProcessJobBackend(prefix="t", ttl_seconds=60, is_distributed=True, name="test")
+        with patch.object(job_runner, "get_job_backend", return_value=backend), patch.object(
+            config, "JOB_QUEUE_ENABLED", True
+        ), patch.object(job_runner, "_poll", return_value=_QueuedOutcome()):
+            job_runner.submit_job(
+                slot="eval",
+                job=_job(request_id="req_recover_1"),
+                request_id="req_recover_1",
+                condition="knee",
+                sources=["Upload"],
+                files=1,
+                pages=5,
+                action_label="Evaluation",
+            )
+        self.assertEqual(
+            backend.lookup_by_request_id("req_recover_1"),
+            st.session_state.get("va_lse_pending_job_eval"),
+        )
+        self.assertIsNotNone(st.session_state.get("va_lse_pending_job_eval"))
+        self.assertEqual(st.session_state.get("va_lse_pending_request_eval"), "req_recover_1")
+
+    def test_resume_falls_back_to_request_id_when_job_id_missing(self):
+        """When session has only the request_id, resume looks it up in the backend."""
+        backend = InProcessJobBackend(prefix="t", ttl_seconds=60, is_distributed=True, name="test")
+        record = backend.enqueue(
+            KIND_EVALUATE,
+            encode_job(KIND_EVALUATE, _job(request_id="req_resume_rq")),
+            request_id="req_resume_rq",
+        )
+        # Claim the job so it transitions to RUNNING, then complete it.
+        claimed = backend.claim([KIND_EVALUATE], worker_id="w1")
+        backend.store_result(record.job_id, _result_json(request_id="req_resume_rq"),
+                             claim_token=claimed[0].claim_token)
+        backend.complete(record.job_id, claim_token=claimed[0].claim_token)
+        backend.set_recovery_index("req_resume_rq", record.job_id)
+
+        st.session_state["va_lse_pending_request_eval"] = "req_resume_rq"
+        st.session_state.pop("va_lse_pending_job_eval", None)
+
+        with patch.object(config, "JOB_QUEUE_ENABLED", True), patch.object(
+            job_runner, "get_job_backend", return_value=backend
+        ):
+            job_runner.resume_pending_job("eval", action_label="Evaluation")
+
+        self.assertIsNotNone(st.session_state.get("eval_result"))
+
+    def test_resume_clears_both_keys_when_request_missing(self):
+        """When a request_id maps to nothing, both session keys are cleared."""
+        backend = InProcessJobBackend(prefix="t", ttl_seconds=60, is_distributed=True, name="test")
+        st.session_state["va_lse_pending_request_eval"] = "req_gone"
+        st.session_state.pop("va_lse_pending_job_eval", None)
+
+        with patch.object(config, "JOB_QUEUE_ENABLED", True), patch.object(
+            job_runner, "get_job_backend", return_value=backend
+        ):
+            job_runner.resume_pending_job("eval", action_label="Evaluation")
+
+        self.assertNotIn("va_lse_pending_job_eval", st.session_state)
+        self.assertNotIn("va_lse_pending_request_eval", st.session_state)
+
+    def test_recover_job_by_request_id_finds_completed_job(self):
+        """recover_job_by_request_id hydrates a finished job from the index."""
+        backend = InProcessJobBackend(prefix="t", ttl_seconds=60, is_distributed=True, name="test")
+        record = backend.enqueue(
+            KIND_EVALUATE,
+            encode_job(KIND_EVALUATE, _job(request_id="req_explicit")),
+            request_id="req_explicit",
+        )
+        claimed = backend.claim([KIND_EVALUATE], worker_id="w1")
+        backend.store_result(record.job_id, _result_json(request_id="req_explicit"),
+                             claim_token=claimed[0].claim_token)
+        backend.complete(record.job_id, claim_token=claimed[0].claim_token)
+        backend.set_recovery_index("req_explicit", record.job_id)
+
+        with patch.object(config, "JOB_QUEUE_ENABLED", True), patch.object(
+            job_runner, "get_job_backend", return_value=backend
+        ):
+            outcome = job_runner.recover_job_by_request_id(
+                "eval", "req_explicit", action_label="Evaluation"
+            )
+
+        self.assertIsNotNone(outcome)
+        self.assertTrue(outcome.ok)
+        self.assertIsNotNone(outcome.run)
+        self.assertIsNotNone(st.session_state.get("eval_result"))
+
+    def test_recover_job_by_request_id_handles_missing_reference(self):
+        """A non-existent reference returns None and does not crash."""
+        backend = InProcessJobBackend(prefix="t", ttl_seconds=60, is_distributed=True, name="test")
+        with patch.object(config, "JOB_QUEUE_ENABLED", True), patch.object(
+            job_runner, "get_job_backend", return_value=backend
+        ):
+            outcome = job_runner.recover_job_by_request_id(
+                "eval", "req_nonexistent", action_label="Evaluation"
+            )
+        self.assertIsNone(outcome)
+
+    def test_full_session_loss_and_recovery_cycle(self):
+        """Submit, simulate total session loss, then recover by request_id."""
+        backend = InProcessJobBackend(prefix="t", ttl_seconds=60, is_distributed=True, name="test")
+        request_id = "req_full_cycle"
+
+        # Phase 1: Submit
+        with patch.object(job_runner, "get_job_backend", return_value=backend), patch.object(
+            config, "JOB_QUEUE_ENABLED", True
+        ), patch.object(job_runner, "_poll", return_value=_QueuedOutcome()):
+            job_runner.submit_job(
+                slot="eval",
+                job=_job(request_id=request_id),
+                request_id=request_id,
+                condition="knee",
+                sources=["Upload"],
+                files=1,
+                pages=3,
+                action_label="Evaluation",
+            )
+        job_id = st.session_state.get("va_lse_pending_job_eval")
+        self.assertIsNotNone(job_id)
+
+        # Phase 2: Simulate total session loss
+        self._fresh_session()
+        self.assertNotIn("va_lse_pending_job_eval", st.session_state)
+        self.assertNotIn("va_lse_pending_request_eval", st.session_state)
+        self.assertNotIn("eval_result", st.session_state)
+
+        # Phase 3: Resume finds nothing
+        with patch.object(config, "JOB_QUEUE_ENABLED", True), patch.object(
+            job_runner, "get_job_backend", return_value=backend
+        ):
+            job_runner.resume_pending_job("eval", action_label="Evaluation")
+        self.assertIsNone(st.session_state.get("eval_result"))
+
+        # Phase 4: Recover by request_id — succeeds
+        with patch.object(config, "JOB_QUEUE_ENABLED", True), patch.object(
+            job_runner, "get_job_backend", return_value=backend
+        ):
+            outcome = job_runner.recover_job_by_request_id(
+                "eval", request_id, action_label="Evaluation"
+            )
+
+        self.assertIsNotNone(outcome)
+        self.assertTrue(outcome.ok)
+        self.assertIsNotNone(st.session_state.get("eval_result"))
+        self.assertEqual(st.session_state.get("va_lse_pending_request_eval"), request_id)
+
+    def test_recovery_index_with_distributed_backend(self):
+        """Recovery index works with a preset (distributed-like) backend."""
+        backend = _PresetBackend()
+        record = backend.enqueue(
+            KIND_EVALUATE,
+            encode_job(KIND_EVALUATE, _job(request_id="req_dist")),
+            request_id="req_dist",
+        )
+        backend.set_recovery_index("req_dist", record.job_id)
+        self.assertEqual(backend.lookup_by_request_id("req_dist"), record.job_id)
+
+
+class _QueuedOutcome:
+    """A QueueOutcome-like stand-in for submit_job's poll result."""
+    ok = True
+    still_running = False
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

@@ -169,6 +169,9 @@ def render_draft_tab() -> None:
     # A queued run outlives this browser session, so re-attach to one started
     # earlier (a reload mid-digest would otherwise look like nothing happened).
     job_runner.resume_pending_job("draft", action_label="Drafting")
+    # If the session state was lost entirely (browser restart, pod failover),
+    # offer a recovery form so the user can paste their reference to recover.
+    job_runner.render_recovery_form("draft", action_label="Drafting")
 
     cached_draft: Any = st.session_state.get("draft_result")
     if cached_draft is None:

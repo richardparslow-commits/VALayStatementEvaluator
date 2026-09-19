@@ -152,6 +152,11 @@ def _lease_key(prefix: str, kind: str) -> str:
     return f"{prefix}:jobs:{kind}:leases"
 
 
+def _recovery_key(prefix: str, request_id: str) -> str:
+    """Map a request_id to its job_id so the UI can recover jobs after a session loss."""
+    return f"{prefix}:index:request:{request_id}"
+
+
 def new_job_id() -> str:
     """Return a short, log-safe job id (``job_…``)."""
     return f"job_{uuid.uuid4().hex[:16]}"
@@ -260,6 +265,19 @@ class JobBackend:
             )
         return payload
 
+    def set_recovery_index(self, request_id: str, job_id: str) -> None:
+        """Persist a request_id → job_id mapping so the UI can recover a job
+        even after the web session is lost.
+
+        The mapping shares the same TTL as every other job key: once the job
+        expires, its recovery index disappears with it.
+        """
+        raise NotImplementedError
+
+    def lookup_by_request_id(self, request_id: str) -> str | None:
+        """Return the job_id for a request_id, or None if no such mapping exists."""
+        raise NotImplementedError
+
 
 # ------------------------------------------------------------ in-process impl
 class InProcessJobBackend(JobBackend):
@@ -276,7 +294,7 @@ class InProcessJobBackend(JobBackend):
     is_distributed = False
     depth_is_remote = False
 
-    def __init__(self, *, prefix: str, ttl_seconds: int) -> None:
+    def __init__(self, *, prefix: str, ttl_seconds: int, is_distributed: bool = False, name: str = "inprocess") -> None:
         self._prefix = prefix
         self._ttl = ttl_seconds
         self._lock = threading.Lock()
@@ -284,7 +302,10 @@ class InProcessJobBackend(JobBackend):
         self._records: dict[str, JobRecord] = {}
         self._payloads: dict[str, str] = {}
         self._results: dict[str, str] = {}
+        self._recovery_index: dict[str, str] = {}
         self._queues: dict[str, deque[str]] = {kind: deque() for kind in KINDS}
+        self.is_distributed = is_distributed
+        self.name = name
 
     # -- producer -----------------------------------------------------------
     def enqueue(self, kind: str, payload: str, *, request_id: str = "") -> JobRecord:
@@ -447,6 +468,18 @@ class InProcessJobBackend(JobBackend):
 
     def ping(self) -> bool:
         return True
+
+    def set_recovery_index(self, request_id: str, job_id: str) -> None:
+        if not request_id:
+            return
+        with self._lock:
+            self._recovery_index[request_id] = job_id
+
+    def lookup_by_request_id(self, request_id: str) -> str | None:
+        if not request_id:
+            return None
+        with self._lock:
+            return self._recovery_index.get(request_id)
 # Lua runs on Redis for both transports. All keys are explicit, and types are
 # checked before any write: Redis scripts are atomic but do not roll back errors.
 # A recovery lease is written BEFORE removing queue membership; recovery removes
@@ -672,6 +705,25 @@ class _AtomicJobBackend(JobBackend):
                     "recover", str(job_id), kind, "", cutoff, MAX_ATTEMPTS
                 ))
         return requeued
+
+    def set_recovery_index(self, request_id: str, job_id: str) -> None:
+        if not request_id:
+            return
+        key = _recovery_key(self._prefix, request_id)
+        try:
+            self._command("SET", key, job_id, "EX", self._ttl)
+        except Exception:  # noqa: BLE001 - best-effort
+            logger.debug("recovery index write failed request_id=%s job_id=%s", request_id, job_id)
+
+    def lookup_by_request_id(self, request_id: str) -> str | None:
+        if not request_id:
+            return None
+        key = _recovery_key(self._prefix, request_id)
+        try:
+            result = self._command("GET", key)
+            return result if isinstance(result, str) else None
+        except Exception:  # noqa: BLE001 - polling must never break the UI
+            return None
 
 
 # ------------------------------------------------------------- redis-py impl
