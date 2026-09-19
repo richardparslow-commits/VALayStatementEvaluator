@@ -100,6 +100,65 @@ def carries(stage: list[str], path: str) -> bool:
     return False
 
 
+def files_carried(stage: list[str]) -> set[str]:
+    """The repo-relative *files* a stage's ``COPY`` lines bring in, expanded.
+
+    Directories are expanded to the files under them, so "would
+    ``requirements-dev.txt`` be in the image?" can be asked of a stage that copies
+    a directory containing it.
+    """
+    found: set[str] = set()
+    for source in copy_sources(stage):
+        found.update(expand(source))
+    return found
+
+
+#: How a RUN line names a file it reads. `pip install -r <file>`,
+#: `pip install --requirement <file>`, and the same flag spelled with `=`.
+_REQUIREMENT_FLAGS = ("-r", "--requirement")
+
+
+def files_read_before_being_carried(
+    stage: list[str], inherited_stage: list[str] | None = None
+) -> list[str]:
+    """Files a ``RUN`` reads that the stage has not brought in *by that point*.
+
+    Docker runs a stage top to bottom, so a RUN cannot read what a later COPY
+    brings in. This is the bug ``pip install -r requirements-dev.txt`` had: the RUN
+    line names the file, so ``carries`` — which asks whether the string appears in
+    the stage — reported it present while the build failed at that step (measured:
+    the first CI run of the sandbox-image job, before any image had ever been
+    built). A test that asks about mentions cannot tell a COPY from a RUN.
+
+    *inherited_stage* is the stage this one is built ``FROM``, whose files are
+    present before this stage's first instruction.
+    """
+    available = files_carried(inherited_stage) if inherited_stage else set()
+    missing: list[str] = []
+    for instruction in stage:
+        if instruction.startswith("COPY "):
+            available |= files_carried([instruction])
+            continue
+        if not instruction.startswith("RUN "):
+            continue
+        for name in _requirement_arguments(instruction):
+            if name not in available:
+                missing.append(name)
+    return sorted(missing)
+
+
+def _requirement_arguments(instruction: str) -> list[str]:
+    """The file names a RUN's ``-r``/``--requirement`` flags point at."""
+    names: list[str] = []
+    tokens = instruction.split()
+    for index, token in enumerate(tokens):
+        if token in _REQUIREMENT_FLAGS and index + 1 < len(tokens):
+            names.append(tokens[index + 1])
+        elif any(token.startswith(f"{flag}=") for flag in _REQUIREMENT_FLAGS):
+            names.append(token.split("=", 1)[1])
+    return [name for name in names if not name.startswith("-")]
+
+
 # ------------------------------------------------------------ ignore patterns
 
 class _Pattern:

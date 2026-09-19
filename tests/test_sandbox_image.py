@@ -176,6 +176,23 @@ class TestSandboxCarriesWhatTheSuiteReads(SandboxImageTestCase):
             "the sandbox image would not carry: " + ", ".join(missing),
         )
 
+    def test_every_run_can_read_the_files_it_names(self) -> None:
+        """A RUN cannot read what a later COPY brings in.
+
+        `pip install -r requirements-dev.txt` named its file while nothing in the
+        stage ever copied it in, and `test_every_required_path_is_in_the_image`
+        passed anyway: a question about mentions is satisfied by a RUN line that
+        mentions it. The build failed at that step the first time the stage was
+        built — which is what the sandbox-image CI job is for — so this asks the
+        ordering question instead.
+        """
+        missing = dockerfile.files_read_before_being_carried(self.sandbox, self.runtime)
+        self.assertEqual(
+            missing,
+            [],
+            "a RUN reads these before anything copies them in: " + ", ".join(missing),
+        )
+
     def test_the_required_paths_still_exist(self) -> None:
         """A renamed directory must fail here, not silently stop being checked."""
         missing = [p for p in self.REQUIRED if not (PROJECT_ROOT / p).exists()]
