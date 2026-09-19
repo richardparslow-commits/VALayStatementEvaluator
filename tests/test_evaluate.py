@@ -25,10 +25,13 @@ from app.documents import (  # noqa: E402
 from app.evaluate import (  # noqa: E402
     DIMENSION_LABELS,
     VERDICTS,
+    VERIFICATION_MAX_ATTEMPTS,
+    VerificationIncompleteError,
     EvaluationResult,
     _citation_index_snapshot,
     _fallback_recommendations,
     _infer_record_type,
+    _normalize_claims,
     _truncate_for_prompt,
     _verifications_text,
     _verify_claims,
@@ -40,7 +43,7 @@ from app.evaluate import (  # noqa: E402
     rubric_and_positive_sources,
     run_evaluation,
 )
-from app.llm import LLMError  # noqa: E402
+from app.llm import LLMError, LLMParseError  # noqa: E402
 from app.medical_review import MedicalDigest, MedicalFact  # noqa: E402
 
 # ---------------------------------------------------------------- helpers
@@ -95,21 +98,13 @@ class _FakeLLM:
         if phase == "verify":
             import json as _json
 
-            # caller sends a JSON batch in user; reflect it with SUPPORTED verdicts
-            # extract claim ids from the claims field embedded in user (best-effort).
-            # For deterministic tests overrides should be used when precise control needed.
-            try:
-                # find the claims JSON blob after "CLAIMS TO VERIFY:"
-                marker = '"claims"'
-                # fallback: pretend 2 verifications
-                return {
-                    "verifications": [
-                        {"id": 1, "verdict": "SUPPORTED", "record_reference": "a.txt p.1", "note": "Matches record."},
-                        {"id": 2, "verdict": "NOT FOUND", "record_reference": "", "note": "Not in records - still valid."},
-                    ]
-                }
-            except Exception:
-                return {"verifications": []}
+            batch = _json.loads(user.split("CLAIMS TO VERIFY:\n<<<\n", 1)[1].split("\n>>>", 1)[0])
+            return {"verifications": [
+                {"id": claim["id"], "verdict": "NOT FOUND" if claim["id"] == 2 else "SUPPORTED",
+                 "record_reference": "" if claim["id"] == 2 else "a.txt p.1",
+                 "note": "Not in records - still valid." if claim["id"] == 2 else "Matches record."}
+                for claim in batch
+            ]}
         if phase == "rubric":
             return {
                 "scores": {k: 6.0 for k in DIMENSION_LABELS},
@@ -347,6 +342,115 @@ class TestCitationIndexSnapshot(unittest.TestCase):
 
 
 class TestVerifyClaims(unittest.TestCase):
+    @staticmethod
+    def _verdict(claim_id=1, verdict="SUPPORTED"):
+        return {"id": claim_id, "verdict": verdict, "record_reference": "a.txt p.1", "note": "Matches."}
+
+    def test_string_ids_match_and_normalize_without_mutating_model_data(self):
+        claim = {"id": "1", "text": "Knee pain."}
+        verdict = self._verdict("1", " supported ")
+        llm = _FakeLLM(overrides={"verify": {"verifications": [verdict]}})
+        result, _ = _verify_claims(llm, [claim], _fake_digest(), [_doc()], lambda f, m: None)
+        self.assertEqual(result[0]["id"], 1)
+        self.assertEqual(result[0]["verdict"], "SUPPORTED")
+        self.assertEqual(claim["id"], "1")
+        self.assertEqual(verdict["id"], "1")
+        self.assertEqual(verdict["verdict"], " supported ")
+
+    def test_missing_verdict_is_retried_with_the_whole_batch(self):
+        prompts = []
+
+        def verify(_system, user, _kwargs):
+            prompts.append(user)
+            if len(prompts) == 1:
+                return {"verifications": [self._verdict("1")]}
+            return {"verifications": [self._verdict("2", "NOT FOUND"), self._verdict(1)]}
+
+        llm = _FakeLLM(overrides={"verify": verify})
+        result, _ = _verify_claims(llm, [{"id": "1", "text": "Knee pain."}, {"id": 2, "text": "Brace use."}], _fake_digest(), [_doc()], lambda f, m: None)
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("previous response was incomplete or invalid", prompts[1])
+        self.assertIn('"id": 1', prompts[1])
+        self.assertIn('"id": 2', prompts[1])
+        self.assertEqual([v["id"] for v in result], [1, 2])
+        self.assertEqual([v["verdict"] for v in result], ["SUPPORTED", "NOT FOUND"])
+
+    def test_invalid_verifier_schemas_never_become_not_found(self):
+        invalid = [None, [], "response", {}, {"verifications": None},
+                   {"verifications": {}}, {"verifications": [None]}]
+        invalid.extend({"verifications": [self._verdict(value)]}
+                       for value in (None, True, False, 0, -1, 1.0, 1.2, "1.0", "-1", "bad", [], {}))
+        invalid.extend({"verifications": [{**self._verdict(), **change}]}
+                       for change in ({"verdict": "UNKNOWN"}, {"verdict": None},
+                                      {"record_reference": []}, {"note": {}}))
+        invalid.extend({"verifications": [{key: value for key, value in self._verdict().items() if key != missing}]}
+                       for missing in ("id", "verdict", "record_reference", "note"))
+        for response in invalid:
+            with self.subTest(response=response):
+                llm = _FakeLLM(overrides={"verify": response})
+                with self.assertRaises(VerificationIncompleteError):
+                    _verify_claims(llm, [{"id": 1, "text": "Knee pain."}], _fake_digest(), [_doc()], lambda f, m: None)
+                self.assertEqual(llm.calls.count(("chat_json", "verify")), VERIFICATION_MAX_ATTEMPTS)
+
+    def test_duplicate_and_unknown_verdict_ids_are_retried_not_overwritten(self):
+        for rows in ([self._verdict(1), self._verdict("01", "CONTRADICTED")],
+                     [self._verdict(1), self._verdict(99)]):
+            with self.subTest(rows=rows):
+                calls = []
+
+                def verify(*_args):
+                    calls.append(1)
+                    return {"verifications": rows if len(calls) == 1 else [self._verdict(1)]}
+
+                result, _ = _verify_claims(_FakeLLM(overrides={"verify": verify}), [{"id": 1, "text": "Knee pain."}], _fake_digest(), [_doc()], lambda f, m: None)
+                self.assertEqual(len(calls), 2)
+                self.assertEqual(result, [self._verdict(1)])
+
+    def test_later_batch_cannot_overwrite_a_previous_claim(self):
+        calls = []
+
+        def verify(*_args):
+            calls.append(1)
+            if len(calls) == 1:
+                rows = [self._verdict(i) for i in range(1, 9)]
+            elif len(calls) == 2:
+                rows = [self._verdict(1, "CONTRADICTED"), self._verdict(9), self._verdict(10)]
+            else:
+                rows = [self._verdict(10), self._verdict("9")]
+            return {"verifications": rows}
+
+        claims = [{"id": str(i), "text": "Knee pain."} for i in range(1, 11)]
+        result, _ = _verify_claims(_FakeLLM(overrides={"verify": verify}), claims, _fake_digest(), [_doc()], lambda f, m: None)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual([v["id"] for v in result], list(range(1, 11)))
+        self.assertTrue(all(v["verdict"] == "SUPPORTED" for v in result))
+
+    def test_invalid_json_is_retried_but_transport_failures_are_not_retried_here(self):
+        calls = []
+
+        def verify(*_args):
+            calls.append(1)
+            if len(calls) == 1:
+                raise LLMParseError("invalid JSON")
+            return {"verifications": [self._verdict()]}
+
+        result, _ = _verify_claims(_FakeLLM(overrides={"verify": verify}), [{"id": 1, "text": "Knee pain."}], _fake_digest(), [_doc()], lambda f, m: None)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(result[0]["verdict"], "SUPPORTED")
+        llm = _FakeLLM(overrides={"verify": LLMError("provider unavailable")})
+        with self.assertRaisesRegex(LLMError, "provider unavailable"):
+            _verify_claims(llm, [{"id": 1, "text": "Knee pain."}], _fake_digest(), [_doc()], lambda f, m: None)
+        self.assertEqual(llm.calls.count(("chat_json", "verify")), 1)
+
+    def test_retry_obeys_pipeline_cancellation(self):
+        from app.pipeline_guard import PipelineCancelledError
+
+        llm = _FakeLLM(overrides={"verify": {"verifications": []}})
+        with patch("app.evaluate.check_pipeline_cancelled", side_effect=[None, PipelineCancelledError("cancelled")]):
+            with self.assertRaises(PipelineCancelledError):
+                _verify_claims(llm, [{"id": 1, "text": "Knee pain."}], _fake_digest(), [_doc()], lambda f, m: None)
+        self.assertEqual(llm.calls.count(("chat_json", "verify")), 1)
+
     def test_single_batch(self):
         llm = _FakeLLM(overrides={
             "verify": {"verifications": [{"id": 1, "verdict": "SUPPORTED", "record_reference": "a.txt p.1", "note": "ok"}]}
@@ -378,14 +482,13 @@ class TestVerifyClaims(unittest.TestCase):
         self.assertEqual(len(result), 10)
         self.assertEqual({r["id"] for r in result}, set(range(1, 11)))
 
-    def test_missing_verdict_defaults_to_not_found(self):
+    def test_missing_verdict_stops_as_incomplete_after_bounded_retries(self):
         llm = _FakeLLM(overrides={"verify": {"verifications": []}})
         claims = [{"id": 1, "text": "Missing."}, {"id": 2, "text": "Also missing."}]
-        result, _gaps = _verify_claims(
-            llm, claims, _fake_digest(), [_doc()], report=lambda f, m: None
-        )
-        self.assertEqual(result[0]["verdict"], "NOT FOUND")
-        self.assertIn("Not returned", result[0]["note"])
+        with self.assertRaises(VerificationIncompleteError) as caught:
+            _verify_claims(llm, claims, _fake_digest(), [_doc()], report=lambda f, m: None)
+        self.assertIn("remain unverified, not NOT FOUND", str(caught.exception))
+        self.assertEqual(llm.calls.count(("chat_json", "verify")), VERIFICATION_MAX_ATTEMPTS)
 
     def test_contradicted_and_not_found_preserved(self):
         llm = _FakeLLM(overrides={
@@ -439,6 +542,56 @@ class TestVerifyClaims(unittest.TestCase):
         )
         self.assertEqual(result[0]["verdict"], "CONTRADICTED")
         self.assertEqual(gaps, [])
+
+
+class TestClaimSchemaBoundary(unittest.TestCase):
+    def test_invalid_claim_shapes_and_ids_fail_before_verification(self):
+        invalid = [None, {}, "claims", [None], [{"id": 1}],
+                   [{"id": 1, "text": " "}], [{"id": 1, "text": []}],
+                   [{"id": 1, "text": "Pain.", "type": "unknown"}],
+                   [{"id": 1, "text": "Pain.", "type": []}],
+                   [{"id": 1, "text": "First."}, {"id": "01", "text": "Second."}]]
+        invalid.extend([{ "id": value, "text": "Pain."}]
+                       for value in (True, False, 1.0, 1.5, 0, -1, "1.0", "-1", None, [], {}))
+        for claims in invalid:
+            with self.subTest(claims=claims), self.assertRaises(LLMParseError):
+                _normalize_claims(claims)
+
+    def test_valid_claims_keep_their_unique_ids_and_normalize_types(self):
+        self.assertEqual(_normalize_claims([{"id": " 07 ", "text": " Pain. ", "type": " Symptom "}]),
+                         [{"id": 7, "text": "Pain.", "type": "symptom"}])
+        self.assertEqual(_normalize_claims([]), [])
+
+    @patch("app.evaluate.review_medical_records", return_value=_fake_digest())
+    @patch("app.evaluate.load_knowledge", return_value="guide")
+    def test_string_ids_work_end_to_end(self, _knowledge, _review):
+        llm = _FakeLLM(overrides={
+            "claims": {"claims": [{"id": "1", "text": "Knee pain.", "type": "symptom"}]},
+            "verify": {"verifications": [TestVerifyClaims._verdict("1")]},
+        })
+        result = run_evaluation(llm, "Knee pain.", [_doc()])
+        self.assertEqual(result.claims[0]["id"], 1)
+        self.assertEqual(result.verifications[0]["id"], 1)
+        self.assertEqual(result.verifications[0]["verdict"], "SUPPORTED")
+        self.assertIn('Claim 1: "Knee pain." => SUPPORTED', _verifications_text(result))
+        self.assertNotIn("Not returned by verifier", result.report_markdown)
+
+    @patch("app.evaluate.review_medical_records", return_value=_fake_digest())
+    def test_exhausted_verification_never_scores_or_rewrites(self, _review):
+        llm = _FakeLLM(overrides={"verify": {"verifications": []}})
+        with self.assertRaises(VerificationIncompleteError):
+            run_evaluation(llm, "Knee pain.", [_doc()])
+        self.assertEqual([phase for _, phase in llm.calls], ["claims"] + ["verify"] * VERIFICATION_MAX_ATTEMPTS)
+
+    @patch("app.evaluate.review_medical_records", return_value=_fake_digest())
+    def test_invalid_claim_responses_never_reach_verification(self, _review):
+        for response in ([], {}, {"claims": None}, {"claims": [], "writer_role": []},
+                         {"claims": [], "claimed_condition": {}}):
+            with self.subTest(response=response):
+                llm = _FakeLLM(overrides={"claims": response})
+                with self.assertRaises(LLMParseError):
+                    run_evaluation(llm, "Knee pain.", [_doc()])
+                self.assertEqual(llm.calls, [("chat_json", "claims")])
 
 
 class TestRunEvaluationHappyPath(unittest.TestCase):

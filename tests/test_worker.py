@@ -282,6 +282,22 @@ class TestExecuteJobFailures(_WorkerCase):
         self.assertEqual(failed.error_class, "LLMError")
         self.assertIn("endpoint down", failed.error)
 
+    def test_incomplete_verification_is_a_failed_job_not_an_evidence_verdict(self):
+        from test_evaluate import _FakeLLM
+
+        job = _evaluate_job()
+        queued = self.backend.enqueue(KIND_EVALUATE, encode_job(KIND_EVALUATE, job))
+        claimed, payload = self.backend.claim([KIND_EVALUATE], worker_id="w1")
+        base = _FakeLLM(overrides={"verify": {"verifications": []}})
+        self.assertFalse(worker.execute_job(claimed, payload, self.backend, llm=_UsageStub(base)))
+        failed = self.backend.get(queued.job_id)
+        self.assertEqual(failed.status, STATUS_ERROR)
+        self.assertEqual(failed.error_class, "VerificationIncompleteError")
+        self.assertIn("remain unverified, not NOT FOUND", failed.error)
+        self.assertIsNone(self.backend.get_result(queued.job_id))
+        self.assertNotIn(("chat_json", "rubric"), base.calls)
+        self.assertNotIn(("chat_json", "revision"), base.calls)
+
     def test_failure_is_written_to_the_run_log(self):
         job = _evaluate_job(request_id="req_failing")
         record = self.backend.enqueue(KIND_EVALUATE, encode_job(KIND_EVALUATE, job))

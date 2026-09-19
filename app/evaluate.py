@@ -19,7 +19,7 @@ from .documents import (
     MAX_STATEMENT_CHARS,
 )
 from .exporter import parse_source
-from .llm import LLMClient, LLMError
+from .llm import LLMClient, LLMError, LLMParseError
 from . import tracing
 from .logging_config import PhaseTimer, get_request_id
 from .profiler import phase_timer
@@ -43,6 +43,16 @@ SEARCH_FEATURE_ID = "22bc7e10-dcda-431e-b3fb-4e8ff9b532cb"  # medical-record-sea
 
 # Feature: Statement Effectiveness Score & Improvement Recommendations
 EFFECTIVENESS_FEATURE_ID = "94104045-aa12-4018-95c6-e6912e659803"  # statement-effectiveness-score-improvement-recommendations
+
+VERIFICATION_MAX_ATTEMPTS = 3
+CLAIM_TYPES = frozenset({
+    "in_service_event", "onset", "symptom", "diagnosis_reference",
+    "treatment_reference", "date_or_place", "functional_impact", "continuity", "other",
+})
+
+
+class VerificationIncompleteError(LLMParseError):
+    """Verification could not produce a complete, unambiguous set of verdicts."""
 
 CLAIMS_SYSTEM = """You are a VA claims evidence analyst. Decompose a lay/witness statement \
 into atomic factual assertions so each can be checked against medical records. Distinguish \
@@ -86,6 +96,9 @@ records and (2) raw record excerpts. Be rigorous but fair:
 Cite the supporting/conflicting record fact (with its source label and date) whenever possible."""
 
 VERIFY_USER = """Verify each claim below against the medical record digest and raw excerpts.
+Return exactly one verdict for EVERY submitted claim id, with no duplicates or extra ids.
+Use NOT FOUND only when the supplied evidence does not confirm or deny the claim, never
+as a substitute for skipping verification.
 
 Return JSON:
 {{
@@ -447,6 +460,72 @@ def _truncate_for_prompt(text: str, limit: int = EVALUATE_INTERNAL_MAX_CHARS) ->
     return text[:limit], len(text) - limit
 
 
+def _normalize_claim_id(value: Any) -> int:
+    """Accept JSON integers and decimal strings, never bools or rounded floats."""
+    if type(value) is int and value > 0:
+        return value
+    if isinstance(value, str) and re.fullmatch(r"[0-9]+", value.strip()):
+        try:
+            parsed = int(value.strip())
+        except ValueError:
+            pass
+        else:
+            if parsed > 0:
+                return parsed
+    raise LLMParseError("Claim ids must be positive integers or decimal integer strings.")
+
+
+def _normalize_claims(data: Any) -> list[dict]:
+    if not isinstance(data, list):
+        raise LLMParseError("Claim extraction is incomplete: expected a claims list.")
+    normalized = []
+    seen: set[int] = set()
+    for item in data:
+        if not isinstance(item, dict):
+            raise LLMParseError("Claim extraction is incomplete: a claim is not an object.")
+        claim_id = _normalize_claim_id(item.get("id"))
+        if claim_id in seen:
+            raise LLMParseError("Claim extraction is incomplete: duplicate claim ids.")
+        text = item.get("text")
+        claim_type = item.get("type", "other")
+        if not isinstance(text, str) or not text.strip():
+            raise LLMParseError("Claim extraction is incomplete: a claim has no valid text.")
+        if not isinstance(claim_type, str) or claim_type.strip().lower() not in CLAIM_TYPES:
+            raise LLMParseError("Claim extraction is incomplete: invalid claim type.")
+        normalized.append({"id": claim_id, "text": text.strip(), "type": claim_type.strip().lower()})
+        seen.add(claim_id)
+    return normalized
+
+
+def _normalize_verifications(data: Any, expected_ids: set[int]) -> list[dict]:
+    if not isinstance(data, dict) or not isinstance(data.get("verifications"), list):
+        raise LLMParseError("Expected an object containing a verifications list.")
+    normalized = []
+    seen: set[int] = set()
+    for item in data["verifications"]:
+        if not isinstance(item, dict):
+            raise LLMParseError("Each verification must be an object.")
+        claim_id = _normalize_claim_id(item.get("id"))
+        if claim_id not in expected_ids:
+            raise LLMParseError("Verifier returned an id not submitted in this batch.")
+        if claim_id in seen:
+            raise LLMParseError("Verifier returned duplicate verdicts for a claim.")
+        verdict = item.get("verdict")
+        if not isinstance(verdict, str) or verdict.strip().upper() not in VERDICTS:
+            raise LLMParseError("Verifier returned an invalid verdict label.")
+        reference, note = item.get("record_reference"), item.get("note")
+        if not isinstance(reference, str) or not isinstance(note, str):
+            raise LLMParseError("Verifier reference and note must both be strings.")
+        normalized.append({
+            "id": claim_id, "verdict": verdict.strip().upper(),
+            "record_reference": reference.strip(), "note": note.strip(),
+        })
+        seen.add(claim_id)
+    if seen != expected_ids:
+        raise LLMParseError(f"Verifier omitted {len(expected_ids - seen)} submitted claim(s).")
+    return normalized
+
+
 def _run_evaluation(
     llm: LLMClient,
     statement_text: str,
@@ -504,9 +583,14 @@ def _run_evaluation(
                 ),
                 phase="claims",
             )
-            result.claimed_condition = claims_data.get("claimed_condition", "")
-            result.writer_role = claims_data.get("writer_role", "")
-            result.claims = claims_data.get("claims", [])
+            if not isinstance(claims_data, dict):
+                raise LLMParseError("Claim extraction is incomplete: expected a JSON object.")
+            result.claims = _normalize_claims(claims_data.get("claims"))
+            for key in ("claimed_condition", "writer_role"):
+                if not isinstance(claims_data.get(key, ""), str):
+                    raise LLMParseError("Claim extraction returned invalid condition or writer metadata.")
+            result.claimed_condition = claims_data.get("claimed_condition", "").strip()
+            result.writer_role = claims_data.get("writer_role", "").strip()
             logger.info(
                 "claims extracted count=%d condition=%s role=%s",
                 len(result.claims), result.claimed_condition[:80] if result.claimed_condition else "-",
@@ -702,7 +786,12 @@ def _verify_claims(
     records addresses this" are different findings and only one of them is true.
     Reporting a coverage gap as a contradiction would put a false statement in front
     of a veteran who is about to sign it.
+
+    Each batch must pass schema, identity, uniqueness and coverage validation.
+    Invalid batches are retried in full; exhaustion raises an explicit incomplete
+    verification error before downstream scoring instead of inventing verdicts.
     """
+    claims = _normalize_claims(claims)
     verdict_by_id: dict[int, dict] = {}
     evidence_gaps: list[dict] = []
     batch_size = 8
@@ -733,21 +822,42 @@ def _verify_claims(
         )
         import json as _json
 
-        data = llm.chat_json(
-            VERIFY_SYSTEM,
-            VERIFY_USER.format(
-                digest=sanitize_digest_text(digest.relevant_facts_text(batch_query, max_facts=150), max_chars=120_000),
-                excerpts=sanitize_digest_text(evidence.text[:16000] or "(no matching raw excerpts found)", max_chars=20_000),
-                claims=sanitize_for_prompt(_json.dumps(batch, indent=1), max_chars=20_000),
-                guard_note=(GUARD_NOTE + "\n\n" + gap_note) if gap_note else GUARD_NOTE,
-            ),
-            phase="verify",
+        prompt = VERIFY_USER.format(
+            digest=sanitize_digest_text(digest.relevant_facts_text(batch_query, max_facts=150), max_chars=120_000),
+            excerpts=sanitize_digest_text(evidence.text[:16000] or "(no matching raw excerpts found)", max_chars=20_000),
+            claims=sanitize_for_prompt(_json.dumps(batch, indent=1), max_chars=20_000),
+            guard_note=(GUARD_NOTE + "\n\n" + gap_note) if gap_note else GUARD_NOTE,
         )
-        for item in data.get("verifications", []):
+        retry_note = ""
+        for attempt in range(1, VERIFICATION_MAX_ATTEMPTS + 1):
+            check_pipeline_cancelled()
             try:
-                claim_id = int(item.get("id"))
-            except (TypeError, ValueError):
-                continue
+                data = llm.chat_json(VERIFY_SYSTEM, prompt + retry_note, phase="verify")
+                verified = _normalize_verifications(data, {c["id"] for c in batch})
+                break
+            except LLMParseError as exc:
+                if attempt == VERIFICATION_MAX_ATTEMPTS:
+                    raise VerificationIncompleteError(
+                        f"Verification incomplete: batch {index}/{len(batches)} did not return "
+                        f"exactly one valid verdict per claim after {attempt} attempts. "
+                        "These claims remain unverified, not NOT FOUND. Evaluation stopped "
+                        "before scoring or rewriting; please re-run."
+                    ) from exc
+                # Do not quote a malformed model response (which can contain
+                # medical text) in logs or the correction instruction.
+                logger.warning(
+                    "verification batch %d/%d invalid; retrying attempt %d/%d",
+                    index, len(batches), attempt + 1, VERIFICATION_MAX_ATTEMPTS,
+                    extra={"phase": "verify", "status": "retry"},
+                )
+                retry_note = (
+                    "\n\nThe previous response was incomplete or invalid. Return a fresh "
+                    "complete verifications list with exactly one valid verdict per "
+                    "submitted id, and no other ids. Include string record_reference "
+                    "and note fields for every verdict."
+                )
+        for item in verified:
+            claim_id = item["id"]
             if evidence_absent and str(item.get("verdict", "")).upper() == "CONTRADICTED":
                 item = dict(item)
                 item["verdict"] = "NOT FOUND"
@@ -766,14 +876,7 @@ def _verify_claims(
                 )
             verdict_by_id[claim_id] = item
     return (
-        [
-            verdict_by_id.get(
-                c["id"],
-                {"id": c["id"], "verdict": "NOT FOUND", "record_reference": "",
-                 "note": "Not returned by verifier."},
-            )
-            for c in claims
-        ],
+        [verdict_by_id[c["id"]] for c in claims],
         evidence_gaps,
     )
 
