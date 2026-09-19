@@ -86,6 +86,7 @@ Infrastructure around the app:
 * `requirements.txt` / `requirements.lock` — reproducible dependency graph (see `README.md → Dependency locking`).
 * `scripts/mock_fetch_sandbox.py` — stdlib-only local mock for the Fetch Sandbox contract.
 * `scripts/smoke_test.py` / `scripts/scale_sim.py` — live E2E and offline 2k-page orchestration checks.
+* `scripts/vercel_sandbox_runner.py` — the `VA_LSE_EXTRACTOR_RUNNER` command that reads one staged file on a Vercel Sandbox (`DEPLOYMENT.md` §6), the box side of the `RecordExtractor` swap in `app/extractors.py`.
 
 ## 3. Data flow
 
