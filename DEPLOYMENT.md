@@ -774,10 +774,21 @@ Four things about it are deliberate and easy to get wrong by hand:
 ```bash
 # Build and push it to Vercel Container Registry, then boot a sandbox from it
 docker build --target sandbox -t va-lse-sandbox:latest .   # local smoke test
+vercel vcr login docker             # docker needs its own login to vcr.vercel.com
 vercel vcr build docker . va-lse-sandbox:latest --push
 sandbox create --name va-lse-dev --image va-lse-sandbox:latest \
   --vcpus 4 --timeout 2h --publish-port 8501 --connect
 ```
+
+Two things about the middle line. The stage has to be named, because `vercel vcr
+build` runs the container tool and the Dockerfile's default target is the
+deployment image — that is the `-- --target sandbox` the CI job passes. And
+`VERCEL_TOKEN` authenticates the Vercel *CLI*, not docker: without a registry
+login for the container tool the build succeeds and the push fails with "no basic
+auth credentials". `vercel vcr login docker` mints a 12-hour project-scoped OIDC
+credential for it; a long-lived token works instead, with the token as the
+password and the **team ID** that owns the project as the username
+(`--username <team ID> --password-stdin`).
 
 `tests/test_sandbox_image.py` asserts this contract (the stage, root, the dev
 extras, OCR tooling, git, the copied files) as *text*, and
@@ -790,7 +801,8 @@ publishes it to Vercel Container Registry and then runs the live test below — 
 is also how a machine without Docker gets an image. It is dispatch-only and skips
 itself unless `VERCEL_TOKEN` is set, in the same shape as the live smoke job
 (`VERCEL_SANDBOX_PROJECT` names the project that owns the registry repository,
-`VERCEL_SANDBOX_SCOPE` the team; VCR creates the repository on the first push).
+`VERCEL_TEAM_ID` is the registry login's username, `VERCEL_SANDBOX_SCOPE` the team;
+VCR creates the repository on the first push).
 
 ### Multi-stage variant (smaller image, optional)
 

@@ -461,9 +461,10 @@ jobs:
   # coverage of the CLI's own half of the contract — every offline test fakes the CLI —
   # and it needs credentials, so it is dispatch-only.
   #
-  # Repository secrets: VERCEL_TOKEN (an access token scoped to the team) and
-  # VERCEL_SANDBOX_PROJECT (the project that owns the registry repository, e.g.
-  # va_draft), optionally VERCEL_SANDBOX_SCOPE (the team slug). VCR creates the
+  # Repository secrets: VERCEL_TOKEN (an access token scoped to the team),
+  # VERCEL_TEAM_ID (the team that owns the project — the username in the registry
+  # login) and VERCEL_SANDBOX_PROJECT (the project that owns the registry repository,
+  # e.g. va_draft), optionally VERCEL_SANDBOX_SCOPE (the team slug). VCR creates the
   # repository on the first push, so nothing has to exist beforehand. The Vercel and
   # Sandbox CLIs are installed here because neither is on a runner.
   sandbox-image-push:
@@ -474,6 +475,7 @@ jobs:
     timeout-minutes: 45
     env:
       VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_TEAM_ID: ${{ secrets.VERCEL_TEAM_ID }}
       VERCEL_SANDBOX_PROJECT: ${{ secrets.VERCEL_SANDBOX_PROJECT }}
       VERCEL_SANDBOX_SCOPE: ${{ secrets.VERCEL_SANDBOX_SCOPE || '' }}
       VA_LSE_SANDBOX_PROJECT: ${{ secrets.VERCEL_SANDBOX_PROJECT }}
@@ -496,6 +498,17 @@ jobs:
 
       - name: Install the Vercel and Sandbox CLIs
         run: npm i -g vercel@latest sandbox@latest
+
+      # The container tool needs its own login to vcr.vercel.com — VERCEL_TOKEN
+      # authenticates the *Vercel CLI*, not docker. Without this the build succeeds and
+      # the push dies with "no basic auth credentials", which is what the first run of
+      # this job did. The password is the access token and the username is the team ID
+      # that owns the project (Vercel's own `vercel vcr login docker` mints a 12-hour
+      # OIDC credential instead; this is the non-interactive token path).
+      - name: Authenticate the container tool with Vercel Container Registry
+        run: |
+          printf '%s' "$VERCEL_TOKEN" | docker login vcr.vercel.com \
+            --username "$VERCEL_TEAM_ID" --password-stdin
 
       # `vercel vcr build` runs the container tool itself, so the stage has to be
       # selected through the `--` passthrough; `[name]` is the *repository* name
