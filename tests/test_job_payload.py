@@ -346,6 +346,18 @@ class TestResultEnvelope(unittest.TestCase):
         run = RunResult(kind=KIND_EVALUATE, result=_evaluation(), usage=_tracker())
         self.assertEqual(json.loads(encode_result(run))["version"], 1)
 
+    def test_a_misshaped_grounding_cannot_lose_a_finished_draft_run(self):
+        """``encode_result`` promises a finished run is never lost; a grounding
+        that is not an object must not make the write fail."""
+        result = DraftResult(
+            grounding=["not", "an", "object"],  # type: ignore[arg-type]
+            draft="Draft body.",
+        )
+        run = RunResult(kind=KIND_DRAFT, result=result, usage=_tracker())
+        restored = decode_result(encode_result(run))
+        self.assertEqual(restored.result.draft, "Draft body.")
+        self.assertEqual(restored.result.grounding, {})
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

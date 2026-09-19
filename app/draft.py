@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from collections import Counter
 from typing import Any
 
+import json
 import logging
 import re
 import time
@@ -18,7 +19,7 @@ from .documents import (
     ExtractedDocument,
     MAX_OBSERVATIONS_CHARS,
 )
-from .llm import LLMClient, LLMError
+from .llm import LLMClient, LLMError, LLMParseError
 from . import tracing
 from .logging_config import PhaseTimer, get_request_id
 from .profiler import phase_timer
@@ -32,6 +33,9 @@ from .medical_review import MedicalDigest, ProgressCallback, review_medical_reco
 FEATURE_ID = "02f0935a-ee5e-4083-88a2-10e11753ccc9"  # condition-specific-templates
 
 REVIEW_MAX_CHARS = 16_000
+# Budget for the grounding analysis handed to the drafting model.
+# The bound is enforced by shrinking the data, never by slicing the JSON.
+GROUNDING_PROMPT_MAX_CHARS = 25_000
 
 GROUNDING_SYSTEM = """You are a veterans-claims evidence specialist preparing to draft a \
 lay/witness statement (VA Form 21-10210 style). You must ground every available fact in the \
@@ -348,6 +352,50 @@ def _pages_to_source(records: list[ExtractedDocument]) -> list[dict]:
     return pages
 
 
+_GROUNDING_OBJECT_LISTS = (
+    "supported_observations",
+    "unverified_observations",
+    "conflicts",
+    "suggested_inclusions",
+    "topic_coverage",
+)
+
+
+def _normalize_grounding(raw: Any) -> dict[str, Any]:
+    """Validate the grounding analysis before it feeds the draft, UI, or store.
+
+    ``chat_json`` guarantees parseable JSON, not the object-of-lists-of-objects
+    the grounding prompt asks for: a model can return an array, a bare string,
+    or rows that are not objects. Every downstream reader (the draft prompt,
+    ``grounding_markdown``, the job payload, follow-up questions) reads these
+    entries with ``.get``, so a shape mismatch is rejected here as a parse
+    failure — a statement cannot be grounded in an analysis that is not there —
+    instead of surfacing later as an AttributeError once the digest work is done.
+    """
+    if not isinstance(raw, dict):
+        raise LLMParseError("Grounding analysis is incomplete: expected a JSON object.")
+    normalized: dict[str, Any] = dict(raw)
+    for field_name in _GROUNDING_OBJECT_LISTS:
+        value = normalized.get(field_name)
+        if value is None:
+            normalized[field_name] = []
+            continue
+        if not isinstance(value, list):
+            raise LLMParseError(f"Grounding analysis is incomplete: {field_name} must be a list.")
+        if any(not isinstance(item, dict) for item in value):
+            raise LLMParseError(
+                f"Grounding analysis is incomplete: each entry in {field_name} must be an object."
+            )
+    questions = normalized.get("strengthening_questions")
+    if questions is None:
+        normalized["strengthening_questions"] = []
+    elif not isinstance(questions, list) or any(not isinstance(item, str) for item in questions):
+        raise LLMParseError(
+            "Grounding analysis is incomplete: strengthening_questions must be a list of strings."
+        )
+    return normalized
+
+
 def _run_draft(
     llm: LLMClient,
     records: list[ExtractedDocument],
@@ -404,7 +452,7 @@ def _run_draft(
             report(0.5, "Step 2/4 — Grounding witness observations against the records and topic checklist…")
             grounding_query = f"{condition} {obs_for_prompt}"
             try:
-                result.grounding = llm.chat_json(
+                raw_grounding = llm.chat_json(
                     GROUNDING_SYSTEM,
                     GROUNDING_USER.format(
                         condition=sanitize_for_prompt(condition, max_chars=500),
@@ -417,6 +465,7 @@ def _run_draft(
                     ),
                     phase="grounding",
                 )
+                result.grounding = _normalize_grounding(raw_grounding)
             except Exception as exc:  # noqa: BLE001
                 raise map_drafting_exception(exc, request_id=rid, phase="grounding") from exc
 
@@ -439,7 +488,7 @@ def _run_draft(
                         claim_type=sanitize_for_prompt(claim_type, max_chars=500),
                         witnessed_event=sanitize_for_prompt(witness.get("witnessed_event", "unknown"), max_chars=500),
                         observations=sanitize_for_prompt(obs_for_prompt, max_chars=DRAFT_INTERNAL_MAX_CHARS),
-                        grounding=sanitize_for_prompt(_json_dumps(result.grounding), max_chars=25_000),
+                        grounding=_grounding_for_prompt(result.grounding),
                         digest_summary=sanitize_digest_text(result.digest.summary or "(no summary)", max_chars=20_000),
                         guard_note=GUARD_NOTE,
                     ),
@@ -507,13 +556,108 @@ def _run_draft(
     return result
 
 
-def _json_dumps(data: Any) -> str:
-    import json
+_GROUNDING_TRIMMED_NOTE = (
+    "Shortened to fit the drafting prompt budget; trailing rows and long fields were dropped."
+)
 
-    try:
-        return json.dumps(data, indent=1)[:20000]
-    except (TypeError, ValueError):
-        return str(data)[:20000]
+# String caps tried in order; within each, the list cap is binary-searched so
+# the analysis retained is as large as the budget allows.
+_GROUNDING_STRING_CAPS = (2_000, 1_000, 400, 120, 60)
+
+
+def _cap_json_value(value: Any, per_string: int, per_list: int) -> Any:
+    """Rebuild a JSON value with long strings capped and lists shortened from the end."""
+    if isinstance(value, str):
+        if len(value) <= per_string:
+            return value
+        return value[:per_string] + "… [shortened for prompt budget]"
+    if isinstance(value, list):
+        return [_cap_json_value(item, per_string, per_list) for item in value[:per_list]]
+    if isinstance(value, dict):
+        return {key: _cap_json_value(item, per_string, per_list) for key, item in value.items()}
+    return value
+
+
+def _longest_list(value: Any) -> int:
+    """Length of the longest list anywhere in a JSON value (0 when there is none)."""
+    if isinstance(value, list):
+        nested = max((_longest_list(item) for item in value), default=0)
+        return max(len(value), nested)
+    if isinstance(value, dict):
+        return max((_longest_list(item) for item in value.values()), default=0)
+    return 0
+
+
+def _trimmed_grounding(grounding: dict[str, Any], per_string: int, per_list: int) -> dict[str, Any]:
+    data: dict[str, Any] = _cap_json_value(grounding, per_string, per_list)
+    if data != grounding:
+        data = {**data, "_note": _GROUNDING_TRIMMED_NOTE}
+    return data
+
+
+def _grounding_text(data: dict[str, Any]) -> str:
+    # ``sanitize_for_prompt`` enforces its bound by slicing, so give it a bound
+    # that cannot truncate: delimiter escaping grows text at most 5/3 (a fence
+    # is 3 chars, its replacement 5), so ``2 * len + 1`` always suffices. The
+    # real budget is enforced on the sanitized result, as the review pass does.
+    raw = json.dumps(data, indent=1)
+    return sanitize_for_prompt(raw, max_chars=2 * len(raw) + 1)
+
+
+def _fits_grounding_budget(grounding: dict[str, Any], per_string: int, per_list: int) -> bool:
+    trimmed = _trimmed_grounding(grounding, per_string, per_list)
+    return len(_grounding_text(trimmed)) <= GROUNDING_PROMPT_MAX_CHARS
+
+
+def _largest_fitting_list_cap(grounding: dict[str, Any], per_string: int) -> int | None:
+    """Largest per-list row cap that fits, or ``None`` when even one row does not."""
+    if not _fits_grounding_budget(grounding, per_string, 1):
+        return None
+    lo, hi = 1, max(1, _longest_list(grounding))
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _fits_grounding_budget(grounding, per_string, mid):
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
+def _grounding_for_prompt(grounding: dict[str, Any]) -> str:
+    """Render the grounding analysis for the drafting prompt as complete JSON.
+
+    The prompt budget is met by shrinking the data — long strings capped,
+    trailing rows shed, tighter string caps last — never by slicing the
+    serialized document, which would hand the drafting model unparseable JSON
+    mid-string. Within each string cap the row cap is binary-searched, so the
+    model receives as much of the analysis as the budget allows. Output is
+    always valid JSON, and carries a note whenever it was trimmed.
+    """
+    text = _grounding_text(grounding)
+    if len(text) <= GROUNDING_PROMPT_MAX_CHARS:
+        return text
+    for per_string in _GROUNDING_STRING_CAPS:
+        per_list = _largest_fitting_list_cap(grounding, per_string)
+        if per_list is not None:
+            return _grounding_text(_trimmed_grounding(grounding, per_string, per_list))
+    # The tightest cap fits any analysis the normalizer accepts; this return
+    # only guards against a future schema change making the last cap too big.
+    return _grounding_text(_trimmed_grounding(grounding, _GROUNDING_STRING_CAPS[-1], 1))
+
+
+def _grounding_rows(grounding: dict[str, Any], field_name: str) -> list[dict]:
+    """Rows a renderer can read; misshapen saved results are skipped, not fatal."""
+    value = grounding.get(field_name)
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _grounding_strings(grounding: dict[str, Any], field_name: str) -> list[str]:
+    value = grounding.get(field_name)
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str)]
 
 
 def grounding_markdown(result: DraftResult) -> str:
@@ -522,20 +666,21 @@ def grounding_markdown(result: DraftResult) -> str:
     if result.truncation_warning:
         lines.append(f"> ⚠️ **Truncated observations:** {result.truncation_warning}")
         lines.append("")
-    supported = result.grounding.get("supported_observations", [])
+    grounding = result.grounding if isinstance(result.grounding, dict) else {}
+    supported = _grounding_rows(grounding, "supported_observations")
     if supported:
         lines.append("### ✅ Observations corroborated by the records")
         for item in supported:
             lines.append(f"- **{item.get('observation', '')}**")
             lines.append(f"  - Record support: {item.get('record_support', '')}")
         lines.append("")
-    unverified = result.grounding.get("unverified_observations", [])
+    unverified = _grounding_rows(grounding, "unverified_observations")
     if unverified:
         lines.append("### ⚪ Observations not found in records (still legitimate lay evidence)")
         for item in unverified:
             lines.append(f"- {item.get('observation', '')} — _{item.get('action', '')}_")
         lines.append("")
-    conflicts = result.grounding.get("conflicts", [])
+    conflicts = _grounding_rows(grounding, "conflicts")
     if conflicts:
         lines.append("### ⚠️ Conflicts with the records — resolve before signing")
         for item in conflicts:
@@ -543,7 +688,7 @@ def grounding_markdown(result: DraftResult) -> str:
             lines.append(f"  - Records show: {item.get('record_fact', '')}")
             lines.append(f"  - Guidance: {item.get('resolution_note', '')}")
         lines.append("")
-    topics = result.grounding.get("topic_coverage", [])
+    topics = _grounding_rows(grounding, "topic_coverage")
     if topics:
         covered = [t for t in topics if t.get("applicable") and t.get("covered")]
         missing = [t for t in topics if t.get("applicable") and not t.get("covered")]
@@ -562,7 +707,7 @@ def grounding_markdown(result: DraftResult) -> str:
                 prompt = t.get("prompt_for_witness") or "Describe what you have observed."
                 lines.append(f"- **{t.get('topic', '')}** — {prompt}")
         lines.append("")
-    questions = result.grounding.get("strengthening_questions", [])
+    questions = _grounding_strings(grounding, "strengthening_questions")
     if questions:
         lines.append("### ❓ Answer these to strengthen the statement (records suggest you may know)")
         for question in questions:

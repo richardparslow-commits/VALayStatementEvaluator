@@ -3,7 +3,9 @@
 Mocks LLMClient so the full grounding → draft → review pipeline is exercised
 without network, Streamlit, or API keys.
 """
+import json
 import logging
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -19,10 +21,19 @@ from app.drafting_service import (  # noqa: E402
     format_error_for_user,
 )
 from app.documents import DRAFT_INTERNAL_MAX_CHARS, document_from_text  # noqa: E402
-from app.draft import DraftResult, REVIEW_MAX_CHARS, _truncate_for_prompt, grounding_markdown, run_draft  # noqa: E402
+from app.draft import (  # noqa: E402
+    GROUNDING_PROMPT_MAX_CHARS,
+    DraftResult,
+    REVIEW_MAX_CHARS,
+    _grounding_for_prompt,
+    _truncate_for_prompt,
+    grounding_markdown,
+    run_draft,
+)
 from app.llm import LLMError, LLMTimeoutError, LLMUpstreamError  # noqa: E402
 from app.logging_config import clear_request_id, set_request_id  # noqa: E402
 from app.medical_review import MedicalDigest, MedicalFact  # noqa: E402
+from app.prompt_sanitize import sanitize_for_prompt  # noqa: E402
 
 # ---------------------------------------------------------------- helpers
 
@@ -43,6 +54,22 @@ def _fake_digest() -> MedicalDigest:
         pages_reviewed=1,
         chunks_reviewed=1,
     )
+
+
+def _large_grounding(rows: int = 120, field_chars: int = 800) -> dict:
+    """A grounding analysis far past the drafting prompt budget."""
+    filler = "Record detail. " * (field_chars // 15)
+    return {
+        "supported_observations": [
+            {"observation": f"Supported observation {i}.", "record_support": f"{filler}{i}"}
+            for i in range(rows)
+        ],
+        "unverified_observations": [],
+        "conflicts": [],
+        "strengthening_questions": [f"Question {i}?" for i in range(10)],
+        "suggested_inclusions": [],
+        "topic_coverage": [],
+    }
 
 
 class _FakeLLM:
@@ -159,6 +186,165 @@ class TestGroundingMarkdown(unittest.TestCase):
         self.assertIn("No grounding details", md)
 
 
+class TestGroundingResponseShape(unittest.TestCase):
+    """A parsed-but-misshaped grounding analysis is a parse failure, never a
+    late AttributeError and never a silently un-audited statement."""
+
+    def _run(self, grounding):
+        with patch("app.draft.review_medical_records", return_value=_fake_digest()), \
+                patch("app.draft.load_knowledge", return_value="k"):
+            llm = _FakeLLM(overrides={"grounding": grounding})
+            return run_draft(
+                llm, [_doc()], WITNESS, "Daily knee pain observed.", "knee pain", "Service connection"
+            )
+
+    def test_a_non_object_analysis_fails_as_a_parse_error(self):
+        for raw in ([], [{"observation": "Limping."}], "no analysis", 7, None):
+            with self.subTest(raw=repr(raw)):
+                with self.assertRaises(DraftingError) as ctx:
+                    self._run(raw)
+                self.assertEqual(ctx.exception.error_kind, "parse_error")
+                self.assertIn("unreadable response", ctx.exception.user_message)
+
+    def test_a_misshaped_field_fails_as_a_parse_error(self):
+        for raw in (
+            {"supported_observations": "Limping."},
+            {"topic_coverage": [{"topic": "A. Hazards"}, "B. Burden"]},
+            {"conflicts": {"observation": "No pain."}},
+            {"strengthening_questions": [{"question": "How often?"}]},
+        ):
+            with self.subTest(raw=repr(raw)):
+                with self.assertRaises(DraftingError) as ctx:
+                    self._run(raw)
+                self.assertEqual(ctx.exception.error_kind, "parse_error")
+
+    def test_a_missing_field_is_treated_as_no_rows(self):
+        supported = [{"observation": "Limping.", "record_support": "Knee pain — a.txt p.1"}]
+        result = self._run({"supported_observations": supported})
+        self.assertEqual(result.grounding["supported_observations"], supported)
+        for empty_field in (
+            "unverified_observations", "conflicts", "suggested_inclusions",
+            "topic_coverage", "strengthening_questions",
+        ):
+            self.assertEqual(result.grounding[empty_field], [])
+        self.assertTrue(result.draft)
+        self.assertIn("Limping.", grounding_markdown(result))
+
+    def test_saved_results_with_misshapen_rows_still_render(self):
+        result = DraftResult(grounding={
+            "supported_observations": [
+                "plain string",
+                {"observation": "Knee pain.", "record_support": "a.txt p.1"},
+            ],
+            "unverified_observations": "not a list",
+            "conflicts": [
+                None,
+                {"observation": "No pain.", "record_fact": "Pain noted.", "resolution_note": "fix"},
+            ],
+            "strengthening_questions": ["Q1?", 42],
+            "topic_coverage": [
+                {"topic": "A. Hazards", "applicable": True, "covered": False, "prompt_for_witness": "What happens?"},
+                "B. Burden",
+            ],
+        })
+        md = grounding_markdown(result)
+        self.assertIn("Knee pain.", md)
+        self.assertIn("No pain.", md)
+        self.assertIn("Q1?", md)
+        self.assertIn("What happens?", md)
+        self.assertNotIn("plain string", md)
+        # A saved result from before the guard existed: not a dict means no analysis.
+        self.assertIn("No grounding details", grounding_markdown(DraftResult(grounding=["not", "an", "object"])))  # type: ignore[arg-type]
+
+    def test_a_misshaped_grounding_does_not_break_the_saved_payload(self):
+        from app.job_payload import draft_from_json, draft_to_json
+
+        serialized = draft_to_json(DraftResult(draft="statement", grounding=["not", "an", "object"]))  # type: ignore[arg-type]
+        self.assertEqual(serialized["grounding"], {})
+        self.assertEqual(serialized["draft"], "statement")
+        self.assertEqual(draft_from_json(serialized).grounding, {})
+
+
+class TestGroundingPromptBudget(unittest.TestCase):
+    """A large grounding analysis must reach the drafting model as whole JSON."""
+
+    def test_a_small_analysis_is_passed_through_unchanged(self):
+        grounding = {
+            "supported_observations": [{"observation": "Daily knee pain.", "record_support": "a.txt p.1"}],
+            "unverified_observations": [],
+            "conflicts": [],
+            "strengthening_questions": ["How often?"],
+            "suggested_inclusions": [],
+            "topic_coverage": [
+                {"topic": "A. Hazards", "applicable": True, "covered": False, "prompt_for_witness": "Any falls?"}
+            ],
+        }
+        text = _grounding_for_prompt(grounding)
+        self.assertEqual(text, json.dumps(grounding, indent=1))
+        self.assertNotIn("_note", text)
+
+    def test_a_large_analysis_arrives_whole_and_parseable(self):
+        grounding = _large_grounding()
+        self.assertGreater(len(json.dumps(grounding, indent=1)), GROUNDING_PROMPT_MAX_CHARS)
+        text = _grounding_for_prompt(grounding)
+        self.assertLessEqual(len(text), GROUNDING_PROMPT_MAX_CHARS)
+        # The bound is tight: the kept analysis should nearly fill the budget,
+        # not collapse far below it in coarse steps.
+        self.assertGreater(len(text), GROUNDING_PROMPT_MAX_CHARS * 0.9)
+        self.assertNotIn("by prompt sanitizer", text)
+        parsed = json.loads(text)  # raises if the document was sliced mid-string
+        self.assertIn("_note", parsed)
+        kept = parsed["supported_observations"]
+        self.assertTrue(0 < len(kept) < len(grounding["supported_observations"]))
+        self.assertEqual(
+            [row["observation"] for row in kept],
+            [f"Supported observation {i}." for i in range(len(kept))],
+        )
+
+    def test_one_oversized_field_is_capped_and_the_rest_survives(self):
+        grounding = {
+            "supported_observations": [
+                {"observation": "Daily knee pain.", "record_support": "detail; " * 20_000}
+            ],
+            "unverified_observations": [],
+            "conflicts": [],
+            "strengthening_questions": [],
+            "suggested_inclusions": [],
+            "topic_coverage": [],
+        }
+        text = _grounding_for_prompt(grounding)
+        parsed = json.loads(text)
+        row = parsed["supported_observations"][0]
+        self.assertEqual(row["observation"], "Daily knee pain.")
+        self.assertTrue(row["record_support"].startswith("detail; "))
+        self.assertIn("[shortened for prompt budget]", row["record_support"])
+
+    def test_escaping_expansion_cannot_slice_the_document(self):
+        # Fences grow under sanitization (3 chars -> 5), so this analysis fits
+        # the budget raw but not after escaping. The bound must still be met by
+        # shrinking the data, not by cutting the serialized document.
+        content = "```" * 2_000 + "y" * 17_000
+        grounding = {
+            "supported_observations": [{"observation": content, "record_support": "a.txt p.1"}],
+            "unverified_observations": [],
+            "conflicts": [],
+            "strengthening_questions": [],
+            "suggested_inclusions": [],
+            "topic_coverage": [],
+        }
+        raw = json.dumps(grounding, indent=1)
+        self.assertLessEqual(len(raw), GROUNDING_PROMPT_MAX_CHARS)
+        self.assertGreater(
+            len(sanitize_for_prompt(raw, max_chars=2 * len(raw) + 1)), GROUNDING_PROMPT_MAX_CHARS
+        )
+        text = _grounding_for_prompt(grounding)
+        self.assertLessEqual(len(text), GROUNDING_PROMPT_MAX_CHARS)
+        self.assertNotIn("by prompt sanitizer", text)
+        parsed = json.loads(text)
+        self.assertIn("_note", parsed)
+        self.assertIn("` ` `", parsed["supported_observations"][0]["observation"])
+
+
 class TestRunDraftHappyPath(unittest.TestCase):
     @patch("app.draft.review_medical_records")
     @patch("app.draft.load_knowledge", return_value="knowledge")
@@ -206,6 +392,24 @@ class TestRunDraftHappyPath(unittest.TestCase):
         self.assertTrue(any(t["applicable"] and not t["covered"] for t in topics))
         md = grounding_markdown(result)
         self.assertIn("Topic coverage", md)
+
+    @patch("app.draft.review_medical_records")
+    @patch("app.draft.load_knowledge", return_value="knowledge")
+    def test_the_draft_prompt_receives_parseable_grounding_json(self, _mk, mock_review):
+        mock_review.return_value = _fake_digest()
+        captured: dict[str, str] = {}
+
+        def capture_draft(system, user, kwargs):
+            captured["user"] = user
+            return "Draft statement."
+
+        llm = _FakeLLM(overrides={"grounding": _large_grounding(), "draft": capture_draft})
+        run_draft(llm, [_doc()], WITNESS, "Daily knee pain observed.", "knee pain", "Service connection")
+        section = re.search(r"GROUNDING ANALYSIS \(JSON\):\n<<<\n(.*?)\n>>>", captured["user"], re.DOTALL)
+        self.assertIsNotNone(section)
+        parsed = json.loads(section.group(1))
+        self.assertIn("_note", parsed)
+        self.assertEqual(parsed["supported_observations"][0]["observation"], "Supported observation 0.")
 
 
 class TestRunDraftEdgeCases(unittest.TestCase):
