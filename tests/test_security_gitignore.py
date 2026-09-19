@@ -275,6 +275,65 @@ class HookRepository(unittest.TestCase):
         )
 
 
+class TestTheHookReadsOddStagedPathsAsTheyAre(HookRepository):
+    """A path is one path, and a fixture is not a source file.
+
+    Both rules read the staged listing through ``tests/staged_sources.py``, whose
+    names used to be split on whitespace: a staged ``tests/test_ two words.py``
+    became several paths, the lookups for the others failed, and the hook refused
+    a commit that broke no rule. Content used to be decoded strictly too, so a
+    binary fixture under ``tests/`` or ``app/`` raised through the rule instead of
+    being filtered out by the name rule that never meant to read it.
+    """
+
+    WIRED = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "\n"
+        "sys.path.insert(0, str(Path(__file__).resolve().parent.parent))\n"
+        "from tests import hermetic  # noqa: E402,F401\n"
+        "\n"
+        "from app import config  # noqa: E402\n"
+    )
+    FORGOT = "import unittest\n\n\nclass T(unittest.TestCase):\n    pass\n"
+
+    def stage_bytes(self, relative: str, payload: bytes) -> None:
+        path = self.repo / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        subprocess.run(
+            ["git", "add", relative],
+            cwd=str(self.repo),
+            check=True,
+            capture_output=True,
+        )
+
+    def test_the_hook_allows_a_wired_module_whose_name_has_a_space(self) -> None:
+        self.stage("tests/test_wired with spaces.py", self.WIRED)
+        result = self.run_hook()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_the_hook_refuses_an_unwired_module_whose_name_has_a_space(self) -> None:
+        self.stage("tests/test_unwired with spaces.py", self.FORGOT)
+        result = self.run_hook()
+        self.assertNotEqual(result.returncode, 0, "the commit should have been refused")
+        self.assertIn("test_unwired with spaces.py", result.stderr)
+        self.assertIn("does not import the hermetic harness", result.stderr)
+        self.assertNotIn("failed:", result.stderr, "the rule spoke, not a failed lookup")
+
+    def test_a_binary_fixture_under_tests_is_not_a_source_file(self) -> None:
+        self.stage_bytes("tests/fixtures/blob.bin", b"\x00\x01\xff\xfe\x89PNG")
+        result = self.run_hook()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_a_binary_fixture_under_app_is_not_a_source_file(self) -> None:
+        self.stage_bytes("app/static/blob.bin", b"\x00\x01\xff\xfe\x89PNG")
+        result = self.run_hook()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+
 class TestTheHookEnforcesTheHarnessImport(HookRepository):
     """The harness rule, at the moment the mistake is made rather than after a push.
 
