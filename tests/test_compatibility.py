@@ -159,5 +159,140 @@ class TestReadmeEnvTableMatchesDefaults(unittest.TestCase):
                 )
 
 
+def _literal(value: object) -> str:
+    """A config default as the documents write it: ``6.0`` renders as ``6``."""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+class TestDeploymentAndCompatibilityTablesMatchDefaults(unittest.TestCase):
+    """The other two documents that state defaults, guarded like the README's table.
+
+    ``DEPLOYMENT.md``'s §9 table is the operator's checklist and
+    ``COMPATIBILITY.md``'s "Current defaults" table is the provider reference;
+    both quote values that live in ``app/config.py``, and neither was checked
+    (the README and ``.env.example`` are, since ``1b79d2a`` / ``f64c8bd``). Rows
+    whose Default is prose - "(empty = off)", "hostname:pid", "(stdout only)" -
+    stay out: they have no single config value to compare.
+    """
+
+    #: DEPLOYMENT.md §9 environment variable -> config attribute its Default cell must quote.
+    DEPLOYMENT_ROWS: dict[str, str] = {
+        "OPENAI_BASE_URL": "DEFAULT_BASE_URL",
+        "LLM_MODEL_MAIN": "DEFAULT_MODEL_MAIN",
+        "LLM_MODEL_FAST": "DEFAULT_MODEL_FAST",
+        "VA_LSE_RECORDS_CONCURRENCY": "RECORDS_CONCURRENCY",
+        "VA_LSE_MAX_CONCURRENT_LLM_CALLS": "LLM_MAX_CONCURRENT",
+        "VA_LSE_HEALTH_PORT": "HEALTH_PORT",
+        "VA_LSE_SHUTDOWN_GRACE_SECONDS": "SHUTDOWN_GRACE_SECONDS",
+        "VA_LSE_LLM_CALL_TIMEOUT_SECONDS": "LLM_CALL_TIMEOUT_SECONDS",
+        "VA_LSE_AUDIT_LOG_MAX_BYTES": "AUDIT_LOG_MAX_BYTES",
+        "VA_LSE_AUDIT_LOG_BACKUPS": "AUDIT_LOG_BACKUPS",
+        "VA_LSE_AUDIT_RETENTION_DAYS": "AUDIT_RETENTION_DAYS",
+        "VA_LSE_AUDIT_BACKUP_INTERVAL_HOURS": "AUDIT_BACKUP_INTERVAL_HOURS",
+        "VA_LSE_RUN_LOG_MAX_BYTES": "RUN_LOG_MAX_BYTES",
+        "VA_LSE_RUN_LOG_BACKUPS": "RUN_LOG_BACKUPS",
+        "VA_LSE_DISK_MIN_FREE_BYTES": "DISK_MIN_FREE_BYTES",
+        "VA_LSE_JOB_QUEUE_TTL_SECONDS": "JOB_QUEUE_TTL_SECONDS",
+        "VA_LSE_JOB_QUEUE_LEASE_SECONDS": "JOB_QUEUE_LEASE_SECONDS",
+        "VA_LSE_WORKER_CONCURRENCY": "JOB_QUEUE_WORKER_CONCURRENCY",
+        "VA_LSE_WORKER_HEALTH_PORT": "JOB_QUEUE_WORKER_HEALTH_PORT",
+        "VA_LSE_JOB_QUEUE_INLINE_MAX_BYTES": "JOB_QUEUE_INLINE_MAX_BYTES",
+        "VA_LSE_BLOB_STORE": "BLOB_STORE_MODE",
+        "VA_LSE_BLOB_DIR": "BLOB_DIR",
+        "VA_LSE_EXTRACTOR": "EXTRACTOR_MODE",
+        "VA_LSE_EXTRACTOR_TIMEOUT_SECONDS": "EXTRACTOR_TIMEOUT_SECONDS",
+    }
+
+    #: COMPATIBILITY.md's "Current defaults" table names the config constants directly.
+    COMPATIBILITY_ROWS: tuple[str, ...] = (
+        "DEFAULT_BASE_URL",
+        "DEFAULT_MODEL_MAIN",
+        "DEFAULT_MODEL_FAST",
+        "DEFAULT_FETCH_SANDBOX_BASE_URL",
+    )
+
+    def _table(self, doc: str, header: tuple[str, str]) -> list[list[str]]:
+        """The rows under one table header, as stripped cells.
+
+        *header* is ``(first cell, a cell naming the Default column)``: both are
+        matched so a table that merely repeats a variable name elsewhere in the
+        document cannot be picked up, and only the contiguous rows under the
+        header are returned.
+        """
+        lines = (Path(__file__).resolve().parent.parent / doc).read_text().splitlines()
+        for index, line in enumerate(lines):
+            if not line.startswith("|"):
+                continue
+            cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+            if cells and cells[0] == header[0] and header[1] in cells[1:]:
+                rows: list[list[str]] = []
+                for row_line in lines[index + 2 :]:  # skip the header and its separator
+                    if not row_line.startswith("|"):
+                        break
+                    rows.append([c.strip() for c in row_line.strip().strip("|").split("|")])
+                return rows
+        self.fail(f"{doc}: no {header[0]} table with a {header[1]!r} column")
+
+    def test_deployment_default_column_matches_config(self) -> None:
+        rows = {row[0]: row for row in self._table("DEPLOYMENT.md", ("Variable", "Default"))}
+        for env_name, attr in sorted(self.DEPLOYMENT_ROWS.items()):
+            with self.subTest(env=env_name):
+                row = rows.get(f"`{env_name}`")
+                self.assertIsNotNone(row, f"{env_name} is missing from DEPLOYMENT.md's table")
+                expected = _literal(getattr(config, attr))
+                self.assertIn(
+                    f"`{expected}`",
+                    row[2],
+                    f"DEPLOYMENT.md's default for {env_name} is {row[2]!r}, "
+                    f"but config.{attr} ships {expected!r}",
+                )
+
+    def test_compatibility_current_defaults_match_config(self) -> None:
+        rows = {
+            row[0]: row
+            for row in self._table("COMPATIBILITY.md", ("Setting", "Default value"))
+        }
+        for name in self.COMPATIBILITY_ROWS:
+            with self.subTest(setting=name):
+                row = rows.get(f"`{name}`")
+                self.assertIsNotNone(row, f"{name} is missing from COMPATIBILITY.md's table")
+                expected = _literal(getattr(config, name))
+                self.assertIn(
+                    f"`{expected}`",
+                    row[1],
+                    f"COMPATIBILITY.md states {name} = {row[1]!r}, but config ships {expected!r}",
+                )
+
+    def test_compatibility_marks_the_shipped_defaults_as_default(self) -> None:
+        """The rows carrying the shipped values must be the ones marked "(default)".
+
+        Derived from config rather than naming a provider, so if the default ever
+        moves to another endpoint the marker has to move with it.
+        """
+        lines = (Path(__file__).resolve().parent.parent / "COMPATIBILITY.md").read_text().splitlines()
+        rows = [
+            [cell.strip() for cell in line.strip().strip("|").split("|")]
+            for line in lines
+            if line.startswith("|") and line.count("|") >= 3
+        ]
+        endpoint_rows = [row for row in rows if f"`{config.DEFAULT_BASE_URL}`" in " ".join(row)]
+        self.assertTrue(
+            endpoint_rows,
+            f"{config.DEFAULT_BASE_URL} appears in no COMPATIBILITY.md table",
+        )
+        self.assertTrue(
+            any("(default)" in " ".join(row) for row in endpoint_rows),
+            "no COMPATIBILITY.md row marks the shipped default endpoint as (default)",
+        )
+        for model in (config.DEFAULT_MODEL_MAIN, config.DEFAULT_MODEL_FAST):
+            with self.subTest(model=model):
+                self.assertTrue(
+                    any(f"`{model}` (default)" in " ".join(row) for row in rows),
+                    f"no COMPATIBILITY.md table row marks {model} as the shipped default",
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
