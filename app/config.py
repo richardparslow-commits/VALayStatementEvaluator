@@ -533,10 +533,6 @@ EXTRACTOR_TIMEOUT_SECONDS = _positive_int_env("VA_LSE_EXTRACTOR_TIMEOUT_SECONDS"
 # Maximum facts selected for a prompt, never a cap on retained evidence.
 MAX_DIGEST_FACTS = _int_env("VA_LSE_MAX_DIGEST_FACTS", 1500)
 
-# Pages whose word n-gram overlap is at least this high are treated as the same
-# page reprinted (different footer, scanner noise) and digested only once.
-DUPLICATE_PAGE_SIMILARITY = _float_env("VA_LSE_DUPLICATE_PAGE_SIMILARITY", 0.92) or 0.92
-
 # Undated facts are dated by the model in batches of this size; one call over
 # every undated fact in a large bundle truncates and loses the whole batch.
 UNDATED_FACT_BATCH_SIZE = _positive_int_env("VA_LSE_UNDATED_FACT_BATCH_SIZE", 40)

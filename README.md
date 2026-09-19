@@ -551,9 +551,15 @@ requests; lower `VA_LSE_DIGEST_CHUNK_CHARS` for extra recall on very dense pages
 cost of more LLM calls). `scripts/scale_sim.py` runs an offline 2,000-page simulation of
 the pipeline (no API calls) to verify orchestration at scale. Ingest quality is tunable too:
 `VA_LSE_DOCUMENT_BLOCK_CHARS`, `VA_LSE_PARAGRAPH_MAX_CHARS`, `VA_LSE_PDF_LAYOUT_EXTRACTION`,
-`VA_LSE_DUPLICATE_PAGE_SIMILARITY`, `VA_LSE_EVIDENCE_WEAK_OVERLAP`,
+`VA_LSE_EVIDENCE_WEAK_OVERLAP`,
 `VA_LSE_RECORD_SIZE_WARN_PAGES` and the `VA_LSE_ZIP_*` archive bounds (all documented in
 `.env.example`).
+
+Duplicate-page removal compares complete extracted text, normalizing only newline
+encoding. Changed values, dates, negations, and near-matching clinical templates
+remain in the review. The former `VA_LSE_DUPLICATE_PAGE_SIMILARITY` setting is
+ignored. Keeping these pages may increase review time and model usage, but avoids
+treating distinct clinical evidence as redundant.
 
 ## Tests
 

@@ -45,8 +45,6 @@ from app.medical_review import (  # noqa: E402
     _llm_infer_undated,
     _merge_facts,
     _parse_citation,
-    _page_shingles,
-    _shingle_similarity,
     statement_element_for,
     verify_citations,
 )
@@ -234,14 +232,13 @@ class TestDuplicatePages(unittest.TestCase):
         )
         return DocumentPage("bundle.pdf", number, f"{header}\n{body}")
 
-    def test_a_reprinted_page_is_matched_by_content_not_bytes(self) -> None:
-        """Same page, different running header: exact hashing alone would miss it."""
+    def test_an_exact_reprint_is_skipped_and_named(self) -> None:
         doc = ExtractedDocument(
             filename="bundle.pdf",
             pages=[
                 self._page(1, "VA record page 1"),
                 DocumentPage("bundle.pdf", 2, "Entirely different note about tinnitus."),
-                self._page(3, "VA record page 3"),
+                self._page(3, "VA record page 1"),
             ],
             total_pages=3,
             unreadable_pages=[9],
@@ -255,6 +252,16 @@ class TestDuplicatePages(unittest.TestCase):
         # Coverage metadata survives deduplication, or the report loses it.
         self.assertEqual(unique[0].total_pages, 3)
         self.assertEqual(unique[0].unreadable_pages, [9])
+        self.assertEqual([p.page for p in doc.pages], [1, 2, 3])
+
+    def test_different_headers_are_not_assumed_to_be_duplicates(self) -> None:
+        doc = ExtractedDocument(
+            filename="bundle.pdf",
+            pages=[self._page(1, "VA record page 1"), self._page(3, "VA record page 3")],
+        )
+        unique, duplicates = _dedupe_pages([doc])
+        self.assertEqual([p.page for p in unique[0].pages], [1, 3])
+        self.assertEqual(duplicates, [])
 
     def test_distinct_pages_are_kept(self) -> None:
         doc = ExtractedDocument(
@@ -269,13 +276,67 @@ class TestDuplicatePages(unittest.TestCase):
         self.assertEqual(len(unique[0].pages), 2)
         self.assertEqual(duplicates, [])
 
-    def test_shingle_similarity_ignores_length_differences(self) -> None:
-        phrase = "knee pain noted on exam "
-        short = _page_shingles(phrase * 8)
-        long = _page_shingles(phrase * 500)
-        self.assertGreater(_shingle_similarity(short, long), 0.9)
-        self.assertEqual(_shingle_similarity(short, frozenset()), 0.0)
-        self.assertEqual(_shingle_similarity(frozenset(), long), 0.0)
+    def test_numeric_and_punctuation_only_clinical_lines_are_preserved(self) -> None:
+        for first, second in [("85", "45"), ("5.0", "50"), ("+", "-"), ("120/80", "120/90")]:
+            with self.subTest(first=first, second=second):
+                pages = [
+                    DocumentPage("labs.pdf", 1, f"Pulmonary function test\nFEV1 percent predicted\n{first}\n"),
+                    DocumentPage("labs.pdf", 2, f"Pulmonary function test\nFEV1 percent predicted\n{second}\n"),
+                ]
+                unique, duplicates = _dedupe_pages([ExtractedDocument("labs.pdf", pages)])
+                self.assertEqual(unique[0].pages, pages)
+                self.assertEqual(duplicates, [])
+
+    def test_similar_templates_preserve_clinical_differences(self) -> None:
+        changes = [
+            ("Patient denies chest pain.", "Patient reports chest pain."),
+            ("Visit date: 2020-01-01", "Visit date: 2025-01-01"),
+            ("Dose: 5 mg daily.", "Dose: 50 mg daily."),
+            ("Pain score: 1/10", "Pain score: 8/10"),
+            ("Measurement: 1.5", "Measurement: 15"),
+            ("Result: ms", "Result: MS"),
+        ]
+        for first, second in changes:
+            with self.subTest(first=first, second=second):
+                pages = [self._page(1, first), self._page(2, second)]
+                unique, duplicates = _dedupe_pages([ExtractedDocument("bundle.pdf", pages)])
+                self.assertEqual(unique[0].pages, pages)
+                self.assertEqual(duplicates, [])
+
+    def test_differences_after_the_old_4000_word_limit_survive(self) -> None:
+        prefix = " ".join(f"template{i}" for i in range(4500))
+        pages = [
+            DocumentPage("bundle.pdf", 1, prefix + "\nNo oxygen required."),
+            DocumentPage("bundle.pdf", 2, prefix + "\nContinuous oxygen required."),
+        ]
+        unique, duplicates = _dedupe_pages([ExtractedDocument("bundle.pdf", pages)])
+        self.assertEqual(unique[0].pages, pages)
+        self.assertEqual(duplicates, [])
+
+    def test_whitespace_and_repetition_are_not_discarded(self) -> None:
+        for first, second in [
+            ("A  B\n1  2", "A B 1 2"),
+            ("knee pain noted on exam " * 8, "knee pain noted on exam " * 9),
+        ]:
+            with self.subTest(first=first):
+                pages = [DocumentPage("a.txt", 1, first), DocumentPage("a.txt", 2, second)]
+                unique, duplicates = _dedupe_pages([ExtractedDocument("a.txt", pages)])
+                self.assertEqual(unique[0].pages, pages)
+                self.assertEqual(duplicates, [])
+
+    def test_only_newline_encoding_is_normalized(self) -> None:
+        text = "Pulmonary function test\nFEV1 percent predicted\n45\n"
+        pages = [
+            DocumentPage("a.txt", 1, text, kind=BLOCK),
+            DocumentPage("a.txt", 2, text.replace("\n", "\r\n"), kind=BLOCK),
+            DocumentPage("a.txt", 3, text.replace("\n", "\r"), kind=BLOCK),
+        ]
+        doc = ExtractedDocument("a.txt", pages, total_pages=3, pagination=BLOCK)
+        unique, duplicates = _dedupe_pages([doc])
+        self.assertEqual(unique[0].pages, pages[:1])
+        self.assertEqual(unique[0].pagination, BLOCK)
+        self.assertEqual(len(duplicates), 2)
+        self.assertTrue(all(row["duplicate_of"] == "a.txt b.1" for row in duplicates))
 
 
 class TestFactCitations(unittest.TestCase):
