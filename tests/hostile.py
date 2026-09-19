@@ -71,7 +71,6 @@ HOSTILE_ENVIRONMENT: dict[str, str] = {
     "VA_LSE_CREDITS_PER_1M_MAIN": "999",
     "VA_LSE_CREDITS_PER_1M_FAST": "999",
     # extraction quality knobs, all at values that should change what a test sees
-    "VA_LSE_DUPLICATE_PAGE_SIMILARITY": "0.1",
     "VA_LSE_EVIDENCE_WEAK_OVERLAP": "0.9",
     "VA_LSE_PDF_LAYOUT_EXTRACTION": "0",
     "VA_LSE_RUNNING_LINE_RATIO": "0.1",

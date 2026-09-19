@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import math
 import re
+import threading
 import zipfile
 import xml.etree.ElementTree as ET
 from collections import Counter
@@ -27,6 +29,34 @@ class UploadedFile(Protocol):
     size: int
 
     def getvalue(self) -> bytes: ...
+
+
+class RecordExtractor(Protocol):
+    """How one record file's bytes become documents.
+
+    Both ingestion paths — the uploader and the local-folder reader — funnel
+    through ``_expand_and_extract``, so this port is the app's single seam
+    between "a file arrived" and "its text is in memory". Keeping the seam
+    narrow is the point: the reader in this module is the only PDF/DOCX parser
+    in the project (page markers, running-header stripping and chunk boundaries
+    all depend on it), so an adapter is allowed to change *where* the bytes are
+    read, never *how* the text is shaped.
+
+    Implementations live here (``InProcessExtractor``, the default) and in
+    ``app/extractors.py`` (a sandbox that can OCR a scan, which this process
+    deliberately cannot). Which one runs is a config choice, installed once by
+    ``install_configured_extractor()``; the views never see the difference.
+    """
+
+    def extract(self, label: str, data: bytes) -> tuple[list[ExtractedDocument], list[str]]:
+        """Return ``(documents, skipped)`` for one file, as the uploader expects.
+
+        ``label`` is the name the user uploaded (or the file's relative path),
+        and it is the name every page marker, citation and skip message must
+        carry — an adapter reading the file elsewhere still answers under the
+        label it was handed.
+        """
+        ...
 
 SUPPORTED_EXTENSIONS = (".pdf", ".txt", ".md", ".docx")
 # Uploading the folder you were given is the natural thing to do, so archives are
@@ -628,25 +658,60 @@ def archive_members(
     return members, skipped
 
 
-def _expand_and_extract(label: str, data: bytes) -> tuple[list[ExtractedDocument], list[str]]:
-    """Extract one file, expanding an archive into its members.
+class InProcessExtractor:
+    """The default ``RecordExtractor``: this module's reader, nothing external.
 
-    Shared by the uploader and the local-folder reader so a zip behaves the same
-    however it arrives.
+    Unchanged behavior, deliberately: it is the body the uploader always ran, so
+    installing it (or failing back to it) cannot alter what a user sees.
     """
-    if label.lower().endswith(ARCHIVE_EXTENSIONS):
-        members, skipped = archive_members(label, data)
-        documents: list[ExtractedDocument] = []
-        for member_label, member_bytes in members:
-            try:
-                documents.append(extract_document(member_label, member_bytes))
-            except ExtractionError as exc:
-                skipped.append(str(exc))
-        return documents, skipped
-    try:
-        return [extract_document(label, data)], []
-    except ExtractionError as exc:
-        return [], [str(exc)]
+
+    def extract(self, label: str, data: bytes) -> tuple[list[ExtractedDocument], list[str]]:
+        """Extract one file, expanding an archive into its members.
+
+        Shared by the uploader and the local-folder reader so a zip behaves the
+        same however it arrives.
+        """
+        if label.lower().endswith(ARCHIVE_EXTENSIONS):
+            members, skipped = archive_members(label, data)
+            documents: list[ExtractedDocument] = []
+            for member_label, member_bytes in members:
+                try:
+                    documents.append(extract_document(member_label, member_bytes))
+                except ExtractionError as exc:
+                    skipped.append(str(exc))
+            return documents, skipped
+        try:
+            return [extract_document(label, data)], []
+        except ExtractionError as exc:
+            return [], [str(exc)]
+
+
+# The extractor every ingestion path uses. Swapped once at startup by
+# ``app.extractors.install_configured_extractor()`` (and by tests); ``None``
+# always means the in-process reader above, never "no extractor".
+_ACTIVE_EXTRACTOR: RecordExtractor = InProcessExtractor()
+
+
+def active_extractor() -> RecordExtractor:
+    """The extractor the uploader and the local-folder reader currently use."""
+    return _ACTIVE_EXTRACTOR
+
+
+def set_active_extractor(extractor: RecordExtractor | None) -> RecordExtractor:
+    """Point every ingestion path at *extractor* (``None`` restores the default).
+
+    Returns the extractor now active, so a caller can log which one it got.
+    """
+    global _ACTIVE_EXTRACTOR
+    _ACTIVE_EXTRACTOR = extractor if extractor is not None else InProcessExtractor()
+    return _ACTIVE_EXTRACTOR
+
+
+def _expand_and_extract(
+    label: str, data: bytes, extractor: RecordExtractor | None = None
+) -> tuple[list[ExtractedDocument], list[str]]:
+    """Extract one file through the active extractor (or *extractor* when given)."""
+    return (extractor or _ACTIVE_EXTRACTOR).extract(label, data)
 
 
 def extract_uploaded_documents(
@@ -825,6 +890,8 @@ def _split_oversized(block: str, limit: int = PARAGRAPH_MAX_CHARS) -> list[str]:
 
 
 _PARAGRAPH_CACHE: dict[tuple[str, int, int], list[Paragraph]] = {}
+_PARAGRAPH_CACHE_LOCK = threading.Lock()
+_PARAGRAPH_CACHE_MAX_ENTRIES = 64
 
 
 def paragraph_index(doc: ExtractedDocument, min_chars: int = 40) -> list[Paragraph]:
@@ -833,21 +900,30 @@ def paragraph_index(doc: ExtractedDocument, min_chars: int = 40) -> list[Paragra
     Large record sets (1,000+ pages) are searched once per claim batch, so the
     split/tokenize work is memoized instead of repeated for every query.
     """
-    key = (doc.filename, len(doc.pages), doc.char_count)
-    cached = _PARAGRAPH_CACHE.get(key)
+    # Snapshot the inputs used by both hashing and extraction. Names and counts
+    # are not identity; labels, page boundaries and ordering affect citations.
+    pages = tuple((page.label, page.text) for page in doc.pages)
+    fingerprint = hashlib.sha256()
+    for page_input in pages:
+        fingerprint.update(json.dumps(page_input, ensure_ascii=True).encode("ascii"))
+    split_limit = PARAGRAPH_MAX_CHARS
+    key = (fingerprint.hexdigest(), min_chars, split_limit)
+    with _PARAGRAPH_CACHE_LOCK:
+        cached = _PARAGRAPH_CACHE.get(key)
     if cached is not None:
         return cached
     paragraphs: list[Paragraph] = []
-    for page in doc.pages:
-        for block in re.split(r"\n{2,}", page.text):
+    for label, text in pages:
+        for block in re.split(r"\n{2,}", text):
             block = block.strip()
             if len(block) < min_chars:
                 continue
-            for piece in _split_oversized(block):
-                paragraphs.append(Paragraph(page.label, piece))
-    if len(_PARAGRAPH_CACHE) > 64:  # keep the cache bounded
-        _PARAGRAPH_CACHE.clear()
-    _PARAGRAPH_CACHE[key] = paragraphs
+            for piece in _split_oversized(block, limit=split_limit):
+                paragraphs.append(Paragraph(label, piece))
+    with _PARAGRAPH_CACHE_LOCK:
+        if len(_PARAGRAPH_CACHE) >= _PARAGRAPH_CACHE_MAX_ENTRIES:
+            _PARAGRAPH_CACHE.clear()
+        _PARAGRAPH_CACHE[key] = paragraphs
     return paragraphs
 
 

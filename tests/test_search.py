@@ -6,20 +6,27 @@ from __future__ import annotations
 
 import sys
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 
 from app.documents import (  # noqa: E402
+    BLOCK,
     DocumentPage,
     ExtractedDocument,
     Paragraph,
+    _PARAGRAPH_CACHE,
+    _PARAGRAPH_CACHE_MAX_ENTRIES,
     build_inverted_index,
     export_citation_index,
+    paragraph_index,
     search_records,
 )
+from app.medical_review import retrieve_evidence  # noqa: E402
 
 
 def _doc(filename: str, pages: list[str]) -> ExtractedDocument:
@@ -42,6 +49,110 @@ class TestBuildInvertedIndex(unittest.TestCase):
 
     def test_empty_paragraphs_yields_empty_index(self) -> None:
         self.assertEqual(build_inverted_index([]), {})
+
+
+class TestParagraphCacheIdentity(unittest.TestCase):
+    def setUp(self) -> None:
+        self.cache_patch = patch.dict(_PARAGRAPH_CACHE, {}, clear=True)
+        self.cache_patch.start()
+        self.addCleanup(self.cache_patch.stop)
+
+    @staticmethod
+    def _patient(name: str, condition: str) -> ExtractedDocument:
+        return _doc(
+            "records.txt",
+            [f"Patient {name}: {condition}. Follow-up clinical observations and treatment plan."],
+        )
+
+    def test_equal_length_replacement_uses_new_text(self) -> None:
+        original = self._patient("A", "asthma")
+        replacement = self._patient("B", "injury")
+        self.assertEqual(original.char_count, replacement.char_count)
+        first = paragraph_index(original)
+        second = paragraph_index(replacement)
+        self.assertIn("Patient A", first[0].text)
+        self.assertIn("Patient B", second[0].text)
+        self.assertNotIn("Patient A", second[0].text)
+
+    def test_search_keeps_duplicate_filenames_distinct(self) -> None:
+        original = self._patient("A", "asthma")
+        replacement = self._patient("B", "injury")
+        results = search_records([original, replacement], "injury")
+        self.assertEqual(len(results), 1)
+        self.assertIn("Patient B", results[0].excerpt)
+        self.assertEqual(search_records([replacement], "asthma"), [])
+
+    def test_independent_sessions_retrieve_only_their_own_evidence(self) -> None:
+        first_session = [self._patient("A", "asthma")]
+        second_session = [self._patient("B", "injury")]
+        first = retrieve_evidence(first_session, "asthma")
+        second = retrieve_evidence(second_session, "injury")
+        self.assertIn("Patient A", first.text)
+        self.assertIn("Patient B", second.text)
+        self.assertNotIn("Patient A", second.text)
+        self.assertGreater(second.best_overlap, 0)
+
+    def test_mutated_document_is_reindexed(self) -> None:
+        doc = self._patient("A", "asthma")
+        first = paragraph_index(doc)
+        doc.pages[0].text = self._patient("B", "injury").pages[0].text
+        second = paragraph_index(doc)
+        self.assertIn("Patient A", first[0].text)
+        self.assertIn("Patient B", second[0].text)
+
+    def test_minimum_length_is_part_of_cache_identity(self) -> None:
+        doc = _doc("records.txt", ["Short note.\n\n" + "Long clinical observation. " * 3])
+        self.assertEqual(len(paragraph_index(doc, min_chars=40)), 1)
+        self.assertEqual(len(paragraph_index(doc, min_chars=1)), 2)
+        self.assertEqual(paragraph_index(doc, min_chars=1000), [])
+        self.assertEqual(len(paragraph_index(doc, min_chars=40)), 1)
+
+    def test_citation_labels_are_part_of_cache_identity(self) -> None:
+        doc = self._patient("A", "asthma")
+        first = paragraph_index(doc)
+        doc.pages[0].filename = "renamed.txt"
+        doc.pages[0].page = 7
+        doc.pages[0].kind = BLOCK
+        second = paragraph_index(doc)
+        self.assertEqual(first[0].label, "records.txt p.1")
+        self.assertEqual(second[0].label, "renamed.txt b.7")
+
+    def test_page_order_and_boundaries_are_part_of_cache_identity(self) -> None:
+        doc = _doc("records.txt", ["a" * 50, "b" * 50])
+        first = paragraph_index(doc)
+        doc.pages.reverse()
+        reversed_index = paragraph_index(doc)
+        self.assertEqual([p.label for p in reversed_index], ["records.txt p.2", "records.txt p.1"])
+        self.assertEqual(first[0].text, "a" * 50)
+        self.assertEqual(reversed_index[0].text, "b" * 50)
+        repartitioned = _doc("records.txt", ["a" * 49, "a" + "b" * 50])
+        self.assertEqual(repartitioned.char_count, doc.char_count)
+        self.assertEqual(paragraph_index(repartitioned)[1].text, "a" + "b" * 50)
+
+    def test_split_limit_is_part_of_cache_identity(self) -> None:
+        doc = _doc("records.txt", ["a" * 50 + "\n" + "b" * 50])
+        with patch("app.documents.PARAGRAPH_MAX_CHARS", 200):
+            self.assertEqual(len(paragraph_index(doc)), 1)
+        with patch("app.documents.PARAGRAPH_MAX_CHARS", 60):
+            self.assertEqual(len(paragraph_index(doc)), 2)
+
+    def test_identical_contents_and_labels_still_reuse_cache(self) -> None:
+        first = paragraph_index(self._patient("A", "asthma"))
+        second = paragraph_index(self._patient("A", "asthma"))
+        self.assertIs(first, second)
+        self.assertEqual(len(_PARAGRAPH_CACHE), 1)
+
+    def test_concurrent_sessions_with_matching_sizes_do_not_share_text(self) -> None:
+        def retrieve(patient: int) -> str:
+            return retrieve_evidence(
+                [self._patient(f"{patient:03d}", "asthma")], "asthma"
+            ).text
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(retrieve, range(100)))
+        for patient, result in enumerate(results):
+            self.assertIn(f"Patient {patient:03d}:", result)
+        self.assertLessEqual(len(_PARAGRAPH_CACHE), _PARAGRAPH_CACHE_MAX_ENTRIES)
 
 
 class TestSearchRecords(unittest.TestCase):

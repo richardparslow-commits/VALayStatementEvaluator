@@ -122,12 +122,20 @@ def render_usage_summary(usage: Any) -> None:
 
         rates, rate_source = effective_credit_rates()
         credits = usage.credit_estimate(rates)
+        quota = config.CREDIT_QUOTA
         if credits is not None:
-            pct = credits / config.CREDIT_QUOTA * 100 if config.CREDIT_QUOTA else 0.0
-            st.caption(
-                f"**Estimated credit burn:** {credits:,.0f} / {config.CREDIT_QUOTA:,.0f} "
-                f"({pct:.1f}% of the weekly quota, {rate_source})"
-            )
+            if quota:
+                pct = credits / quota * 100
+                st.caption(
+                    f"**Estimated credit burn:** {credits:,.0f} / {quota:,.0f} "
+                    f"({pct:.1f}% of the weekly quota, {rate_source})"
+                )
+            else:
+                st.caption(
+                    f"**Estimated credit burn:** {credits:,.0f} units ({rate_source}). "
+                    "Set `VA_LSE_CREDIT_QUOTA` to render this as a percentage of your "
+                    "plan's weekly allowance."
+                )
         else:
             st.caption(
                 "Set `VA_LSE_CREDITS_PER_1M_MAIN` / `VA_LSE_CREDITS_PER_1M_FAST` in your "

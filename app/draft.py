@@ -3,9 +3,11 @@ medical records plus the witness's own observations."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from collections import Counter
 from typing import Any
 
 import logging
+import re
 import time
 
 from .agiloop_telemetry import track_feature_error
@@ -28,6 +30,8 @@ from .medical_review import MedicalDigest, ProgressCallback, review_medical_reco
 
 # Feature: Condition-Specific Templates
 FEATURE_ID = "02f0935a-ee5e-4083-88a2-10e11753ccc9"  # condition-specific-templates
+
+REVIEW_MAX_CHARS = 16_000
 
 GROUNDING_SYSTEM = """You are a veterans-claims evidence specialist preparing to draft a \
 lay/witness statement (VA Form 21-10210 style). You must ground every available fact in the \
@@ -142,8 +146,11 @@ from the checklist that the draft fails to cover. Then return the IMPROVED full 
 Where an applicable topic lacks any supplied material, insert a "[Witness to add: ...]" \
 placeholder rather than inventing content."""
 
-REVIEW_USER = """Improve this draft statement. Preserve all bracketed [Confirm: ...] \
-placeholders and all grounded facts; do not add new facts. Return JSON:
+REVIEW_USER = """Improve this draft statement. Preserve all bracketed placeholders \
+(including every [Confirm: ...] and [Witness to add: ...]) and all grounded facts; \
+do not add new facts. Keep all section headings. Copy the certification and the \
+entire signature/contact closing verbatim. Return the full statement, never a \
+summary or an excerpt. Return JSON:
 {{
   "issues_found": ["issue 1", "..."],
   "improved_statement": "<the full improved statement text>"
@@ -257,6 +264,67 @@ def _truncate_for_prompt(text: str, limit: int = DRAFT_INTERNAL_MAX_CHARS) -> tu
     return text[:limit], len(text) - limit
 
 
+def _normalized_text(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _section_headings(text: str, *, with_content: bool = False) -> Counter[str]:
+    """Recognize explicit sections without trying to infer meaning from prose."""
+    headings: Counter[str] = Counter()
+    pending_heading = ""
+    plain_labels = {
+        "header", "introduction", "introduction & credentials of observation",
+        "in-service event / onset", "observed symptoms and their progression",
+        "observed symptoms", "functional impact", "continuity", "continuity statement",
+        "closing", "certification", "closing & certification", "signature",
+    }
+    for line in text.splitlines():
+        line = line.strip()
+        label = re.sub(r"^(?:#{1,6}\s+|\d+[.)]\s+)", "", line)
+        label = _normalized_text(label.strip("*_#: ")).casefold()
+        if label and (
+            line.startswith("#") or (line.startswith("**") and line.rstrip(":").endswith("**"))
+            or (re.match(r"^\d+[.)]\s+", line) and len(label) <= 120)
+            or label in plain_labels
+        ):
+            pending_heading = label
+            if not with_content:
+                headings[label] += 1
+        elif with_content and pending_heading and line:
+            headings[pending_heading] += 1
+            pending_heading = ""
+    return headings
+
+
+def _review_rejection_reason(original: str, improved: Any) -> str:
+    """Conservative structural checks, not a claim of semantic fact verification."""
+    if not isinstance(improved, str) or not improved.strip():
+        return "the reviewer did not return a statement"
+    if len(improved.strip()) <= max(200, int(len(original) * 0.4)):
+        return "the proposed statement was too short to adopt safely"
+    original_placeholders = Counter(
+        _normalized_text(value) for value in re.findall(r"\[[^\[\]]+\]", original)
+    )
+    improved_placeholders = Counter(
+        _normalized_text(value) for value in re.findall(r"\[[^\[\]]+\]", improved)
+    )
+    if original_placeholders - improved_placeholders:
+        return "the proposed statement removed or changed a confirmation or other placeholder"
+    if _section_headings(original) - _section_headings(improved):
+        return "the proposed statement removed or changed a section heading"
+    if _section_headings(original, with_content=True) - _section_headings(improved, with_content=True):
+        return "the proposed statement left a previously populated section empty"
+    closing = re.search(
+        r"\bI\s+(?:(?:hereby|solemnly)\s+)?(?:certify|declare|affirm|attest)\b",
+        original, re.IGNORECASE,
+    )
+    if closing and not _normalized_text(improved).endswith(
+        _normalized_text(original[closing.start():])
+    ):
+        return "the proposed statement did not preserve the certification and signature closing"
+    return ""
+
+
 def _run_draft(
     llm: LLMClient,
     records: list[ExtractedDocument],
@@ -357,11 +425,22 @@ def _run_draft(
     with tracing.phase_span("review"), PhaseTimer(logger, "review", request_id=rid):
         with phase_timer("review"):
             report(0.85, "Step 4/4 — Self-review and improvement pass…")
+            # Escaping can expand text (e.g. code fences). Sanitize without
+            # truncation, then check the actual review input against its budget.
+            review_draft = sanitize_for_prompt(result.draft, max_chars=2 * len(result.draft) + 1)
+            if len(review_draft) > REVIEW_MAX_CHARS:
+                result.review_issues = [
+                    f"Self-review was skipped because the full statement exceeds the "
+                    f"{REVIEW_MAX_CHARS:,}-character review limit. The complete original "
+                    "draft is preserved; review it manually before signing."
+                ]
+                report(1.0, "Draft complete (full original preserved; self-review skipped).")
+                return result
             try:
                 review = llm.chat_json(
                     REVIEW_SYSTEM,
                     REVIEW_USER.format(
-                        draft=sanitize_for_prompt(result.draft[:16000], max_chars=20_000),
+                        draft=review_draft,
                         guide=load_knowledge("drafting_guide.md")[:6000],
                         checklist=load_knowledge("topic_checklist.md")[:6000],
                         guard_note=GUARD_NOTE,
@@ -383,9 +462,18 @@ def _run_draft(
                 ]
                 report(1.0, "Draft complete (self-review skipped — model call failed).")
                 return result
-    result.review_issues = review.get("issues_found", [])
+    if not isinstance(review, dict):
+        review = {}
+    issues = review.get("issues_found", [])
+    result.review_issues = [issue for issue in issues if isinstance(issue, str)] if isinstance(issues, list) else []
     improved = review.get("improved_statement", "")
-    if improved and len(improved) > max(200, int(len(result.draft) * 0.4)):
+    rejection = _review_rejection_reason(result.draft, improved)
+    if rejection:
+        result.review_issues.append(
+            f"Self-review was not applied because {rejection}. The complete original "
+            "draft is preserved; review it manually before signing."
+        )
+    else:
         result.final_statement = improved.strip()
 
     report(1.0, "Draft complete.")

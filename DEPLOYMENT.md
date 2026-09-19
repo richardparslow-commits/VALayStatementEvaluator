@@ -560,6 +560,13 @@ The production Dockerfile is optimized for the smallest possible image and
 fastest startup. It installs from the hash-pinned lockfile and runs as a
 non-root user.
 
+What can reach either stage is decided by [`.dockerignore`](.dockerignore) as
+well as by the `COPY` lines: it excludes credentials, the audit trail, the blob
+store and exported reports from the build context entirely, so a later
+`COPY . .` cannot pick them up either. See
+[SECURITY.md §8](SECURITY.md#the-same-audit-for-dockerignore) for the guard that
+keeps it that way.
+
 ```dockerfile
 # Dockerfile
 FROM python:3.12-slim AS runtime
@@ -621,7 +628,10 @@ workspace needs:
 FROM runtime AS sandbox
 USER root                                        # a clone must be writable
 RUN apt-get install -y git curl ripgrep less procps
+RUN apt-get install -y tesseract-ocr tesseract-ocr-eng poppler-utils \
+                       ghostscript qpdf          # the OCR toolchain (below)
 RUN pip install -r requirements-dev.txt          # mypy, boto3, pyyaml, otel
+RUN pip install "ocrmypdf>=16.0"                 # requirements-local.txt's floor
 COPY tests/ scripts/ deploy/ nginx/ examples/ ./
 # ... plus every root page, .github/workflows, pyproject.toml, docker-compose.yml
 RUN git init && git add -A && git commit -m "baseline"   # so `git status` is usable
@@ -629,11 +639,17 @@ ENV VA_LSE_HEALTH_HOST=127.0.0.1                 # see §7
 CMD ["streamlit", "run", "run_app.py", "--server.address=0.0.0.0"]
 ```
 
-Three things about it are deliberate and easy to get wrong by hand:
+Four things about it are deliberate and easy to get wrong by hand:
 
 * **A custom image, not a managed one.** The managed sandbox images ship Python
-  3.14; this lock has no 3.14 wheel for several of its pins (`jiter==0.17.0` is
-  the first refusal), so they cannot install the set CI proves.
+  3.14, and this lock's hash-pinned set does not install there: resolution stops
+  at `httptools==0.8.0`, whose cp314 wheel exists on PyPI but is not among the
+  hashes the lock carries (measured with `pip install --dry-run
+  --require-hashes --only-binary=:all: --python-version 3.14 --platform
+  manylinux_2_39_x86_64 --implementation cp --abi cp314 -r requirements.lock`).
+  `jiter==0.17.0`, which this note used to name as the first refusal, carries a
+  cp314 wheel hash and resolves on 3.14 — so the pin named here has to be the one
+  that actually refuses, or the next reader checks the wrong package.
 * **No `--server.port`.** 8501 is already Streamlit's default, and a *set* port is
   fatal when Streamlit resolves as a development-layout install —
   `server.port does not work when global.developmentMode is true` — which is what
@@ -642,17 +658,170 @@ Three things about it are deliberate and easy to get wrong by hand:
 * **`VA_LSE_HEALTH_HOST=127.0.0.1`.** Sandbox ports are published as public URLs
   and the sidecar's routes carry no authentication (§7), so the image keeps it on
   loopback; publish `8001` *and* override this only if you mean to.
+* **OCR tooling, and only here.** The app deliberately has no OCR dependency and
+  never shells out (`scripts/ocr_records.py`), so a page that is a scan is counted
+  and reported, never read — records from a portal are routinely half scans, so
+  that is a real gap, and the box is where it closes. `scripts/ocr_and_extract.py`
+  is the entrypoint: it OCRs every image-only page in a bundle, then extracts with
+  the app's own reader **under the original file names** (citations have to point
+  at the record the user has, not at `.ocr.pdf`) and writes the queue's document
+  JSON for the app to consume:
+
+  ```bash
+  python scripts/ocr_and_extract.py /work/records --out /work/bundle.json
+  # --report-only        say which pages need OCR, change nothing
+  # --no-ocr             reproduce what the app sees today (all scans unreadable)
+  ```
+
+  Exit codes: `0` extracted, `1` no record files found, `2` scans present and no
+  OCR tooling installed, `3` bad input or nothing extractable. Nothing here is
+  installed in the `runtime` stage — `tests/test_sandbox_image.py` fails if the
+  deployment image grows a PDF renderer or an OCR engine.
+* **The app can read records on the box instead (a swap, not a rewrite).**
+  `app/extractors.py` implements the same `RecordExtractor` port as the reader in
+  `app/documents.py`, so setting `VA_LSE_EXTRACTOR=sandbox` plus
+  `VA_LSE_EXTRACTOR_RUNNER` moves *where* bytes are read without changing how text
+  is shaped: the box runs the entrypoint above, this app maps the report JSON back
+  through `app/job_payload.documents_from_json`, and a document answered under a
+  name the user never uploaded is refused. Every failure — no runner, no tooling on
+  the box, a refusal, a timeout (capped by the run's own remaining budget),
+  unparseable JSON — is logged once through `app.error_report` and the file is read
+  in-process, so a misconfigured box costs a warning rather than a run.
+
+  Measured on a generated 20-file / 400-page all-scan bundle (`--no-ocr` vs. the
+  box, engine cost excluded): **0 → 20 documents read, ≈124,000 characters of record
+  text (≈31,000 tokens) reaching the digest**, at ≈4 ms per page of non-engine work.
+  On a mixed bundle (born-digital pages, scans, one part-digital file) the today-path
+  silently carries 14 of 120 pages with no text and refuses 2 of 6 files; the box
+  answers with text on every page.
+* **Vercel Sandbox is one script away, and it ships here.**
+  `scripts/vercel_sandbox_runner.py` is the `VA_LSE_EXTRACTOR_RUNNER` command for a
+  Vercel box — one staged file in, the box's report JSON out — so a deployment turns
+  the swap on with two variables:
+
+  ```bash
+  VA_LSE_EXTRACTOR=sandbox
+  VA_LSE_EXTRACTOR_RUNNER="python scripts/vercel_sandbox_runner.py {work}"
+  ```
+
+  Use an interpreter that actually exists. The runner is spawned as a subprocess, so
+  the command is only as good as its first word: macOS ships `python3` and no `python`,
+  and Streamlit started from a virtualenv does not put `python` on `PATH` either — the
+  file then fails open with "the runner command does not exist (python)" and every
+  record is read in-process, which is a warning per run rather than an error. Point it
+  at an absolute interpreter path (`…/venv/bin/python`) or at `python3`.
+
+  Per file it runs `sandbox create --name va-lse-ocr-<id> --image va-lse-sandbox:latest
+  --timeout 20m --non-persistent --silent`, then `exec … mkdir -p
+  /work/bundle/<the label's directory>`, `copy <work>/<file> <name>:/work/bundle/<label>`,
+  `exec … python3 /app/scripts/ocr_and_extract.py /work/bundle --out
+  /work/report.json --force`, `copy <name>:/work/report.json <work>/report.json`, and
+  `sandbox remove <name>` in a `finally`. Three details are the load-bearing ones:
+  the report comes back as a **file**, because `app/extractors.py` parses the runner's
+  whole stdout as that JSON and `sandbox exec`'s stdout carries more than the command's;
+  the **label is copied to its own path** (`records/2024/visit note.pdf` lands at that
+  path under `/work/bundle`, so the entrypoint answers under the name the citation
+  needs, and a label that climbs out of the bundle is refused rather than rewritten);
+  and the staged bytes are checked against the manifest's **sha256** before a box is
+  booted.
+
+  | Knob | Default | Notes |
+  |---|---|---|
+  | `VA_LSE_SANDBOX_CLI` | `sandbox` | Split like a shell command, so `sbx`, `npx sandbox` or a wrapper of your own works. Install with `npm i -g sandbox` |
+  | `VA_LSE_SANDBOX_IMAGE` | `va-lse-sandbox:latest` | The VCR image from the block below. Set it to `none` to drop `--image` and boot the CLI's *default runtime* — the way to prove a credential and the create/exec/copy/remove cycle before anything is pushed (measured: 4.4.0's default runtime is Python 3.14, which this lock refuses, so `none` is a probe and not a way to read records). A `create` that answers 404 says so and names this option |
+  | `VA_LSE_SANDBOX_TIMEOUT` | `20m` | Box session timeout. It is also the backstop for a box whose runner was SIGKILLed, so keep it above `VA_LSE_EXTRACTOR_TIMEOUT_SECONDS` — and raise both together for large bundles |
+  | `VA_LSE_SANDBOX_SCOPE` / `VA_LSE_SANDBOX_PROJECT` | (empty) | Passed as `--scope` / `--project` on every call that takes them |
+  | `VA_LSE_SANDBOX_TOKEN` / `VERCEL_AUTH_TOKEN` / `VERCEL_OIDC_TOKEN` / `VERCEL_TOKEN` | (empty) | Read in that order and passed as `--token`; unset everywhere means the CLI's stored `sandbox login` session. Only the first is this app's own name: `VERCEL_AUTH_TOKEN` is the variable the **CLI itself** reads (measured against 4.4.0 — exporting `VERCEL_TOKEN` does *not* authenticate it, it waits for an interactive login), `VERCEL_OIDC_TOKEN` is what a Function is handed, and `VERCEL_TOKEN` is the REST API's convention, which the CLI ignores — so the runner passes it explicitly. The value is never logged |
+
+  Sandbox takes a Vercel **access token** (Account Settings → Tokens, scoped to the team)
+  or the **OIDC token** a Function is handed — Vercel's recommendation, because nothing
+  long-lived has to be stored. One Vercel credential is not on that list: an **AI Gateway
+  API key** (`vck_…`) authenticates the LLM gateway, not compute
+  (`COMPATIBILITY.md` → *Vercel credentials are not interchangeable*), and the runner
+  refuses it in the token slot by name rather than letting the CLI answer 401.
+
+  One prerequisite is not about this repository at all. **The project that owns the image
+  needs a slug-safe name.** The registry path is
+  `vcr.vercel.com/<team-slug>/<project-slug>/<repository>`, and Vercel slugifies the
+  *team* (`Secondary_Condition_Finder` → `secondary-condition-finder`) but not a
+  project: pushing from a project named `va_draft` uploads every layer and then fails
+  with `NAME_INVALID: invalid project slug` (measured — the same request against
+  `…/secondary-condition-finder/va_draft/…` answers `NAME_INVALID` while
+  `…/va-lse-sandbox/…` answers `not_found`, which is a valid path with no tags in it
+  yet). The image and the boxes therefore live in one dedicated, dash-safe project,
+  which is what `VA_LSE_SANDBOX_PROJECT` names; the app's own Vercel project is
+  unrelated to it.
+
+  Two things to expect. **One microVM per file** — that is the port's shape (one file
+  in, documents out) — and `--non-persistent` plus the `finally` mean each one leaves
+  nothing behind. **A SIGKILLed runner cannot clean up**: the app's own per-file
+  timeout kills the runner in a way it cannot catch, which is exactly why the box
+  carries its own `--timeout`. A box nobody removed stops itself; an unreachable
+  `sandbox remove` is a warning, not a failed file. SIGTERM — what a Cancel or a
+  container stop sends first — does run the cleanup.
+
+  `tests/test_vercel_sandbox_runner.py` drives all of it with the CLI faked:
+  `tests/fake_sandbox_cli.py` stands in for the microVMs and runs the real entrypoint
+  over the file the runner really copied in, so the manifest, the label-to-path
+  mapping, the argv shapes, the copy-back, the JSON on stdout and the `finally` are
+  asserted, and one test goes through `CommandBoxRunner` + `SandboxExtractor` so the
+  contract the app parses is the contract the script prints.
+
+  `tests/test_vercel_sandbox_live.py` is the other half — the CLI's own behavior, which
+  no fake can pin. It needs a credential and skips without one, so CI is unaffected:
+
+  ```bash
+  VA_LSE_TEST_VERCEL_SANDBOX_TOKEN=vcp_... \
+  VA_LSE_TEST_VERCEL_SANDBOX_SCOPE=<team> \
+  VA_LSE_TEST_VERCEL_SANDBOX_PROJECT=<project> \
+  VA_LSE_TEST_VERCEL_SANDBOX_CLI='npx -y sandbox' \
+    python -m unittest tests.test_vercel_sandbox_live
+  ```
+
+  The knobs arrive under the `VA_LSE_TEST_*` prefix because `tests/hermetic.py` strips
+  ambient `VA_LSE_*` configuration; the first test creates a box on the default
+  runtime, copies a file in and back out and removes the box (the credential, the
+  transport and the lifecycle, for a fraction of a cent and no registry write), and the
+  second runs the whole runner so the entrypoint reads a real staged record — skipping,
+  with the build command, while the image is not in the registry. Four assumptions in
+  this section were corrected by running it against a real account: `remove` does take
+  the auth flags, the CLI's credential variable is `VERCEL_AUTH_TOKEN`, a failed `create`
+  reports a bare status rather than "Image not found" (the message stays in its response
+  buffer, which is why the last output line is a `hint:`), and a failure inside `exec`
+  still has to forward the box's output or the diagnosis is lost.
 
 ```bash
 # Build and push it to Vercel Container Registry, then boot a sandbox from it
 docker build --target sandbox -t va-lse-sandbox:latest .   # local smoke test
+vercel vcr login docker             # docker needs its own login to vcr.vercel.com
 vercel vcr build docker . va-lse-sandbox:latest --push
 sandbox create --name va-lse-dev --image va-lse-sandbox:latest \
   --vcpus 4 --timeout 2h --publish-port 8501 --connect
 ```
 
+Two things about the middle line. The stage has to be named, because `vercel vcr
+build` runs the container tool and the Dockerfile's default target is the
+deployment image — that is the `-- --target sandbox` the CI job passes. And
+`VERCEL_TOKEN` authenticates the Vercel *CLI*, not docker: without a registry
+login for the container tool the build succeeds and the push fails with "no basic
+auth credentials". `vercel vcr login docker` mints a 12-hour project-scoped OIDC
+credential for it; a long-lived token works instead, with the token as the
+password and the **team ID** that owns the project as the username
+(`--username <team ID> --password-stdin`).
+
 `tests/test_sandbox_image.py` asserts this contract (the stage, root, the dev
-extras, git, the copied files) because no CI job builds an image.
+extras, OCR tooling, git, the copied files) as *text*, and
+`tests/test_ocr_and_extract.py` covers the entrypoint's decisions with the OCR engine
+faked — the binaries are not installed in CI and must not be required. Two CI jobs
+build the stage as a whole: **Build the sandbox image stage** runs `docker build
+--target sandbox` on every event (nothing is pushed, no credentials are needed), and
+on manual dispatch **Push the sandbox image and read a record on a real box** builds,
+publishes it to Vercel Container Registry and then runs the live test below — which
+is also how a machine without Docker gets an image. It is dispatch-only and skips
+itself unless `VERCEL_TOKEN` is set, in the same shape as the live smoke job
+(`VERCEL_SANDBOX_PROJECT` names the project that owns the registry repository,
+`VERCEL_TEAM_ID` is the registry login's username, `VERCEL_SANDBOX_SCOPE` the team;
+VCR creates the repository on the first push).
 
 ### Multi-stage variant (smaller image, optional)
 
@@ -842,6 +1011,17 @@ All deployment-relevant variables (see `README.md` for the full list):
 | `VA_LSE_BLOB_STORE` | Blob backend for job documents | `auto` | `filesystem` or `s3` to pin it explicitly |
 | `VA_LSE_BLOB_DIR` | Filesystem blob root | `blobs` | `/app/blobs` on the shared RWX PVC |
 | `VA_LSE_BLOB_S3_BUCKET` | S3-compatible bucket | (empty) | Only for `s3`; needs `requirements-s3.txt` |
+| `VA_LSE_EXTRACTOR` | Where record text is read: `in-process` or `sandbox` | `in-process` | Leave `in-process` on worker pods; a box is an operator choice, and `sandbox` falls back to `in-process` per file |
+| `VA_LSE_EXTRACTOR_RUNNER` | Command that runs `scripts/ocr_and_extract.py` in the box | (empty) | `{work}` is the staged directory; stdout must end with the report JSON. `python scripts/vercel_sandbox_runner.py {work}` drives a Vercel Sandbox |
+| `VA_LSE_EXTRACTOR_TIMEOUT_SECONDS` | Ceiling for one file's box work | `900` | Also capped by the run's remaining budget (`VA_LSE_PIPELINE_TIMEOUT_SECONDS`) |
+| `VA_LSE_SANDBOX_CLI` | The Sandbox CLI `scripts/vercel_sandbox_runner.py` invokes | `sandbox` | Split like a shell command (`sbx`, `npx sandbox`, a wrapper); needs `npm i -g sandbox` |
+| `VA_LSE_SANDBOX_IMAGE` | VCR image one file's box boots from | `va-lse-sandbox:latest` | The image `vercel vcr build docker …` pushes (see §6) |
+| `VA_LSE_SANDBOX_TIMEOUT` | Box session timeout, and the backstop when a killed runner cannot remove the box | `20m` | Keep above `VA_LSE_EXTRACTOR_TIMEOUT_SECONDS` |
+| `VA_LSE_SANDBOX_SCOPE` | Team scope passed to every Sandbox CLI call | (empty) | Only when the token spans teams |
+| `VA_LSE_SANDBOX_PROJECT` | Vercel project the sandbox belongs to | (empty) | Only when it is not the token's default project |
+| `VA_LSE_SANDBOX_TOKEN` | Sandbox credential, read before the Vercel-named ones below | (empty) | Use it when the token should not live in a `VERCEL_*` variable |
+| `VERCEL_OIDC_TOKEN` | Sandbox credential a Function is provisioned with automatically | (empty) | Vercel's recommendation: nothing long-lived to store |
+| `VERCEL_TOKEN` | Sandbox credential passed to the CLI as `--token` | (empty) | A team-scoped **access token** (Account Settings → Tokens) — never an AI Gateway key; unset means the CLI's stored `sandbox login` |
 | `VA_LSE_TRACING` | Emit OpenTelemetry traces | `0` | `1` on the web tier **and** every worker; needs `requirements-otel.txt` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Collector/APM intake for spans | `http://localhost:4318` | In-cluster collector Service, or a vendor OTLP endpoint |
 | `VA_LSE_TRACE_SAMPLE_RATIO` | Fraction of runs traced | `1.0` | Lower it if the backend meters per span |

@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 from app import config
-from app.documents import document_from_text
+from app.documents import DocumentPage, ExtractedDocument, document_from_text
 from app.draft import run_draft
 from app.exporter import export_facts_csv
 from app.job_payload import digest_from_json, digest_to_json, draft_from_json, draft_to_json
@@ -48,6 +48,41 @@ def _facts():
 
 
 class TestEvidencePreservation(unittest.TestCase):
+    def test_changed_pages_reach_extraction_and_draft_grounding(self):
+        class PageAwareLLM(_EvidenceLLM):
+            def chat_json(self, system, user, *, phase, **kwargs):
+                if phase == "records:digest":
+                    return {"facts": [vars(f) for f in self.facts if f.quote in user]}
+                return super().chat_json(system, user, phase=phase, **kwargs)
+
+        template = " ".join(f"Routine clinical assessment {i}." for i in range(100))
+        for first, second in [
+            ("FEV1 percent predicted\n85", "FEV1 percent predicted\n45"),
+            (template + "\nPatient denies chest pain.", template + "\nPatient reports chest pain."),
+        ]:
+            with self.subTest(first=first[-40:]):
+                facts = [
+                    MedicalFact("2020-01", "test", "Earlier assessment", "a.txt p.1", first, document="a.txt", page=1),
+                    MedicalFact("2025-01", "test", "Later changed assessment", "b.txt p.1", second, document="b.txt", page=1),
+                ]
+                llm = PageAwareLLM(facts)
+                docs = [
+                    ExtractedDocument(name, [DocumentPage(name, 1, text)])
+                    for name, text in [("a.txt", first), ("b.txt", second), ("copy.txt", first)]
+                ]
+                result = run_draft(
+                    llm, docs, {"name": "Witness", "relationship": "Spouse"},
+                    "Changed pulmonary function and chest pain", "Respiratory condition", "New claim",
+                )
+                self.assertEqual(result.digest.facts, facts)
+                self.assertEqual(result.digest.pages_reviewed, 3)
+                self.assertEqual(result.digest.duplicates_skipped, 1)
+                self.assertEqual(result.digest.duplicate_pages, [
+                    {"document": "copy.txt", "page": 1, "duplicate_of": "a.txt p.1"},
+                ])
+                self.assertIn("Later changed assessment", llm.grounding_prompt)
+                self.assertIn("b.txt p.1", llm.grounding_prompt)
+
     def test_legacy_loss_warning_survives_reload_and_summary_merge(self):
         from app.evaluate import coverage_lines
 

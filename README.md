@@ -71,6 +71,13 @@ scripts/
                           (see TROUBLESHOOTING.md → *Split Large Record Sets*)
   ocr_records.py          Add a text layer to a scanned record PDF so the app can
                           read its pages (see *Scanned pages and OCR* below)
+  ocr_and_extract.py      OCR a whole record bundle and extract it with the app's
+                          own reader, emitting the queue's document JSON — the
+                          sandbox image's entrypoint (see DEPLOYMENT.md §6)
+  vercel_sandbox_runner.py
+                          Read one staged file on a Vercel Sandbox and print the
+                          report JSON — the VA_LSE_EXTRACTOR_RUNNER command for
+                          VA_LSE_EXTRACTOR=sandbox (see *Scanned pages and OCR*)
   va_records_download.py  Walk VA.gov's records-download wizard locally (you sign
                           in); writes a provenance manifest beside the PDF
 tests/                    Offline unit tests (no API key required)
@@ -174,7 +181,7 @@ installs on macOS and Linux CI.
 | Variable | Meaning | Default |
 |---|---|---|
 | `OPENAI_API_KEY` | LLM API key. By default this is a **Perplexity** key, which also serves the Research tab's grounded lookups | (required) |
-| `OPENAI_BASE_URL` | OpenAI-compatible base URL | `https://api.perplexity.ai/router/v1` — Perplexity's Router API (in **private preview**; request access from api@perplexity.ai). Any OpenAI-compatible endpoint works |
+| `OPENAI_BASE_URL` | OpenAI-compatible base URL | `https://api.perplexity.ai/router/v1` — Perplexity's Router API (in **private preview**; request access from api@perplexity.ai). Any OpenAI-compatible endpoint works, including Vercel's AI Gateway (`https://ai-gateway.vercel.sh/v1`, with gateway catalog ids) — see COMPATIBILITY.md → *Tested endpoints* |
 | `LLM_MODEL_MAIN` | Low-volume heavy model (analysis/scoring/drafting) | `perplexity/kimi-k3` |
 | `LLM_MODEL_FAST` | Cheap model for the bulk digest/merge passes | `perplexity/glm-5.3-flash` |
 | `OPENAI_BASE_URL_FALLBACK` | **Optional** second endpoint used when the primary fails for a sustained period; unset = no failover | (empty) |
@@ -182,6 +189,9 @@ installs on macOS and Linux CI.
 | `LLM_MODEL_MAIN_FALLBACK` / `LLM_MODEL_FAST_FALLBACK` | The fallback provider's model names for the two roles | primary models |
 | `LLM_ENDPOINT_FALLBACK_TIMEOUT_SECONDS` | How long the primary must fail before failover engages (a grace period, not an HTTP timeout) | `300` |
 | `VA_LSE_MAX_RECORD_PAGES` | Max total pages across uploaded record files | `5000` |
+| `VA_LSE_EXTRACTOR` | Where record text is read: `in-process` (this app's reader) or `sandbox` (the box, which can OCR a scan) | `in-process` |
+| `VA_LSE_EXTRACTOR_RUNNER` | Command that runs `scripts/ocr_and_extract.py` in the box, with `{work}` for the staged directory; stdout must end with its report JSON. `python scripts/vercel_sandbox_runner.py {work}` drives a Vercel Sandbox (see *Scanned pages and OCR*) | (empty = in-process) |
+| `VA_LSE_EXTRACTOR_TIMEOUT_SECONDS` | Ceiling for one file's box work (never past the run's own budget) | `900` |
 | `VA_LSE_JOB_QUEUE` | Run Evaluate/Draft on worker pods instead of in-process (Pattern C) | `0` |
 | `VA_LSE_REDIS_URL` | Redis backend for the job queue | (empty) |
 | `VA_LSE_JOB_QUEUE_TTL_SECONDS` | How long a finished job's payload/result is kept | `86400` |
@@ -218,7 +228,7 @@ installs on macOS and Linux CI.
 | `VA_LSE_ALLOW_LOCAL_PATHS` | Explicitly enable local folder/file imports (`1`) for trusted single-user use only; keep unset or `0` on hosted/shared deployments | `0` (disabled) |
 | `VA_LSE_CREDITS_PER_1M_MAIN` | Approx credits per 1M tokens for the main model (enables the credit-burn gauge) | (unset — gauge shows tokens/calls only) |
 | `VA_LSE_CREDITS_PER_1M_FAST` | Approx credits per 1M tokens for the fast model (enables the credit-burn gauge) | (unset — gauge shows tokens/calls only) |
-| `VA_LSE_CREDIT_QUOTA` | Your plan's weekly credit quota, used to render %-of-quota burn | `2500` |
+| `VA_LSE_CREDIT_QUOTA` | Your plan's weekly allowance (in whatever unit the rates above use), to render %-of-quota burn | (unset — burn renders without a percentage) |
 | `VA_GOV_API_BASE_URL` | HTTPS base URL for the VA.gov record-retrieval API. Leave unset to run VA.gov auth/fetch in mock mode. | empty (mock mode) |
 | `FRONTEND_URL` | App origin for CORS allowlisting. Unused today (single-origin Streamlit app); documented for deploy-harness forward compatibility. | empty |
 | `AGILOOP_INSPECT_API_KEY` | Server-side Agiloop Inspect telemetry API key. Leave unset (with `AGILOOP_PROJECT_ID`) to run telemetry in mock/no-op mode. | empty (mock mode) |
@@ -283,17 +293,26 @@ provider: the app checks `GET {base_url}/models` at startup and warns if `LLM_MO
 ### Before a run starts: the endpoint preflight
 
 Pressing **Draft the statement** or **Run exhaustive evaluation** first checks that the
-configured endpoint can serve the configured models — one `GET {base_url}/models` request, no
-model call. A run that cannot possibly work therefore costs a second instead of the first
-minutes of a bundle, which is the failure this was built for: a rejected key or an unusable
-model id fails *every* chunk identically, and the run only says so after the chunks have been
-paid for.
+configured endpoint can serve the configured models — a `GET {base_url}/models` listing, then
+one **one-token call** per configured model. A run that cannot possibly work therefore costs a
+second or two instead of the first minutes of a bundle, which is the failure this was built for:
+a rejected key or an unusable model id fails *every* chunk identically, and the run only says so
+after the chunks have been paid for.
 
-It stops the run in two cases, both unambiguous: the endpoint lists models and one of the
-configured names is not among them, or the endpoint rejects the key (`401`/`403`). Everything
-else is **reported but allowed** — a host that does not answer, a provider that serves
-completions without listing models (`404`), a provider-side `5xx`. Refusing to start a working
-run is worse than the failure this prevents, so an inconclusive check never blocks.
+The one-token call is there because a listing is not a promise. Perplexity's Router API is the
+measured case: it answers `/models` with its own ids and then refuses every completion with
+`403 The Router API is currently in limited preview` until the account is granted access, so the
+listing alone called that endpoint healthy and the run failed once per chunk. An answer confirms
+the configuration, a refusal stops the run with the provider's own words, and anything ambiguous
+leaves the listing's verdict in place.
+
+It stops the run when the evidence is unambiguous: the endpoint lists models and one of the
+configured names is not among them, the endpoint rejects the key (`401`/`403`), or a real
+one-token call is refused (`401`/`403`, or a `404` that says the base URL serves no
+completions path at all). Everything else is **reported but allowed** — a host that does not
+answer, a `404` on `/models` (some providers serve completions without listing models), a `429`,
+a provider-side `5xx`. Refusing to start a working run is worse than the failure this prevents, so
+an inconclusive check never blocks.
 
 The block appears above the run button with the reason and the fix, plus an expander to run
 anyway: some OpenAI-compatible servers answer `/models` differently than they serve
@@ -328,18 +347,19 @@ Every run shows a live usage line in the progress caption and, after completion,
 draft/review on the Draft tab). Token counts are estimates based on prompt length and model
 output, using the provider's reported usage when the endpoint supplies it.
 
-Because QwenCloud Token Plan doesn't publish a fixed credits-per-1M-token rate, you can provide
-it two ways:
+Because providers don't publish a fixed credits-per-1M-token rate (QwenCloud Token Plan's
+changes; Perplexity bills per token in USD), you can provide one two ways:
 
 1. **Set explicit rates** — `VA_LSE_CREDITS_PER_1M_MAIN` and `VA_LSE_CREDITS_PER_1M_FAST` to
-   your plan's effective rates (explicit values always win), plus `VA_LSE_CREDIT_QUOTA` if your
-   quota differs from the 2,500-credit Lite default.
+   your plan's effective rates (explicit values always win), plus `VA_LSE_CREDIT_QUOTA` for
+   your plan's weekly allowance if you want a percentage rather than a raw estimate.
 2. **Let the watchdog learn it** (default). Every finished run persists its per-role token totals
    (main vs fast model) to a git-ignored `usage_history.json`. In the sidebar's **Usage watchdog**
-   panel, enter the plan's cumulative "credits used" reading from the QwenCloud console each time
-   after a run. With readings separated by new runs, the app fits a **separate credits-per-1M rate
-   per model** by least squares over the calibration intervals (falling back to one blended rate
-   when the data can't separate them), and uses those rates for the credit-burn estimate.
+   panel, enter your provider console's cumulative units-used reading (QwenCloud Token Plan
+   credits, a pay-per-token provider's spend) each time after a run. With readings separated by
+   new runs, the app fits a **separate units-per-1M rate per model** by least squares over the
+   calibration intervals (falling back to one blended rate when the data can't separate them), and
+   uses those rates for the credit-burn estimate.
 
 The estimator is purely informational — it never limits or throttles a run.
 
@@ -531,9 +551,15 @@ requests; lower `VA_LSE_DIGEST_CHUNK_CHARS` for extra recall on very dense pages
 cost of more LLM calls). `scripts/scale_sim.py` runs an offline 2,000-page simulation of
 the pipeline (no API calls) to verify orchestration at scale. Ingest quality is tunable too:
 `VA_LSE_DOCUMENT_BLOCK_CHARS`, `VA_LSE_PARAGRAPH_MAX_CHARS`, `VA_LSE_PDF_LAYOUT_EXTRACTION`,
-`VA_LSE_DUPLICATE_PAGE_SIMILARITY`, `VA_LSE_EVIDENCE_WEAK_OVERLAP`,
+`VA_LSE_EVIDENCE_WEAK_OVERLAP`,
 `VA_LSE_RECORD_SIZE_WARN_PAGES` and the `VA_LSE_ZIP_*` archive bounds (all documented in
 `.env.example`).
+
+Duplicate-page removal compares complete extracted text, normalizing only newline
+encoding. Changed values, dates, negations, and near-matching clinical templates
+remain in the review. The former `VA_LSE_DUPLICATE_PAGE_SIMILARITY` setting is
+ignored. Keeping these pages may increase review time and model usage, but avoids
+treating distinct clinical evidence as redundant.
 
 ## Tests
 
@@ -642,7 +668,10 @@ All public helpers in `app/main.py`, `app/fetch_client.py`, `app/evaluate.py` ca
 > pull requests). The live smoke test is triggered **manually** from the
 > Actions tab and only runs when an `OPENAI_API_KEY` secret is configured; the optional
 > `OPENAI_BASE_URL`, `LLM_MODEL_MAIN`, and `LLM_MODEL_FAST` secrets override the endpoint and
-> models in that job if set (see `.env.example`).
+> models in that job if set (see `.env.example`). The sandbox image is built on every event
+> (nothing pushed), and a manual dispatch builds and pushes it to Vercel Container Registry and
+> then reads a record on a real box — that job needs a `VERCEL_TOKEN` secret and skips itself
+> without one, exactly like the smoke test (`DEPLOYMENT.md` §6).
 
 ## QwenCloud Individual Plan Lite tuning
 
@@ -801,6 +830,47 @@ python scripts/ocr_records.py ~/Desktop/va_medical_records.pdf
 writes a **new** file (never the input) and re-reads it to confirm how many pages now carry
 text. Upload the `.ocr.pdf` and leave the original where it is. Exit codes: `0` wrote a copy,
 `1` nothing to do, `2` no OCR tooling installed, `3` bad input or refused to overwrite.
+
+If you are working in the sandbox image (`DEPLOYMENT.md` §6), none of that install is needed:
+the box ships Tesseract, Poppler, Ghostscript, qpdf and `ocrmypdf`, and
+`scripts/ocr_and_extract.py` does the whole bundle at once — OCR every scan, then extract with
+the app's own reader, under the original file names:
+
+```bash
+python scripts/ocr_and_extract.py /work/records --out /work/bundle.json
+```
+
+Or let the app do per file what that command does for a whole folder. Point the extractor at
+a Vercel Sandbox and each uploaded file is staged, copied into a fresh ephemeral microVM
+booted from the pushed `va-lse-sandbox` image, read there by the same entrypoint, and mapped
+back through `app/extractors.py` — a file the box cannot read is read in-process instead,
+with one warning that names the reason:
+
+```bash
+export VA_LSE_EXTRACTOR=sandbox
+export VA_LSE_EXTRACTOR_RUNNER="python scripts/vercel_sandbox_runner.py {work}"
+export VA_LSE_SANDBOX_TOKEN=vcp_...   # a Vercel access token, or run `sandbox login` once
+```
+
+The runner command is a subprocess, so its first word has to exist: on macOS there is
+`python3` and no `python`, and a virtualenv is not on `PATH` unless it is activated — use an
+absolute interpreter path there, or every file falls back in-process with one warning.
+`scripts/vercel_sandbox_runner.py` also needs the Sandbox CLI (`npm i -g sandbox`) and the image
+pushed (`DEPLOYMENT.md` §6 has that build line, the image/timeout/team/project knobs, and what
+happens when a box is killed mid-file). Its credential is a Vercel **access token** (or a
+Function's OIDC token) — not the AI Gateway key, which is this app's LLM credential; Vercel
+issues both and they are not interchangeable (`COMPATIBILITY.md` → *Vercel credentials are not
+interchangeable*). `VA_LSE_SANDBOX_TOKEN` is this app's own name for it; bare CLI use wants the
+CLI's own `VERCEL_AUTH_TOKEN`, and `VERCEL_TOKEN` (the REST API's convention, which the CLI
+ignores) is passed through as `--token` — the runner reads all four, in that order. The image
+itself can come from CI: on manual dispatch a job builds, pushes and then reads a real record
+on a real box, so nothing has to be built locally. Failure is fail-open by design: records are
+still read and the run still finishes.
+
+Two opt-in live tests cover the halves a fake cannot: `tests/test_ai_gateway_live.py` for the
+LLM endpoint (`VA_LSE_TEST_AI_GATEWAY_KEY`) and `tests/test_vercel_sandbox_live.py` for the box
+(`VA_LSE_TEST_VERCEL_SANDBOX_TOKEN`, plus the team/project and `VA_LSE_TEST_VERCEL_SANDBOX_CLI`
+if the CLI is not on `PATH`). Both skip without their variable, so CI is unaffected.
 
 `scripts/va_records_download.py` also inspects what it just downloaded — page count,
 text-vs-image balance, sha256 — prints a warning when the export is implausibly small or mostly

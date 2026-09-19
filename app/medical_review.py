@@ -11,7 +11,6 @@ citable digest of every uploaded medical document.
 from __future__ import annotations
 
 import datetime
-import hashlib
 import json
 import math
 import re
@@ -549,45 +548,6 @@ _CITATION_SOURCE_RE = re.compile(r"\b[pb]\.\d|\b(?:page|block)\s*\d", re.IGNOREC
 
 
 # ------------------------------------------------------- duplicate page detection
-# A line that is only digits/punctuation is a page number or a footer rule, not
-# content: ignoring such lines is what lets a re-printed page match its original.
-_NUMBER_ONLY_LINE_RE = re.compile(r"^[\W\d_]+$")
-
-
-def _page_fingerprint(text: str) -> str:
-    """Hash a page's content with page-number-only lines removed."""
-    kept = [
-        line.strip()
-        for line in text.splitlines()
-        if line.strip() and not _NUMBER_ONLY_LINE_RE.match(line.strip())
-    ]
-    return hashlib.sha1(_norm_key(" ".join(kept)).encode("utf-8")).hexdigest()
-
-
-def _page_shingles(text: str, size: int = 5, limit: int = 4_000) -> frozenset[str]:
-    """Word n-grams of a page, for near-duplicate comparison (bounded work).
-
-    Bounded at ``limit`` words: comparison cost must not grow with the longest
-    page in a 5,000-page bundle.
-    """
-    words = re.findall(r"[a-z0-9]+", text.lower())[:limit]
-    if len(words) < size:
-        return frozenset(words)
-    return frozenset(" ".join(words[i : i + size]) for i in range(len(words) - size + 1))
-
-
-def _shingle_similarity(left: frozenset[str], right: frozenset[str]) -> float:
-    if not left or not right:
-        return 0.0
-    union = len(left | right)
-    return len(left & right) / union if union else 0.0
-
-
-# Bound on how many same-size candidates a page is compared against, so near-dup
-# detection stays linear-ish on large bundles.
-_NEAR_DUP_CANDIDATES = 8
-
-
 def _cross_source_corroborations(
     duplicates: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -607,17 +567,13 @@ def _cross_source_corroborations(
 def _dedupe_pages(
     documents: list[ExtractedDocument],
 ) -> tuple[list[ExtractedDocument], list[dict[str, Any]]]:
-    """Drop repeated pages, exactly and nearly, naming every page that was dropped.
+    """Drop only exact text repetitions, naming every page that was dropped.
 
-    Record bundles routinely repeat pages, and the repeats are rarely byte-equal:
-    the same page re-printed with a different footer, or scanned twice. Exact
-    hashing catches neither. Pages are compared by content fingerprint (exact) and
-    by word n-gram overlap within a similar-length bucket (near), and each skip is
-    recorded with the page it duplicated so the coverage report can name it — a
-    silently dropped page is indistinguishable from a page that was never read.
+    Normalize newline encodings only. Numbers, punctuation, case, whitespace and
+    the full page tail can carry clinical meaning, even on near-identical forms.
+    Dictionary keys compare the complete text, not a lossy similarity signature.
     """
-    fingerprints: dict[str, str] = {}
-    signatures: dict[int, list[tuple[frozenset[str], str]]] = {}
+    seen_pages: dict[str, str] = {}
     unique_docs: list[ExtractedDocument] = []
     duplicates: list[dict[str, Any]] = []
 
@@ -629,26 +585,9 @@ def _dedupe_pages(
             pagination=doc.pagination,
         )
         for page in doc.pages:
-            fingerprint = _page_fingerprint(page.text)
-            origin = fingerprints.get(fingerprint)
-            if origin is None:
-                shingles = _page_shingles(page.text)
-                bucket = len(page.text) // 200
-                for candidate_bucket in (bucket - 1, bucket, bucket + 1):
-                    for candidate_shingles, candidate_origin in signatures.get(
-                        candidate_bucket, []
-                    )[:_NEAR_DUP_CANDIDATES]:
-                        if (
-                            _shingle_similarity(shingles, candidate_shingles)
-                            >= config.DUPLICATE_PAGE_SIMILARITY
-                        ):
-                            origin = candidate_origin
-                            break
-                    if origin is not None:
-                        break
-                if origin is None:
-                    fingerprints[fingerprint] = page.label
-                    signatures.setdefault(bucket, []).append((shingles, page.label))
+            check_pipeline_cancelled()
+            page_text = page.text.replace("\r\n", "\n").replace("\r", "\n")
+            origin = seen_pages.get(page_text)
             if origin is not None:
                 duplicates.append(
                     {
@@ -658,6 +597,7 @@ def _dedupe_pages(
                     }
                 )
                 continue
+            seen_pages[page_text] = page.label
             kept.pages.append(page)
         if kept.pages:
             unique_docs.append(kept)

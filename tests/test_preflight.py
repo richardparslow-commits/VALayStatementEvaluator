@@ -9,17 +9,20 @@ configuration and never open a socket.
 
 from __future__ import annotations
 
+import json
 import sys
 import types
 import unittest
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+from urllib.error import HTTPError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 
-from app.llm import ModelProbe  # noqa: E402
+from app.llm import ChatProbe, ModelProbe, probe_chat  # noqa: E402
 from app import preflight  # noqa: E402
 
 
@@ -38,10 +41,40 @@ def _probe(models=None, status=None, error="") -> ModelProbe:
     return ModelProbe(set(models) if models else None, status, error)
 
 
-def _check(probe_result: ModelProbe, settings: SimpleNamespace | None = None) -> preflight.Verdict:
-    """Run the policy against a canned probe result."""
+def _chat(status=None, error="URLError: name or service not known", reply="") -> ChatProbe:
+    return ChatProbe(status, error, reply)
+
+
+#: A one-token call that answered. The commonest canned outcome in these tests, so it
+#: has a name rather than a `_chat(200, "", "ok")` at every call site.
+_ANSWERED = _chat(200, "", "ok")
+
+
+def _check(
+    probe_result: ModelProbe,
+    settings: SimpleNamespace | None = None,
+    *,
+    chat: ChatProbe | None = None,
+    chat_calls: list[str] | None = None,
+) -> preflight.Verdict:
+    """Run the policy against canned probe results.
+
+    ``chat`` defaults to a call that got no response, which is the behaviour these
+    tests had before the one-token call existed: the model listing decides alone. Pass
+    ``chat=`` for the second probe's outcome, and ``chat_calls`` to record which models
+    it was asked about (an empty list is the assertion that it was not asked at all).
+    """
+    canned = _chat() if chat is None else chat
+
+    def fake_chat(base_url: str, api_key: str, model: str) -> ChatProbe:
+        if chat_calls is not None:
+            chat_calls.append(model)
+        return canned
+
     return preflight.check_endpoint(
-        settings or _settings(), probe=lambda base_url, api_key: probe_result
+        settings or _settings(),
+        probe=lambda base_url, api_key: probe_result,
+        chat_probe=fake_chat,
     )
 
 
@@ -120,6 +153,227 @@ class TestPreflightPolicy(unittest.TestCase):
         for kind in (preflight.OK, preflight.UNVERIFIED):
             with self.subTest(kind=kind):
                 self.assertFalse(preflight.Verdict(kind, headline="x").blocks)
+
+
+class TestTheOneTokenCallAfterTheListing(unittest.TestCase):
+    """The second probe: `/models` is a listing, a listing is not a promise.
+
+    Perplexity's Router API is the endpoint that forced this. It answers the listing
+    with its own ids and then refuses every completion with `403 The Router API is
+    currently in limited preview` until the account is granted access (measured against
+    the live app, where the listing alone reported a healthy endpoint and the run failed
+    142 times). So the chat probe can only ever *strengthen* a verdict: a refusal blocks,
+    an answer confirms, and anything ambiguous leaves the listing's verdict alone.
+    """
+
+    ROUTER = "https://api.perplexity.ai/router/v1"
+    LISTING_OK = _probe({"model-main", "model-fast", "other"}, 200)
+
+    def test_a_listed_model_that_refuses_every_call_blocks_the_run(self) -> None:
+        verdict = _check(
+            self.LISTING_OK,
+            _settings(base_url=self.ROUTER),
+            chat=_chat(403, "HTTP 403: The Router API is currently in limited preview."),
+        )
+
+        self.assertTrue(verdict.blocks)
+        self.assertIn("refused a real call", verdict.headline)
+        self.assertIn("403", verdict.headline)
+        self.assertIn("limited preview", verdict.fix, "the provider's own words are the point")
+        self.assertIn("api@perplexity.ai", verdict.fix, "and so is the remedy")
+
+    def test_the_router_note_is_not_attached_to_another_endpoint(self) -> None:
+        verdict = _check(self.LISTING_OK, chat=_chat(403, "HTTP 403: nope"))
+
+        self.assertTrue(verdict.blocks)
+        self.assertIn("nope", verdict.fix)
+        self.assertNotIn("limited preview", verdict.fix)
+
+    def test_a_refused_fast_model_blocks_even_when_the_main_one_answers(self) -> None:
+        """The bulk digest runs on the fast model, so its refusal is fatal on its own."""
+        asked: list[str] = []
+
+        def per_model(base_url: str, api_key: str, model: str) -> ChatProbe:
+            asked.append(model)
+            return _ANSWERED if model == "model-main" else _chat(403, "HTTP 403: not entitled")
+
+        verdict = preflight.check_endpoint(
+            _settings(), probe=lambda base_url, api_key: self.LISTING_OK, chat_probe=per_model
+        )
+
+        self.assertTrue(verdict.blocks)
+        self.assertIn("model-fast", verdict.headline)
+        self.assertEqual(asked, ["model-main", "model-fast"])
+
+    def test_an_answered_call_confirms_the_configuration(self) -> None:
+        verdict = _check(self.LISTING_OK, chat=_ANSWERED)
+
+        self.assertEqual(verdict.kind, preflight.OK)
+        self.assertFalse(verdict.blocks)
+        self.assertIn("offers every configured model", verdict.headline)
+        self.assertIn("real call", verdict.headline)
+
+    def test_a_rate_limit_is_not_a_refusal(self) -> None:
+        """The key worked; a limit is the account's business and the run decides."""
+        verdict = _check(self.LISTING_OK, chat=_chat(429, "HTTP 429: rate limited"))
+
+        self.assertEqual(verdict.kind, preflight.OK)
+        self.assertFalse(verdict.blocks)
+
+    def test_a_payload_the_endpoint_rejects_leaves_the_listing_verdict(self) -> None:
+        """A 400 may be about this probe's shape rather than about any real call."""
+        verdict = _check(self.LISTING_OK, chat=_chat(400, "HTTP 400: bad request"))
+
+        self.assertEqual(verdict.kind, preflight.OK)
+
+    def test_no_response_leaves_the_listing_verdict_alone(self) -> None:
+        verdict = _check(self.LISTING_OK, chat=_chat())
+
+        self.assertEqual(verdict.kind, preflight.OK)
+        self.assertNotIn("real call", verdict.headline)
+
+    def test_the_call_upgrades_an_endpoint_that_publishes_no_listing(self) -> None:
+        """No `/models` route but a real call works is better than "unverified"."""
+        verdict = _check(_probe(None, 404, "HTTP 404: Not Found"), chat=_ANSWERED)
+
+        self.assertEqual(verdict.kind, preflight.OK)
+        self.assertFalse(verdict.blocks)
+
+    def test_the_call_can_block_an_endpoint_with_no_listing_route(self) -> None:
+        verdict = _check(_probe(None, 404, "HTTP 404: Not Found"), chat=_chat(403, "HTTP 403: refused"))
+
+        self.assertTrue(verdict.blocks)
+        self.assertIn("refused a real call", verdict.headline)
+        self.assertNotIn(
+            "models route answered",
+            verdict.fix,
+            "there was no listing here, so the fix must not claim one",
+        )
+
+    def test_a_missing_completions_route_blocks_too(self) -> None:
+        """A 404 on the call is as deterministic as a rejected key, unlike one on `/models`."""
+        verdict = _check(self.LISTING_OK, chat=_chat(404, "HTTP 404: Not Found"))
+
+        self.assertTrue(verdict.blocks)
+        self.assertIn("404", verdict.headline)
+        self.assertEqual(verdict.listed, 3, "the listing is still the evidence it was")
+
+    def test_a_blocked_listing_is_never_second_guessed_by_a_call(self) -> None:
+        """One request is enough when the listing already proves the run cannot work."""
+        asked: list[str] = []
+        verdict = _check(_probe(None, 403, "HTTP 403: rejected"), chat_calls=asked)
+
+        self.assertTrue(verdict.blocks)
+        self.assertEqual(asked, [], "the gate is supposed to be cheap when it already knows")
+
+    def test_no_configured_models_means_nothing_to_call(self) -> None:
+        asked: list[str] = []
+        verdict = _check(
+            _probe({"whatever"}, 200),
+            _settings(model_main="", model_fast="  "),
+            chat_calls=asked,
+        )
+
+        self.assertEqual(verdict.kind, preflight.UNVERIFIED)
+        self.assertEqual(asked, [])
+
+    def test_the_same_model_configured_twice_is_called_once(self) -> None:
+        asked: list[str] = []
+        _check(
+            _probe({"same"}, 200),
+            _settings(model_main="same", model_fast="same"),
+            chat_calls=asked,
+        )
+
+        self.assertEqual(asked, ["same"])
+
+
+class TestTheOneTokenProbeItself(unittest.TestCase):
+    """``probe_chat``'s own mapping, over a stubbed transport — this suite opens no socket.
+
+    The policy above is tested against canned outcomes; this is what turns a socket into
+    those outcomes, so its shapes are worth pinning: which URL, what payload, and what
+    each answer means.
+    """
+
+    def _stub(self, body: object, status: int = 200) -> MagicMock:
+        payload = body if isinstance(body, bytes) else json.dumps(body).encode()
+        response = MagicMock()
+        response.read.return_value = payload
+        response.status = status
+        response.__enter__ = lambda _: response
+        response.__exit__ = lambda *_: False
+        return response
+
+    def test_a_completion_is_the_proof(self) -> None:
+        body = {"choices": [{"message": {"content": "ok"}}]}
+        with patch("urllib.request.urlopen", return_value=self._stub(body)):
+            result = probe_chat("https://api.example.test/v1", "example-key", "model-main")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.status, 200)
+        self.assertEqual(result.reply, "ok")
+
+    def test_it_asks_for_one_token_with_the_configured_model(self) -> None:
+        body = {"choices": [{"message": {"content": "ok"}}]}
+        with patch("urllib.request.urlopen", return_value=self._stub(body)) as urlopen:
+            probe_chat("https://api.example.test/v1/", "example-key", "model-main")
+
+        request = urlopen.call_args[0][0]
+        self.assertEqual(request.full_url, "https://api.example.test/v1/chat/completions")
+        self.assertEqual(request.get_method(), "POST")
+        self.assertIn("Bearer example-key", request.headers.get("Authorization", ""))
+        sent = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(sent["model"], "model-main")
+        self.assertEqual(sent["max_tokens"], 1)
+        self.assertEqual(sent["messages"][0]["role"], "user")
+
+    def test_a_refusal_keeps_the_providers_own_words(self) -> None:
+        body = b'{"error":{"message":"The Router API is currently in limited preview."}}'
+        error = HTTPError("https://api.example.test/v1/chat/completions", 403, "Forbidden", None, BytesIO(body))
+        with patch("urllib.request.urlopen", side_effect=error):
+            result = probe_chat("https://api.example.test/v1", "example-key", "model-main")
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, 403)
+        self.assertIn("limited preview", result.error)
+
+    def test_a_200_without_a_completion_is_not_a_pass(self) -> None:
+        with patch("urllib.request.urlopen", return_value=self._stub({"choices": []})):
+            result = probe_chat("https://api.example.test/v1", "example-key", "model-main")
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, 200)
+        self.assertIn("without a completion", result.error)
+
+    def test_content_parts_are_read_too(self) -> None:
+        """Some servers answer with a list of content parts instead of a string."""
+        body = {"choices": [{"message": {"content": [{"type": "text", "text": "ok"}]}}]}
+        with patch("urllib.request.urlopen", return_value=self._stub(body)):
+            result = probe_chat("https://api.example.test/v1", "example-key", "model-main")
+
+        self.assertTrue(result.ok)
+
+    def test_no_key_means_no_request(self) -> None:
+        with patch("urllib.request.urlopen") as urlopen:
+            result = probe_chat("https://api.example.test/v1", "", "model-main")
+
+        urlopen.assert_not_called()
+        self.assertEqual(result.status, None)
+        self.assertIn("no API key", result.error)
+
+    def test_a_dead_endpoint_has_no_status(self) -> None:
+        with patch("urllib.request.urlopen", side_effect=Exception("name or service not known")):
+            result = probe_chat("https://api.example.test/v1", "example-key", "model-main")
+
+        self.assertEqual(result.status, None)
+        self.assertIn("name or service not known", result.error)
+
+    def test_the_timeout_is_longer_than_a_listing_s_ceiling(self) -> None:
+        """A call has to reach a model, which is slower than reading a list."""
+        from app.llm import CHAT_PROBE_TIMEOUT_SECONDS, MODELS_ENDPOINT_TIMEOUT_SECONDS
+
+        self.assertGreater(CHAT_PROBE_TIMEOUT_SECONDS, MODELS_ENDPOINT_TIMEOUT_SECONDS)
 
 
 class TestSignature(unittest.TestCase):
@@ -367,6 +621,63 @@ class TestRunFlowsAreStopped(unittest.TestCase):
         ):
             evaluate_view._run_evaluation_flow("statement", [MagicMock()])
         queued.assert_not_called()
+
+
+class TestVercelCredentials(unittest.TestCase):
+    """Vercel's credentials are not interchangeable, and a rejection says which is which.
+
+    An AI Gateway key is not a provider key, a provider key is not a gateway key, and
+    neither is the access token the *Sandbox* product takes — which is the third
+    thing carrying Vercel's name and must not be suggested as an LLM credential.
+    """
+
+    GATEWAY = preflight.VERCEL_GATEWAY_BASE_URL
+
+    def test_a_gateway_key_against_another_endpoint_names_the_gateway(self) -> None:
+        verdict = _check(
+            _probe(None, 401, "HTTP 401: unauthorized"),
+            _settings(api_key="vck_example", base_url="https://api.perplexity.ai/router/v1"),
+        )
+        self.assertTrue(verdict.blocks)
+        self.assertIn("AI Gateway", verdict.fix)
+        self.assertIn(self.GATEWAY, verdict.fix)
+        self.assertIn("OPENAI_BASE_URL", verdict.fix)
+
+    def test_the_gateway_url_with_a_provider_key_names_the_key_to_create(self) -> None:
+        verdict = _check(
+            _probe(None, 401, "HTTP 401: unauthorized"),
+            _settings(api_key="pplx-example", base_url=self.GATEWAY),
+        )
+        self.assertTrue(verdict.blocks)
+        self.assertIn("AI Gateway API key", verdict.fix)
+        self.assertIn("Sandbox", verdict.fix)
+
+    def test_the_shape_never_decides_a_verdict_on_its_own(self) -> None:
+        """A proxy can front the gateway with the same key, so an answered probe wins."""
+        verdict = _check(
+            _probe({"model-main", "model-fast"}, 200),
+            _settings(api_key="vck_example", base_url="https://llm.internal.test/v1"),
+        )
+        self.assertEqual(verdict.kind, preflight.OK)
+
+    def test_a_missing_gateway_model_id_gets_the_catalog_note(self) -> None:
+        verdict = _check(
+            _probe({"moonshotai/kimi-k3", "alibaba/qwen3.7-flash"}, 200),
+            _settings(
+                base_url=self.GATEWAY,
+                api_key="vck_example",
+                model_main="perplexity/kimi-k3",
+                model_fast="alibaba/qwen3.7-flash",
+            ),
+        )
+        self.assertTrue(verdict.blocks)
+        self.assertEqual(verdict.missing, ("perplexity/kimi-k3",))
+        self.assertIn("its own catalog", verdict.fix)
+        self.assertIn("moonshotai/kimi-k3", verdict.fix)
+
+    def test_an_unrelated_rejection_keeps_the_generic_fix(self) -> None:
+        verdict = _check(_probe(None, 401, "HTTP 401: unauthorized"))
+        self.assertNotIn("AI Gateway", verdict.fix)
 
 
 if __name__ == "__main__":
