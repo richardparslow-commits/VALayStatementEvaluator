@@ -409,6 +409,11 @@ def resume_pending_job(slot: str, *, action_label: str) -> None:
             if job_id is not None:
                 # Found it: re-hydrate the session so the normal path proceeds.
                 st.session_state[_pending_key(slot)] = job_id
+            else:
+                # The reference maps to nothing (expired, or from another
+                # deployment): drop it rather than looking it up again on every
+                # rerun. render_recovery_form still offers manual entry.
+                st.session_state.pop(_pending_request_key(slot), None)
     if not isinstance(job_id, str) or not job_id:
         return
     try:
