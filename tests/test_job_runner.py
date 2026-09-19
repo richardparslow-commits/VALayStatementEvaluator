@@ -76,11 +76,10 @@ def _result_json(request_id: str = "req_q1") -> str:
 class _PresetBackend(InProcessJobBackend):
     """Distributed-looking backend whose jobs are already in a chosen state."""
 
-    is_distributed = True
-    name = "preset"
-
     def __init__(self, *, finish: bool = True, result: str | None = None) -> None:
-        super().__init__(prefix="test", ttl_seconds=60)
+        # ``InProcessJobBackend.__init__`` assigns these from its arguments, so
+        # class attributes would be shadowed; pass them where they belong.
+        super().__init__(prefix="test", ttl_seconds=60, is_distributed=True, name="preset")
         self._finish = finish
         self._result = result if result is not None else _result_json()
         self.last_payload: str | None = None
@@ -544,7 +543,9 @@ class TestRecovery(unittest.TestCase):
 
     def test_full_session_loss_and_recovery_cycle(self):
         """Submit, simulate total session loss, then recover by request_id."""
-        backend = InProcessJobBackend(prefix="t", ttl_seconds=60, is_distributed=True, name="test")
+        # The preset backend completes the job on enqueue, so the recovery phase
+        # finds a terminal record instead of polling a queue with no worker.
+        backend = _PresetBackend()
         request_id = "req_full_cycle"
 
         # Phase 1: Submit
@@ -602,10 +603,20 @@ class TestRecovery(unittest.TestCase):
         self.assertEqual(backend.lookup_by_request_id("req_dist"), record.job_id)
 
 
-class _QueuedOutcome:
-    """A QueueOutcome-like stand-in for submit_job's poll result."""
-    ok = True
-    still_running = False
+class _QueuedOutcome(job_runner.QueueOutcome):
+    """A QueueOutcome-like stand-in for submit_job's poll result.
+
+    Represents the tab giving up while the job is still on a worker: the pending
+    keys must survive the submit call, which is what the recovery tests need
+    (a terminal outcome clears the pending job key by design).
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            ok=False,
+            still_running=True,
+            error="this run is still going on a worker.",
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover
