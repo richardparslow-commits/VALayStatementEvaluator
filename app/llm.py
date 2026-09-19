@@ -41,14 +41,25 @@ __all__ = [
     "CircuitBreakerOpenError",
     "QueueFullError",
     "ModelProbe",
+    "ChatProbe",
     "check_model_availability",
     "probe_models",
+    "probe_chat",
 ]
 
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 1.0
 MAX_RETRY_BACKOFF_SECONDS = 4.0
 MODELS_ENDPOINT_TIMEOUT_SECONDS = 6
+
+# The one-token call the preflight makes after the model listing. One token and a
+# two-character prompt, so the request cannot be mistaken for a run — and a ceiling
+# longer than the listing's, because a listing is a database read while a call has to
+# reach a model (and wake a cold one): a 6-second ceiling would report "no response"
+# for an endpoint that is merely slow, and the run would start unverified.
+CHAT_PROBE_MAX_TOKENS = 1
+CHAT_PROBE_PROMPT = "hi"
+CHAT_PROBE_TIMEOUT_SECONDS = 20
 
 # --------------------------------------------------------------- endpoints
 #
@@ -293,6 +304,101 @@ def probe_models(base_url: str, api_key: str) -> ModelProbe:
     if not ids:
         return ModelProbe(None, 200, f"{url} answered but published no model ids")
     return ModelProbe(ids, 200, "")
+
+
+class ChatProbe(NamedTuple):
+    """Outcome of a one-token ``POST {base_url}/chat/completions`` check.
+
+    A model *listing* is not a promise. Perplexity's Router API answers
+    ``GET /models`` with its ids and then refuses every completion with ``403 The
+    Router API is currently in limited preview`` (measured), which is indistinguishable
+    from a healthy endpoint until something actually calls it — so the preflight
+    follows the listing with one real call.
+
+    ``ok`` means a completion came back. ``status`` is the HTTP status when one arrived,
+    and ``None`` when the request got no response at all (DNS, refused, timeout).
+    ``error`` carries the provider's own words, which is what makes a refusal
+    actionable rather than a status code to look up.
+    """
+
+    status: int | None
+    error: str
+    reply: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.reply)
+
+
+def probe_chat(base_url: str, api_key: str, model: str) -> ChatProbe:
+    """Ask the endpoint for one token, reporting the reply *or* why there is none.
+
+    Best-effort and never raises, like :func:`probe_models`. Deliberately one raw
+    request rather than ``LLMClient``: this runs *before* a run, and the client's
+    retries plus shared circuit breaker would let a dead endpoint open the breaker
+    during the check and poison the run the check exists to protect.
+
+    Stdlib only (urllib), so it adds no dependency and no client to keep in sync.
+    """
+    if not api_key or not api_key.strip():
+        return ChatProbe(None, "no API key was supplied")
+    if not model or not model.strip():
+        return ChatProbe(None, "no model was configured to call")
+    url = base_url.rstrip("/") + "/chat/completions"
+    payload = json.dumps(
+        {
+            "model": model.strip(),
+            "messages": [{"role": "user", "content": CHAT_PROBE_PROMPT}],
+            "max_tokens": CHAT_PROBE_MAX_TOKENS,
+            "temperature": 0,
+        }
+    ).encode("utf-8")
+    try:
+        import urllib.error
+        import urllib.request
+
+        req = urllib.request.Request(  # noqa: S310 - the operator's own endpoint
+            url,
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {api_key.strip()}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=CHAT_PROBE_TIMEOUT_SECONDS) as resp:  # noqa: S310
+            body = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001 - availability check is advisory only
+        return ChatProbe(_http_status(exc), _probe_error_text(exc))
+    reply = _completion_text(body)
+    if not reply:
+        return ChatProbe(200, f"{url} answered without a completion")
+    return ChatProbe(200, "", reply)
+
+
+def _completion_text(body: Any) -> str:
+    """The assistant text in a Chat Completions response, or "" when there is none.
+
+    Accepts both shapes providers return: ``choices[0].message.content`` (a string, or
+    the list of content parts some servers send) and the legacy ``choices[0].text``.
+    """
+    rows = body.get("choices") if isinstance(body, dict) else None
+    if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+        return ""
+    choice = rows[0]
+    message = choice.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = [
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        ]
+        return "".join(parts).strip()
+    text = choice.get("text")
+    return text.strip() if isinstance(text, str) else ""
 
 
 def _http_status(exc: BaseException) -> int | None:
