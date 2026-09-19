@@ -8,6 +8,7 @@ from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests
 from app import config
 from app.documents import DocumentPage, ExtractedDocument, document_from_text
 from app.draft import run_draft
+from app.evaluate import run_evaluation
 from app.exporter import export_facts_csv
 from app.job_payload import digest_from_json, digest_to_json, draft_from_json, draft_to_json
 from app.medical_review import MedicalDigest, MedicalFact, _merge_facts, review_medical_records
@@ -28,6 +29,88 @@ class _EvidenceLLM:
             return {"facts": facts[:1] if self.lossy_merge else facts}
         if phase == "grounding":
             self.grounding_prompt = user
+            return {
+                "supported_observations": [],
+                "record_conflicts": [],
+                "observations_needing_verification": [],
+                "grounded_in_records": [],
+                "unverifiable_observations": [],
+                "follow_up_questions": [],
+            }
+        if phase == "claims":
+            # Produce one claim per fact to keep verification balanced
+            _FACT_TO_CLAIM_TYPE = {
+                "in_service_event": "in_service_event",
+                "diagnosis": "diagnosis_reference",
+                "symptom": "symptom",
+                "treatment": "treatment_reference",
+                "medication": "treatment_reference",
+                "hospitalization": "treatment_reference",
+                "provider_visit": "treatment_reference",
+                "functional_limitation": "functional_impact",
+                "test_result": "diagnosis_reference",
+            }
+            return {
+                "claimed_condition": "Test condition",
+                "writer_role": "veteran",
+                "claims": [
+                    {
+                        "id": i + 1,
+                        "text": f.description,
+                        "type": _FACT_TO_CLAIM_TYPE.get(f.type, "other"),
+                    }
+                    for i, f in enumerate(self.facts)
+                ],
+            }
+        if phase == "verify":
+            # Each fact's claim gets a SUPPORTED verdict
+            import re
+            claim_ids = set()
+            for match in re.finditer(r'"id"\s*:\s*(\d+)', user):
+                claim_ids.add(int(match.group(1)))
+            return {
+                "verifications": [
+                    {
+                        "id": cid,
+                        "verdict": "SUPPORTED",
+                        "record_reference": "clinic.pdf p.1",
+                        "note": "Verified against records",
+                    }
+                    for cid in sorted(claim_ids)
+                ]
+            }
+        if phase == "rubric":
+            return {
+                "scores": {
+                    "clarity": 8, "specificity": 7, "consistency": 8,
+                    "completeness": 6, "credibility": 7, "relevance": 8,
+                    "timeliness": 7, "probative_value": 6,
+                },
+                "rationales": {k: "Adequate" for k in [
+                    "clarity", "specificity", "consistency",
+                    "completeness", "credibility", "relevance",
+                    "timeliness", "probative_value",
+                ]},
+                "improvements": [],
+            }
+        if phase == "topic":
+            return {
+                "claim_focus": "Test focus",
+                "topics": [],
+                "critical_gaps": [],
+                "notes": "",
+            }
+        if phase == "revision":
+            return {
+                "revision_notes": "",
+                "changes": [],
+                "revised_statement": user,
+                "added_facts_to_verify": [],
+            }
+        if phase == "records:summary":
+            return {}  # let chat() handle it
+        if phase == "recommendations":
+            return {"recommendations": []}
         return {}
 
     def chat(self, system, user, **kwargs):
@@ -143,6 +226,108 @@ class TestEvidencePreservation(unittest.TestCase):
             self.assertIn(facts[-1].description, prompt)
             self.assertLessEqual(len(prompt), 500)
         self.assertEqual(digest.facts, facts)
+
+    def test_evidence_source_preserved_independently_of_prompt_budgets(self):
+        """Raw source pages are preserved in the result store, not just digest facts."""
+        from app.evaluate import run_evaluation, _pages_to_source
+        from app.job_payload import evaluation_from_json, evaluation_to_json
+
+        # Build minimal records: two pages with known content
+        records = [
+            document_from_text("clinic.pdf", "Page one: back pain diagnosis."),
+            document_from_text("imaging.pdf", "Page two: MRI shows L4-L5 herniation."),
+        ]
+
+        # Verify _pages_to_source extracts correctly
+        source = _pages_to_source(records)
+        self.assertEqual(len(source), 2)
+        self.assertEqual(source[0]["filename"], "clinic.pdf")
+        self.assertEqual(source[1]["filename"], "imaging.pdf")
+        self.assertIn("back pain", source[0]["text"])
+        self.assertIn("MRI", source[1]["text"])
+
+        # Run evaluation: source must land in the result
+        llm = _EvidenceLLM(_facts())
+        statement = "I have chronic back pain from the herniated disc."
+        result = run_evaluation(llm, statement, records)
+        self.assertEqual(len(result.evidence_source), 2)
+        self.assertEqual(result.evidence_source[0]["filename"], "clinic.pdf")
+        self.assertIn("back pain", result.evidence_source[0]["text"])
+
+        # Prompt budget changes must NOT affect evidence_source
+        with patch.object(config, "MAX_DIGEST_FACTS", 2):
+            # Re-run with a tight prompt budget
+            result2 = run_evaluation(llm, statement, records)
+            self.assertEqual(result2.evidence_source, result.evidence_source)
+            self.assertIn("back pain", result2.evidence_source[0]["text"])
+
+        # evidence_source must survive round-trip serialization
+        serialized = evaluation_to_json(result)
+        self.assertIn("evidence_source", serialized)
+        self.assertEqual(len(serialized["evidence_source"]), 2)
+        restored = evaluation_from_json(serialized)
+        self.assertEqual(restored.evidence_source, result.evidence_source)
+        self.assertEqual(restored.evidence_source[0]["filename"], "clinic.pdf")
+        self.assertIn("back pain", restored.evidence_source[0]["text"])
+
+    def test_draft_evidence_source_preserved(self):
+        """Draft results also carry the raw source records."""
+        from app.draft import _pages_to_source
+        from app.job_payload import draft_from_json, draft_to_json
+
+        records = [
+            document_from_text("notes.txt", "Medical notes: wheezing on exertion."),
+        ]
+        source = _pages_to_source(records)
+        self.assertEqual(len(source), 1)
+        self.assertEqual(source[0]["filename"], "notes.txt")
+
+        # Draft must preserve evidence_source
+        llm = _EvidenceLLM(_facts())
+        result = run_draft(
+            llm, records, {"name": "Witness", "relationship": "Self"},
+            "Wheezing when walking", "Asthma", "New claim",
+        )
+        self.assertEqual(result.evidence_source, source)
+        self.assertEqual(len(result.evidence_source), 1)
+
+        # Round-trip: draft serialization includes evidence_source
+        serialized = draft_to_json(result)
+        self.assertIn("evidence_source", serialized)
+        restored = draft_from_json(serialized)
+        self.assertEqual(restored.evidence_source, result.evidence_source)
+        self.assertIn("wheezing", restored.evidence_source[0]["text"])
+
+    def test_evidence_source_links_to_digest_facts(self):
+        """The source pages contain the raw text from which digest facts were extracted."""
+        from app.evaluate import run_evaluation
+
+        # Facts that reference pages in the source records
+        fact = MedicalFact(
+            "2023-05", "diagnosis",
+            "Diagnosis of lumbar strain",
+            "clinic.pdf p.1", "lumbar strain",
+            document="clinic.pdf", page=1,
+        )
+        llm = _EvidenceLLM([fact])
+        records = [
+            ExtractedDocument("clinic.pdf", [
+                DocumentPage("clinic.pdf", 1, "Assessment: lumbar strain diagnosed.")
+            ]),
+        ]
+        statement = "I have a lumbar strain from an injury."
+        result = run_evaluation(llm, statement, records)
+
+        # evidence_source carries the raw page text
+        self.assertEqual(len(result.evidence_source), 1)
+        raw_page = result.evidence_source[0]["text"]
+        self.assertIn("lumbar strain", raw_page)
+
+        # digest fact's document+page link back to evidence_source
+        self.assertEqual(result.digest.facts[0].document, "clinic.pdf")
+        self.assertEqual(result.digest.facts[0].page, 1)
+        # The fact's quote is verifiable against the raw source text
+        self.assertIn(result.digest.facts[0].quote, raw_page)
 
 
 if __name__ == "__main__":

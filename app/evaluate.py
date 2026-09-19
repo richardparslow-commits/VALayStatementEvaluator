@@ -356,6 +356,12 @@ class EvaluationResult:
     # gaps, not findings: the statement is silent *and* the records supplied
     # nothing to check it against, which is a different thing to tell a veteran.
     evidence_gaps: list[dict] = field(default_factory=list)
+    # Complete source evidence preserved independently of prompt budgets.
+    # Each dict holds {"filename": str, "kind": "page"|"block", "page": int,
+    # "text": str} — the raw record pages that fed the digest extraction and
+    # verification. Summaries and selected facts in this result are derived
+    # views of this store; prompt budget limits never truncate it.
+    evidence_source: list[dict] = field(default_factory=list)
 
     @property
     def contradiction_count(self) -> int:
@@ -526,6 +532,25 @@ def _normalize_verifications(data: Any, expected_ids: set[int]) -> list[dict]:
     return normalized
 
 
+def _pages_to_source(records: list[ExtractedDocument]) -> list[dict]:
+    """Extract raw source pages into a compact, serialisable list.
+
+    Each entry is ``{"filename": str, "kind": "page"|"block", "page": int,
+    "text": str}``. This store is preserved in the result independently of
+    prompt budgets — summaries and selected facts are derived views of it.
+    """
+    pages: list[dict] = []
+    for doc in records:
+        for page in doc.pages:
+            pages.append({
+                "filename": page.filename,
+                "kind": page.kind,
+                "page": page.page,
+                "text": page.text,
+            })
+    return pages
+
+
 def _run_evaluation(
     llm: LLMClient,
     statement_text: str,
@@ -534,6 +559,11 @@ def _run_evaluation(
 ) -> EvaluationResult:
     result = EvaluationResult()
     result.input_chars = len(statement_text)
+    # Preserve complete source evidence — the raw record pages that
+    # produced every digest fact and verification. This store lives
+    # independently of prompt budgets so saved results always carry
+    # full provenance.
+    result.evidence_source = _pages_to_source(records)
     # Hard bound for LLM prompts (80k) — the 60k soft limit is enforced in the UI
     # with a warning + confirmation. Direct callers bypassing the UI still get
     # bounded prompts and an auditable warning in the report.

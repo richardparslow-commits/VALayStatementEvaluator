@@ -233,6 +233,7 @@ def evaluation_to_json(result: EvaluationResult) -> dict[str, Any]:
         "input_chars": result.input_chars,
         "truncated_chars": result.truncated_chars,
         "truncation_warning": result.truncation_warning,
+        "evidence_source": list(result.evidence_source),
     }
 
 
@@ -262,6 +263,7 @@ def evaluation_from_json(raw: Any) -> EvaluationResult:
         input_chars=_as_int(data.get("input_chars")),
         truncated_chars=_as_int(data.get("truncated_chars")),
         truncation_warning=_as_str(data.get("truncation_warning")),
+        evidence_source=_dict_items(data.get("evidence_source")),
     )
 
 
@@ -275,6 +277,7 @@ def draft_to_json(result: DraftResult) -> dict[str, Any]:
         "input_chars": result.input_chars,
         "truncated_chars": result.truncated_chars,
         "truncation_warning": result.truncation_warning,
+        "evidence_source": list(result.evidence_source),
     }
 
 
@@ -289,6 +292,7 @@ def draft_from_json(raw: Any) -> DraftResult:
         input_chars=_as_int(data.get("input_chars")),
         truncated_chars=_as_int(data.get("truncated_chars")),
         truncation_warning=_as_str(data.get("truncation_warning")),
+        evidence_source=_dict_items(data.get("evidence_source")),
     )
 
 

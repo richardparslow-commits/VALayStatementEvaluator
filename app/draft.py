@@ -185,6 +185,10 @@ class DraftResult:
     input_chars: int = 0
     truncated_chars: int = 0
     truncation_warning: str = ""
+    # Complete source evidence preserved independently of prompt budgets.
+    # Each dict holds {"filename": str, "kind": "page"|"block", "page": int,
+    # "text": str} — the raw record pages that fed the digest extraction.
+    evidence_source: list[dict] = field(default_factory=list)
 
     @property
     def output_statement(self) -> str:
@@ -325,6 +329,25 @@ def _review_rejection_reason(original: str, improved: Any) -> str:
     return ""
 
 
+def _pages_to_source(records: list[ExtractedDocument]) -> list[dict]:
+    """Extract raw source pages into a compact, serialisable list.
+
+    Each entry is ``{"filename": str, "kind": "page"|"block", "page": int,
+    "text": str}``. This store is preserved in the result independently of
+    prompt budgets — summaries and selected facts are derived views of it.
+    """
+    pages: list[dict] = []
+    for doc in records:
+        for page in doc.pages:
+            pages.append({
+                "filename": page.filename,
+                "kind": page.kind,
+                "page": page.page,
+                "text": page.text,
+            })
+    return pages
+
+
 def _run_draft(
     llm: LLMClient,
     records: list[ExtractedDocument],
@@ -336,6 +359,10 @@ def _run_draft(
 ) -> DraftResult:
     result = DraftResult()
     result.input_chars = len(observations)
+    # Preserve complete source evidence — the raw record pages that
+    # produced every digest fact. This store lives independently of
+    # prompt budgets so saved results always carry full provenance.
+    result.evidence_source = _pages_to_source(records)
     obs_for_prompt, removed = _truncate_for_prompt(observations, DRAFT_INTERNAL_MAX_CHARS)
     result.truncated_chars = removed
     if removed:
