@@ -733,6 +733,18 @@ Four things about it are deliberate and easy to get wrong by hand:
   (`COMPATIBILITY.md` → *Vercel credentials are not interchangeable*), and the runner
   refuses it in the token slot by name rather than letting the CLI answer 401.
 
+  One prerequisite is not about this repository at all. **The project that owns the image
+  needs a slug-safe name.** The registry path is
+  `vcr.vercel.com/<team-slug>/<project-slug>/<repository>`, and Vercel slugifies the
+  *team* (`Secondary_Condition_Finder` → `secondary-condition-finder`) but not a
+  project: pushing from a project named `va_draft` uploads every layer and then fails
+  with `NAME_INVALID: invalid project slug` (measured — the same request against
+  `…/secondary-condition-finder/va_draft/…` answers `NAME_INVALID` while
+  `…/va-lse-sandbox/…` answers `not_found`, which is a valid path with no tags in it
+  yet). The image and the boxes therefore live in one dedicated, dash-safe project,
+  which is what `VA_LSE_SANDBOX_PROJECT` names; the app's own Vercel project is
+  unrelated to it.
+
   Two things to expect. **One microVM per file** — that is the port's shape (one file
   in, documents out) — and `--non-persistent` plus the `finally` mean each one leaves
   nothing behind. **A SIGKILLed runner cannot clean up**: the app's own per-file
