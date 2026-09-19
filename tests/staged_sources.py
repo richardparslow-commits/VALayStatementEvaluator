@@ -19,23 +19,36 @@ run it in a checkout where the app's dependencies are not installed.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
-def _git(*args: str) -> str:
+def _git(*args: str) -> bytes:
+    """Raw stdout of a ``git`` call — a path or a file need not be text."""
     result = subprocess.run(
         ["git", *args],
         cwd=str(PROJECT_ROOT),
         capture_output=True,
-        text=True,
         check=False,
     )
     if result.returncode != 0:
-        raise SystemExit(f"git {' '.join(args)} failed:\n{result.stderr.strip()}")
+        failure = result.stderr.decode("utf-8", errors="replace").strip()
+        raise SystemExit(f"git {' '.join(args)} failed:\n{failure}")
     return result.stdout
+
+
+def _index_source(path: str) -> str:
+    """The index's copy of *path*, as text.
+
+    Decoded with replacement rather than strictly: a binary fixture is not a source
+    file any rule should read, and the rules filter by name before they judge
+    content — so refusing to decode one turned a file no rule objected to into a
+    traceback.
+    """
+    return _git("show", f":{path}").decode("utf-8", errors="replace")
 
 
 def staged(pathspec: str) -> list[tuple[str, str]]:
@@ -44,11 +57,18 @@ def staged(pathspec: str) -> list[tuple[str, str]]:
     Renames come along — a file must not be able to escape a rule by moving — and
     deletions do not, having no content to judge. The content is the index's, for
     the reason in this module's docstring.
+
+    Names are read NUL-separated and as bytes. Git leaves a space in a path
+    unquoted, so splitting on whitespace turned one path into several and the
+    lookups for the others failed — refusing a commit no rule objected to.
+    ``os.fsdecode`` also reverses exactly when the name is handed back to git, so
+    even a path that is not UTF-8 still names its blob.
     """
-    paths = _git(
-        "diff", "--cached", "--name-only", "--diff-filter=ACMR", "--", pathspec
-    ).split()
-    return [(path, _git("show", f":{path}")) for path in paths]
+    listing = _git(
+        "diff", "--cached", "--name-only", "-z", "--diff-filter=ACMR", "--", pathspec
+    )
+    paths = [os.fsdecode(name) for name in listing.split(b"\0") if name]
+    return [(path, _index_source(path)) for path in paths]
 
 
 def worktree(root: Path) -> list[tuple[str, str]]:
