@@ -151,6 +151,13 @@ with, read from the staged copy, and it has already caught a real mistake: a new
 merge result. It needs `python3` on `PATH` (the project's `.venv` is preferred);
 when no interpreter exists the commit is **blocked**, not waved through.
 
+The same treatment covers a staged **app** module that reads a Streamlit config
+option (`tests/streamlit_option_reads.py`): an option's value comes from the
+machine and the directory the process started in, so a decision made from one — the
+hardening check answering "is XSRF on *here*?" rather than "does this deployment
+ship it?" — is ambient. The suite scans for it too; the hook catches it at the
+commit, when the rule is still cheap to satisfy.
+
 To install as a `pre-commit` framework hook instead, add to `.pre-commit-config.yaml`:
 
 ```yaml
@@ -160,7 +167,8 @@ repos:
       - id: no-secrets
         name: Block .env and sk-* secrets
         entry: bash scripts/hooks/pre-commit
-        # Also enforces the test-harness import (tests/harness_imports.py).
+        # Also enforces the test-harness import (tests/harness_imports.py) and
+        # refuses Streamlit config reads in app/ (tests/streamlit_option_reads.py).
         language: system
         pass_filenames: false
 ```
