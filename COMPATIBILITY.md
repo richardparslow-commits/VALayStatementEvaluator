@@ -141,14 +141,22 @@ model-list-only form) and `app/main.py:_sidebar_settings`.
 
 ### The same check, with teeth, at the moment a run starts
 
-The launch check is advisory; the **preflight** is not. Pressing a run button probes once and
+The launch check is advisory; the **preflight** is not. Pressing a run button probes twice and
 refuses to start when the configuration cannot work: a configured model missing from the
-endpoint's catalog, or a key the endpoint rejects (`401`/`403`). Both mean every call in the
-run would be rejected, and the probe costs one request instead of the first minutes of the
-bundle's chunks.
+endpoint's catalog, a key the endpoint rejects (`401`/`403`), or — the case a listing cannot
+see — a **one-token call** the endpoint refuses (`401`/`403`, or a `404` that says the base URL
+serves no completions path at all). Each means every call in the run would be rejected, and the
+probes cost two requests instead of the first minutes of the bundle's chunks.
 
-Nothing inconclusive blocks: an unreachable host, `404` (some OpenAI-compatible servers serve
-completions without listing models), and provider-side `5xx` are reported and the run proceeds.
+The second probe is why this section exists in a document about compatibility. A listing is not
+a promise: Perplexity's Router API publishes its ids and then answers every completion with
+`403 The Router API is currently in limited preview`, so the listing alone reports a healthy
+endpoint. That is an entitlement gate, not a missing model — which is precisely why it has to be
+observed by calling, and why the verdict carries the provider's own message.
+
+Nothing inconclusive blocks: an unreachable host, a `404` on `/models` (some
+OpenAI-compatible servers serve completions without listing models), a `429`, and provider-side
+`5xx` are reported and the run proceeds.
 A block carries a per-configuration waiver for endpoints whose `/models` answer does not
 describe what they serve — see `README.md → Before a run starts` and
 `TROUBLESHOOTING.md → The run did not start`.

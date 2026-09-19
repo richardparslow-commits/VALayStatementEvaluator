@@ -259,15 +259,19 @@ Key metrics:
 
 A message ending in **Run not started** above the run button is not a failure: it is the
 preflight refusing to spend a run on a configuration that cannot work. Nothing was sent to the
-model and no credits were used.
+model and no credits were used — the check itself is a model listing plus one one-token call,
+which is what a run's own first call costs.
 
 | Message | What it means | What to do |
 |---|---|---|
 | The endpoint rejected this API key (HTTP 401/403) | The key and the base URL are not from the same provider account — or, on Perplexity's Router API, the account does not have Router access (private preview) | Fix the key/base URL pair, click **Test connection** to confirm, then re-run. **Run not started** disappears on its own once the settings change |
 | The endpoint does not offer `model-x` (or several) | The configured model id is not in the endpoint's published catalog, so every call would be rejected | Correct `LLM_MODEL_MAIN`/`LLM_MODEL_FAST` (or the sidebar fields) against the provider's list; `COMPATIBILITY.md` has the per-provider ids |
+| The endpoint refused a real call to `model-x` (HTTP 403) | The endpoint publishes the id and then refuses an actual call — an entitlement or preview gate rather than a missing model. The provider's own message is in the fix line | Read that message: Perplexity's Router API says "currently in limited preview" and is granted per account (`api@perplexity.ai`). Until it is, run on an endpoint that serves the account — their standard `sonar` API, or another provider. Re-running unchanged reproduces it exactly |
+| The endpoint refused a real call to `model-x` (HTTP 404) | The base URL serves no completions path, so every call in the run would 404 — a wrong base URL (or a provider whose chat route is not `/chat/completions`) | Check `OPENAI_BASE_URL` against the provider's docs. A `404` on `/models` alone does **not** block — only a real call that fails does |
 
 What does **not** block: an unreachable host, a `404` on `/models` (some OpenAI-compatible
-servers serve completions without listing models), and provider-side `5xx`. Those are reported
+servers serve completions without listing models), a `429` (the key worked; a limit is the
+account's business and the run decides for itself), and provider-side `5xx`. Those are reported
 and the run proceeds, because an inconclusive check must not refuse to start a working run.
 
 If the check is wrong about your endpoint — a gateway that answers `/models` differently than it
