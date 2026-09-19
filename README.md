@@ -744,6 +744,12 @@ already loaded in the same workflow this session, and shows a **merged records s
 label + file + page count per row) that requires explicit confirmation before the merged set is
 used for evaluation or drafting.
 
+The summary has one row per retained document. Only exact copies with matching
+text, page addresses, and coverage metadata are combined, with every contributing
+source listed on that row. Distinct documents with the same filename remain in
+the review; source-qualified names keep their citations separate without changing
+the original session records.
+
 - **Sandbox mode (default):** leave `VA_GOV_API_BASE_URL` unset — `authenticate_va_gov` and
   `fetch_va_records` return a deterministic in-memory mock session and two mock records, so the
   full login → fetch → merge → confirm flow works with zero env vars configured.

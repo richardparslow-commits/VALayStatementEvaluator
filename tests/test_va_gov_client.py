@@ -2,6 +2,7 @@
 import json
 import sys
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
@@ -9,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 
 from app import va_gov_client  # noqa: E402
+from app.documents import BLOCK, DocumentPage, ExtractedDocument, document_from_text  # noqa: E402
 from app.va_gov_client import (  # noqa: E402
     VaGovError,
     VaGovFetchResult,
@@ -98,6 +100,106 @@ class TestMergeRecords(unittest.TestCase):
         merged = merge_records({"VA.gov": [doc_a], "Fetch Sandbox": [doc_b]})
         self.assertEqual(len(merged.documents), 1)
         self.assertEqual(merged.sources_merged, 2)
+        self.assertEqual(len(merged.summary), 1)
+        self.assertEqual(merged.summary[0].source, "VA.gov, Fetch Sandbox")
+        self.assertEqual(merged.summary[0].filename, merged.documents[0].filename)
+
+    def test_same_name_and_size_do_not_discard_distinct_records(self):
+        first = document_from_text("records.txt", "Patient A: asthma.")
+        second = document_from_text("records.txt", "Patient B: injury.")
+        self.assertEqual(first.char_count, second.char_count)
+        originals = deepcopy([first, second])
+        merged = merge_records({"Upload": [first], "VA.gov": [second]})
+        self.assertEqual([doc.full_text for doc in merged.documents], [first.full_text, second.full_text])
+        self.assertEqual([row.source for row in merged.summary], ["Upload", "VA.gov"])
+        self.assertEqual([row.filename for row in merged.summary], [doc.filename for doc in merged.documents])
+        self.assertEqual(len({p.label for d in merged.documents for p in d.pages}), 2)
+        self.assertEqual([first, second], originals)
+
+    def test_same_source_can_contain_distinct_same_named_records(self):
+        docs = [document_from_text("records.txt", f"Patient {letter}: asthma.") for letter in "ABC"]
+        merged = merge_records({"Upload": docs})
+        self.assertEqual([doc.full_text for doc in merged.documents], [doc.full_text for doc in docs])
+        self.assertEqual(len({doc.filename for doc in merged.documents}), 3)
+        self.assertEqual(len(merged.summary), 3)
+
+    def test_alias_does_not_collide_with_an_existing_filename(self):
+        docs = [
+            document_from_text("records.txt", "Patient A: asthma."),
+            document_from_text("records.txt", "Patient B: injury."),
+            document_from_text("Upload/records.txt", "Patient C: asthma."),
+        ]
+        merged = merge_records({"Upload": docs})
+        self.assertEqual(len({doc.filename for doc in merged.documents}), 3)
+        self.assertEqual(merged.documents[2].filename, "Upload/records.txt")
+        self.assertEqual(merged.documents[1].pages[0].filename, merged.documents[1].filename)
+
+    def test_duplicate_after_renaming_retains_all_sources_once(self):
+        first = document_from_text("records.txt", "Patient A: asthma.")
+        second = document_from_text("records.txt", "Patient B: injury.")
+        merged = merge_records({
+            "Upload": [first], "VA.gov": [second, deepcopy(second)], "Fetch Sandbox": [deepcopy(second)],
+        })
+        self.assertEqual(len(merged.documents), 2)
+        self.assertEqual(len(merged.summary), 2)
+        self.assertEqual(merged.summary[1].source, "VA.gov, Fetch Sandbox")
+        self.assertEqual(merged.summary[1].filename, merged.documents[1].filename)
+        self.assertEqual(merged.sources_merged, 3)
+
+    def test_document_identity_includes_page_boundaries_order_and_metadata(self):
+        original = ExtractedDocument("record.pdf", [
+            DocumentPage("record.pdf", 1, "a" * 50),
+            DocumentPage("record.pdf", 2, "b" * 50),
+        ], total_pages=3, unreadable_pages=[3])
+        for change in ("boundaries", "order", "page_number", "page_kind", "page_filename",
+                       "total_pages", "unreadable_pages", "pagination"):
+            with self.subTest(change=change):
+                modified = deepcopy(original)
+                if change == "boundaries":
+                    modified.pages[0].text = "a" * 49
+                    modified.pages[1].text = "a" + "b" * 50
+                elif change == "order":
+                    modified.pages.reverse()
+                elif change == "page_number":
+                    modified.pages[0].page = 7
+                elif change == "page_kind":
+                    modified.pages[0].kind = BLOCK
+                elif change == "page_filename":
+                    modified.pages[0].filename = "other.pdf"
+                elif change == "total_pages":
+                    modified.total_pages = 4
+                elif change == "unreadable_pages":
+                    modified.unreadable_pages = [4]
+                else:
+                    modified.pagination = BLOCK
+                merged = merge_records({"Upload": [original], "VA.gov": [modified]})
+                self.assertEqual(len(merged.documents), 2)
+                self.assertEqual(merged.documents[1].total_pages, modified.total_pages)
+                self.assertEqual(merged.documents[1].unreadable_pages, modified.unreadable_pages)
+                self.assertEqual(merged.documents[1].pagination, modified.pagination)
+
+    def test_different_filenames_keep_their_provenance_even_with_identical_text(self):
+        docs = [document_from_text(name, "Same clinical evidence.") for name in ("a.txt", "b.txt")]
+        merged = merge_records({"Upload": [docs[0]], "VA.gov": [docs[1]]})
+        self.assertEqual(merged.documents, docs)
+        self.assertEqual(len(merged.summary), 2)
+
+    def test_merged_record_citations_point_to_each_distinct_document(self):
+        from app.medical_review import MedicalFact, verify_citations
+
+        docs = [document_from_text("records.txt", text) for text in (
+            "Patient A reports chronic asthma symptoms during exercise",
+            "Patient B reports chronic injury symptoms during exercise",
+        )]
+        merged = merge_records({"Upload": [docs[0]], "VA.gov": [docs[1]]})
+        self.assertEqual(len(merged.documents), 2)
+        facts = [MedicalFact(
+            "2025", "diagnosis", doc.full_text, doc.pages[0].label,
+            quote=doc.full_text, document=doc.filename, page=doc.pages[0].page,
+        ) for doc in merged.documents]
+        checked = verify_citations(facts, merged.documents)
+        self.assertEqual(checked["checked"], 2)
+        self.assertEqual(checked["missing"], 0)
 
     def test_ignores_empty_sources(self):
         merged = merge_records({"Upload": [], "VA.gov": []})

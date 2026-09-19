@@ -28,7 +28,7 @@ import logging
 import os
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from http.client import HTTPConnection, HTTPSConnection
 from typing import Any
 from urllib.parse import urlencode, urlparse
@@ -95,7 +95,7 @@ class VaGovFetchResult:
 
 @dataclass
 class MergedRecordSummaryRow:
-    """One row of the post-merge summary table (source label + file)."""
+    """One retained document, with all contributing source labels."""
 
     source: str
     filename: str
@@ -274,30 +274,53 @@ def fetch_va_records(session: VaGovSession) -> VaGovFetchResult:
 def merge_records(sources: dict[str, list[ExtractedDocument]]) -> MergedRecordSet:
     """Merge documents from multiple record sources into one labeled set.
 
-    Records are treated identically regardless of source for downstream
-    extraction/chunking/page-labeling: this function only adds a source label
-    for the confirmation summary and de-duplicates documents that appear
-    under more than one source (matched on filename + page count + character
-    count, since two independently-fetched copies of the same record will
-    match on all three).
+    Only exact copies of text, page addresses and coverage metadata are combined.
+    Distinct documents keep unique citation names without mutating the originals.
+    The summary has one row per retained document, naming every source of a copy.
     """
-    seen: set[tuple[str, int, int]] = set()
+    seen: dict[tuple[Any, ...], int] = {}
     documents: list[ExtractedDocument] = []
-    summary: list[MergedRecordSummaryRow] = []
+    source_labels: list[list[str]] = []
+    reserved_names = {doc.filename for docs in sources.values() for doc in docs}
+    used_names: set[str] = set()
     sources_merged = 0
     for source_label, docs in sources.items():
         if not docs:
             continue
         sources_merged += 1
         for doc in docs:
-            summary.append(
-                MergedRecordSummaryRow(source=source_label, filename=doc.filename, pages=len(doc.pages))
+            # Full immutable inputs, not filename/size heuristics. Tuple equality
+            # verifies text as well as the citation and unreadable-page metadata.
+            key = (
+                doc.filename, doc.pagination, doc.total_pages, tuple(doc.unreadable_pages),
+                tuple((p.filename, p.page, p.kind, p.text) for p in doc.pages),
             )
-            key = (doc.filename, len(doc.pages), doc.char_count)
-            if key in seen:
+            existing = seen.get(key)
+            if existing is not None:
+                if source_label not in source_labels[existing]:
+                    source_labels[existing].append(source_label)
                 continue
-            seen.add(key)
-            documents.append(doc)
+            retained = doc
+            if doc.filename in used_names:
+                base_name = f"{source_label}/{doc.filename}"
+                filename = base_name
+                suffix = 2
+                while filename in reserved_names or filename in used_names:
+                    filename = f"{base_name} ({suffix})"
+                    suffix += 1
+                retained = replace(
+                    doc, filename=filename,
+                    pages=[replace(page, filename=filename) for page in doc.pages],
+                    unreadable_pages=list(doc.unreadable_pages),
+                )
+            seen[key] = len(documents)
+            used_names.add(retained.filename)
+            documents.append(retained)
+            source_labels.append([source_label])
+    summary = [
+        MergedRecordSummaryRow(source=", ".join(labels), filename=doc.filename, pages=len(doc.pages))
+        for doc, labels in zip(documents, source_labels)
+    ]
     return MergedRecordSet(documents=documents, summary=summary, sources_merged=sources_merged)
 
 

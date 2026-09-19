@@ -75,6 +75,43 @@ class TestVaGovSelector(unittest.TestCase):
         # checkbox is now shown before the records are returned to the pipeline.
         self.assertIn("va_gov_confirm_eval", at.session_state)
 
+    def test_confirmation_summary_matches_retained_records_and_sources(self):
+        from streamlit.testing.v1 import AppTest
+
+        for same_text in (False, True):
+            with self.subTest(same_text=same_text):
+                fetched_text = "Patient A: asthma." if same_text else "Patient B: injury."
+                at = AppTest.from_string(f'''
+import streamlit as st
+from app.documents import document_from_text
+from app.va_gov_client import VaGovFetchResult
+from app.views.records import _va_gov_records
+
+st.session_state.source_records_eval = {{
+    "Upload": [document_from_text("records.txt", "Patient A: asthma.")],
+}}
+st.session_state.va_gov_fetch_eval = VaGovFetchResult(
+    documents=[document_from_text("records.txt", {fetched_text!r})],
+    retrieved=1, expected=1, partial=False,
+)
+st.session_state.selected_records = _va_gov_records("eval")
+''', default_timeout=20).run()
+                self.assertFalse(at.exception)
+                self.assertEqual(at.session_state.selected_records, [])
+                rows = at.dataframe[0].value.to_dict("records")
+                expected_count = 1 if same_text else 2
+                self.assertEqual(len(rows), expected_count)
+                if same_text:
+                    self.assertEqual(rows[0]["Source"], "Upload, VA.gov")
+                else:
+                    self.assertEqual([row["Source"] for row in rows], ["Upload", "VA.gov"])
+                at.checkbox(key="va_gov_confirm_eval").set_value(True).run()
+                self.assertFalse(at.exception)
+                selected = at.session_state.selected_records
+                self.assertEqual(len(selected), expected_count)
+                self.assertEqual([row["File"] for row in rows], [doc.filename for doc in selected])
+                self.assertIn(fetched_text, [doc.full_text for doc in selected])
+
 
 if __name__ == "__main__":
     unittest.main()
