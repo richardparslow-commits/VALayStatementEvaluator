@@ -113,11 +113,6 @@ def files_carried(stage: list[str]) -> set[str]:
     return found
 
 
-#: How a RUN line names a file it reads. `pip install -r <file>`,
-#: `pip install --requirement <file>`, and the same flag spelled with `=`.
-_REQUIREMENT_FLAGS = ("-r", "--requirement")
-
-
 def files_read_before_being_carried(
     stage: list[str], inherited_stage: list[str] | None = None
 ) -> list[str]:
@@ -130,6 +125,12 @@ def files_read_before_being_carried(
     the first CI run of the sandbox-image job, before any image had ever been
     built). A test that asks about mentions cannot tell a COPY from a RUN.
 
+    Includes are followed, because the file a RUN names is often not the file pip
+    reads: ``requirements-dev.txt`` begins with ``-r requirements.txt``, so a stage
+    that carries the first and not the second fails inside pip with a path nobody
+    reading the Dockerfile can see (measured: the second CI run, after the first
+    fix). One level of indirection is the whole trap, and it is free to follow.
+
     *inherited_stage* is the stage this one is built ``FROM``, whose files are
     present before this stage's first instruction.
     """
@@ -139,24 +140,66 @@ def files_read_before_being_carried(
         if instruction.startswith("COPY "):
             available |= files_carried([instruction])
             continue
-        if not instruction.startswith("RUN "):
+        if not instruction.startswith("RUN ") or "pip install" not in instruction:
+            # Only pip reads requirements files, and asking every RUN is not
+            # harmless: `rm -rf /var/lib/apt/lists/*` reads as `-rf` to a flag
+            # parser, which is how the attached form below reported a file `f`.
             continue
-        for name in _requirement_arguments(instruction):
+        named = requirement_files_named(instruction)
+        for name in _requirement_closure(named):
             if name not in available:
                 missing.append(name)
-    return sorted(missing)
+    return sorted(set(missing))
 
 
-def _requirement_arguments(instruction: str) -> list[str]:
-    """The file names a RUN's ``-r``/``--requirement`` flags point at."""
+def requirement_files_named(text: str) -> list[str]:
+    """The files a command's ``-r``/``--requirement`` flags point at.
+
+    Covers the three forms pip accepts: ``-r file``, ``-rfile`` and
+    ``--requirement=file``. The attached form additionally has to look like a path,
+    so a short option cluster is not mistaken for a filename.
+    """
     names: list[str] = []
-    tokens = instruction.split()
+    tokens = text.split()
     for index, token in enumerate(tokens):
-        if token in _REQUIREMENT_FLAGS and index + 1 < len(tokens):
-            names.append(tokens[index + 1])
-        elif any(token.startswith(f"{flag}=") for flag in _REQUIREMENT_FLAGS):
+        if token in ("-r", "--requirement"):
+            if index + 1 < len(tokens):
+                names.append(tokens[index + 1])
+        elif token.startswith("--requirement="):
             names.append(token.split("=", 1)[1])
+        elif token.startswith("-r") and len(token) > 2 and any(c in token for c in "./"):
+            names.append(token[2:])
     return [name for name in names if not name.startswith("-")]
+
+
+def _requirement_closure(names: list[str]) -> list[str]:
+    """*names* plus everything those requirement files include, repo-relative.
+
+    Paths inside a requirements file are relative to that file, which is why the
+    queue carries the directory each name came from.
+    """
+    found: list[str] = []
+    queue: list[tuple[str, str]] = [(name, "") for name in names]
+    while queue:
+        name, base = queue.pop(0)
+        if name.startswith("/"):  # an absolute path is the image's business, not the repo's
+            continue
+        relative = f"{base}/{name}".lstrip("/") if base else name
+        if relative in found:
+            continue
+        # Named but absent on disk is still reported: the caller decides whether the
+        # stage carries it, and a typo in a requirements file is the same failure.
+        found.append(relative)
+        if not (PROJECT_ROOT / relative).is_file():
+            continue
+        for line in (PROJECT_ROOT / relative).read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            parent = str(Path(relative).parent)
+            for include in requirement_files_named(stripped):
+                queue.append((include, "" if parent == "." else parent))
+    return found
 
 
 # ------------------------------------------------------------ ignore patterns

@@ -134,7 +134,7 @@ RUN apt-get update && \
 # `pip install -r requirements-dev.txt` reads as carried. The CI job that builds
 # this stage failed on it the first time it ran; `files_read_before_being_carried`
 # in tests/dockerfile.py now asks the ordering question instead.
-COPY requirements-dev.txt requirements-local.txt ./
+COPY requirements.txt requirements-dev.txt requirements-local.txt ./
 
 # The dev extras, in the same order CI installs them (lock first, then these —
 # see .github/workflows/test.yml). Additive: the lock's pins already satisfy

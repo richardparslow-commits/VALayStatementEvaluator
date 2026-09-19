@@ -269,6 +269,33 @@ class TestTheSandboxCanReadAScan(SandboxImageTestCase):
         self.assertTrue((PROJECT_ROOT / "scripts" / "ocr_and_extract.py").is_file())
 
 
+class TestWhatARequirementLineNames(unittest.TestCase):
+    """The reader behind the ordering guard, whose job is to be neither blind nor
+    gullible: it has to see all three spellings pip accepts, and it must not read an
+    option cluster as a filename."""
+
+    def test_all_three_spellings_are_read(self) -> None:
+        for line in (
+            "pip install -r requirements.txt",
+            "pip install -rrequirements.txt",
+            "pip install --requirement=requirements.txt",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(dockerfile.requirement_files_named(line), ["requirements.txt"])
+
+    def test_an_option_cluster_is_not_a_filename(self) -> None:
+        """`rm -rf …` used to be reported as reading a file named `f`."""
+        self.assertEqual(dockerfile.requirement_files_named("rm -rf /var/lib/apt/lists/*"), [])
+
+    def test_includes_are_followed_through_a_requirement_file(self) -> None:
+        """requirements-dev.txt begins with `-r requirements.txt`, so a stage that
+        carries only the first one cannot install."""
+        self.assertEqual(
+            dockerfile._requirement_closure(["requirements-dev.txt"]),
+            ["requirements-dev.txt", "requirements.txt"],
+        )
+
+
 class TestTheDeploymentImageIsUnchanged(SandboxImageTestCase):
     def test_it_stays_non_root(self) -> None:
         self.assertEqual(self.last_user(self.runtime), "nobody")
