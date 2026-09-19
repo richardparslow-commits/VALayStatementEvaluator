@@ -224,7 +224,7 @@ installs on macOS and Linux CI.
 | `VA_LSE_ALLOW_LOCAL_PATHS` | Explicitly enable local folder/file imports (`1`) for trusted single-user use only; keep unset or `0` on hosted/shared deployments | `0` (disabled) |
 | `VA_LSE_CREDITS_PER_1M_MAIN` | Approx credits per 1M tokens for the main model (enables the credit-burn gauge) | (unset — gauge shows tokens/calls only) |
 | `VA_LSE_CREDITS_PER_1M_FAST` | Approx credits per 1M tokens for the fast model (enables the credit-burn gauge) | (unset — gauge shows tokens/calls only) |
-| `VA_LSE_CREDIT_QUOTA` | Your plan's weekly credit quota, used to render %-of-quota burn | `2500` |
+| `VA_LSE_CREDIT_QUOTA` | Your plan's weekly allowance (in whatever unit the rates above use), to render %-of-quota burn | (unset — burn renders without a percentage) |
 | `VA_GOV_API_BASE_URL` | HTTPS base URL for the VA.gov record-retrieval API. Leave unset to run VA.gov auth/fetch in mock mode. | empty (mock mode) |
 | `FRONTEND_URL` | App origin for CORS allowlisting. Unused today (single-origin Streamlit app); documented for deploy-harness forward compatibility. | empty |
 | `AGILOOP_INSPECT_API_KEY` | Server-side Agiloop Inspect telemetry API key. Leave unset (with `AGILOOP_PROJECT_ID`) to run telemetry in mock/no-op mode. | empty (mock mode) |
@@ -334,18 +334,19 @@ Every run shows a live usage line in the progress caption and, after completion,
 draft/review on the Draft tab). Token counts are estimates based on prompt length and model
 output, using the provider's reported usage when the endpoint supplies it.
 
-Because QwenCloud Token Plan doesn't publish a fixed credits-per-1M-token rate, you can provide
-it two ways:
+Because providers don't publish a fixed credits-per-1M-token rate (QwenCloud Token Plan's
+changes; Perplexity bills per token in USD), you can provide one two ways:
 
 1. **Set explicit rates** — `VA_LSE_CREDITS_PER_1M_MAIN` and `VA_LSE_CREDITS_PER_1M_FAST` to
-   your plan's effective rates (explicit values always win), plus `VA_LSE_CREDIT_QUOTA` if your
-   quota differs from the 2,500-credit Lite default.
+   your plan's effective rates (explicit values always win), plus `VA_LSE_CREDIT_QUOTA` for
+   your plan's weekly allowance if you want a percentage rather than a raw estimate.
 2. **Let the watchdog learn it** (default). Every finished run persists its per-role token totals
    (main vs fast model) to a git-ignored `usage_history.json`. In the sidebar's **Usage watchdog**
-   panel, enter the plan's cumulative "credits used" reading from the QwenCloud console each time
-   after a run. With readings separated by new runs, the app fits a **separate credits-per-1M rate
-   per model** by least squares over the calibration intervals (falling back to one blended rate
-   when the data can't separate them), and uses those rates for the credit-burn estimate.
+   panel, enter your provider console's cumulative units-used reading (QwenCloud Token Plan
+   credits, a pay-per-token provider's spend) each time after a run. With readings separated by
+   new runs, the app fits a **separate units-per-1M rate per model** by least squares over the
+   calibration intervals (falling back to one blended rate when the data can't separate them), and
+   uses those rates for the credit-burn estimate.
 
 The estimator is purely informational — it never limits or throttles a run.
 
