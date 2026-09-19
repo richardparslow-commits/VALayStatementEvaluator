@@ -100,5 +100,64 @@ class TestEnvExampleDocumentsProviders(unittest.TestCase):
         )
 
 
+class TestReadmeEnvTableMatchesDefaults(unittest.TestCase):
+    """The README environment table states defaults in prose; keep them true.
+
+    Nothing else can catch a default moving in ``app/config.py`` while its README
+    row keeps describing the old value - the drift ``.env.example`` shipped once
+    (see ``TestEnvExampleDocumentsProviders``). Only rows whose Default column
+    quotes a config value directly are listed; rows that describe derived
+    behavior ("(empty = off)", "(required)") are prose and stay out.
+    """
+
+    #: README environment variable -> the config attribute its Default cell must quote.
+    ROWS: dict[str, str] = {
+        "OPENAI_BASE_URL": "DEFAULT_BASE_URL",
+        "LLM_MODEL_MAIN": "DEFAULT_MODEL_MAIN",
+        "LLM_MODEL_FAST": "DEFAULT_MODEL_FAST",
+        "LLM_ENDPOINT_FALLBACK_TIMEOUT_SECONDS": "DEFAULT_FAILOVER_AFTER_SECONDS",
+        "VA_LSE_MAX_RECORD_PAGES": "MAX_RECORD_PAGES",
+        "VA_LSE_RECORDS_CONCURRENCY": "RECORDS_CONCURRENCY",
+        "VA_LSE_PIPELINE_TIMEOUT_SECONDS": "PIPELINE_TIMEOUT_SECONDS",
+        "VA_LSE_MAX_CONCURRENT_LLM_CALLS": "LLM_MAX_CONCURRENT",
+        "VA_LSE_BLOB_STORE": "BLOB_STORE_MODE",
+        "VA_LSE_HEALTH_PORT": "HEALTH_PORT",
+        "VA_LSE_EXTRACTOR_TIMEOUT_SECONDS": "EXTRACTOR_TIMEOUT_SECONDS",
+        "VA_LSE_MAX_DIGEST_FACTS": "MAX_DIGEST_FACTS",
+        "VA_LSE_DIGEST_CHUNK_CHARS": "DIGEST_CHUNK_CHARS",
+        "VA_LSE_LLM_CALL_TIMEOUT_SECONDS": "LLM_CALL_TIMEOUT_SECONDS",
+        "VA_LSE_AUDIT_RETENTION_DAYS": "AUDIT_RETENTION_DAYS",
+    }
+
+    def _readme_defaults(self) -> dict[str, str]:
+        """The table's rows as ``env name -> Default cell``; multi-name rows are skipped."""
+        text = (Path(__file__).resolve().parent.parent / "README.md").read_text()
+        rows: dict[str, str] = {}
+        for line in text.splitlines():
+            if not line.startswith("| `"):
+                continue
+            cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+            if len(cells) < 3:
+                continue
+            name = cells[0].strip("`")
+            if "`" in name:  # a row naming two variables has no single default
+                continue
+            rows[name] = cells[2]
+        return rows
+
+    def test_readme_defaults_match_config(self) -> None:
+        rows = self._readme_defaults()
+        for env_name, attr in sorted(self.ROWS.items()):
+            with self.subTest(env=env_name):
+                self.assertIn(env_name, rows, f"{env_name} is missing from the README table")
+                expected = getattr(config, attr)
+                self.assertIn(
+                    f"`{expected}`",
+                    rows[env_name],
+                    f"README's default for {env_name} is {rows[env_name]!r}, "
+                    f"but config.{attr} ships {expected!r}",
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
