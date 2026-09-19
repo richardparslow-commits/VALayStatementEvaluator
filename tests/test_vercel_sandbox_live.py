@@ -49,6 +49,7 @@ from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests
 from scripts import vercel_sandbox_runner as runner  # noqa: E402
 
 TOKEN_ENV = "VA_LSE_TEST_VERCEL_SANDBOX_TOKEN"
+RUNNER = PROJECT_ROOT / "scripts" / "vercel_sandbox_runner.py"
 TYPED = (
     "Knee pain noted on examination, December 2024. Range of motion 100 degrees, "
     "painful motion, no ankylosis reported by the examiner."
@@ -187,6 +188,53 @@ class TestTheRunnerAgainstARealBox(LiveSandboxTestCase):
 
         self.assertEqual([doc.filename for doc in from_box], [doc.filename for doc in expected])
         self.assertEqual([doc.full_text for doc in from_box], [doc.full_text for doc in expected])
+
+
+class TestTheAppsExtractorAgainstARealBox(LiveSandboxTestCase):
+    """The whole path, live: ``app/extractors.py`` stages the record, the runner boots a
+    box from the pushed image, the entrypoint reads it, and the report is mapped back
+    through the app's own document JSON. The offline twin of this test fakes the CLI, so
+    this is the only place that contract meets a real microVM.
+
+    ``SandboxExtractor`` is fail-open, so a silent fallback would make this pass while
+    proving nothing: the assertion is that no ``extractor_sandbox`` failure was recorded,
+    and an image that is not in the registry skips rather than fails — the same condition
+    the runner's own live test skips on.
+    """
+
+    def test_a_record_is_read_on_the_box_and_mapped_back(self) -> None:
+        from app import error_report
+        from app.documents import InProcessExtractor
+        from app.extractors import CommandBoxRunner, SandboxExtractor
+
+        label, data = "progress_note.pdf", _pdf_bytes(TYPED)
+        settings = self._settings(VA_LSE_SANDBOX_IMAGE=runner.DEFAULT_IMAGE)
+        error_report._ONCE_SEEN.clear()
+        self.addCleanup(error_report._ONCE_SEEN.clear)
+
+        with patch.dict(
+            os.environ, {**self.overrides, "VA_LSE_SANDBOX_IMAGE": settings.image}, clear=False
+        ):
+            box = SandboxExtractor(
+                CommandBoxRunner(f"{sys.executable} {RUNNER} {{work}}")
+            )
+            documents, skipped = box.extract(label, data)
+
+        failures = [
+            message
+            for phase, message in error_report._ONCE_SEEN
+            if phase == "extractor_sandbox"
+        ]
+        if any(marker in " ".join(failures).lower() for marker in IMAGE_MISSING):
+            self.skipTest(f"{settings.image} is not in the registry yet: {failures[0]}")
+        self.assertEqual(
+            failures, [], "the app fell back to the in-process reader instead of the box"
+        )
+
+        expected, _expected_skipped = InProcessExtractor().extract(label, data)
+        self.assertEqual([doc.filename for doc in documents], [doc.filename for doc in expected])
+        self.assertEqual([doc.full_text for doc in documents], [doc.full_text for doc in expected])
+        self.assertEqual(skipped, [])
 
 
 if __name__ == "__main__":
