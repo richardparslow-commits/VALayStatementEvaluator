@@ -393,6 +393,77 @@ class TestTheHookEnforcesTheHarnessImport(HookRepository):
         self.assertIn("no python3 on PATH", result.stderr)
 
 
+class TestTheHookNoticesAStaleInstall(HookRepository):
+    """A copy of the hook checks less than it claims, and only its bytes can say so.
+
+    The rules resolve from the checkout, but the hook around them is whichever file
+    was installed: a copy frozen the day it was made, or — since every worktree
+    shares the main checkout's ``.git/hooks`` — a link into another checkout. No
+    rule can notice that, so the hook compares its own bytes with the checkout's
+    ``scripts/hooks/pre-commit`` and refuses a mismatch. A checkout without that
+    file (a branch from before the hook) has nothing to compare, and is not judged.
+    """
+
+    CANONICAL = "scripts/hooks/pre-commit"
+
+    def install_canonical(self, text: str) -> None:
+        path = self.repo / self.CANONICAL
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        path.chmod(0o755)
+
+    def run_installed(self, relative: str) -> subprocess.CompletedProcess:
+        """Run an installed path the way git would: bash <path>, from the root.
+
+        Git invokes a hook by its path with the working directory at the checkout
+        root — what lets a relative install (``core.hooksPath``) resolve, and what
+        the hook's comparison of its own bytes relies on.
+        """
+        bash = shutil.which("bash") or "bash"
+        return subprocess.run(
+            [bash, relative],
+            cwd=str(self.repo),
+            capture_output=True,
+            text=True,
+        )
+
+    def test_a_copy_that_does_not_match_is_refused(self) -> None:
+        """The running bytes and the checkout's disagree: whichever side is behind,
+        that side is checking less, and nothing in a commit can show which it is."""
+        self.install_canonical("#!/usr/bin/env bash\n# an older hook\nexit 0\n")
+        result = self.run_hook()
+        self.assertNotEqual(result.returncode, 0, "the commit should have been refused")
+        self.assertIn("not this checkout's hook", result.stderr)
+        self.assertIn(self.CANONICAL, result.stderr, "name the file it should be")
+        self.assertIn("core.hooksPath", result.stderr, "say how to install it")
+
+    def test_the_checkouts_own_hook_passes(self) -> None:
+        """The ``core.hooksPath`` install: git runs the checkout's file itself."""
+        self.install_canonical(HOOK.read_text(encoding="utf-8"))
+        result = self.run_installed(self.CANONICAL)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_link_to_the_checkouts_own_hook_passes(self) -> None:
+        """The link install: a different path, the same bytes."""
+        self.install_canonical(HOOK.read_text(encoding="utf-8"))
+        link = self.repo / ".git" / "hooks" / "pre-commit"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(Path("../../scripts/hooks/pre-commit"))
+        result = self.run_installed(".git/hooks/pre-commit")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_checkout_without_the_hook_file_is_not_refused(self) -> None:
+        """A branch from before the hook has nothing to compare against.
+
+        The comparison cannot be made there, and a gate must not invent a
+        mismatch — the suite's throwaway repositories and older branches both run
+        without the file.
+        """
+        result = self.run_hook()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("checkout's hook", result.stderr)
+
+
 class TestTheHookRefusesAStreamlitOptionRead(HookRepository):
     """The option rule, at the moment the mistake is made rather than after a push.
 

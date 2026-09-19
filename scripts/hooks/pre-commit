@@ -6,7 +6,9 @@
 # rules are modules it resolves from the checkout (and it is edited whenever one
 # is added), so a checkout holding a copy keeps running the version it was copied
 # from: it reports green while checking less than this file claims, which is the
-# one failure a gate may not have.
+# one failure a gate may not have. Rule 5 is the response — this version compares
+# the bytes being run with the checkout's own hook and refuses a mismatch — and a
+# copy older than that check cannot notice, because noticing is the check.
 #   ln -sfn ../../scripts/hooks/pre-commit .git/hooks/pre-commit
 #   git config core.hooksPath scripts/hooks
 # Or wire via pre-commit.com (see SECURITY.md).
@@ -19,6 +21,9 @@
 #      (tests/harness_imports.py, the same rule the suite scans with).
 #   4. Refuses staged app modules that read a Streamlit config option
 #      (tests/streamlit_option_reads.py, likewise shared with the suite).
+#   5. Refuses the commit when the bytes that ran are not this checkout's own
+#      hook — a copy, or a link into another checkout, checks what it checked the
+#      day it was installed, and only the bytes can say which version that was.
 
 set -e
 
@@ -29,6 +34,30 @@ STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null || t
 STAGED_DIFF=$(git diff --cached 2>/dev/null || true)
 
 FAIL=0
+
+# ---------------------------------------------------------------- install
+# Which file is running is the one fact no rule can recover. The modules a rule
+# calls resolve from this checkout, but the hook around them is whatever was
+# installed: a copy frozen the day it was made, or — since every worktree shares
+# the main checkout's ``.git/hooks`` — another checkout's link. Compare the bytes
+# being run with this checkout's own hook and refuse a mismatch.
+RUNNING="${BASH_SOURCE[0]:-$0}"
+TOPLEVEL=$(git rev-parse --show-toplevel 2>/dev/null || true)
+CANONICAL="$TOPLEVEL/scripts/hooks/pre-commit"
+if [ -n "$TOPLEVEL" ] && [ -f "$CANONICAL" ]; then
+  running_hash=$(git hash-object "$RUNNING" 2>/dev/null || true)
+  canonical_hash=$(git hash-object "$CANONICAL" 2>/dev/null || true)
+  if [ -n "$running_hash" ] && [ "$running_hash" != "$canonical_hash" ]; then
+    echo "✖  Blocked: the pre-commit hook that ran is not this checkout's hook." >&2
+    echo "   ran:  $RUNNING" >&2
+    echo "   here: $CANONICAL" >&2
+    echo "   A copy, or a link into another checkout, keeps checking what it" >&2
+    echo "   checked the day it was installed — green while this checkout's hook" >&2
+    echo "   would have checked more. Point git at this checkout's own file:" >&2
+    echo "     git config core.hooksPath scripts/hooks" >&2
+    FAIL=1
+  fi
+fi
 
 # ---------------------------------------------------------------- files
 block_pattern=0

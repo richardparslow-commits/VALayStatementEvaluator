@@ -116,22 +116,20 @@ in the Agiloop environment and reference them.
 
 ### Pre-commit hook (recommended)
 
-Copy `scripts/hooks/pre-commit` to `.git/hooks/pre-commit` (or wire it via
-[`pre-commit`](https://pre-commit.com/)):
-
-```bash
-cp scripts/hooks/pre-commit .git/hooks/pre-commit
-chmod +x .git/hooks/pre-commit
-```
-
-That copy goes stale the next time the hook changes, so it is worth installing as a
-link or a configured hooks path instead — either one keeps the checks below at the
-version in this repository:
+Install it as a link, or point git at the hooks directory — not as a copy (wiring
+it via [`pre-commit`](https://pre-commit.com/) is also supported, see below):
 
 ```bash
 ln -sfn ../../scripts/hooks/pre-commit .git/hooks/pre-commit   # a link to the file
 git config core.hooksPath scripts/hooks                        # or point git at the directory
 ```
+
+A copy goes stale the next time the hook changes, and in a repository with
+worktrees `.git/hooks` lives in the main checkout — so the hook every worktree runs
+can belong to another branch entirely. The hook therefore compares the bytes being
+run with the checkout's own `scripts/hooks/pre-commit` and **refuses the commit**
+when they differ, naming both files and the `core.hooksPath` install that cannot
+drift. Only a hook from before that check can still run stale.
 
 The hook rejects any staged path matching:
 
