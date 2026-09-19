@@ -606,19 +606,21 @@ MAX_TOTAL_UPLOAD_BYTES = _positive_int_env(
 )
 
 # ---------------------------------------------------------------------------
-# Optional credit-burn gauge for the usage estimator. QwenCloud Token Plan does
-# not publish a fixed credits-per-1M-token rate (and it changes), so we default
-# to "unbounded": the estimator reports calls + estimated tokens per phase but
-# only shows a credit figure once you set these to your plan's effective rates.
-# Example: if the fast model burns ~800 credits per 1M tokens on your plan, set
-# VA_LSE_CREDITS_PER_1M_FAST=800. The contributions are summed and compared to
-# the quota shown in the UI.
+# Optional credit-burn gauge for the usage estimator. No provider publishes a
+# fixed credits-per-1M-token rate (QwenCloud Token Plan's changes; Perplexity
+# bills per token in USD), so we default to "unbounded": the estimator reports
+# calls + estimated tokens per phase but only shows a plan figure once you set
+# these to your plan's effective rates. Example: if the fast model burns ~800
+# units per 1M tokens on your plan, set VA_LSE_CREDITS_PER_1M_FAST=800. The
+# contributions are summed and compared to the quota shown in the UI.
 CREDITS_PER_1M_MAIN = _float_env("VA_LSE_CREDITS_PER_1M_MAIN", None)
 CREDITS_PER_1M_FAST = _float_env("VA_LSE_CREDITS_PER_1M_FAST", None)
 
-# Weekly credit quota on the QwenCloud Individual Plan Lite (informational; used
-# only for the usage gauge, never limits the run).
-CREDIT_QUOTA = _float_env("VA_LSE_CREDIT_QUOTA", 2500.0)
+# Weekly allowance for whatever unit the rates above are in (informational; used
+# only for the usage gauge, never limits the run). Unset by default — a fresh
+# clone has no plan figure to inherit, so the gauge reports burn without a
+# percentage until you set your own.
+CREDIT_QUOTA = _float_env("VA_LSE_CREDIT_QUOTA", None)
 
 # ---------------------------------------------------------------------------
 # Circuit breaker + concurrency limiter for LLM calls (100-user protection).

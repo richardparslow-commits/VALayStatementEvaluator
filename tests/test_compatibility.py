@@ -10,6 +10,7 @@ from unittest.mock import patch, MagicMock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 
+from app import config  # noqa: E402
 from app.llm import check_model_availability, MODELS_ENDPOINT_TIMEOUT_SECONDS  # noqa: E402
 
 
@@ -71,8 +72,32 @@ class TestEnvExampleDocumentsProviders(unittest.TestCase):
     def test_env_example_lists_providers(self):
         text = (Path(__file__).resolve().parent.parent / ".env.example").read_text()
         self.assertIn("COMPATIBILITY.md", text)
+        self.assertIn("Perplexity", text)
         self.assertIn("OpenAI", text)
         self.assertIn("Ollama", text)
+
+    def test_env_example_defaults_match_the_shipped_defaults(self):
+        """The file a fresh clone copies must name the defaults app/config.py ships.
+
+        This drifted once: the Router API became the default while .env.example
+        still described QwenCloud as "(default)" with a Token Plan key and its
+        models, so a new deployment landed on the old provider with no signal.
+        """
+        values: dict[str, str] = {}
+        for line in (
+            Path(__file__).resolve().parent.parent / ".env.example"
+        ).read_text().splitlines():
+            if line and not line.lstrip().startswith("#") and "=" in line:
+                key, _, value = line.partition("=")
+                values[key.strip()] = value.strip()
+        self.assertEqual(values.get("OPENAI_BASE_URL"), config.DEFAULT_BASE_URL)
+        self.assertEqual(values.get("LLM_MODEL_MAIN"), config.DEFAULT_MODEL_MAIN)
+        self.assertEqual(values.get("LLM_MODEL_FAST"), config.DEFAULT_MODEL_FAST)
+        self.assertTrue(
+            values.get("OPENAI_API_KEY", "").startswith("pplx-"),
+            "the placeholder key should be a Perplexity key (pplx-...), got "
+            + repr(values.get("OPENAI_API_KEY")),
+        )
 
 
 if __name__ == "__main__":
