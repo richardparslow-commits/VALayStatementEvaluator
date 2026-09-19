@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import math
 import re
+import threading
 import zipfile
 import xml.etree.ElementTree as ET
 from collections import Counter
@@ -888,6 +890,8 @@ def _split_oversized(block: str, limit: int = PARAGRAPH_MAX_CHARS) -> list[str]:
 
 
 _PARAGRAPH_CACHE: dict[tuple[str, int, int], list[Paragraph]] = {}
+_PARAGRAPH_CACHE_LOCK = threading.Lock()
+_PARAGRAPH_CACHE_MAX_ENTRIES = 64
 
 
 def paragraph_index(doc: ExtractedDocument, min_chars: int = 40) -> list[Paragraph]:
@@ -896,21 +900,30 @@ def paragraph_index(doc: ExtractedDocument, min_chars: int = 40) -> list[Paragra
     Large record sets (1,000+ pages) are searched once per claim batch, so the
     split/tokenize work is memoized instead of repeated for every query.
     """
-    key = (doc.filename, len(doc.pages), doc.char_count)
-    cached = _PARAGRAPH_CACHE.get(key)
+    # Snapshot the inputs used by both hashing and extraction. Names and counts
+    # are not identity; labels, page boundaries and ordering affect citations.
+    pages = tuple((page.label, page.text) for page in doc.pages)
+    fingerprint = hashlib.sha256()
+    for page_input in pages:
+        fingerprint.update(json.dumps(page_input, ensure_ascii=True).encode("ascii"))
+    split_limit = PARAGRAPH_MAX_CHARS
+    key = (fingerprint.hexdigest(), min_chars, split_limit)
+    with _PARAGRAPH_CACHE_LOCK:
+        cached = _PARAGRAPH_CACHE.get(key)
     if cached is not None:
         return cached
     paragraphs: list[Paragraph] = []
-    for page in doc.pages:
-        for block in re.split(r"\n{2,}", page.text):
+    for label, text in pages:
+        for block in re.split(r"\n{2,}", text):
             block = block.strip()
             if len(block) < min_chars:
                 continue
-            for piece in _split_oversized(block):
-                paragraphs.append(Paragraph(page.label, piece))
-    if len(_PARAGRAPH_CACHE) > 64:  # keep the cache bounded
-        _PARAGRAPH_CACHE.clear()
-    _PARAGRAPH_CACHE[key] = paragraphs
+            for piece in _split_oversized(block, limit=split_limit):
+                paragraphs.append(Paragraph(label, piece))
+    with _PARAGRAPH_CACHE_LOCK:
+        if len(_PARAGRAPH_CACHE) >= _PARAGRAPH_CACHE_MAX_ENTRIES:
+            _PARAGRAPH_CACHE.clear()
+        _PARAGRAPH_CACHE[key] = paragraphs
     return paragraphs
 
 
