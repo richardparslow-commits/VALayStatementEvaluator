@@ -22,7 +22,10 @@
 
 set -e
 
-STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACM 2>/dev/null || true)
+# ``R`` travels with a rename: ``git mv notes.txt .env`` stages the destination as
+# a rename, and with ``ACM`` none of the checks below ever saw that path — the
+# escape ``tests/staged_sources.py`` closes for the rules with its own filter.
+STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null || true)
 STAGED_DIFF=$(git diff --cached 2>/dev/null || true)
 
 FAIL=0
@@ -64,9 +67,14 @@ done
 # Scan only non-example files — .env.example is intentionally allowed to
 # contain placeholder keys (e.g. OPENAI_API_KEY=sk-sp-your-key-here).
 NON_EXAMPLE_FILES=$(echo "$STAGED_FILES" | grep -v "^\.env\.example$" | grep -v "/\.env\.example$" || true)
-if [ -n "$NON_EXAMPLE_FILES" ]; then
-  # git diff filtered to non-example files (ignore errors if pathspec fails)
-  STAGED_DIFF_FOR_SECRETS=$(git diff --cached -- $NON_EXAMPLE_FILES 2>/dev/null || echo "$STAGED_DIFF")
+# A rename's *source* travels with its destination: `git diff -- <destination>`
+# alone cannot pair the rename, so it reports every unchanged line of the moved
+# file as added — which refused correct renames of docs that quote key shapes.
+RENAME_SOURCES=$(git diff --cached -M --name-status --diff-filter=R 2>/dev/null | cut -f2 || true)
+if [ -n "$NON_EXAMPLE_FILES" ] || [ -n "$RENAME_SOURCES" ]; then
+  # git diff over non-example files and both sides of every rename
+  # (ignore errors if the pathspec fails)
+  STAGED_DIFF_FOR_SECRETS=$(git diff --cached -M -- $NON_EXAMPLE_FILES $RENAME_SOURCES 2>/dev/null || echo "$STAGED_DIFF")
 else
   STAGED_DIFF_FOR_SECRETS=""
 fi
