@@ -462,5 +462,112 @@ class TestTheHookRefusesAStreamlitOptionRead(HookRepository):
         self.assertIn("get_option", result.stderr)
 
 
+# Fixture keys assembled at runtime rather than written as one literal,
+# deliberately: ``scripts/hooks/pre-commit`` blocks any added line containing an
+# ``sk-`` token, so a secret-shaped literal would make this file uncommittable
+# for anyone who has the hook installed. The secret rules are tested against the
+# value, and the value is exactly provider-shaped.
+_PROVIDER_KEY = "sk-" + "sp-abcdefgh12345678"
+_KEY_ASSIGNMENT = "OPENAI_API_KEY=" + _PROVIDER_KEY
+_EXTRA_KEY_ASSIGNMENT = "EXTRA_KEY=" + _PROVIDER_KEY
+
+
+class TestTheHookRefusesASecretUnderARename(HookRepository):
+    """A renamed path is a staged path: ``git mv notes.txt .env`` commits a .env.
+
+    The name patterns and the content scan both read ``--diff-filter=ACMR``, so a
+    rename arrives under the name it lands on. With ``ACM`` the destination was
+    invisible to every check below the gate's name list, and the commit was
+    accepted while ``SECURITY.md`` promises a staged ``.env`` or ``*.pem`` is
+    refused.
+    """
+
+    def commit(self, relative: str, text: str) -> None:
+        self.stage(relative, text)
+        subprocess.run(
+            ["git", "config", "user.name", "Test User"],
+            cwd=str(self.repo),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.invalid"],
+            cwd=str(self.repo),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-qm", f"add {relative}"],
+            cwd=str(self.repo),
+            check=True,
+            capture_output=True,
+        )
+
+    def rename(self, source: str, destination: str) -> None:
+        subprocess.run(
+            ["git", "mv", source, destination],
+            cwd=str(self.repo),
+            check=True,
+            capture_output=True,
+        )
+
+    def test_a_renamed_env_file_is_refused(self) -> None:
+        self.commit("notes.txt", _KEY_ASSIGNMENT + "\n")
+        self.rename("notes.txt", ".env")
+        result = self.run_hook()
+        self.assertNotEqual(result.returncode, 0, "the commit should have been refused")
+        self.assertIn(".env", result.stderr)
+
+    def test_a_renamed_pem_file_is_refused(self) -> None:
+        self.commit("certificate.txt", "-----BEGIN PRIVATE KEY-----\n")
+        self.rename("certificate.txt", "server.pem")
+        result = self.run_hook()
+        self.assertNotEqual(result.returncode, 0, "the commit should have been refused")
+        self.assertIn("server.pem", result.stderr)
+
+    def test_a_rename_that_adds_a_key_is_refused(self) -> None:
+        """The content scan follows the rename too, not only the name patterns.
+
+        The body is long enough that git calls this a rename *with changes* rather
+        than an unrelated add and delete — the shape where the destination is the
+        path a check has to look at.
+        """
+        body = "".join(f"line {number}\n" for number in range(15))
+        self.commit("notes.txt", body)
+        self.rename("notes.txt", "renamed.txt")
+        (self.repo / "renamed.txt").write_text(
+            body + _EXTRA_KEY_ASSIGNMENT + "\n", encoding="utf-8"
+        )
+        subprocess.run(
+            ["git", "add", "renamed.txt"],
+            cwd=str(self.repo),
+            check=True,
+            capture_output=True,
+        )
+        result = self.run_hook()
+        self.assertNotEqual(result.returncode, 0, "the commit should have been refused")
+        self.assertIn("sk-", result.stderr)
+
+    def test_an_ordinary_rename_is_allowed(self) -> None:
+        self.commit("notes.txt", "hello\n")
+        self.rename("notes.txt", "renamed.txt")
+        result = self.run_hook()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_rename_of_a_file_that_quotes_key_shapes_is_allowed(self) -> None:
+        """A moved file is judged on what it *changes*, not on what it already says.
+
+        Docs quote key shapes — ``MIGRATION.md`` and ``.env.example`` both do — and
+        a moved file's unchanged lines are not new to the repository. Reading them
+        as if they were added refused ordinary renames, which is why the content
+        scan keeps each rename's source beside its destination.
+        """
+        quoted = "Set `" + _KEY_ASSIGNMENT + "` in `.env`.\n"
+        self.commit("guide.md", quoted)
+        self.rename("guide.md", "moved-guide.md")
+        result = self.run_hook()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
