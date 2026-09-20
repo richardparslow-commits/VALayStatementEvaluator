@@ -263,7 +263,8 @@ preflight refusing to spend a run on a configuration that cannot work. Nothing w
 model and no credits were used — the check itself is a model listing plus one short chat call,
 which is what a run's own first call costs. If that configuration was checked moments ago —
 by **Test connection** or an earlier run attempt — its verdict is reused for a few minutes
-instead of probing again.
+instead of probing again; when that reused verdict is what refused the run, the notice
+says how old the check is.
 
 | Message | What it means | What to do |
 |---|---|---|

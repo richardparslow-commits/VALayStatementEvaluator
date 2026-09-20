@@ -202,9 +202,24 @@ def _endpoint_block_key(action: str) -> str:
     return f"endpoint_preflight_block_{action}"
 
 
+def _endpoint_age_key(action: str) -> str:
+    """Session key for how old a *reused* block's verdict was when it was stored."""
+    return _endpoint_block_key(action) + "_age"
+
+
 def _clear_endpoint_block(action: str) -> None:
     st.session_state.pop(_endpoint_block_key(action), None)
     st.session_state.pop(_endpoint_block_key(action) + "_sig", None)
+    st.session_state.pop(_endpoint_age_key(action), None)
+
+
+def _age_label(seconds: float) -> str:
+    """A short human age — ``40 seconds`` / ``3 minutes`` — for the reuse notes."""
+    if seconds < 90:
+        value, unit = max(1, round(seconds)), "second"
+    else:
+        value, unit = max(1, round(seconds / 60)), "minute"
+    return f"{value} {unit}{'' if value == 1 else 's'}"
 
 
 def check_endpoint_gate(action: str, *, log_action: str, request_id: str = "") -> bool:
@@ -219,7 +234,8 @@ def check_endpoint_gate(action: str, *, log_action: str, request_id: str = "") -
     :func:`render_endpoint_preflight_notice` can keep it on screen with the waiver
     beside it — a user must be able to overrule a check that is wrong about their
     endpoint, because refusing to start a working run is worse than the failure the
-    check prevents.
+    check prevents. A reused check is stated where the run starts — with the age of
+    the check behind it — so a skipped probe is never silent.
     """
     settings = session_settings()
     signature = preflight.signature(settings)
@@ -228,6 +244,7 @@ def check_endpoint_gate(action: str, *, log_action: str, request_id: str = "") -
     # keeps a healthy configuration from being probed once per run.
     verdict = preflight.reusable_verdict(st.session_state, settings)
     reused = verdict is not None
+    age = preflight.verdict_age(st.session_state, settings) if reused else None
     if verdict is None:
         verdict = preflight.check_endpoint(settings)
         # Keep it for the next attempt on this configuration. Only a probe refreshes
@@ -235,15 +252,21 @@ def check_endpoint_gate(action: str, *, log_action: str, request_id: str = "") -
         # that keeps running cannot postpone the next real check forever.
         preflight.remember_verdict(st.session_state, settings, verdict)
     logger.info(
-        "endpoint preflight action=%s kind=%s status=%s missing=%s reused=%s",
+        "endpoint preflight action=%s kind=%s status=%s missing=%s reused=%s age_s=%s",
         action,
         verdict.kind,
         verdict.status,
         list(verdict.missing),
         reused,
+        None if age is None else round(age, 1),
         extra={"request_id": request_id or "-", "phase": "endpoint_preflight", "status": verdict.kind},
     )
     if not verdict.blocks:
+        if age is not None:
+            st.caption(
+                f"Endpoint preflight: reused the check from {_age_label(age)} ago — "
+                "no request was sent."
+            )
         _clear_endpoint_block(action)
         return True
 
@@ -261,6 +284,10 @@ def check_endpoint_gate(action: str, *, log_action: str, request_id: str = "") -
 
     st.session_state[_endpoint_block_key(action)] = verdict
     st.session_state[_endpoint_block_key(action) + "_sig"] = signature
+    if age is not None:
+        st.session_state[_endpoint_age_key(action)] = age
+    else:
+        st.session_state.pop(_endpoint_age_key(action), None)
     run_log_event(
         log_action,
         "rejected",
@@ -290,6 +317,12 @@ def render_endpoint_preflight_notice(action: str) -> None:
         _clear_endpoint_block(action)
         return
     st.error(f"⛔ Run not started — {verdict.headline}\n\n{verdict.fix}")
+    age = st.session_state.get(_endpoint_age_key(action))
+    if isinstance(age, (int, float)):
+        st.caption(
+            f"Reused the check from {_age_label(float(age))} ago — no request was sent "
+            "when the run was attempted."
+        )
     with st.expander("The check can be wrong — start the run anyway"):
         st.caption(
             "Some OpenAI-compatible servers answer `/models` differently than they serve "

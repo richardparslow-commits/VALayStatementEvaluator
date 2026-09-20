@@ -542,6 +542,22 @@ class TestVerdictReuse(unittest.TestCase):
         self.assertEqual(store[preflight.VERDICT_SESSION_KEY]["at"], 1_000.0)
         self.assertIsNone(preflight.reusable_verdict(store, settings, now=boundary + 0.001))
 
+    def test_the_age_of_a_reusable_verdict_is_its_probe_age(self) -> None:
+        settings = _settings()
+        store = self._store(settings, self._verdict(), now=1_000.0)
+
+        self.assertEqual(preflight.verdict_age(store, settings, now=1_042.5), 42.5)
+
+    def test_there_is_no_age_without_a_reusable_verdict(self) -> None:
+        settings = _settings()
+        store = self._store(settings, self._verdict(), now=1_000.0)
+        boundary = 1_000.0 + preflight.VERDICT_REUSE_SECONDS
+
+        self.assertIsNone(preflight.verdict_age({}, settings, now=1_000.0))
+        self.assertIsNone(preflight.verdict_age(store, _settings(api_key="other-key"), now=1_010.0))
+        self.assertIsNone(preflight.verdict_age(store, settings, now=boundary + 0.001))
+        self.assertIsNone(preflight.verdict_age(store, settings, now=999.0))
+
     def test_remembering_again_replaces_the_earlier_verdict(self) -> None:
         settings = _settings()
         store = self._store(settings, self._verdict(), now=1_000.0)
@@ -708,6 +724,76 @@ class TestEndpointGate(unittest.TestCase):
             shared.check_endpoint_gate("draft", log_action="draft", request_id="req_3")
             self.assertEqual(check.call_count, 2)  # stale on schedule: probed again
 
+    def test_a_reused_check_is_reported_where_the_run_starts(self) -> None:
+        import app.views.shared as shared
+
+        st_mock = _fake_st()
+        preflight.remember_verdict(
+            st_mock.session_state, _settings(), preflight.Verdict(preflight.OK, headline="fine")
+        )
+        with patch.object(shared, "st", st_mock), patch.object(
+            shared, "session_settings", return_value=_settings()
+        ), patch.object(
+            shared.preflight, "check_endpoint", side_effect=AssertionError("probed anyway")
+        ):
+            self.assertTrue(
+                shared.check_endpoint_gate("draft", log_action="draft", request_id="req_1")
+            )
+        note = str(st_mock.caption.call_args[0][0])
+        self.assertIn("reused the check", note)
+        self.assertIn("no request was sent", note)
+        self.assertIn("1 second", note)  # an age of zero reads as a second, never as none
+
+    def test_a_fresh_probe_reports_no_reuse(self) -> None:
+        import app.views.shared as shared
+
+        st_mock = _fake_st()
+        with patch.object(shared, "st", st_mock), patch.object(
+            shared, "session_settings", return_value=_settings()
+        ), patch.object(
+            shared.preflight, "check_endpoint", return_value=preflight.Verdict(preflight.OK, "fresh")
+        ):
+            self.assertTrue(
+                shared.check_endpoint_gate("draft", log_action="draft", request_id="req_1")
+            )
+        st_mock.caption.assert_not_called()
+
+    def test_a_reused_block_remembers_how_old_the_check_was(self) -> None:
+        import app.views.shared as shared
+
+        st_mock = _fake_st()
+        verdict = preflight.Verdict(preflight.BLOCKED, headline="The endpoint rejected this API key.")
+        preflight.remember_verdict(st_mock.session_state, _settings(), verdict)
+        with patch.object(shared, "st", st_mock), patch.object(
+            shared, "session_settings", return_value=_settings()
+        ), patch.object(
+            shared.preflight, "check_endpoint", side_effect=AssertionError("probed anyway")
+        ), patch.object(shared, "run_log_event"):
+            self.assertFalse(
+                shared.check_endpoint_gate("draft", log_action="draft", request_id="req_1")
+            )
+        age = st_mock.session_state[shared._endpoint_age_key("draft")]
+        self.assertIsInstance(age, float)
+        self.assertGreaterEqual(age, 0.0)
+
+    def test_a_fresh_block_clears_an_older_reuse_age(self) -> None:
+        """A stale age must not decorate a block that was just probed."""
+        import app.views.shared as shared
+
+        st_mock = _fake_st()
+        st_mock.session_state[shared._endpoint_age_key("draft")] = 42.0
+        with patch.object(shared, "st", st_mock), patch.object(
+            shared, "session_settings", return_value=_settings()
+        ), patch.object(
+            shared.preflight,
+            "check_endpoint",
+            return_value=preflight.Verdict(preflight.BLOCKED, headline="blocked"),
+        ), patch.object(shared, "run_log_event"):
+            self.assertFalse(
+                shared.check_endpoint_gate("draft", log_action="draft", request_id="req_1")
+            )
+        self.assertNotIn(shared._endpoint_age_key("draft"), st_mock.session_state)
+
     def test_a_reused_block_still_refuses_the_run(self) -> None:
         import app.views.shared as shared
 
@@ -823,6 +909,52 @@ class TestEndpointNotice(unittest.TestCase):
         ):
             shared.render_endpoint_preflight_notice("draft")
         st_mock.error.assert_not_called()
+
+
+    def test_the_notice_says_when_the_block_came_from_a_reused_check(self) -> None:
+        import app.views.shared as shared
+
+        st_mock = _fake_st()
+        signature = preflight.signature(_settings())
+        st_mock.session_state[shared._endpoint_block_key("draft")] = preflight.Verdict(
+            preflight.BLOCKED, headline="The endpoint rejected this API key."
+        )
+        st_mock.session_state[shared._endpoint_block_key("draft") + "_sig"] = signature
+        st_mock.session_state[shared._endpoint_age_key("draft")] = 42.0
+        with patch.object(shared, "st", st_mock), patch.object(
+            shared, "session_settings", return_value=_settings()
+        ):
+            shared.render_endpoint_preflight_notice("draft")
+        notes = [str(call.args[0]) for call in st_mock.caption.call_args_list]
+        reuse = [n for n in notes if "Reused the check" in n]
+        self.assertEqual(len(reuse), 1, notes)
+        self.assertIn("42 seconds ago", reuse[0])
+        self.assertIn("no request was sent", reuse[0])
+
+    def test_a_fresh_block_says_nothing_about_reuse(self) -> None:
+        import app.views.shared as shared
+
+        st_mock = _fake_st()
+        signature = preflight.signature(_settings())
+        st_mock.session_state[shared._endpoint_block_key("draft")] = preflight.Verdict(
+            preflight.BLOCKED, headline="blocked"
+        )
+        st_mock.session_state[shared._endpoint_block_key("draft") + "_sig"] = signature
+        with patch.object(shared, "st", st_mock), patch.object(
+            shared, "session_settings", return_value=_settings()
+        ):
+            shared.render_endpoint_preflight_notice("draft")
+        notes = [str(call.args[0]) for call in st_mock.caption.call_args_list]
+        self.assertFalse([n for n in notes if "Reused" in n], notes)
+
+    def test_clearing_a_block_also_clears_the_reuse_age(self) -> None:
+        import app.views.shared as shared
+
+        st_mock = _fake_st()
+        st_mock.session_state[shared._endpoint_age_key("draft")] = 42.0
+        with patch.object(shared, "st", st_mock):
+            shared._clear_endpoint_block("draft")
+        self.assertNotIn(shared._endpoint_age_key("draft"), st_mock.session_state)
 
 
 class TestRunFlowsAreStopped(unittest.TestCase):

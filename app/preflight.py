@@ -464,13 +464,12 @@ def remember_verdict(
     }
 
 
-def reusable_verdict(
+def _reusable_entry(
     store: VerdictStore,
     settings: Settings,
-    *,
-    now: float | None = None,
-) -> Verdict | None:
-    """The stored verdict for *settings*, if recent enough to stand in for a probe.
+    now: float | None,
+) -> tuple[dict[str, Any], float] | None:
+    """The stored entry for *settings* and its age, when it may stand in for a probe.
 
     ``None`` whenever the entry is missing, describes a different configuration, or
     is older than :data:`VERDICT_REUSE_SECONDS` — the caller then probes as usual.
@@ -489,4 +488,31 @@ def reusable_verdict(
     age = (time.monotonic() if now is None else now) - at
     if age < 0 or age > VERDICT_REUSE_SECONDS:
         return None
-    return verdict_from_session(entry.get("verdict"))
+    return entry, age
+
+
+def reusable_verdict(
+    store: VerdictStore,
+    settings: Settings,
+    *,
+    now: float | None = None,
+) -> Verdict | None:
+    """The stored verdict for *settings*, if recent enough to stand in for a probe."""
+    found = _reusable_entry(store, settings, now)
+    return verdict_from_session(found[0].get("verdict")) if found else None
+
+
+def verdict_age(
+    store: VerdictStore,
+    settings: Settings,
+    *,
+    now: float | None = None,
+) -> float | None:
+    """Seconds since the probe behind the verdict that would be reused, or ``None``.
+
+    The companion to :func:`reusable_verdict`, for callers that report *why* no probe
+    happened. Measured from the probe, never from a later read — see
+    :data:`VERDICT_REUSE_SECONDS`.
+    """
+    found = _reusable_entry(store, settings, now)
+    return found[1] if found else None
