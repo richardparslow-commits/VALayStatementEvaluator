@@ -149,6 +149,30 @@ class TestResponsesOutputText(unittest.TestCase):
         self.assertEqual(llm._responses_output_text("not a dict"), "")
         self.assertEqual(llm._responses_output_text({"output_text": "   "}), "")
 
+    def test_a_failed_run_body_yields_the_provider_error_not_generic_empty(self) -> None:
+        body = _responses_body(text="", status="failed", with_output_text_key=False)
+        body["error"] = {"message": "quota exhausted"}
+        err = llm._responses_empty_error(body)
+        self.assertIn("failed", str(err))
+        self.assertIn("quota exhausted", str(err))
+        self.assertNotIn("empty response", str(err))
+
+    def test_a_completed_run_with_no_text_still_says_empty(self) -> None:
+        err = llm._responses_empty_error(_responses_body(text="  "))
+        self.assertIn("empty response", str(err))
+
+    def test_the_error_object_is_read_off_the_sdk_typed_shape(self) -> None:
+        # Through the real SDK the error object arrives as a typed attribute
+        # object, not a dict — found by the live wire harness.
+        from types import SimpleNamespace
+
+        obj = SimpleNamespace(
+            status="failed",
+            error=SimpleNamespace(message="invalid model id: nope/bogus"),
+        )
+        self.assertEqual(llm._responses_error_message(obj), "invalid model id: nope/bogus")
+        self.assertIn("nope/bogus", str(llm._responses_empty_error(obj)))
+
     def test_chat_output_text_reads_choices(self) -> None:
         self.assertEqual(llm._chat_output_text(_chat_response(" hi ")), "hi")
         self.assertEqual(llm._chat_output_text(MagicMock(choices=[])), "")
@@ -229,6 +253,18 @@ class TestResponsesWireCall(unittest.TestCase):
 
         with self.assertRaises(llm.LLMError):
             client.chat("s", "u", phase="t")
+
+    def test_runs_are_sent_with_store_false(self) -> None:
+        # The app's payloads carry medical records; runs are not continued via
+        # previous_response_id, so server-side storage is opted out of.
+        client = self._client("https://api.perplexity.ai/v1")
+        responses = MagicMock()
+        responses.create.return_value = _responses_body()
+        client._client.responses = responses
+
+        client.chat("s", "u", phase="t")
+
+        self.assertIs(responses.create.call_args.kwargs["store"], False)
 
     def test_chat_endpoint_sends_messages_unchanged(self) -> None:
         client = self._client("https://openai-compatible.invalid/v1")
@@ -312,6 +348,29 @@ class TestProbeChatDialects(unittest.TestCase):
             probe = llm.probe_chat("https://api.perplexity.ai/v1", "k", "m")
         self.assertEqual(probe.status, 403)
         self.assertIn("no entitlement", probe.error)
+
+    def test_a_failed_run_under_http_200_names_the_provider_error(self) -> None:
+        # The Agent API returns 200 for a run that then failed server-side; the
+        # reason lives in error.message. The probe must surface it, not report
+        # a generic empty-completion.
+        body = _responses_body(text="", status="failed", with_output_text_key=False)
+        body["error"] = {"message": "model is over capacity"}
+        with _ok(json.dumps(body).encode("utf-8")):
+            probe = llm.probe_chat("https://api.perplexity.ai/v1", "k", "m")
+        self.assertFalse(probe.ok)
+        self.assertIn("failed", probe.error)
+        self.assertIn("model is over capacity", probe.error)
+
+    def test_the_probe_does_not_ask_the_endpoint_to_store_anything(self) -> None:
+        captured: dict = {}
+
+        def fake_urlopen(req, timeout):  # noqa: ANN001
+            captured["payload"] = json.loads(req.data.decode("utf-8"))
+            return _Resp(json.dumps(_responses_body()).encode("utf-8"))
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            llm.probe_chat("https://api.perplexity.ai/v1", "k", "m")
+        self.assertIs(captured["payload"].get("store"), False)
 
 
 if __name__ == "__main__":
