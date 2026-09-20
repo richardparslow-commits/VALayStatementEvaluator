@@ -122,31 +122,32 @@ def _setting(
     return env or default
 
 
-# Default endpoint: Perplexity's **Router API**, which serves the OpenAI Chat
-# Completions schema at POST {base_url}/chat/completions — the documented drop-in
-# for an existing OpenAI integration, where "only the base URL and API key need to
-# change" (https://docs.perplexity.ai/docs/router/quickstart). Nothing in
-# ``app/llm.py`` is Perplexity-specific: it sends model/temperature/max_tokens/
-# messages and parses text, so the same one Perplexity key also serves the
-# web-grounded Agent API on the Research tab.
+# Default endpoint: Perplexity's **Agent API**, which serves the OpenAI SDK's
+# Responses schema at POST {base_url}/responses (``/v1/agent`` is the same route;
+# ``/v1/responses`` is the SDK-compatibility alias —
+# https://docs.perplexity.ai/docs/agent-api/openai-compatibility). The Agent API
+# replaces the deprecated Sonar API, routes to first-party models (OpenAI,
+# Anthropic, Google, xAI, Moonshot, Z.ai) under one Perplexity key at direct
+# provider pricing, and is the multi-provider endpoint Perplexity documents for
+# building agents — unlike the Router API, which is a *private preview* whose
+# completion route refused every call without an entitlement (the 403 that took
+# whole runs down before this pivot). Nothing in ``app/llm.py`` is
+# Perplexity-specific: it sends the system+user pair as ``input`` and parses the
+# answer, so the same client also serves any Chat-Completions endpoint when the
+# operator points ``OPENAI_BASE_URL`` at one.
 #
 # The same API key must be in OPENAI_API_KEY (this endpoint) and, for the Research
 # tab, PERPLEXITY_API_KEY — both are the same credential, read under the names the
 # two integrations use. The app still speaks to ANY OpenAI-compatible endpoint;
 # see COMPATIBILITY.md / MIGRATION.md for the other providers.
-#
-# CAVEAT: the Router API is in *private preview* — request access from
-# api@perplexity.ai before relying on this default. The catalog is also an
-# allowlist: an unknown model id returns 400 naming it, which is why the two
-# defaults below are ids from the published catalog rather than guesses.
-DEFAULT_BASE_URL = "https://api.perplexity.ai/router/v1"
+DEFAULT_BASE_URL = "https://api.perplexity.ai/v1"
 # Host check for the credential aliasing in ``_perplexity_api_key_setting``.
 PERPLEXITY_HOST = "api.perplexity.ai"
 
 # Model split, tuned to how this app actually spends tokens.
 #
 # Main — claim extraction, verification, rubric scoring, topic audit, rewrite:
-# low-volume and quality-critical, so it gets the strongest model in the Router
+# low-volume and quality-critical, so it gets the strongest model in the Agent API
 # catalog. Kimi K3 is the flagship there ($3 in / $15 out per 1M; cache reads
 # $0.30). Override with LLM_MODEL_MAIN.
 DEFAULT_MODEL_MAIN = "perplexity/kimi-k3"
@@ -368,7 +369,7 @@ def load_settings() -> Settings:
 def _perplexity_api_key_setting(base_url: str, from_secrets: set[str]) -> str:
     """Resolve the Agent API key, aliasing ``OPENAI_API_KEY`` when the primary is Perplexity.
 
-    One Perplexity API key serves both the Router endpoint (Chat Completions, set as
+    One Perplexity API key serves both the main endpoint (Responses/Chat, set as
     ``OPENAI_API_KEY``) and the Agent API (web-grounded research), and the default base URL
     is now Perplexity's. Requiring the *same* string under a second variable would leave a
     correctly configured install reporting "research is not configured" — so when, and only

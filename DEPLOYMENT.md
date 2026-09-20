@@ -977,7 +977,7 @@ All deployment-relevant variables (see `README.md` for the full list):
 | Variable | Purpose | Default | Recommended for production |
 |---|---|---|---|
 | `OPENAI_API_KEY` | LLM API key | (required) | Store in K8s Secret or Docker secret |
-| `OPENAI_BASE_URL` | LLM endpoint | Perplexity Router API (`https://api.perplexity.ai/router/v1`) | Verify against your provider; pin it explicitly in production rather than relying on a default |
+| `OPENAI_BASE_URL` | LLM endpoint | Perplexity Agent API (`https://api.perplexity.ai/v1`) | Verify against your provider; pin it explicitly in production rather than relying on a default |
 | `LLM_MODEL_MAIN` | Analysis model | `perplexity/kimi-k3` | Match your plan |
 | `LLM_MODEL_FAST` | Bulk digest model | `perplexity/glm-5.3-flash` | Match your plan |
 | `VA_LSE_RECORDS_CONCURRENCY` | Parallel digest workers | `2` | Raise for higher-tier endpoints |
@@ -1459,7 +1459,7 @@ environment variables above. Add your provider key there under `OPENAI_API_KEY`,
 endpoint and models as:
 
 ```toml
-OPENAI_BASE_URL = "https://api.perplexity.ai/router/v1"
+OPENAI_BASE_URL = "https://api.perplexity.ai/v1"
 LLM_MODEL_MAIN = "perplexity/kimi-k3"
 LLM_MODEL_FAST = "perplexity/glm-5.3-flash"
 ```

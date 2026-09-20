@@ -13,7 +13,13 @@ from openai import NOT_GIVEN, OpenAI
 from . import tracing
 from . import metrics
 from .circuit_breaker import CircuitBreakerOpenError, QueueFullError, get_llm_breaker, get_llm_limiter
-from .config import FALLBACK_ENDPOINT, PRIMARY_ENDPOINT, Settings
+from .config import (
+    DEFAULT_BASE_URL,
+    FALLBACK_ENDPOINT,
+    PRIMARY_ENDPOINT,
+    PERPLEXITY_HOST,
+    Settings,
+)
 from .logging_config import get_request_id
 from .pipeline_guard import (
     check_pipeline_cancelled, pipeline_remaining_seconds, wait_with_cancellation,
@@ -310,11 +316,131 @@ def probe_models(base_url: str, api_key: str) -> ModelProbe:
     return ModelProbe(ids, 200, "")
 
 
-class ChatProbe(NamedTuple):
-    """Outcome of one short ``POST {base_url}/chat/completions`` check.
+# ---------------------------------------------------------------- wire formats
+#
+# Two schemas share the ``LLMClient.chat`` signature. Which one an endpoint speaks
+# is decided once, from its base URL:
+#
+# * **Responses** (Perplexity's Agent API, the default endpoint): POST
+#   {base_url}/responses with ``input`` / ``instructions`` / ``max_output_tokens``
+#   (https://docs.perplexity.ai/docs/agent-api/openai-compatibility). ``input``
+#   accepts a plain string, which the service treats as a single user turn; the
+#   system prompt travels in ``instructions``.
+# * **Chat Completions** (every other OpenAI-compatible endpoint): POST
+#   {base_url}/chat/completions with ``messages`` / ``max_tokens``.
+#
+# ``/v1/agent`` is the same service as ``/v1/responses``; the SDK alias is what a
+# base URL of ``.../v1`` hits.
 
-    A model *listing* is not a promise. Perplexity's Router API answers
-    ``GET /models`` with its ids and then refuses every completion with ``403 The
+def _is_perplexity_base_url(base_url: str) -> bool:
+    """True when *base_url* is any Perplexity host (main or fallback endpoint).
+
+    The path is not inspected: ``.../v1`` and ``.../router/v1`` both name the same
+    provider, and the Router host also serves Chat Completions, so only the host
+    identifies it. Comparing registered domains (not ``in``) keeps a hostile lookalike
+    like ``api.perplexity.ai.evil.test`` from being classed as Perplexity.
+    """
+    host = (urlparse(base_url.strip()).hostname or "").lower()
+    if not host:
+        return False
+    return host == PERPLEXITY_HOST or host.endswith(f".{PERPLEXITY_HOST}")
+
+
+def _uses_responses_schema(base_url: str) -> bool:
+    """Endpoints on a Perplexity host speak Responses; everything else, Chat Completions.
+
+    A custom deployment that wants Chat Completions on a Perplexity host (the retired
+    Router) can still be addressed by IP or a proxy URL, which falls through to the
+    Chat path — the split exists to make the *documented* shape the effortless one.
+    """
+    return _is_perplexity_base_url(base_url)
+
+
+def _responses_input(system: str, user: str) -> str:
+    """Serialize the system+user pair into the stateless ``input`` string.
+
+    The Responses endpoint is stateless — there is no server-side thread — so the
+    whole prompt travels in ``input`` on every call, exactly as the Chat path sends
+    ``messages`` every call. The system text rides in ``instructions`` and is joined
+    here with the same separation the Chat payload's two roles give it.
+    """
+    return f"{system}\n\n{user}" if system.strip() else user
+
+
+def _responses_field(obj: Any, name: str) -> Any:
+    """Read *name* off a Responses payload, which arrives as two shapes.
+
+    The SDK's ``responses.create`` returns a typed object with attributes; the
+    preflight probe parses the same JSON by hand and holds dicts. Reading both
+    here keeps one parser honest for the two callers.
+    """
+    if isinstance(obj, dict):
+        return obj.get(name)
+    return getattr(obj, name, None)
+
+
+def _responses_output_text(body: Any) -> str:
+    """The answer text in a Responses payload, or "" when there is none.
+
+    Reads ``output_text`` (the SDK's convenience aggregation, and what Perplexity's
+    own examples read), then walks ``output`` items — an ``output_text`` content part
+    on any item — so a service that omits the aggregation still yields its text.
+    Accepts the SDK's typed response object or a raw parsed dict.
+    """
+    text = _responses_field(body, "output_text")
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+    items = _responses_field(body, "output")
+    if not isinstance(items, (list, tuple)):
+        return ""
+    for item in items:
+        content = _responses_field(item, "content")
+        if not isinstance(content, (list, tuple)):
+            continue
+        for part in content:
+            if _responses_field(part, "type") != "output_text":
+                continue
+            text = _responses_field(part, "text")
+            if isinstance(text, str) and text.strip():
+                return text.strip()
+    return ""
+
+
+def _responses_usage_tokens(body: Any) -> tuple[int | None, int | None]:
+    """``usage.input_tokens`` / ``usage.output_tokens`` from a Responses payload.
+
+    The Responses schema renames the Chat usage fields; both are optional. Accepts
+    the SDK's typed response object or a raw parsed dict.
+    """
+    usage = _responses_field(body, "usage")
+    prompt = _responses_field(usage, "input_tokens")
+    completion = _responses_field(usage, "output_tokens")
+    if not isinstance(prompt, int) or prompt < 0:
+        prompt = None
+    if not isinstance(completion, int) or completion < 0:
+        completion = None
+    return prompt, completion
+
+
+def _chat_output_text(response: Any) -> str:
+    """Answer text from an SDK Chat Completions response, or "" when there is none."""
+    try:
+        content = response.choices[0].message.content
+    except (AttributeError, IndexError, TypeError):
+        return ""
+    return content.strip() if isinstance(content, str) else ""
+
+
+def _endpoint_request_url(base_url: str, *, responses: bool) -> str:
+    """The URL the wire call (or a probe log line) will actually hit."""
+    return base_url.rstrip("/") + ("/responses" if responses else "/chat/completions")
+
+
+class ChatProbe(NamedTuple):
+    """Outcome of one short real-call check against the configured endpoint.
+
+    A model *listing* is not a promise. Perplexity's Router API answered
+    ``GET /models`` with its ids and then refused every completion with ``403 The
     Router API is currently in limited preview`` (measured), which is indistinguishable
     from a healthy endpoint until something actually calls it — so the preflight
     follows the listing with one real call.
@@ -350,20 +476,36 @@ def probe_chat(base_url: str, api_key: str, model: str) -> ChatProbe:
     during the check and poison the run the check exists to protect.
 
     Stdlib only (urllib), so it adds no dependency and no client to keep in sync.
+
+    The request body matches the endpoint's schema: Responses (``input`` /
+    ``max_output_tokens``) on a Perplexity base URL, Chat Completions
+    (``messages`` / ``max_tokens``) everywhere else — the same split the run-time
+    client uses, so the probe practices exactly what a run will do.
     """
     if not api_key or not api_key.strip():
         return ChatProbe(None, "no API key was supplied")
     if not model or not model.strip():
         return ChatProbe(None, "no model was configured to call")
-    url = base_url.rstrip("/") + "/chat/completions"
-    payload = json.dumps(
-        {
-            "model": model.strip(),
-            "messages": [{"role": "user", "content": CHAT_PROBE_PROMPT}],
-            "max_tokens": CHAT_PROBE_MAX_TOKENS,
-            "temperature": 0,
-        }
-    ).encode("utf-8")
+    responses = _uses_responses_schema(base_url)
+    url = _endpoint_request_url(base_url, responses=responses)
+    if responses:
+        payload = json.dumps(
+            {
+                "model": model.strip(),
+                "input": CHAT_PROBE_PROMPT,
+                "max_output_tokens": CHAT_PROBE_MAX_TOKENS,
+                "temperature": 0,
+            }
+        ).encode("utf-8")
+    else:
+        payload = json.dumps(
+            {
+                "model": model.strip(),
+                "messages": [{"role": "user", "content": CHAT_PROBE_PROMPT}],
+                "max_tokens": CHAT_PROBE_MAX_TOKENS,
+                "temperature": 0,
+            }
+        ).encode("utf-8")
     try:
         import urllib.error
         import urllib.request
@@ -381,6 +523,23 @@ def probe_chat(base_url: str, api_key: str, model: str) -> ChatProbe:
             body = json.loads(resp.read().decode("utf-8"))
     except Exception as exc:  # noqa: BLE001 - availability check is advisory only
         return ChatProbe(_http_status(exc), _probe_error_text(exc))
+    if responses:
+        reply = _responses_output_text(body)
+        if reply:
+            return ChatProbe(200, "", reply)
+        status = body.get("status") if isinstance(body, dict) else None
+        if isinstance(status, str) and status == "completed":
+            # The provider served the call and reports the run completed; the model
+            # spent the probe's budget on hidden reasoning (see ``ChatProbe.silent``).
+            return ChatProbe(200, "", silent=True)
+        if isinstance(body, dict) and ("output" in body or "output_text" in body):
+            # A Responses-shaped answer object with no text in it. An "incomplete"
+            # status is reported as the error it is; anything else still proves the
+            # endpoint served a Responses run.
+            if isinstance(status, str) and status != "completed":
+                return ChatProbe(200, f"the run did not complete (status: {status})")
+            return ChatProbe(200, "", silent=True)
+        return ChatProbe(200, f"{url} answered without a completion")
     reply = _completion_text(body)
     if reply:
         return ChatProbe(200, "", reply)
@@ -780,6 +939,57 @@ class LLMClient:
             return self._fallback_client
         return self._client
 
+    def _call_openai(
+        self,
+        endpoint: str,
+        model: str,
+        system: str,
+        user: str,
+        temperature: float,
+        max_tokens: int,
+        request_timeout: Any,
+    ) -> tuple[Any, bool]:
+        """One provider call in the endpoint's own schema; ``(response, is_responses)``.
+
+        The OpenAI SDK's ``responses.create`` is used for the Responses schema so the
+        SDK stays the single wire dependency (it posts ``{base_url}/responses`` and
+        parses into objects); raw kwargs mirror what the SDK sends so the failover
+        and retry paths behave identically across schemas. Returns the schema flag
+        alongside the response because the answer and usage live at different keys
+        in each shape, and the caller must not guess.
+        """
+        client = self._endpoint_client(endpoint)
+        if _uses_responses_schema(self._endpoint_base_url(endpoint)):
+            request: dict[str, Any] = {
+                "model": model,
+                "input": _responses_input(system, user),
+                "max_output_tokens": max(1, max_tokens),
+            }
+            if system.strip():
+                request["instructions"] = system
+            if temperature != 0.2:
+                request["temperature"] = temperature
+            if request_timeout is not NOT_GIVEN:
+                request["timeout"] = request_timeout
+            return client.responses.create(**request), True
+        return client.chat.completions.create(
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            timeout=request_timeout,
+        ), False
+
+    def _endpoint_base_url(self, endpoint: str) -> str:
+        """The base URL *endpoint* will be called with (schema is decided from it)."""
+        if endpoint == FALLBACK_ENDPOINT:
+            target = _fallback_target(self._settings)
+            return target.base_url
+        return self._settings.base_url
+
     def _resolve_model(self, endpoint: str, requested: str | None) -> str:
         """The model name to send to *endpoint* for the model the caller asked for.
 
@@ -981,22 +1191,21 @@ class LLMClient:
                             )
                             if remaining is not None else NOT_GIVEN
                         )
-                        response = self._endpoint_client(endpoint).chat.completions.create(
-                            model=model,
-                            temperature=temperature,
-                            max_tokens=max_tokens,
-                            messages=[
-                                {"role": "system", "content": system},
-                                {"role": "user", "content": user},
-                            ],
-                            timeout=request_timeout,
+                        response, responses = self._call_openai(
+                            endpoint, model, system, user, temperature, max_tokens,
+                            request_timeout,
                         )
                     check_pipeline_cancelled()
-                    content = response.choices[0].message.content
-                    if not content or not content.strip():
+                    content = (
+                        _responses_output_text(response) if responses
+                        else _chat_output_text(response)
+                    )
+                    if not content:
                         raise LLMError("Model returned an empty response.")
-                    content = content.strip()
-                    prompt_tokens, completion_tokens = _usage_tokens(response)
+                    prompt_tokens, completion_tokens = (
+                        _responses_usage_tokens(response) if responses
+                        else _usage_tokens(response)
+                    )
                     self.usage.record(
                         model=model,
                         endpoint=endpoint,
