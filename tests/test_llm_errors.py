@@ -240,6 +240,25 @@ class TestChatRetryPolicy(unittest.TestCase):
         self.assertEqual(client.chat("system", "user", phase="draft"), "ok response")
         self.assertEqual(create_mock.call_count, 3)
 
+    def test_an_empty_response_is_deterministic_and_never_retried(self):
+        # Empty and whitespace-only completions are deterministic: identical input
+        # reproduces them, so retrying only burns credits and delays the error.
+        # (The one surviving piece of the retired backup branch 678376d — its
+        # fail-fast flag is unnecessary now that the error taxonomy classifies
+        # deterministic 4xxs as non-retriable, and its stub-client tests are
+        # superseded by this module and test_llm_failover.)
+        for content in ("", "   "):
+            client = LLMClient(_FakeSettings())  # type: ignore[arg-type]
+            resp = MagicMock()
+            resp.choices = [MagicMock(message=MagicMock(content=content))]
+            resp.usage = None
+            create_mock = MagicMock(return_value=resp)
+            client._client.chat.completions.create = create_mock  # type: ignore[attr-defined]
+            with self.assertRaises(LLMError) as ctx:
+                client.chat("system", "user", phase="draft")
+            self.assertIn("empty response", str(ctx.exception))
+            self.assertEqual(create_mock.call_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
