@@ -22,7 +22,7 @@ from urllib.error import HTTPError
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 
-from app.llm import ChatProbe, ModelProbe, probe_chat  # noqa: E402
+from app.llm import CHAT_PROBE_MAX_TOKENS, ChatProbe, ModelProbe, probe_chat  # noqa: E402
 from app import preflight  # noqa: E402
 
 
@@ -41,11 +41,16 @@ def _probe(models=None, status=None, error="") -> ModelProbe:
     return ModelProbe(set(models) if models else None, status, error)
 
 
-def _chat(status=None, error="URLError: name or service not known", reply="") -> ChatProbe:
-    return ChatProbe(status, error, reply)
+def _chat(
+    status=None,
+    error="URLError: name or service not known",
+    reply="",
+    silent=False,
+) -> ChatProbe:
+    return ChatProbe(status, error, reply, silent)
 
 
-#: A one-token call that answered. The commonest canned outcome in these tests, so it
+#: A short chat call that answered. The commonest canned outcome in these tests, so it
 #: has a name rather than a `_chat(200, "", "ok")` at every call site.
 _ANSWERED = _chat(200, "", "ok")
 
@@ -60,7 +65,7 @@ def _check(
     """Run the policy against canned probe results.
 
     ``chat`` defaults to a call that got no response, which is the behaviour these
-    tests had before the one-token call existed: the model listing decides alone. Pass
+    tests had before the chat call existed: the model listing decides alone. Pass
     ``chat=`` for the second probe's outcome, and ``chat_calls`` to record which models
     it was asked about (an empty list is the assertion that it was not asked at all).
     """
@@ -114,6 +119,9 @@ class TestPreflightPolicy(unittest.TestCase):
                 self.assertTrue(verdict.blocks)
                 self.assertIn(f"HTTP {status}", verdict.headline)
                 self.assertIn("Router access", verdict.fix)
+                # The key and the base URL are one credential pair: a mismatched
+                # path reads as a rejected key, so say that before blaming the key.
+                self.assertIn("same provider account", verdict.fix)
 
     def test_a_missing_models_route_is_reported_but_does_not_block(self) -> None:
         """A server can serve completions without listing models."""
@@ -127,6 +135,9 @@ class TestPreflightPolicy(unittest.TestCase):
         self.assertEqual(verdict.kind, preflight.UNVERIFIED)
         self.assertIn("no response", verdict.headline)
         self.assertIn("name or service not known", verdict.fix)
+        # Point the blame at the host, not the key: one failed probe is not proof
+        # that calls will fail, and the run stays allowed.
+        self.assertIn("not the key", verdict.fix)
 
     def test_a_provider_side_failure_does_not_block(self) -> None:
         verdict = _check(_probe(None, 503, "HTTP 503: unavailable"))
@@ -155,7 +166,7 @@ class TestPreflightPolicy(unittest.TestCase):
                 self.assertFalse(preflight.Verdict(kind, headline="x").blocks)
 
 
-class TestTheOneTokenCallAfterTheListing(unittest.TestCase):
+class TestTheChatCallAfterTheListing(unittest.TestCase):
     """The second probe: `/models` is a listing, a listing is not a promise.
 
     Perplexity's Router API is the endpoint that forced this. It answers the listing
@@ -212,6 +223,20 @@ class TestTheOneTokenCallAfterTheListing(unittest.TestCase):
         self.assertFalse(verdict.blocks)
         self.assertIn("offers every configured model", verdict.headline)
         self.assertIn("real call", verdict.headline)
+
+    def test_a_silent_reasoning_answer_still_confirms_the_endpoint(self) -> None:
+        """The model wrote nothing, but the call came back — that is what was checked.
+
+        A reasoning model can spend the short call's budget thinking; the endpoint is
+        proven by the call being served at all, and the headline has to say that rather
+        than read like a failure.
+        """
+        verdict = _check(self.LISTING_OK, chat=_chat(200, "", silent=True))
+
+        self.assertEqual(verdict.kind, preflight.OK)
+        self.assertFalse(verdict.blocks)
+        self.assertIn("was served", verdict.headline)
+        self.assertIn("no visible text", verdict.headline)
 
     def test_a_rate_limit_is_not_a_refusal(self) -> None:
         """The key worked; a limit is the account's business and the run decides."""
@@ -288,7 +313,7 @@ class TestTheOneTokenCallAfterTheListing(unittest.TestCase):
         self.assertEqual(asked, ["same"])
 
 
-class TestTheOneTokenProbeItself(unittest.TestCase):
+class TestTheChatProbeItself(unittest.TestCase):
     """``probe_chat``'s own mapping, over a stubbed transport — this suite opens no socket.
 
     The policy above is tested against canned outcomes; this is what turns a socket into
@@ -314,7 +339,7 @@ class TestTheOneTokenProbeItself(unittest.TestCase):
         self.assertEqual(result.status, 200)
         self.assertEqual(result.reply, "ok")
 
-    def test_it_asks_for_one_token_with_the_configured_model(self) -> None:
+    def test_it_asks_for_a_short_answer_with_the_configured_model(self) -> None:
         body = {"choices": [{"message": {"content": "ok"}}]}
         with patch("urllib.request.urlopen", return_value=self._stub(body)) as urlopen:
             probe_chat("https://api.example.test/v1/", "example-key", "model-main")
@@ -325,8 +350,18 @@ class TestTheOneTokenProbeItself(unittest.TestCase):
         self.assertIn("Bearer example-key", request.headers.get("Authorization", ""))
         sent = json.loads(request.data.decode("utf-8"))
         self.assertEqual(sent["model"], "model-main")
-        self.assertEqual(sent["max_tokens"], 1)
+        self.assertEqual(sent["max_tokens"], CHAT_PROBE_MAX_TOKENS)
         self.assertEqual(sent["messages"][0]["role"], "user")
+
+    def test_the_budget_leaves_room_for_a_reasoning_model_to_answer(self) -> None:
+        """A single token is spent entirely on hidden reasoning by some models.
+
+        Measured on ``alibaba/qwen3.7-flash`` (Vercel AI Gateway): at ``max_tokens=1``
+        the answer is 200 with an empty message, ``finish_reason`` "length" and 230
+        reasoning tokens; the same ask answers normally once the budget allows for the
+        thinking, so the probe has to budget for the thinking and not just the words.
+        """
+        self.assertGreater(CHAT_PROBE_MAX_TOKENS, 1)
 
     def test_a_refusal_keeps_the_providers_own_words(self) -> None:
         body = b'{"error":{"message":"The Router API is currently in limited preview."}}'
@@ -343,8 +378,30 @@ class TestTheOneTokenProbeItself(unittest.TestCase):
             result = probe_chat("https://api.example.test/v1", "example-key", "model-main")
 
         self.assertFalse(result.ok)
+        self.assertFalse(result.silent)
         self.assertEqual(result.status, 200)
         self.assertIn("without a completion", result.error)
+
+    def test_a_reasoning_model_with_no_visible_text_is_still_a_served_call(self) -> None:
+        """The measured shape of a budget-starved reasoning answer.
+
+        ``choices[0].message`` is present and empty, with ``finish_reason: "length"``:
+        the endpoint served the call and the budget went to hidden reasoning, so this
+        must not read as "answered without a completion".
+        """
+        body = {
+            "choices": [
+                {"finish_reason": "length", "message": {"role": "assistant", "content": ""}}
+            ]
+        }
+        with patch("urllib.request.urlopen", return_value=self._stub(body)):
+            result = probe_chat("https://api.example.test/v1", "example-key", "model-main")
+
+        self.assertTrue(result.ok)
+        self.assertTrue(result.silent)
+        self.assertEqual(result.status, 200)
+        self.assertEqual(result.reply, "")
+        self.assertEqual(result.error, "")
 
     def test_content_parts_are_read_too(self) -> None:
         """Some servers answer with a list of content parts instead of a string."""

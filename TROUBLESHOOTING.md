@@ -78,7 +78,8 @@ Verify your LLM endpoint is actually reachable and working:
 **Using the app's built-in test:**
 1. Open the Streamlit app sidebar
 2. Enter your API key and base URL (if not already set)
-3. Click **"Test connection"** — this checks if the endpoint responds
+3. Click **"Test connection"** — it runs the same preflight a run does (the model listing
+   plus a real call) and shows the verdict it produces
 
 **Manual check:**
 ```bash
@@ -259,7 +260,7 @@ Key metrics:
 
 A message ending in **Run not started** above the run button is not a failure: it is the
 preflight refusing to spend a run on a configuration that cannot work. Nothing was sent to the
-model and no credits were used — the check itself is a model listing plus one one-token call,
+model and no credits were used — the check itself is a model listing plus one short chat call,
 which is what a run's own first call costs.
 
 | Message | What it means | What to do |

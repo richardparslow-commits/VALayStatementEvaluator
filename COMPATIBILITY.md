@@ -131,20 +131,22 @@ On every app launch the sidebar runs a best-effort **model availability check**:
 - If `model_main` or `model_fast` is missing from the provider's model list, the UI shows a non-blocking warning linking to this file and `MIGRATION.md`
 - Network/permission failures are ignored — the app always remains usable (warnings only).
 
-The sidebar's **Test connection** button runs the same `GET {base_url}/models` request but
-reports *why* it failed, because it is the screen where the user can still fix it: the HTTP
-status and the provider's response body distinguish a rejected key (`401`/`403`) from a wrong
-path in the base URL (`404`) from a host that does not answer.
+The sidebar's **Test connection** button runs the same **preflight** the run buttons do — the
+`GET {base_url}/models` listing *and* one real call per configured model — and shows the verdict
+it produces, because it is the screen where the user can still fix it: the HTTP status and the
+provider's response body distinguish a rejected key (`401`/`403`) from a wrong path in the base
+URL (`404`) from a host that does not answer, and a listing that answers while every completion
+is refused is caught by the real call instead of being reported as healthy.
 
-See `app/llm.py` (`app.llm.probe_models`, and `check_model_availability` for the advisory
-model-list-only form) and `app/main.py:_sidebar_settings`.
+See `app/preflight.py` (`check_endpoint`, the shared policy), `app/llm.py` (`probe_models` and
+`probe_chat`) and `app/views/sidebar.py:render_sidebar_settings`.
 
 ### The same check, with teeth, at the moment a run starts
 
 The launch check is advisory; the **preflight** is not. Pressing a run button probes twice and
 refuses to start when the configuration cannot work: a configured model missing from the
 endpoint's catalog, a key the endpoint rejects (`401`/`403`), or — the case a listing cannot
-see — a **one-token call** the endpoint refuses (`401`/`403`, or a `404` that says the base URL
+see — a **short chat call** the endpoint refuses (`401`/`403`, or a `404` that says the base URL
 serves no completions path at all). Each means every call in the run would be rejected, and the
 probes cost two requests instead of the first minutes of the bundle's chunks.
 

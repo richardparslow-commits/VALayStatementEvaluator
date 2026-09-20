@@ -7,6 +7,8 @@ in place exactly as before — only the rendering moved here.
 from __future__ import annotations
 
 import time
+from copy import copy
+from dataclasses import is_dataclass, replace
 from typing import Any
 
 import streamlit as st
@@ -15,7 +17,8 @@ from .. import config
 from .. import watchdog
 from ..config import DEFAULT_BASE_URL, load_settings
 from ..error_report import report_failure
-from ..llm import ModelProbe, check_model_availability, probe_models
+from ..llm import check_model_availability
+from ..preflight import BLOCKED, OK, Verdict, check_endpoint
 from ..prompt_sanitize import validate_api_key, validate_model_name
 from .usage import load_usage_history, save_usage_history
 
@@ -106,7 +109,13 @@ def render_sidebar_settings() -> None:
                 settings.fetch_records_path = st.session_state.fetch_records_path_input.strip()
                 st.rerun()
 
-        if st.button("Test connection"):
+        if st.button(
+            "Test connection",
+            help=(
+                "Runs the same preflight a run does, against the values above: the model "
+                "listing and one real call per configured model."
+            ),
+        ):
             _test_connection_report(settings)
 
         _pending_settings_warning(settings)
@@ -537,11 +546,15 @@ def _pending_settings_warning(settings: Any) -> None:
 
 
 def _test_connection_report(settings: Any) -> None:
-    """Validate the on-screen key + base URL + models against ``GET /models``.
+    """Run the same preflight a run does, on the on-screen settings, and show its verdict.
 
-    Turns a 7-minute failing run into a 2-second answer: a base URL that does
-    not match the key is the most common hosted-deployment failure, and the
-    gateway rejects it with a generic auth error.
+    A listing is not a promise — Perplexity's Router API publishes its ids and then refuses
+    every completion — so checking ``GET /models`` alone let this button call a dead
+    configuration healthy. Going through :func:`app.preflight.check_endpoint` means the whole
+    preflight runs here too: the same two probes and the same policy that decides whether a
+    run starts, so the button cannot promise something the run buttons will refuse. It is
+    still the screen where a bad key or endpoint is fixed in seconds, which is why the
+    verdict is rendered whole — headline and fix.
     """
     base_url = _field_value("base_url_input", settings.base_url)
     api_key = _field_value("api_key_input", settings.api_key)
@@ -552,72 +565,51 @@ def _test_connection_report(settings: Any) -> None:
         st.error("Enter an API key first, then test the connection.")
         return
 
-    with st.spinner("Checking the endpoint…"):
-        probe = probe_models(base_url, api_key)
+    probe_settings = _with_on_screen_fields(
+        settings,
+        base_url=base_url,
+        api_key=api_key,
+        model_main=model_main,
+        model_fast=model_fast,
+    )
+    with st.spinner("Checking the endpoint — the model listing and a real call…"):
+        verdict = check_endpoint(probe_settings)
 
-    if not probe.ok:
-        st.error(
-            f"Could not list models from `{base_url.rstrip('/')}/models` — "
-            f"{probe.error}. "
-            f"{_probe_failure_advice(probe, base_url)}"
-        )
-        return
-
-    available = probe.models or set()
-
-    missing = [
-        m for m in (model_main, model_fast)
-        if m and m not in available
-    ]
-    if missing:
-        st.warning(
-            f"Reached the endpoint ({len(available)} model(s) available) but it does not "
-            f"offer: {', '.join(missing)}. Fix the model name(s) or leave them blank to "
-            "use the provider default."
-        )
+    message = verdict.headline if not verdict.fix else f"{verdict.headline}\n\n{verdict.fix}"
+    if verdict.kind == OK:
+        st.success(f"✅ {message}")
+    elif verdict.kind == BLOCKED:
+        st.error(f"⛔ {message}")
     else:
-        st.success(
-            f"Endpoint reachable — {len(available)} model(s) available, including "
-            f"`{model_main}` and `{model_fast}`."
-        )
+        # UNVERIFIED: the run is allowed, but the check could not tell — say so.
+        st.warning(f"⚠️ {message}")
+    _render_preflight_evidence(verdict, base_url)
 
 
-def _probe_failure_advice(probe: ModelProbe, base_url: str) -> str:
-    """What a failed model listing most likely means, chosen by its status.
+def _with_on_screen_fields(settings: Any, **fields: str) -> Any:
+    """*settings* with the sidebar's field values applied, whatever object it is.
 
-    The old message offered both possibilities at once ("unreachable *or* it
-    rejected this key"), which leaves the user to guess between two fixes that
-    have nothing to do with each other. The status picks one.
-
-    This is worth the words: it is the only screen where the user can fix a bad
-    key or endpoint in seconds, and every branch here exists because a real
-    deployment failed in that way.
+    ``Settings`` is a mutable dataclass, so it is rebuilt with
+    :func:`dataclasses.replace`; the views' tests hand in a ``SimpleNamespace``, so the
+    generic path copies it instead. The preflight reads the base URL, the key and the
+    two model ids, and nothing else.
     """
-    if probe.status in {401, 403}:
-        return (
-            "The endpoint rejected this key. The API key and the base URL must belong "
-            "to the same provider account — a key issued by one provider (QwenCloud, "
-            "Perplexity, OpenAI) is rejected by another's endpoint. If the key is a "
-            "Perplexity key and the base URL ends in `/router/v1`, Router API is in "
-            "private preview and this account may not have access yet "
-            "(api@perplexity.ai to request it); a platform key that works on the "
-            "Agent API can still be refused here."
-        )
-    if probe.status == 404:
-        return (
-            f"`{base_url.rstrip('/')}/models` does not exist on that host. Check the "
-            "base URL *path* — Perplexity's Router API is "
-            "`https://api.perplexity.ai/router/v1`, and an OpenAI-compatible provider "
-            "usually ends in `/v1`."
-        )
-    if probe.status is not None and probe.status >= 500:
-        return "The provider is failing on its own side; try again shortly."
-    if probe.status is None:
-        return (
-            "No HTTP response arrived, so the host or the network is the problem rather "
-            "than the key: check the URL for typos and that this machine can reach it."
-        )
-    return "Check the base URL and the API key, then test again."
+    if is_dataclass(settings) and not isinstance(settings, type):
+        return replace(settings, **fields)
+    shadow = copy(settings)
+    for name, value in fields.items():
+        setattr(shadow, name, value)
+    return shadow
+
+
+def _render_preflight_evidence(verdict: Verdict, base_url: str) -> None:
+    """What the check compared, under the verdict — evidence, not a second opinion."""
+    parts = [f"endpoint `{base_url.rstrip('/')}`" if base_url else "no base URL set"]
+    if verdict.listed:
+        parts.append(f"{verdict.listed:,} models listed")
+    if verdict.checked:
+        parts.append("checked " + ", ".join(f"`{m}`" for m in verdict.checked))
+    st.caption("Preflight: " + " · ".join(parts) + ".")
 
 
 def _compat_model_warning(settings: Any) -> None:

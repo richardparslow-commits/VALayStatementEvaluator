@@ -52,12 +52,16 @@ RETRY_BACKOFF_SECONDS = 1.0
 MAX_RETRY_BACKOFF_SECONDS = 4.0
 MODELS_ENDPOINT_TIMEOUT_SECONDS = 6
 
-# The one-token call the preflight makes after the model listing. One token and a
-# two-character prompt, so the request cannot be mistaken for a run — and a ceiling
-# longer than the listing's, because a listing is a database read while a call has to
-# reach a model (and wake a cold one): a 6-second ceiling would report "no response"
-# for an endpoint that is merely slow, and the run would start unverified.
-CHAT_PROBE_MAX_TOKENS = 1
+# The short chat call the preflight makes after the model listing. A two-character
+# prompt, so the request cannot be mistaken for a run — and a small-but-not-one-token
+# budget, because a reasoning model spends tokens thinking before it writes anything:
+# at max_tokens=1 the measured main model (alibaba/qwen3.7-flash, Vercel AI Gateway)
+# answered 200 with an empty message, finish_reason "length" and 230 reasoning tokens,
+# which reads as "the endpoint answered, but not usefully" when the endpoint is fine.
+# The ceiling is longer than the listing's, because a listing is a database read while
+# a call has to reach a model (and wake a cold one): a 6-second ceiling would report
+# "no response" for an endpoint that is merely slow, and the run would start unverified.
+CHAT_PROBE_MAX_TOKENS = 64
 CHAT_PROBE_PROMPT = "hi"
 CHAT_PROBE_TIMEOUT_SECONDS = 20
 
@@ -307,7 +311,7 @@ def probe_models(base_url: str, api_key: str) -> ModelProbe:
 
 
 class ChatProbe(NamedTuple):
-    """Outcome of a one-token ``POST {base_url}/chat/completions`` check.
+    """Outcome of one short ``POST {base_url}/chat/completions`` check.
 
     A model *listing* is not a promise. Perplexity's Router API answers
     ``GET /models`` with its ids and then refuses every completion with ``403 The
@@ -315,23 +319,30 @@ class ChatProbe(NamedTuple):
     from a healthy endpoint until something actually calls it — so the preflight
     follows the listing with one real call.
 
-    ``ok`` means a completion came back. ``status`` is the HTTP status when one arrived,
-    and ``None`` when the request got no response at all (DNS, refused, timeout).
-    ``error`` carries the provider's own words, which is what makes a refusal
-    actionable rather than a status code to look up.
+    ``ok`` means a completion came back — visible text (``reply``), or a completion
+    object the model left empty (``silent``). Either one proves what this probe is for:
+    the endpoint served the call. ``status`` is the HTTP status when one arrived, and
+    ``None`` when the request got no response at all (DNS, refused, timeout). ``error``
+    carries the provider's own words, which is what makes a refusal actionable rather
+    than a status code to look up.
     """
 
     status: int | None
     error: str
     reply: str = ""
+    #: True when a completion object came back with no visible text. A reasoning model
+    #: can spend the probe's whole budget thinking and finish with an empty message
+    #: (``finish_reason: "length"``), which is a served call, not a silent endpoint —
+    #: reporting it as "no completion" blamed the endpoint for the probe's budget.
+    silent: bool = False
 
     @property
     def ok(self) -> bool:
-        return bool(self.reply)
+        return bool(self.reply) or self.silent
 
 
 def probe_chat(base_url: str, api_key: str, model: str) -> ChatProbe:
-    """Ask the endpoint for one token, reporting the reply *or* why there is none.
+    """Ask the endpoint for a short answer, reporting the reply *or* why there is none.
 
     Best-effort and never raises, like :func:`probe_models`. Deliberately one raw
     request rather than ``LLMClient``: this runs *before* a run, and the client's
@@ -371,9 +382,14 @@ def probe_chat(base_url: str, api_key: str, model: str) -> ChatProbe:
     except Exception as exc:  # noqa: BLE001 - availability check is advisory only
         return ChatProbe(_http_status(exc), _probe_error_text(exc))
     reply = _completion_text(body)
-    if not reply:
-        return ChatProbe(200, f"{url} answered without a completion")
-    return ChatProbe(200, "", reply)
+    if reply:
+        return ChatProbe(200, "", reply)
+    if _has_completion_object(body):
+        # The provider served the call; the model just wrote nothing visible and used
+        # the budget on hidden reasoning instead. That still proves the key, endpoint
+        # and model id can call — see ``ChatProbe.silent``.
+        return ChatProbe(200, "", silent=True)
+    return ChatProbe(200, f"{url} answered without a completion")
 
 
 def _completion_text(body: Any) -> str:
@@ -399,6 +415,20 @@ def _completion_text(body: Any) -> str:
         return "".join(parts).strip()
     text = choice.get("text")
     return text.strip() if isinstance(text, str) else ""
+
+
+def _has_completion_object(body: Any) -> bool:
+    """Whether the response carries a completion object, even with no visible text.
+
+    The shape a budget-starved reasoning model answers with: one choice whose
+    ``message`` is present and whose ``content`` is empty. Reading that as "no
+    completion" reported the endpoint as silent when it had served the call.
+    """
+    rows = body.get("choices") if isinstance(body, dict) else None
+    if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+        return False
+    choice = rows[0]
+    return isinstance(choice.get("message"), dict) or isinstance(choice.get("text"), str)
 
 
 def _http_status(exc: BaseException) -> int | None:

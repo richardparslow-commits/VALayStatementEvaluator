@@ -210,7 +210,7 @@ def _clear_endpoint_block(action: str) -> None:
 def check_endpoint_gate(action: str, *, log_action: str, request_id: str = "") -> bool:
     """Return True when the endpoint can serve the configured models.
 
-    Two cheap requests per attempt — a model listing and one one-token call per
+    Two cheap requests per attempt — a model listing and one short chat call per
     configured model — and only when a run is actually being attempted, so ordinary
     reruns cost nothing. A block is stored so
     :func:`render_endpoint_preflight_notice` can keep it on screen with the waiver

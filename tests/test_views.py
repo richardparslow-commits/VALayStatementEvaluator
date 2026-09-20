@@ -18,7 +18,7 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 
-from app.llm import ModelProbe  # noqa: E402
+from app.preflight import BLOCKED, OK, UNVERIFIED, Verdict  # noqa: E402
 from app.usage import UsageTracker  # noqa: E402
 
 
@@ -1413,119 +1413,157 @@ class TestSidebarSettingsGuards(unittest.TestCase):
             sidebar._pending_settings_warning(self._settings())
         st_mock.warning.assert_not_called()
 
-    def test_connection_success_names_models(self) -> None:
+    def _verdict(self, kind: str, headline: str, fix: str = "", **over: object) -> Verdict:
+        fields: dict = dict(
+            kind=kind,
+            headline=headline,
+            fix=fix,
+            status=200,
+            checked=("qwen3.7-max", "qwen3.7-flash"),
+            listed=2,
+        )
+        fields.update(over)
+        return Verdict(**fields)
+
+    def test_the_button_runs_the_same_check_the_run_buttons_do(self) -> None:
+        """Parity is the point: one code path, so the button cannot promise something
+        the gate that starts a run will refuse."""
+        import app.preflight as preflight
+        import app.views.sidebar as sidebar
+
+        self.assertIs(sidebar.check_endpoint, preflight.check_endpoint)
+
+    def test_connection_renders_the_verdict_and_its_evidence(self) -> None:
         import app.views.sidebar as sidebar
 
         st_mock, session = _fake_streamlit()
         session["base_url_input"] = "https://ws-example.us-east-1.maas.aliyuncs.com"
         session["api_key_input"] = "test-workspace-key"
+        verdict = self._verdict(
+            OK,
+            "The endpoint offers every configured model (2 listed). A real call to "
+            "`qwen3.7-max` answered, so the configured key, endpoint and ids all work.",
+        )
         with _patch_st(sidebar, st_mock), patch.object(
-            sidebar,
-            "probe_models",
-            return_value=ModelProbe({"qwen3.7-max", "qwen3.7-flash"}, 200, ""),
-        ):
+            sidebar, "check_endpoint", return_value=verdict
+        ) as check:
             sidebar._test_connection_report(self._settings())
-        st_mock.success.assert_called_once()
-        self.assertIn("reachable", str(st_mock.success.call_args[0][0]))
 
-    def test_connection_failure_explains_key_url_pairing(self) -> None:
+        check.assert_called_once()
+        st_mock.success.assert_called_once()
+        self.assertIn("A real call", str(st_mock.success.call_args[0][0]))
+        st_mock.error.assert_not_called()
+        st_mock.warning.assert_not_called()
+        caption = str(st_mock.caption.call_args[0][0])
+        self.assertIn("2 models listed", caption)
+        self.assertIn("qwen3.7-max", caption)
+
+    def test_connection_checks_the_on_screen_values_not_the_saved_ones(self) -> None:
         import app.views.sidebar as sidebar
 
         st_mock, session = _fake_streamlit()
         session["base_url_input"] = "https://token-plan.example/v1"
-        session["api_key_input"] = "test-workspace-key"
+        session["api_key_input"] = "typed-key"
+        session["model_main_input"] = "typed-main"
+        session["model_fast_input"] = "typed-fast"
+        seen: dict = {}
+
+        def fake_check(settings: object) -> Verdict:
+            seen.update(
+                base_url=settings.base_url,
+                api_key=settings.api_key,
+                model_main=settings.model_main,
+                model_fast=settings.model_fast,
+            )
+            return self._verdict(OK, "ok")
+
         with _patch_st(sidebar, st_mock), patch.object(
-            sidebar,
-            "probe_models",
-            return_value=ModelProbe(None, 401, 'HTTP 401: {"error":"invalid api key"}'),
+            sidebar, "check_endpoint", side_effect=fake_check
         ):
             sidebar._test_connection_report(self._settings())
+
+        self.assertEqual(
+            seen,
+            {
+                "base_url": "https://token-plan.example/v1",
+                "api_key": "typed-key",
+                "model_main": "typed-main",
+                "model_fast": "typed-fast",
+            },
+        )
+
+    def test_connection_shows_a_block_with_the_verdict_s_fix(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, session = _fake_streamlit()
+        session["api_key_input"] = "test-workspace-key"
+        verdict = self._verdict(
+            BLOCKED,
+            "The endpoint rejected this API key (HTTP 401).",
+            fix="A rejected key fails every call, so the run was not started.",
+            status=401,
+            listed=0,
+        )
+        with _patch_st(sidebar, st_mock), patch.object(
+            sidebar, "check_endpoint", return_value=verdict
+        ):
+            sidebar._test_connection_report(self._settings())
+
         st_mock.error.assert_called_once()
-        self.assertIn("same provider account", str(st_mock.error.call_args[0][0]))
+        message = str(st_mock.error.call_args[0][0])
+        self.assertIn("rejected this API key", message)
+        self.assertIn("was not started", message)
+        st_mock.success.assert_not_called()
 
-    def test_connection_failure_quotes_the_status_and_body(self) -> None:
-        """A 401 was reported as equal possibilities ("unreachable or bad key")."""
+    def test_connection_shows_unverified_as_a_warning_not_a_pass(self) -> None:
         import app.views.sidebar as sidebar
 
         st_mock, session = _fake_streamlit()
         session["api_key_input"] = "test-workspace-key"
+        verdict = self._verdict(
+            UNVERIFIED,
+            "The preflight request got no response from the endpoint.",
+            fix="The host or the network is the problem, not the key.",
+            status=None,
+            listed=0,
+        )
         with _patch_st(sidebar, st_mock), patch.object(
-            sidebar,
-            "probe_models",
-            return_value=ModelProbe(None, 401, "HTTP 401: invalid api key"),
+            sidebar, "check_endpoint", return_value=verdict
         ):
             sidebar._test_connection_report(self._settings())
-        msg = str(st_mock.error.call_args[0][0])
-        self.assertIn("HTTP 401", msg)
-        self.assertNotIn("unreachable", msg)
 
-    def test_a_perplexity_key_without_router_access_is_named(self) -> None:
-        """The live failure: a platform key the Router API will not serve."""
-        import app.views.sidebar as sidebar
-
-        st_mock, session = _fake_streamlit()
-        session["base_url_input"] = "https://api.perplexity.ai/router/v1"
-        session["api_key_input"] = "test-workspace-key"
-        with _patch_st(sidebar, st_mock), patch.object(
-            sidebar,
-            "probe_models",
-            return_value=ModelProbe(None, 403, "HTTP 403: router access not enabled"),
-        ):
-            sidebar._test_connection_report(self._settings())
-        msg = str(st_mock.error.call_args[0][0])
-        self.assertIn("private preview", msg)
-
-    def test_a_wrong_path_is_distinguished_from_a_bad_key(self) -> None:
-        import app.views.sidebar as sidebar
-
-        st_mock, session = _fake_streamlit()
-        session["api_key_input"] = "test-workspace-key"
-        with _patch_st(sidebar, st_mock), patch.object(
-            sidebar,
-            "probe_models",
-            return_value=ModelProbe(None, 404, "HTTP 404: Not Found"),
-        ):
-            sidebar._test_connection_report(self._settings())
-        msg = str(st_mock.error.call_args[0][0])
-        self.assertIn("does not exist on that host", msg)
-
-    def test_no_response_blames_the_host_not_the_key(self) -> None:
-        import app.views.sidebar as sidebar
-
-        st_mock, session = _fake_streamlit()
-        session["api_key_input"] = "test-workspace-key"
-        with _patch_st(sidebar, st_mock), patch.object(
-            sidebar,
-            "probe_models",
-            return_value=ModelProbe(None, None, "URLError: name or service not known"),
-        ):
-            sidebar._test_connection_report(self._settings())
-        msg = str(st_mock.error.call_args[0][0])
-        self.assertIn("No HTTP response", msg)
-
-    def test_connection_flags_models_the_endpoint_lacks(self) -> None:
-        import app.views.sidebar as sidebar
-
-        st_mock, session = _fake_streamlit()
-        session["api_key_input"] = "test-workspace-key"
-        with _patch_st(sidebar, st_mock), patch.object(
-            sidebar,
-            "probe_models",
-            return_value=ModelProbe({"some-other-model"}, 200, ""),
-        ):
-            sidebar._test_connection_report(self._settings())
         st_mock.warning.assert_called_once()
-        msg = str(st_mock.warning.call_args[0][0])
-        self.assertIn("qwen3.7-max", msg)
-        self.assertIn("qwen3.7-flash", msg)
+        message = str(st_mock.warning.call_args[0][0])
+        self.assertIn("no response", message)
+        self.assertIn("not the key", message)
+        st_mock.success.assert_not_called()
+
+    def test_a_missing_model_verdict_names_the_model(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, session = _fake_streamlit()
+        session["api_key_input"] = "test-workspace-key"
+        verdict = self._verdict(
+            BLOCKED,
+            "The endpoint does not offer `qwen3.7-flash`.",
+            fix="Every call would be rejected, so the run was not started.",
+            missing=("qwen3.7-flash",),
+        )
+        with _patch_st(sidebar, st_mock), patch.object(
+            sidebar, "check_endpoint", return_value=verdict
+        ):
+            sidebar._test_connection_report(self._settings())
+
+        self.assertIn("qwen3.7-flash", str(st_mock.error.call_args[0][0]))
 
     def test_connection_requires_a_key(self) -> None:
         import app.views.sidebar as sidebar
 
         st_mock, _ = _fake_streamlit()
-        with _patch_st(sidebar, st_mock):
+        with _patch_st(sidebar, st_mock), patch.object(sidebar, "check_endpoint") as check:
             sidebar._test_connection_report(self._settings(api_key=""))
         st_mock.error.assert_called_once_with("Enter an API key first, then test the connection.")
+        check.assert_not_called()
 
     def test_secrets_origin_is_captioned(self) -> None:
         """A hosted run pre-fills the fields from st.secrets — say so."""
