@@ -731,8 +731,10 @@ All public helpers in `app/main.py`, `app/fetch_client.py`, `app/evaluate.py` ca
 > GitHub Actions installs from the hash-pinned `requirements.lock` (see **Dependency locking**),
 > then runs the offline tests and scale simulation automatically on every push to `main` (and on
 > pull requests). The live smoke test is triggered **manually** from the
-> Actions tab and only runs when an `OPENAI_API_KEY` secret is configured; the optional
-> `OPENAI_BASE_URL`, `LLM_MODEL_MAIN`, and `LLM_MODEL_FAST` secrets override the endpoint and
+> Actions tab and only runs when an LLM API key secret is configured — either
+> `OPENAI_API_KEY` or `PERPLEXITY_API` (a key created in the Perplexity console
+> under that name works as-is; the job maps it onto the app's primary-key
+> variable); the optional `OPENAI_BASE_URL`, `LLM_MODEL_MAIN`, and `LLM_MODEL_FAST` secrets override the endpoint and
 > models in that job if set (see `.env.example`). The sandbox image is built on every event
 > (nothing pushed), and a manual dispatch builds and pushes it to Vercel Container Registry and
 > then reads a record on a real box — that job needs a `VERCEL_TOKEN` secret and skips itself
