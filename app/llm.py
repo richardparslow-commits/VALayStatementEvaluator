@@ -406,6 +406,45 @@ def _responses_output_text(body: Any) -> str:
     return ""
 
 
+def _responses_status(body: Any) -> str:
+    """The run status of a Responses payload ("completed", "failed", ...), or "".
+
+    The Agent API returns HTTP 200 for runs that then failed server-side: the
+    status and the reason live in the body (``status`` + ``error.message``).
+    """
+    status = _responses_field(body, "status")
+    return status if isinstance(status, str) else ""
+
+
+def _responses_error_message(body: Any) -> str:
+    """The provider's own error text in a Responses payload, or "".
+
+    A 200 body that reports a failed run carries the reason in
+    ``error.message`` — the actionable part, same as a refusal's body. The
+    error object arrives as a dict from the hand-parsed probe and a typed
+    object from the SDK, so both reads go through :func:`_responses_field`.
+    """
+    err = _responses_field(body, "error")
+    message = _responses_field(err, "message")
+    return message.strip() if isinstance(message, str) and message.strip() else ""
+
+
+def _responses_empty_error(body: Any) -> LLMError:
+    """The error for a Responses answer with no visible text, with its real cause.
+
+    A 200 body can carry ``status: failed`` with the provider's own reason in
+    ``error.message`` — reporting that beats a generic "empty response" for the
+    same wire event. A completed run with no text is the reasoning-model case
+    the probe already treats as a served call; at run time, empty text cannot
+    feed a pipeline, so it stays an error, but a status-aware one.
+    """
+    status = _responses_status(body)
+    if status and status != "completed":
+        detail = _responses_error_message(body) or "no details given"
+        return LLMError(f"The Responses run did not complete (status: {status}): {detail}")
+    return LLMError("Model returned an empty response.")
+
+
 def _responses_usage_tokens(body: Any) -> tuple[int | None, int | None]:
     """``usage.input_tokens`` / ``usage.output_tokens`` from a Responses payload.
 
@@ -495,6 +534,9 @@ def probe_chat(base_url: str, api_key: str, model: str) -> ChatProbe:
                 "input": CHAT_PROBE_PROMPT,
                 "max_output_tokens": CHAT_PROBE_MAX_TOKENS,
                 "temperature": 0,
+                # The probe says only "the endpoint served this call"; it stores
+                # nothing, so the check never creates retrievable run state.
+                "store": False,
             }
         ).encode("utf-8")
     else:
@@ -527,17 +569,20 @@ def probe_chat(base_url: str, api_key: str, model: str) -> ChatProbe:
         reply = _responses_output_text(body)
         if reply:
             return ChatProbe(200, "", reply)
-        status = body.get("status") if isinstance(body, dict) else None
-        if isinstance(status, str) and status == "completed":
+        status = _responses_status(body)
+        if status == "completed":
             # The provider served the call and reports the run completed; the model
             # spent the probe's budget on hidden reasoning (see ``ChatProbe.silent``).
             return ChatProbe(200, "", silent=True)
         if isinstance(body, dict) and ("output" in body or "output_text" in body):
-            # A Responses-shaped answer object with no text in it. An "incomplete"
-            # status is reported as the error it is; anything else still proves the
-            # endpoint served a Responses run.
-            if isinstance(status, str) and status != "completed":
-                return ChatProbe(200, f"the run did not complete (status: {status})")
+            # A Responses-shaped answer object with no text in it. A failed or
+            # incomplete run is reported as the error it is, with the provider's
+            # own words (the body arrives with HTTP 200); anything else still
+            # proves the endpoint served a Responses run.
+            if status and status != "completed":
+                detail = _responses_error_message(body)
+                suffix = f": {detail}" if detail else ""
+                return ChatProbe(200, f"the run did not complete (status: {status}){suffix}")
             return ChatProbe(200, "", silent=True)
         return ChatProbe(200, f"{url} answered without a completion")
     reply = _completion_text(body)
@@ -964,6 +1009,13 @@ class LLMClient:
                 "model": model,
                 "input": _responses_input(system, user),
                 "max_output_tokens": max(1, max_tokens),
+                # The endpoint is stateless for this app's use: every prompt is
+                # fully self-contained, nothing is continued via
+                # previous_response_id, and the payloads carry medical records.
+                # Opting out of server-side storage keeps retrievable copies of
+                # that content from accumulating on the provider — the
+                # documented way to run once and leave nothing behind.
+                "store": False,
             }
             if system.strip():
                 request["instructions"] = system
@@ -1201,7 +1253,8 @@ class LLMClient:
                         else _chat_output_text(response)
                     )
                     if not content:
-                        raise LLMError("Model returned an empty response.")
+                        raise _responses_empty_error(response) if responses \
+                            else LLMError("Model returned an empty response.")
                     prompt_tokens, completion_tokens = (
                         _responses_usage_tokens(response) if responses
                         else _usage_tokens(response)
