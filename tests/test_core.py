@@ -917,7 +917,12 @@ class TestLargeRecordPipeline(unittest.TestCase):
         raise AssertionError(f"no chunk-count message in {messages!r}")
 
     def test_deterministic_rejection_skips_the_doomed_retry_round(self):
-        """A 403-class rejection is not re-attempted; a retry cannot change it."""
+        """A non-retriable rejection is not re-attempted; a retry cannot change it.
+
+        Uses a 400, not a refusal status: 401/403/404 end the pass early (see
+        the stop test below), while this one needs the pass to run to its end so
+        that the missing second attempt is what the counts prove.
+        """
         from app.llm import LLMError, LLMUpstreamError
 
         class RefusingLLM(FakeLLM):
@@ -929,9 +934,9 @@ class TestLargeRecordPipeline(unittest.TestCase):
                 if "CHUNK TEXT" in user:
                     self.attempts += 1
                     raise LLMUpstreamError(
-                        "LLM provider rejected the request (Error code: 403)",
+                        "LLM provider rejected the request (Error code: 400)",
                         retriable=False,
-                        status_code=403,
+                        status_code=400,
                     )
                 return super().chat_json(system, user, **kwargs)
 
@@ -948,6 +953,63 @@ class TestLargeRecordPipeline(unittest.TestCase):
         error = str(ctx.exception)
         self.assertIn("which retrying cannot fix", error)
         self.assertIn(f"Chunks affected: {chunk_total} of {chunk_total}", error)
+        # A 400 is per-request, not a refusal of the configuration: the pass
+        # runs to the end and nothing is reported as never attempted.
+        self.assertNotIn("not attempted", error)
+        self.assertNotIn("Stopped early", "\n".join(m for _, m in messages))
+
+    def test_refusal_stops_the_pass_and_counts_what_was_never_attempted(self):
+        """401/403/404 end the pass: queued chunks are canceled, not visited."""
+        import time
+
+        from app import config as _config
+        from app.llm import LLMError, LLMUpstreamError
+
+        class RefusingLLM(FakeLLM):
+            def __init__(self):
+                super().__init__()
+                self.attempts = 0
+
+            def chat_json(self, system, user, **kwargs):
+                if "CHUNK TEXT" in user:
+                    self.attempts += 1
+                    time.sleep(0.2)  # one worker; keep it from racing the cancel
+                    raise LLMUpstreamError(
+                        "LLM provider rejected the request (Error code: 403)",
+                        retriable=False,
+                        status_code=403,
+                    )
+                return super().chat_json(system, user, **kwargs)
+
+        original = _config.RECORDS_CONCURRENCY
+        _config.RECORDS_CONCURRENCY = 1
+        try:
+            llm = RefusingLLM()
+            messages = []
+            with self.assertRaises(LLMError) as ctx:
+                review_medical_records(
+                    llm, self._multi_chunk_docs(), progress=lambda f, m: messages.append((f, m))
+                )
+        finally:
+            _config.RECORDS_CONCURRENCY = original
+        rendered = "\n".join(m for _, m in messages)
+        chunk_total = self._chunk_total(messages)
+        self.assertEqual(chunk_total, 4)
+        # The worker raises once and the queued chunks are canceled; at most one
+        # call already under way can land before the cancel takes effect.
+        self.assertLessEqual(llm.attempts, 2)
+        not_attempted = chunk_total - llm.attempts
+        self.assertGreaterEqual(not_attempted, 2)
+        self.assertNotIn(f"— {chunk_total}/{chunk_total} chunks done", rendered)
+        self.assertIn(
+            f"Stopped early — {not_attempted} chunk(s) not attempted after the endpoint "
+            "refused the run.",
+            rendered,
+        )
+        error = str(ctx.exception)
+        self.assertIn("HTTP 403", error)
+        self.assertIn(f"Chunks affected: {llm.attempts} of {chunk_total}", error)
+        self.assertIn(f"{not_attempted} more chunk(s) were not attempted", error)
 
     def test_transient_failures_retry_with_round_local_counts(self):
         """Every chunk retries once, and no progress line counts past its round."""
