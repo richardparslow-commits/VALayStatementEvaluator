@@ -249,6 +249,7 @@ installs on macOS and Linux CI.
 | `VA_LSE_LLM_QUEUE_MAX_DEPTH` | Max queued callers waiting for a concurrency slot | `50` |
 | `VA_LSE_LLM_QUEUE_TIMEOUT_SECONDS` | Seconds a queued caller waits before `QueueFullError` | `30` |
 | `VA_LSE_HEALTH_PORT` | Sidecar health server port (`0` disables `GET /health` & `GET /ready`) | `8001` |
+| `VA_LSE_BUILD_SHA` | Short commit SHA baked into the image (Docker `--build-arg`); auto-detected from git when unset; shown in **About** so a stale deployment is visible | *(empty)* |
 | `VA_LSE_HEALTH_HOST` | Interface the sidecar binds to. Set `127.0.0.1` where that port is published to the internet (a Vercel Sandbox, a forwarded dev port) — `/health`, `/ready` and `/metrics` carry no authentication | `0.0.0.0` |
 | `VA_LSE_AUDIT_LOG_DIR` | Directory for the separate `audit.log` JSON stream (audit trail, distinct from `VA_LSE_LOG_DIR`) | `logs` (or `VA_LSE_LOG_DIR` when set) |
 | `VA_LSE_AUDIT_LOG_FILE` | Filename inside `VA_LSE_AUDIT_LOG_DIR` | `audit.log` |
