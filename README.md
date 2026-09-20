@@ -300,8 +300,10 @@ Pressing **Draft the statement** or **Run exhaustive evaluation** first checks t
 configured endpoint can serve the configured models — a `GET {base_url}/models` listing, then
 one **short chat call** per configured model — or no probes at all for a few minutes after
 that configuration was checked (**Test connection**, or a recent run attempt), whose verdict
-is reused. A run that cannot possibly work therefore costs a second or two instead of the
-first minutes of a bundle, which is the failure this was built for:
+is reused. When a check is reused rather than run, the run says so where it starts — with
+the age of the check behind it — so a skipped probe is never silent. A run that cannot
+possibly work therefore costs a second or two instead of the first minutes of a bundle,
+which is the failure this was built for:
 a rejected key or an unusable model id fails *every* chunk identically, and the run only says so
 after the chunks have been paid for.
 

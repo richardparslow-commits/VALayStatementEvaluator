@@ -152,7 +152,8 @@ see — a **short chat call** the endpoint refuses (`401`/`403`, or a `404` that
 serves no completions path at all). Each means every call in the run would be rejected, and the
 probes cost two requests instead of the first minutes of the bundle's chunks — or none when
 that configuration was just checked (by **Test connection** or a recent run attempt), whose
-verdict is reused for a few minutes.
+verdict is reused for a few minutes — and a run that reuses a check says so where it
+starts, with the age of the check behind it.
 
 The second probe is why this section exists in a document about compatibility. A listing is not
 a promise: Perplexity's Router API publishes its ids and then answers every completion with
