@@ -3,13 +3,39 @@ from __future__ import annotations
 
 import streamlit as st
 
+from ..build_info import build_sha, build_source
 from ..config import load_knowledge
 from ..diagnostics import CAPTURE_LIMIT, MAX_LINES, lookup
 from .ops import render_run_log_tail
 
 
+def _render_build_identity() -> None:
+    """Show which commit this deployment runs, so staleness is visible.
+
+    A stale deployment hides a merged feature — the question "where is the
+    credentials section?" was really "is my deployment current?" three times
+    in one week. The answer belongs where the user is looking, with an honest
+    "unknown" (a source upload or an image built without the build arg) rather
+    than a blank that reads as absence of the feature.
+    """
+    sha = build_sha()
+    source = build_source()
+    if sha:
+        origin = {"environment": "from the image/deployment", "git": "from the git checkout"}.get(
+            source, ""
+        )
+        st.caption(f"Running build: `{sha}` {origin}")
+    else:
+        st.caption(
+            "Running build: **unknown** — this deployment cannot see its own commit "
+            "(source upload, or an image built without `VA_LSE_BUILD_SHA`). If a "
+            "recently announced feature appears missing, redeploy from `main` first."
+        )
+
+
 def render_about_tab() -> None:
     """Render the About / Guide tab (static content, no session state)."""
+    _render_build_identity()
     st.subheader("What this tool does")
     st.markdown(
         """

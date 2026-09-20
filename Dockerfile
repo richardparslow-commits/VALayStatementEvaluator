@@ -49,6 +49,14 @@ COPY .streamlit/config.toml ./.streamlit/config.toml
 COPY app/ ./app/
 COPY run_app.py ./
 
+# Build identity: `docker build --build-arg VA_LSE_BUILD_SHA=$(git rev-parse --short HEAD)`
+# stamps the image so the About tab can answer "is this deployment current?".
+# No .git directory ships in the image, so without this arg the build reports
+# "unknown" — honest, but not actionable. The ARG has no default on purpose: an
+# unset build arg must not bake a misleading empty ENV into the layer cache.
+ARG VA_LSE_BUILD_SHA=""
+ENV VA_LSE_BUILD_SHA=${VA_LSE_BUILD_SHA}
+
 # Create the logs directory (audit + diagnostic logs) and the blob directory
 # (large job payloads shared with the workers — see app/blob_store.py).
 #
