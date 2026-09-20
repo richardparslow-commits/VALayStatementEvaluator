@@ -212,9 +212,10 @@ def check_endpoint_gate(action: str, *, log_action: str, request_id: str = "") -
 
     Two cheap requests per attempt — a model listing and one short chat call per
     configured model — and only when a run is actually being attempted, so ordinary
-    reruns cost nothing. A verdict **Test connection** just produced for this same
-    configuration is reused instead (see :func:`app.preflight.reusable_verdict`), so
-    a healthy configuration is not probed twice in a row. A block is stored so
+    reruns cost nothing. A verdict this gate or **Test connection** just produced for
+    this same configuration is reused instead (see
+    :func:`app.preflight.reusable_verdict`), so a healthy configuration is not probed
+    twice in a row. A block is stored so
     :func:`render_endpoint_preflight_notice` can keep it on screen with the waiver
     beside it — a user must be able to overrule a check that is wrong about their
     endpoint, because refusing to start a working run is worse than the failure the
@@ -222,13 +223,17 @@ def check_endpoint_gate(action: str, *, log_action: str, request_id: str = "") -
     """
     settings = session_settings()
     signature = preflight.signature(settings)
-    # **Test connection** runs this same check on the same configuration; its verdict is
-    # evidence until it goes stale, and reusing it keeps a healthy configuration from
-    # being probed twice in a row.
+    # **Test connection** and this gate's previous attempt run the same check on the
+    # same configuration; their verdict is evidence until it goes stale, and reusing it
+    # keeps a healthy configuration from being probed once per run.
     verdict = preflight.reusable_verdict(st.session_state, settings)
     reused = verdict is not None
     if verdict is None:
         verdict = preflight.check_endpoint(settings)
+        # Keep it for the next attempt on this configuration. Only a probe refreshes
+        # this: a reused verdict ages from when it was actually gathered, so a session
+        # that keeps running cannot postpone the next real check forever.
+        preflight.remember_verdict(st.session_state, settings, verdict)
     logger.info(
         "endpoint preflight action=%s kind=%s status=%s missing=%s reused=%s",
         action,

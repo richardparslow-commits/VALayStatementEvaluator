@@ -137,8 +137,8 @@ it produces, because it is the screen where the user can still fix it: the HTTP 
 provider's response body distinguish a rejected key (`401`/`403`) from a wrong path in the base
 URL (`404`) from a host that does not answer, and a listing that answers while every completion
 is refused is caught by the real call instead of being reported as healthy. The verdict is
-remembered for the run gate, so the first run after a check reuses it instead of repeating the
-same two requests.
+remembered for the run gate, so the first run after a check — and the run after that — reuses
+it instead of repeating the same two requests.
 
 See `app/preflight.py` (`check_endpoint`, the shared policy), `app/llm.py` (`probe_models` and
 `probe_chat`) and `app/views/sidebar.py:render_sidebar_settings`.
@@ -151,8 +151,8 @@ endpoint's catalog, a key the endpoint rejects (`401`/`403`), or — the case a 
 see — a **short chat call** the endpoint refuses (`401`/`403`, or a `404` that says the base URL
 serves no completions path at all). Each means every call in the run would be rejected, and the
 probes cost two requests instead of the first minutes of the bundle's chunks — or none when
-**Test connection** just ran the same check on the same configuration, whose verdict is reused
-for a few minutes.
+that configuration was just checked (by **Test connection** or a recent run attempt), whose
+verdict is reused for a few minutes.
 
 The second probe is why this section exists in a document about compatibility. A listing is not
 a promise: Perplexity's Router API publishes its ids and then answers every completion with
