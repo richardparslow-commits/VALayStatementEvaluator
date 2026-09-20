@@ -530,6 +530,18 @@ class TestVerdictReuse(unittest.TestCase):
                     preflight.reusable_verdict({key: junk}, settings, now=1_010.0)
                 )
 
+    def test_reading_a_verdict_does_not_refresh_it(self) -> None:
+        """Only a probe refreshes the window: a read ages from when the probe ran,
+        so a session that keeps checking cannot postpone a real check forever."""
+        settings = _settings()
+        store = self._store(settings, self._verdict(), now=1_000.0)
+        boundary = 1_000.0 + preflight.VERDICT_REUSE_SECONDS
+
+        self.assertIsNotNone(preflight.reusable_verdict(store, settings, now=1_010.0))
+        self.assertIsNotNone(preflight.reusable_verdict(store, settings, now=boundary))
+        self.assertEqual(store[preflight.VERDICT_SESSION_KEY]["at"], 1_000.0)
+        self.assertIsNone(preflight.reusable_verdict(store, settings, now=boundary + 0.001))
+
     def test_remembering_again_replaces_the_earlier_verdict(self) -> None:
         settings = _settings()
         store = self._store(settings, self._verdict(), now=1_000.0)
@@ -646,6 +658,55 @@ class TestEndpointGate(unittest.TestCase):
             allowed = shared.check_endpoint_gate("draft", log_action="draft", request_id="req_1")
         self.assertTrue(allowed)
         check.assert_called_once()
+
+    def test_the_gate_remembers_its_own_verdict_for_the_next_run(self) -> None:
+        """The first run pays for the probes; the next attempt on the same
+        configuration must not pay again while the evidence is fresh."""
+        import app.views.shared as shared
+
+        st_mock = _fake_st()
+        fresh = preflight.Verdict(preflight.OK, headline="fresh")
+        with patch.object(shared, "st", st_mock), patch.object(
+            shared, "session_settings", return_value=_settings()
+        ), patch.object(shared.preflight, "check_endpoint", return_value=fresh) as check:
+            self.assertTrue(
+                shared.check_endpoint_gate("draft", log_action="draft", request_id="req_1")
+            )
+            check.assert_called_once()
+
+        with patch.object(shared, "st", st_mock), patch.object(
+            shared, "session_settings", return_value=_settings()
+        ), patch.object(
+            shared.preflight, "check_endpoint", side_effect=AssertionError("probed again")
+        ):
+            for request_id in ("req_2", "req_3"):
+                self.assertTrue(
+                    shared.check_endpoint_gate("draft", log_action="draft", request_id=request_id)
+                )
+
+    def test_reusing_does_not_postpone_the_next_real_check(self) -> None:
+        """The window runs from the probe, not from the last reuse."""
+        import app.views.shared as shared
+
+        st_mock = _fake_st()
+        clock = {"t": 1_000.0}
+        with patch.object(
+            shared.preflight.time, "monotonic", side_effect=lambda: clock["t"]
+        ), patch.object(shared, "st", st_mock), patch.object(
+            shared, "session_settings", return_value=_settings()
+        ), patch.object(
+            shared.preflight, "check_endpoint", return_value=preflight.Verdict(preflight.OK, "fresh")
+        ) as check:
+            shared.check_endpoint_gate("draft", log_action="draft", request_id="req_1")
+            self.assertEqual(check.call_count, 1)
+
+            clock["t"] = 1_000.0 + preflight.VERDICT_REUSE_SECONDS - 1.0
+            shared.check_endpoint_gate("draft", log_action="draft", request_id="req_2")
+            check.assert_called_once()  # still fresh: reused, not re-probed
+
+            clock["t"] = 1_000.0 + preflight.VERDICT_REUSE_SECONDS + 1.0
+            shared.check_endpoint_gate("draft", log_action="draft", request_id="req_3")
+            self.assertEqual(check.call_count, 2)  # stale on schedule: probed again
 
     def test_a_reused_block_still_refuses_the_run(self) -> None:
         import app.views.shared as shared

@@ -452,10 +452,10 @@ def remember_verdict(
 ) -> None:
     """Record *verdict* as evidence a later check of the same configuration can reuse.
 
-    Called by **Test connection**: it runs the same check the run gate runs, so the
-    gate would otherwise pay for the same two requests seconds later. The verdict is
-    keyed by :func:`signature`, so any change to the endpoint, key or model names
-    makes it unreadable rather than misleading.
+    Called by both ends that pay for probes — **Test connection** and the run gate —
+    so the next check of the same configuration, seconds later, does not pay for them
+    again. The verdict is keyed by :func:`signature`, so any change to the endpoint,
+    key or model names makes it unreadable rather than misleading.
     """
     store[VERDICT_SESSION_KEY] = {
         "signature": signature(settings),

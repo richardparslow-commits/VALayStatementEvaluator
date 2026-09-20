@@ -285,8 +285,9 @@ provider: the app checks `GET {base_url}/models` at startup and warns if `LLM_MO
 > preflight a run does — the `GET {base_url}/models` listing *and* one real call per configured
 > model, on the on-screen key/URL — and renders the verdict that check produces, so the button
 > cannot call a configuration healthy that the run buttons would refuse. A few seconds instead
-> of a failed multi-minute run — and the verdict is kept for a few minutes, so the first run
-> button pressed after a passing check reuses it instead of repeating the same two requests.
+> of a failed multi-minute run — and the verdict is kept for a few minutes, so the next
+> attempt on the same configuration (the first run after a check, or the run after that)
+> reuses it instead of repeating the same two requests.
 > A block quotes the HTTP status and the provider's own words, and
 > names what that means for this app: a `401`/`403` is the key and the endpoint belonging to
 > different providers, a `404` is a wrong path in the base URL, and no response at all is the
@@ -298,9 +299,9 @@ provider: the app checks `GET {base_url}/models` at startup and warns if `LLM_MO
 Pressing **Draft the statement** or **Run exhaustive evaluation** first checks that the
 configured endpoint can serve the configured models — a `GET {base_url}/models` listing, then
 one **short chat call** per configured model — or no probes at all for a few minutes after
-**Test connection** checked the same configuration, whose verdict is reused. A run that cannot
-possibly work therefore costs a second or two instead of the first minutes of a bundle, which
-is the failure this was built for:
+that configuration was checked (**Test connection**, or a recent run attempt), whose verdict
+is reused. A run that cannot possibly work therefore costs a second or two instead of the
+first minutes of a bundle, which is the failure this was built for:
 a rejected key or an unusable model id fails *every* chunk identically, and the run only says so
 after the chunks have been paid for.
 
