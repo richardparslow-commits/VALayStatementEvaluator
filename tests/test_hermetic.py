@@ -1173,5 +1173,95 @@ class TestTheCIGateIsStillWired(unittest.TestCase):
         self.assertNotIn("continue-on-error", job)
 
 
+class TestTheLiveSmokeJobAcceptsAKey(unittest.TestCase):
+    """The live smoke job must actually run when a key secret exists.
+
+    The job is dispatch-only and skips itself without credentials, which makes
+    it the one job whose "green" can mean "never ran". That is the right shape
+    for a credit-consuming job, but it hides a specific failure: a key stored
+    under a name the gate does not read looks identical to no key at all, and
+    the smoke test silently never runs again. The gate and the job must
+    therefore agree on the secret names — including ``PERPLEXITY_API``, the
+    name a key created in the Perplexity console gets.
+    """
+
+    WORKFLOW = PROJECT_ROOT / ".github" / "workflows" / "test.yml"
+    GATE_JOB = "live-credentials"
+    SMOKE_JOB = "smoke"
+    KEY_SECRETS = ("OPENAI_API_KEY", "PERPLEXITY_API")
+
+    def _workflow(self) -> dict:
+        try:
+            import yaml
+        except ImportError:  # pragma: no cover - a declared test prerequisite
+            raise unittest.SkipTest("PyYAML is not installed")
+        return yaml.safe_load(self.WORKFLOW.read_text(encoding="utf-8"))
+
+    def _job(self, name: str) -> dict:
+        job = self._workflow()["jobs"].get(name)
+        self.assertIsNotNone(job, f"there is no '{name}' job")
+        return job
+
+    def test_the_gate_checks_at_least_one_key_secret(self) -> None:
+        """Every accepted key name must appear in the gate's secret reads."""
+
+        gate = self._job(self.GATE_JOB)
+        reads = "\n".join(
+            str(value)
+            for step in gate["steps"]
+            for value in (step.get("env") or {}).values()
+        )
+        for name in self.KEY_SECRETS:
+            self.assertIn(
+                f"secrets.{name}",
+                reads,
+                f"the smoke-credentials gate never reads {name}, so a key stored "
+                "under that name is indistinguishable from no key and the live "
+                "smoke silently stops running",
+            )
+
+    def test_the_smoke_job_maps_every_key_secret_onto_the_primary_variable(
+        self,
+    ) -> None:
+        """The app reads OPENAI_API_KEY; each accepted secret must feed it."""
+
+        smoke = self._job(self.SMOKE_JOB)
+        primary = str((smoke.get("env") or {}).get("OPENAI_API_KEY", ""))
+        self.assertTrue(
+            primary,
+            f"the '{self.SMOKE_JOB}' job no longer sets OPENAI_API_KEY, so the app "
+            "in that job has no key at all",
+        )
+        for name in self.KEY_SECRETS:
+            self.assertIn(
+                f"secrets.{name}",
+                primary,
+                f"{name} is accepted by the gate but never mapped into "
+                "OPENAI_API_KEY — the job would run keyless and fail at the "
+                "first LLM call",
+            )
+
+    def test_the_gate_and_job_agree_on_the_key_names(self) -> None:
+        """A name one side knows and the other forgot is a silent skip or a
+        keyless run; the two must stay in lockstep."""
+
+        gate = self._job(self.GATE_JOB)
+        gate_reads = "\n".join(
+            str(value)
+            for step in gate["steps"]
+            for value in (step.get("env") or {}).values()
+        )
+        smoke_env = str((self._job(self.SMOKE_JOB).get("env") or {}).get("OPENAI_API_KEY", ""))
+        for name in self.KEY_SECRETS:
+            in_gate = f"secrets.{name}" in gate_reads
+            in_job = f"secrets.{name}" in smoke_env
+            self.assertEqual(
+                in_gate,
+                in_job,
+                f"{name} is {'accepted' if in_gate else 'mapped'} by only one of "
+                "the gate and the smoke job — update both together",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

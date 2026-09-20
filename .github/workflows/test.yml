@@ -372,20 +372,24 @@ jobs:
     outputs:
       present: ${{ steps.check.outputs.present }}
     steps:
-      - name: Is OPENAI_API_KEY configured?
+      - name: Is an LLM API key configured?
         id: check
         env:
-          HAS_KEY: ${{ secrets.OPENAI_API_KEY != '' }}
+          HAS_OPENAI: ${{ secrets.OPENAI_API_KEY != '' }}
+          HAS_PPLX: ${{ secrets.PERPLEXITY_API != '' }}
         run: |
-          echo "present=$HAS_KEY" >> "$GITHUB_OUTPUT"
-          if [ "$HAS_KEY" != "true" ]; then
-            echo "OPENAI_API_KEY is not set — skipping the live smoke test."
+          if [ "$HAS_OPENAI" = "true" ] || [ "$HAS_PPLX" = "true" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "Neither OPENAI_API_KEY nor PERPLEXITY_API is set — skipping the live smoke test."
           fi
 
   # Live end-to-end run of both pathways against the configured LLM endpoint.
   # Intentionally NOT triggered automatically: it consumes real API credits and
-  # requires credentials, so it only runs on manual dispatch and only when the
-  # OPENAI_API_KEY secret is configured. Otherwise the job is skipped (never fails).
+  # requires credentials, so it only runs on manual dispatch and only when an LLM
+  # API key secret is configured — OPENAI_API_KEY, or PERPLEXITY_API (the name a
+  # Perplexity console key gets). Otherwise the job is skipped (never fails).
   smoke:
     name: Live smoke test (LLM endpoint)
     needs: live-credentials
@@ -393,7 +397,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      # A Perplexity key may live under its real name; it fills the same role as
+      # OPENAI_API_KEY — the primary key for whatever endpoint OPENAI_BASE_URL
+      # (or the default) points at. GitHub's || picks the first non-empty value.
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY || secrets.PERPLEXITY_API || '' }}
       OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL || '' }}
       LLM_MODEL_MAIN: ${{ secrets.LLM_MODEL_MAIN || '' }}
       LLM_MODEL_FAST: ${{ secrets.LLM_MODEL_FAST || '' }}
