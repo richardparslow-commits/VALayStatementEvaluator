@@ -19,9 +19,10 @@ Two probes, and the second one is the reason this module has a second probe at a
 answers it with its ids and then refuses every completion — ``403 The Router API is
 currently in limited preview`` (measured on an account without preview access), which
 looks exactly like a healthy endpoint until something calls it. So once the listing has
-not already blocked the run, the preflight asks for one token from each configured model
-and judges that: a refusal blocks, an answer confirms, and anything ambiguous (no
-response, a rate limit, a 5xx) leaves the listing's verdict alone.
+not already blocked the run, the preflight asks for a short answer from each configured
+model and judges that: a refusal blocks, a served call confirms (even one whose model
+wrote no visible text — see ``ChatProbe.silent``), and anything ambiguous (no response,
+a rate limit, a 5xx) leaves the listing's verdict alone.
 """
 
 from __future__ import annotations
@@ -44,7 +45,7 @@ BLOCKED = "blocked"
 UNVERIFIED = "unverified"
 
 ProbeFn = Callable[[str, str], ModelProbe]
-#: ``(base_url, api_key, model) -> ChatProbe`` — the one-token call.
+#: ``(base_url, api_key, model) -> ChatProbe`` — the short chat call.
 ChatProbeFn = Callable[[str, str, str], ChatProbe]
 
 #: Statuses that mean *every* call will be refused as configured. A model listing that
@@ -247,14 +248,20 @@ def _verified_by_a_call(
         )
 
     if answered:
-        return replace(
-            allowed,
-            kind=OK,
-            headline=(
+        silent = tuple(model for model, probe in outcomes if probe.ok and probe.silent)
+        if silent and len(silent) == len(answered):
+            headline = (
+                f"{allowed.headline} A real call to {_quoted(answered)} was served — the "
+                "model produced no visible text, which is what a reasoning model can do "
+                "when it spends the probe's budget thinking — and a served call is the "
+                "evidence this check needs."
+            )
+        else:
+            headline = (
                 f"{allowed.headline} A real call to {_quoted(answered)} answered, so the "
                 "configured key, endpoint and ids all work."
-            ),
-        )
+            )
+        return replace(allowed, kind=OK, headline=headline)
 
     return allowed
 
@@ -344,7 +351,7 @@ def check_endpoint(
         )
 
     if result.status == 404:
-        # No listing route, so the one-token call is the only thing that can tell a
+        # No listing route, so the short chat call is the only thing that can tell a
         # working endpoint from a wrong base URL — exactly what it is for.
         return _verified_by_a_call(
             settings,

@@ -1516,8 +1516,9 @@ a rejected-key error that looks nothing like "wrong host" — and because nothin
 check runs, the UI reports it almost instantly, which reads as a silent failure.
 
 Set the key and the base URL from the same provider account, then click **Test connection** in
-the sidebar: it calls `GET {base_url}/models` with the on-screen values and should answer
-"Endpoint reachable — N model(s) available, including `…`".
+the sidebar: it runs the same preflight a run does on the on-screen values — the model listing
+plus one real call per configured model — and should answer that a real call answered, so the
+configured key, endpoint and ids all work.
 
 Remember **Apply settings**: the API key is read live on every run, but the base URL and model
 names only take effect after clicking it (the sidebar warns while a change is pending), and
@@ -1531,7 +1532,7 @@ names only take effect after clicking it (the sidebar warns while a change is pe
       framework-currency check loadable on the platform); no `pip install` step is possible here
 - [ ] `PERPLEXITY_API_KEY` set if the base URL is *not* Perplexity's, or the Research tab is off
 - [ ] App rebooted after editing secrets
-- [ ] Sidebar **Test connection** reports "Endpoint reachable" on the deployed URL
+- [ ] Sidebar **Test connection** reports a real call answered on the deployed URL
 - [ ] Sidebar captions the values as `🔐 From Streamlit secrets:`
 - [ ] No key typed into a chat, issue, or commit; rotate anything that was exposed
 - [ ] Long runs: leave the tab open — a real Evaluate takes minutes
@@ -2217,7 +2218,7 @@ python scripts/rehearse_failover.py --expect-idle
 - [ ] Secrets are stored in K8s Secret / Docker secret / cloud secret manager
 - [ ] On a host with no `.env` (Streamlit Cloud), `OPENAI_API_KEY` **and** `OPENAI_BASE_URL` are
       set together in **Settings → Secrets** and the app was rebooted afterwards ([§14](#14-pattern-d--streamlit-community-cloud))
-- [ ] Sidebar **Test connection** reports "Endpoint reachable" against the deployed base URL
+- [ ] Sidebar **Test connection** reports a real call answered against the deployed base URL
 - [ ] Sidebar field(s) sourced from secrets are captioned (`🔐 From Streamlit secrets: …`)
 - [ ] Any API key pasted into a chat, issue, or commit has been rotated (`SECURITY.md`)
 - [ ] `OPENAI_API_KEY` is set and valid

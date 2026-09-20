@@ -281,11 +281,12 @@ provider: the app checks `GET {base_url}/models` at startup and warns if `LLM_MO
 > then starts on the default Token Plan base URL, so a key issued for a different endpoint gets
 > sent to the wrong host and is rejected with a generic auth error.
 >
-> Use **Test connection** (next to *Apply settings*) before a long run: it calls
-> `GET {base_url}/models` with the on-screen key/URL, reports the model count, and flags model
-> names the endpoint does not offer — a two-second check instead of a failed multi-minute run.
-> When the check fails it quotes the HTTP status and the provider's response body, and names
-> what that status means for this app: a `401`/`403` is the key and the endpoint belonging to
+> Use **Test connection** (next to *Apply settings*) before a long run: it runs the same
+> preflight a run does — the `GET {base_url}/models` listing *and* one real call per configured
+> model, on the on-screen key/URL — and renders the verdict that check produces, so the button
+> cannot call a configuration healthy that the run buttons would refuse. A few seconds instead
+> of a failed multi-minute run. A block quotes the HTTP status and the provider's own words, and
+> names what that means for this app: a `401`/`403` is the key and the endpoint belonging to
 > different providers, a `404` is a wrong path in the base URL, and no response at all is the
 > host or the network. With no key in the environment, enter the key **and** the matching base
 > URL, then click *Apply settings*.
@@ -294,21 +295,22 @@ provider: the app checks `GET {base_url}/models` at startup and warns if `LLM_MO
 
 Pressing **Draft the statement** or **Run exhaustive evaluation** first checks that the
 configured endpoint can serve the configured models — a `GET {base_url}/models` listing, then
-one **one-token call** per configured model. A run that cannot possibly work therefore costs a
+one **short chat call** per configured model. A run that cannot possibly work therefore costs a
 second or two instead of the first minutes of a bundle, which is the failure this was built for:
 a rejected key or an unusable model id fails *every* chunk identically, and the run only says so
 after the chunks have been paid for.
 
-The one-token call is there because a listing is not a promise. Perplexity's Router API is the
+The chat call is there because a listing is not a promise. Perplexity's Router API is the
 measured case: it answers `/models` with its own ids and then refuses every completion with
 `403 The Router API is currently in limited preview` until the account is granted access, so the
 listing alone called that endpoint healthy and the run failed once per chunk. An answer confirms
-the configuration, a refusal stops the run with the provider's own words, and anything ambiguous
-leaves the listing's verdict in place.
+the configuration — including one that comes back with no visible text because a reasoning model
+spent the budget thinking, which is still a served call — a refusal stops the run with the
+provider's own words, and anything ambiguous leaves the listing's verdict in place.
 
 It stops the run when the evidence is unambiguous: the endpoint lists models and one of the
 configured names is not among them, the endpoint rejects the key (`401`/`403`), or a real
-one-token call is refused (`401`/`403`, or a `404` that says the base URL serves no
+chat call is refused (`401`/`403`, or a `404` that says the base URL serves no
 completions path at all). Everything else is **reported but allowed** — a host that does not
 answer, a `404` on `/models` (some providers serve completions without listing models), a `429`,
 a provider-side `5xx`. Refusing to start a working run is worse than the failure this prevents, so
