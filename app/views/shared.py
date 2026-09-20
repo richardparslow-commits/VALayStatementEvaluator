@@ -212,7 +212,9 @@ def check_endpoint_gate(action: str, *, log_action: str, request_id: str = "") -
 
     Two cheap requests per attempt — a model listing and one short chat call per
     configured model — and only when a run is actually being attempted, so ordinary
-    reruns cost nothing. A block is stored so
+    reruns cost nothing. A verdict **Test connection** just produced for this same
+    configuration is reused instead (see :func:`app.preflight.reusable_verdict`), so
+    a healthy configuration is not probed twice in a row. A block is stored so
     :func:`render_endpoint_preflight_notice` can keep it on screen with the waiver
     beside it — a user must be able to overrule a check that is wrong about their
     endpoint, because refusing to start a working run is worse than the failure the
@@ -220,13 +222,20 @@ def check_endpoint_gate(action: str, *, log_action: str, request_id: str = "") -
     """
     settings = session_settings()
     signature = preflight.signature(settings)
-    verdict = preflight.check_endpoint(settings)
+    # **Test connection** runs this same check on the same configuration; its verdict is
+    # evidence until it goes stale, and reusing it keeps a healthy configuration from
+    # being probed twice in a row.
+    verdict = preflight.reusable_verdict(st.session_state, settings)
+    reused = verdict is not None
+    if verdict is None:
+        verdict = preflight.check_endpoint(settings)
     logger.info(
-        "endpoint preflight action=%s kind=%s status=%s missing=%s",
+        "endpoint preflight action=%s kind=%s status=%s missing=%s reused=%s",
         action,
         verdict.kind,
         verdict.status,
         list(verdict.missing),
+        reused,
         extra={"request_id": request_id or "-", "phase": "endpoint_preflight", "status": verdict.kind},
     )
     if not verdict.blocks:
