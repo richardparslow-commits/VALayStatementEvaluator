@@ -269,7 +269,7 @@ def evaluation_from_json(raw: Any) -> EvaluationResult:
 
 def draft_to_json(result: DraftResult) -> dict[str, Any]:
     return {
-        "grounding": dict(result.grounding),
+        "grounding": dict(result.grounding) if isinstance(result.grounding, dict) else {},
         "draft": result.draft,
         "final_statement": result.final_statement,
         "review_issues": list(result.review_issues),
