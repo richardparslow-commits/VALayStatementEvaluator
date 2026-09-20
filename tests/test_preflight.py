@@ -1156,5 +1156,84 @@ class TestVercelCredentials(unittest.TestCase):
         self.assertNotIn("AI Gateway", verdict.fix)
 
 
+class TestRetiredEndpointBanner(unittest.TestCase):
+    """The sidebar names a retired provider configuration before a run can start.
+
+    ``retired_endpoint_reason`` is the pure matcher behind the banner. It is offline
+    by design — the retired setups fail in ways that need no request to name — and
+    it must never fire on a supported configuration, so the “not retired” cases are
+    asserted as deliberately as the “retired” ones.
+    """
+
+    def test_the_gateway_base_url_is_retired_whatever_the_models_are(self) -> None:
+        reason = preflight.retired_endpoint_reason(
+            _settings(
+                base_url=preflight.VERCEL_GATEWAY_BASE_URL,
+                model_main="model-main",
+                model_fast="model-fast",
+            )
+        )
+        self.assertIn("AI Gateway", reason)
+        self.assertIn("429", reason, "the measured failure is the evidence")
+        self.assertIn(preflight.DEFAULT_BASE_URL, reason, "and the remedy names the default")
+
+    def test_a_gateway_subdomain_is_caught_too(self) -> None:
+        reason = preflight.retired_endpoint_reason(
+            _settings(base_url="https://team.ai-gateway.vercel.sh/v1")
+        )
+        self.assertIn("AI Gateway", reason)
+
+    def test_the_router_path_is_retired(self) -> None:
+        reason = preflight.retired_endpoint_reason(
+            _settings(base_url="https://api.perplexity.ai/router/v1")
+        )
+        self.assertIn("Router", reason)
+        self.assertIn("private preview", reason)
+        self.assertIn(preflight.DEFAULT_BASE_URL, reason)
+
+    def test_a_gateway_era_model_id_is_retired_on_any_other_endpoint(self) -> None:
+        reason = preflight.retired_endpoint_reason(
+            _settings(
+                base_url="https://llm.internal.test/v1",
+                model_main="MoonshotAI/Kimi-K3",
+                model_fast="alibaba/qwen3.7-flash",
+            )
+        )
+        self.assertIn("retired model id", reason)
+        self.assertIn("moonshotai/kimi-k3", reason, "the canonical id is quoted")
+        self.assertIn("alibaba/qwen3.7-flash", reason)
+
+    def test_the_banner_silences_itself_on_current_defaults(self) -> None:
+        reason = preflight.retired_endpoint_reason(
+            _settings(
+                base_url=preflight.DEFAULT_BASE_URL,
+                model_main="perplexity/kimi-k3",
+                model_fast="perplexity/glm-5.3-flash",
+            )
+        )
+        self.assertEqual(reason, "")
+
+    def test_plain_provider_ids_and_other_gateways_are_not_retired(self) -> None:
+        for settings in (
+            _settings(model_main="qwen3.7-max", model_fast="qwen3.7-flash"),
+            _settings(base_url="https://openrouter.ai/api/v1"),
+            _settings(base_url="https://not-the-gateway.vercel.app/v1"),
+            _settings(model_main="", model_fast=""),
+        ):
+            with self.subTest(base_url=settings.base_url, main=settings.model_main):
+                self.assertEqual(preflight.retired_endpoint_reason(settings), "")
+
+    def test_a_dated_variant_of_a_gateway_id_is_not_flagged(self) -> None:
+        """Providers append dates to ids; the extended id is a different model."""
+        reason = preflight.retired_endpoint_reason(
+            _settings(
+                base_url="https://llm.internal.test/v1",
+                model_main="moonshotai/kimi-k3-2025-04-16",
+                model_fast="model-fast",
+            )
+        )
+        self.assertEqual(reason, "")
+
+
 if __name__ == "__main__":
     unittest.main()

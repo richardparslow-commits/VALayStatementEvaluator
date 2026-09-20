@@ -1530,6 +1530,59 @@ class TestSidebarSettingsGuards(unittest.TestCase):
             sidebar._pending_settings_warning(self._settings())
         st_mock.warning.assert_not_called()
 
+    def test_a_retired_configuration_raises_the_banner(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, session = _fake_streamlit()
+        with _patch_st(sidebar, st_mock):
+            sidebar._retired_endpoint_warning(
+                self._settings(base_url="https://ai-gateway.vercel.sh/v1")
+            )
+        st_mock.warning.assert_called_once()
+        msg = str(st_mock.warning.call_args[0][0])
+        self.assertIn("AI Gateway", msg)
+        self.assertIn("retired", msg)
+
+    def test_a_current_configuration_stays_silent(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, session = _fake_streamlit()
+        with _patch_st(sidebar, st_mock):
+            sidebar._retired_endpoint_warning(
+                self._settings(
+                    base_url="https://api.perplexity.ai/v1",
+                    model_main="perplexity/kimi-k3",
+                    model_fast="perplexity/glm-5.3-flash",
+                )
+            )
+        st_mock.warning.assert_not_called()
+
+    def test_the_sidebar_renders_the_banner_with_the_applied_settings(self) -> None:
+        """The banner reads the *applied* settings, so it reflects what a run uses."""
+        import app.views.sidebar as sidebar
+
+        st_mock, session = _fake_streamlit()
+        session["settings"] = self._settings(
+            base_url="https://ai-gateway.vercel.sh/v1",
+            fetch_api_key="",
+            fetch_base_url="https://fetchsandbox.com",
+            fetch_records_path="/medical_records/{patient_id}",
+        )
+        st_mock.columns.return_value = (MagicMock(), MagicMock())
+        st_mock.button.return_value = False
+        with (
+            _patch_st(sidebar, st_mock),
+            patch.object(sidebar, "_pending_settings_warning"),
+            patch.object(sidebar, "_compat_model_warning"),
+            patch.object(sidebar, "_credit_calibration_widget"),
+            patch.object(sidebar, "_job_queue_panel"),
+            patch.object(sidebar, "_audit_backup_panel"),
+            patch.object(sidebar, "_llm_failover_panel"),
+        ):
+            sidebar.render_sidebar_settings()
+        st_mock.warning.assert_called_once()
+        self.assertIn("AI Gateway", str(st_mock.warning.call_args[0][0]))
+
     def _verdict(self, kind: str, headline: str, fix: str = "", **over: object) -> Verdict:
         fields: dict = dict(
             kind=kind,

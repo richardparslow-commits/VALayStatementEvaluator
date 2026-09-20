@@ -18,7 +18,14 @@ from .. import watchdog
 from ..config import DEFAULT_BASE_URL, load_settings
 from ..error_report import report_failure
 from ..llm import check_model_availability
-from ..preflight import BLOCKED, OK, Verdict, check_endpoint, remember_verdict
+from ..preflight import (
+    BLOCKED,
+    OK,
+    Verdict,
+    check_endpoint,
+    remember_verdict,
+    retired_endpoint_reason,
+)
 from ..prompt_sanitize import validate_api_key, validate_model_name
 from .usage import load_usage_history, save_usage_history
 
@@ -127,6 +134,7 @@ def render_sidebar_settings() -> None:
 
         _pending_settings_warning(settings)
         _compat_model_warning(settings)
+        _retired_endpoint_warning(settings)
 
         st.divider()
         _credit_calibration_widget()
@@ -678,6 +686,22 @@ def _compat_model_warning(settings: Any) -> None:
     st.session_state["_compat_warnings"] = warnings
     for msg in warnings:
         st.warning(msg)
+
+
+def _retired_endpoint_warning(settings: Any) -> None:
+    """Banner when the configured endpoint or models belong to a retired provider.
+
+    Vercel AI Gateway and Perplexity's Router each worked here once and were retired,
+    and both fail runs in ways a pre-run check can name without any request: the
+    gateway's free tier rate-limits per model (a measured 329-chunk run lost 315
+    chunks to `429` in under a minute) and the Router refuses completions without
+    private-preview entitlement. ``retired_endpoint_reason`` is pure string matching,
+    so the banner renders on every paint with no network call and no session state —
+    visible before the user reaches for a run button, which is the point.
+    """
+    reason = retired_endpoint_reason(settings)
+    if reason:
+        st.warning(reason)
 
 
 def _credit_calibration_widget() -> None:
