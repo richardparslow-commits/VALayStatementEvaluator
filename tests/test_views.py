@@ -1390,6 +1390,41 @@ class TestSidebarSettingsGuards(unittest.TestCase):
         base.update(over)
         return types.SimpleNamespace(**base)
 
+    def test_the_model_ids_in_use_are_printed_where_clipping_cannot_mislead(self) -> None:
+        """Both model boxes are half-width, so a long id is cut off at the box edge —
+        and the character the cut lands on can read as part of the id.
+
+        This is how the app's own default (``perplexity/glm-5.3-flash``) comes to look
+        like a value with a stray trailing period, so the sidebar states the applied
+        ids in full.
+        """
+        import app.views.sidebar as sidebar
+
+        st_mock, session = _fake_streamlit()
+        session["settings"] = self._settings(
+            model_main="perplexity/kimi-k3",
+            model_fast="perplexity/glm-5.3-flash",
+            fetch_api_key="",
+            fetch_base_url="https://fetchsandbox.com",
+            fetch_records_path="/medical_records/{patient_id}",
+        )
+        st_mock.columns.return_value = (MagicMock(), MagicMock())
+        st_mock.button.return_value = False
+        with (
+            _patch_st(sidebar, st_mock),
+            patch.object(sidebar, "_pending_settings_warning"),
+            patch.object(sidebar, "_compat_model_warning"),
+            patch.object(sidebar, "_credit_calibration_widget"),
+            patch.object(sidebar, "_job_queue_panel"),
+            patch.object(sidebar, "_audit_backup_panel"),
+            patch.object(sidebar, "_llm_failover_panel"),
+        ):
+            sidebar.render_sidebar_settings()
+
+        captions = " ".join(str(call.args[0]) for call in st_mock.caption.call_args_list)
+        self.assertIn("perplexity/kimi-k3", captions)
+        self.assertIn("perplexity/glm-5.3-flash", captions)
+
     def test_pending_warning_lists_unapplied_fields(self) -> None:
         import app.views.sidebar as sidebar
 

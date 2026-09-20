@@ -294,6 +294,7 @@ the same **What happened?** panel as any other failure.
 | Fails after some successful calls | Rate limiting | Reduce `VA_LSE_RECORDS_CONCURRENCY` or wait |
 | Intermittent failures | Provider outage or network issue | Configure fallback endpoint |
 | Fails only on large files | Timeout or payload too large | Split records or increase `VA_LSE_LLM_CALL_TIMEOUT_SECONDS` |
+| **Apply settings** rejects a model name ("ends with '.'") | A model id copied out of a sentence or list kept its punctuation ("… the cheapest is `perplexity/glm-5.3-flash`.") | Delete the trailing `.` — copy ids from the provider's own model list, never from running prose. The same check refuses the run before any call is made. If the field only *looks* like it ends in punctuation, it is clipped, not mistyped — the applied ids are printed in full beneath the model boxes |
 | Fails with "content filter" message | Moderation filter on output | Retry (filter is stochastic); reword graphic details |
 
 ## When to Contact Support

@@ -115,8 +115,22 @@ class TestValidateModelName(unittest.TestCase):
     def test_rejects_invalid_chars(self):
         self.assertIsNotNone(validate_model_name("model; rm -rf"))
 
+    def test_rejects_trailing_sentence_punctuation(self):
+        """A model id copied out of a sentence arrives with the full stop attached."""
+        for name in ("perplexity/glm-5.", "perplexity/kimi-k.", "sonar,", "model;", "model:"):
+            message = validate_model_name(name)
+            self.assertIsNotNone(message, msg=name)
+            self.assertIn("ends with", message or "", msg=name)
+
     def test_accepts_normal(self):
-        for name in ("qwen3.7-max", "qwen3.7-flash", "gpt-4o-mini", "openai/gpt-4o"):
+        for name in (
+            "qwen3.7-max",
+            "qwen3.7-flash",
+            "gpt-4o-mini",
+            "openai/gpt-4o",
+            "perplexity/glm-5.3-flash",  # interior dots are fine
+            "llama-3.1:8b",  # an interior colon is fine
+        ):
             self.assertIsNone(validate_model_name(name), msg=name)
 
 
