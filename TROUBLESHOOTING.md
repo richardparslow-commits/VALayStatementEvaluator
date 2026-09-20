@@ -299,6 +299,35 @@ the same **What happened?** panel as any other failure.
 | Fails only on large files | Timeout or payload too large | Split records or increase `VA_LSE_LLM_CALL_TIMEOUT_SECONDS` |
 | **Apply settings** rejects a model name ("ends with '.'") | A model id copied out of a sentence or list kept its punctuation ("… the cheapest is `perplexity/glm-5.3-flash`.") | Delete the trailing `.` — copy ids from the provider's own model list, never from running prose. The same check refuses the run before any call is made. If the field only *looks* like it ends in punctuation, it is clipped, not mistyped — the applied ids are printed in full beneath the model boxes |
 | Fails with "content filter" message | Moderation filter on output | Retry (filter is stochastic); reword graphic details |
+| GitHub commit shows a red **Preview/Production deployment failure** from `vercel[bot]` | Vercel's Git integration auto-detected this repo as a Python **serverless** app and demanded a WSGI `app`/`handler` export, which a Streamlit app can never have | See **Vercel Preview deployments fail** below |
+
+## Vercel Preview deployments fail
+
+`vercel[bot]` created one failed Preview deployment per push on September 18–19
+(seven in total, including one Production twin), each reporting:
+
+> Found app/main.py but it does not export a top-level "app", "application",
+> or "handler" variable.
+
+**Why it cannot be fixed in code.** Vercel's Python framework preset builds a
+*serverless* app — short-lived request handlers exporting a WSGI/ASGI callable
+from a single module. This application is a long-running **Streamlit server**
+(`streamlit run app/main.py`) with background job queues; it is architecturally
+incapable of that export, and `app/main.py` deliberately has no `app =` symbol.
+No commit can satisfy both models at once.
+
+**What was done (September 20, 2026).** All seven failed deployments were
+deleted from the Vercel project, their GitHub deployment records marked
+`inactive`, and the project's framework preset set to *Other* so the detector
+cannot fire again. The GitHub→Vercel connection had already gone quiet after
+September 19, and the project never had a successful deployment.
+
+**If Vercel previews start failing again**, the Git integration has been
+re-connected: disconnect `VALayStatementEvaluator` from the Vercel project in
+the Vercel dashboard (**Project Settings → Git → Disconnect**), or delete the
+project. This repo's supported hosting paths are Streamlit Community Cloud (the
+deployed app), Docker Compose, and Kubernetes — see `DEPLOYMENT.md` §2–§4.
+Railway deploys succeed through its own integration and are unaffected.
 
 ## When to Contact Support
 
