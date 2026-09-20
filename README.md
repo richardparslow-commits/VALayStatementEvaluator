@@ -492,7 +492,17 @@ for the session (no new endpoints, no new env vars).
 2. Pick the **claimed condition** (body system + searchable dropdown) the same way as in
    Evaluate mode; adjust the pre-selected topics or toggle **Aid & Attendance / SMC-L**, then
    click **Proceed**.
-3. Enter witness details and bulleted firsthand observations.
+3. Enter witness details and bulleted firsthand observations. If the witness also
+   holds a medical or professional credential (RN, NP/PA, physician, therapist,
+   vocational or forensic background), record it under **Step 3b — Professional
+   credentials**: credential level, specialties, licenses/certifications, and how
+   the expertise relates to the observations. A credentialed witness produces a
+   stronger hybrid statement — clinical descriptions of personally observed
+   symptoms, functional/ADL impact, medication effects — with the statement's
+   assertions kept inside the credential's scope (a nurse's statement will not
+   claim a diagnosis or nexus opinion; a physician's may, attributed to their own
+   qualifications per 38 CFR § 3.159). Leave the level at **None** for a
+   purely lay witness and nothing changes.
 4. Click **Draft the statement** — the app grounds every observation in the records, flags
    conflicts, suggests strengthening questions, drafts the statement, and self-reviews it.
 5. Resolve every bracketed `[Confirm: ...]` placeholder with the witness before signing.

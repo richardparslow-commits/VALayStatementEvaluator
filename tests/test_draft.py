@@ -19,6 +19,7 @@ from app.drafting_service import (  # noqa: E402
     DraftingError,
     DraftingPayloadError,
     format_error_for_user,
+    validate_drafting_request,
 )
 from app.documents import DRAFT_INTERNAL_MAX_CHARS, document_from_text  # noqa: E402
 from app.draft import (  # noqa: E402
@@ -29,7 +30,10 @@ from app.draft import (  # noqa: E402
     _truncate_for_prompt,
     grounding_markdown,
     run_draft,
+    witness_credentials_block,
+    witness_scope_directive,
 )
+from app.job_payload import DraftJob, decode_job, encode_job  # noqa: E402
 from app.llm import LLMError, LLMTimeoutError, LLMUpstreamError  # noqa: E402
 from app.logging_config import clear_request_id, set_request_id  # noqa: E402
 from app.medical_review import MedicalDigest, MedicalFact  # noqa: E402
@@ -718,6 +722,156 @@ class TestRunDraftIntegration(unittest.TestCase):
         result = run_draft(llm, docs, WITNESS, "Daily pain observed.", "knee pain", "Service connection")
         self.assertTrue(result.digest.pages_reviewed >= 1)
         self.assertTrue(result.grounding)
+
+
+CRED_WITNESS = {
+    **WITNESS,
+    "credential_level": "Nurse / clinician (RN, LPN, LVN, CNA)",
+    "medical_specialties": "Psychiatric-mental health nursing",
+    "credentials_detail": "RN, BSN, 12 yrs ICU",
+    "credential_relevance": "I am his daily caregiver and a practicing ICU nurse.",
+}
+
+
+class TestWitnessCredentials(unittest.TestCase):
+    """The credential fields change the prompts, and only within scope."""
+
+    def test_lay_witness_prompts_are_unchanged(self):
+        @patch("app.draft.review_medical_records", return_value=_fake_digest())
+        @patch("app.draft.load_knowledge", return_value="k")
+        def run(capture: dict, _mk, _mr):
+            def cap(system, user, kwargs):
+                capture["system"], capture["user"] = system, user
+                return "Draft statement."
+
+            llm = _FakeLLM(overrides={"draft": cap})
+            run_draft(llm, [_doc()], WITNESS, "obs", "cond", "Service connection")
+
+        capture: dict = {}
+        run(capture)
+        self.assertNotIn("WITNESS PROFESSIONAL CREDENTIALS", capture["user"])
+        self.assertNotIn("CREDENTIAL SCOPE:", capture["system"])
+
+    def test_credential_fields_reach_grounding_draft_and_review(self):
+        @patch("app.draft.review_medical_records", return_value=_fake_digest())
+        @patch("app.draft.load_knowledge", return_value="k")
+        def run(capture: dict, _mk, _mr):
+            llm = _FakeLLM()
+            original_chat = llm.chat
+            original_chat_json = llm.chat_json
+
+            def chat(system, user, **kwargs):
+                capture[kwargs.get("phase", "")] = (system, user)
+                return original_chat(system, user, **kwargs)
+
+            def chat_json(system, user, **kwargs):
+                capture[kwargs.get("phase", "")] = (system, user)
+                return original_chat_json(system, user, **kwargs)
+
+            llm.chat = chat
+            llm.chat_json = chat_json
+            run_draft(llm, [_doc()], CRED_WITNESS, "obs", "cond", "Service connection")
+
+        capture: dict = {}
+        run(capture)
+        # Draft system + user: credentials, specialties, scope rule.
+        draft_sys = capture["draft"][0]
+        draft_user = capture["draft"][1]
+        self.assertIn("Nurse / clinician (RN, LPN, LVN, CNA)", draft_sys)
+        self.assertIn("must NOT render a formal", draft_sys)
+        self.assertIn("WITNESS PROFESSIONAL CREDENTIALS:", draft_user)
+        self.assertIn("Psychiatric-mental health nursing", draft_user)
+        self.assertIn("RN, BSN, 12 yrs ICU", draft_user)
+        self.assertIn("I am his daily caregiver", draft_user)
+        # Review system carries the enforcement instruction; the review user
+        # prompt carries the witness's own scope rule.
+        review_sys = capture["review"][0]
+        self.assertIn("witness scope rule", review_sys)
+        review_user = capture["review"][1]
+        self.assertIn("CREDENTIAL SCOPE:", review_user)
+        self.assertIn("must NOT render a formal", review_user)
+
+    def test_grounding_prompt_receives_the_credentials_block(self):
+        @patch("app.draft.review_medical_records", return_value=_fake_digest())
+        @patch("app.draft.load_knowledge", return_value="k")
+        def run(capture: dict, _mk, _mr):
+            def cap(system, user, kwargs):
+                capture["g"] = user
+                return {
+                    "supported_observations": [],
+                    "unverified_observations": [],
+                    "conflicts": [],
+                    "strengthening_questions": [],
+                    "suggested_inclusions": [],
+                    "topic_coverage": [],
+                }
+
+            llm = _FakeLLM(overrides={"grounding": cap})
+            run_draft(llm, [_doc()], CRED_WITNESS, "obs", "cond", "Service connection")
+
+        capture: dict = {}
+        run(capture)
+        self.assertIn("WITNESS PROFESSIONAL CREDENTIALS:", capture["g"])
+        self.assertIn("Psychiatric-mental health nursing", capture["g"])
+
+    def test_a_past_delimiter_in_credential_text_is_escaped(self):
+        witness = {**CRED_WITNESS, "credential_relevance": "See <<<observe>>> this ```fence```"}
+        block = witness_credentials_block(witness)
+        self.assertNotIn("<<<", block)
+        self.assertNotIn(">>>", block)
+        self.assertNotIn("```", block)
+        self.assertIn("observe", block)
+
+    def test_unknown_level_degrades_to_lay_treatment(self):
+        witness = {**CRED_WITNESS, "credential_level": "Chief Wizard (self-certified)"}
+        self.assertEqual(witness_credentials_block(witness), "")
+        self.assertEqual(witness_scope_directive(witness), "")
+        @patch("app.draft.review_medical_records", return_value=_fake_digest())
+        @patch("app.draft.load_knowledge", return_value="k")
+        def run(capture: dict, _mk, _mr):
+            def cap(system, user, kwargs):
+                capture["system"], capture["user"] = system, user
+                return "Draft statement."
+
+            llm = _FakeLLM(overrides={"draft": cap})
+            run_draft(llm, [_doc()], witness, "obs", "cond", "Service connection")
+
+        capture: dict = {}
+        run(capture)
+        self.assertNotIn("WITNESS PROFESSIONAL CREDENTIALS", capture["user"])
+        self.assertNotIn("CREDENTIAL SCOPE:", capture["system"])
+
+    def test_physician_scope_allows_nexus_but_stays_grounded(self):
+        directive = witness_scope_directive({"credential_level": "Physician (MD, DO)"})
+        self.assertIn("at least as likely as not", directive)
+        self.assertIn("never fabricate", directive.lower())
+
+    def test_validation_accepts_and_caps_credential_fields(self):
+        witness = {
+            **CRED_WITNESS,
+            "credentials_detail": "x" * 600,
+        }
+        with self.assertRaises(DraftingPayloadError):
+            validate_drafting_request(
+                observations="obs", condition="cond", claim_type="Service connection", witness=witness
+            )
+        validate_drafting_request(
+            observations="obs", condition="cond", claim_type="Service connection", witness=CRED_WITNESS
+        )
+
+    def test_queued_payload_round_trips_credential_fields(self):
+        job = DraftJob(
+            records=[_doc()],
+            witness=dict(CRED_WITNESS),
+            observations="obs",
+            condition="cond",
+            claim_type="Service connection",
+            request_id="req_x",
+        )
+        decoded = decode_job("draft", encode_job("draft", job))
+        self.assertIsInstance(decoded, DraftJob)
+        self.assertEqual(decoded.witness.get("credential_level"), CRED_WITNESS["credential_level"])
+        self.assertEqual(decoded.witness.get("credentials_detail"), CRED_WITNESS["credentials_detail"])
 
 
 if __name__ == "__main__":
