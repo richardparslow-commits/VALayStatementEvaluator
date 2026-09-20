@@ -285,6 +285,13 @@ provider: the app checks `GET {base_url}/models` at startup and warns if `LLM_MO
 > then starts on the default Perplexity Agent API base URL, so a key issued for a different
 > endpoint gets sent to the wrong host and is rejected with a generic auth error.
 >
+> A sidebar banner also names a **retired provider configuration** before any run: a Vercel AI
+> Gateway base URL, a Perplexity Router path, or a gateway-era model id (`moonshotai/kimi-k3`,
+> `alibaba/qwen3.7-flash`, `openai/gpt-4.1-nano`). Both providers worked here once and were
+> retired — the gateway's free tier rate-limits per model and the Router refuses completions
+> without preview entitlement — so the banner states the measured failure and the fix instead
+> of letting a doomed run rediscover it. See [`COMPATIBILITY.md`](COMPATIBILITY.md).
+>
 > Use **Test connection** (next to *Apply settings*) before a long run: it runs the same
 > preflight a run does — the `GET {base_url}/models` listing *and* one real call per configured
 > model, on the on-screen key/URL — and renders the verdict that check produces, so the button

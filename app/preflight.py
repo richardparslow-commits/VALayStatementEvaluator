@@ -33,7 +33,7 @@ from hashlib import sha256
 from typing import Any, Callable, Protocol
 from urllib.parse import urlparse
 
-from .config import Settings
+from .config import DEFAULT_BASE_URL, Settings
 from .llm import ChatProbe, ModelProbe, probe_chat, probe_models
 
 # A run may start. The endpoint answered and lists every configured model.
@@ -126,6 +126,98 @@ def _credential_mismatch(settings: Settings) -> str:
             "`OPENAI_BASE_URL` is Vercel's AI Gateway, which needs an **AI Gateway API key** "
             f"(`{VERCEL_GATEWAY_KEY_PREFIX}…`, from the project's AI Gateway → API Keys; a Vercel "
             "*access token*, which the Sandbox product takes, is a different credential again)."
+        )
+    return ""
+
+
+#: Model ids that identify a **retired** configuration even when the base URL does not.
+#: These are the settings this repo shipped between 2026-09-18 and 2026-09-19 (Vercel AI
+#: Gateway era) and the Router-era default before that; a deployment still carrying them
+#: is one that has not picked up the Agent-API defaults. Matched exactly, case- and
+#: whitespace-insensitively — a `provider/` prefix or a suffix the endpoint may add
+#: (``-2025-04-16``) is not a retired id, and flagging it would be crying wolf.
+RETIRED_MODEL_IDS = frozenset(
+    {
+        # Vercel AI Gateway catalog ids this repo's defaults/tests referenced.
+        "moonshotai/kimi-k3",
+        "alibaba/qwen3.7-flash",
+        "openai/gpt-4.1-nano",
+        # Router-era default ids, before the Agent API pivot.
+        "perplexity/glm-5",
+        "perplexity/kimi-k",
+    }
+)
+
+
+def _is_router_url(base_url: str) -> bool:
+    """True when *base_url* addresses Perplexity's Router API — a path on its host.
+
+    The host decides, not the word: ``openrouter.ai`` and any proxy URL containing
+    "router" are other endpoints, and an advisory that fires on them is noise the
+    user learns to ignore. ``PERPLEXITY_HOST`` match mirrors
+    ``app.llm._is_perplexity_base_url``; the *path* is what separates the retired
+    Router route from the supported Agent API on the same host.
+    """
+    from .llm import _is_perplexity_base_url  # local: keeps module import order stable
+
+    return _is_perplexity_base_url(base_url) and "router" in urlparse(base_url or "").path.lower()
+
+
+def _stripped_lower(value: str) -> str:
+    return (value or "").strip().lower()
+
+
+def retired_endpoint_reason(settings: Settings) -> str:
+    """Why the configuration is a retired provider, or "" when it is not.
+
+    Retired means: this app worked against it once and the project has moved on, and
+    every failure it still produces is one already paid for — the gateway's free-tier
+    per-model rate limit turned a 329-chunk run into 315 rejections in under a minute
+    (measured 2026-09-19), and the Router refuses completions outright without
+    private-preview access. The failure is deterministic, so the place for the
+    remedy is before the run, not in its error report.
+
+    Three independent signals, any one of which is enough:
+
+    * **Vercel AI Gateway base URL** — the strongest: the endpoint itself is the
+      retired one, whatever models are configured.
+    * **Perplexity Router path** — ``…/router/v1``; private preview, completions
+      refused without entitlement.
+    * **Gateway-era model ids on a non-gateway endpoint** — the ids identify the era
+      even when the URL was corrected; that combination is at least half stale and
+      never something this app's current defaults produce.
+
+    Deliberately *not* here: ordinary Perplexity hosts (the supported default) and
+    any other OpenAI-compatible endpoint the user has chosen — an advisory must not
+    name a working setup as retired.
+    """
+    if _is_vercel_gateway_url(settings.base_url):
+        return (
+            "⚠️ The base URL is Vercel's **AI Gateway**, which this app has retired in "
+            "favour of Perplexity's Agent API. The gateway's free tier is rate-limited "
+            "per model — a large run was measured dying with 315 of 329 chunks rejected "
+            "as `429` — so runs here are expected to fail. Set the base URL to "
+            f"`{DEFAULT_BASE_URL}` with a `pplx-` key."
+        )
+    if _is_router_url(settings.base_url):
+        return (
+            "⚠️ The base URL is Perplexity's **Router API**, a private preview this app "
+            "has retired: the models route answers, but every completion is refused with "
+            "`403 The Router API is currently in limited preview` unless the account has "
+            f"preview entitlement. Set the base URL to `{DEFAULT_BASE_URL}`."
+        )
+    ids = (
+        _stripped_lower(settings.model_main),
+        _stripped_lower(settings.model_fast),
+    )
+    if retired := sorted(RETIRED_MODEL_IDS & set(ids)):
+        return (
+            "⚠️ "
+            + ", ".join(f"`{m}`" for m in retired)
+            + " is a retired model id (Vercel AI Gateway / Router era) — this app's default "
+            f"models now live on Perplexity's Agent API. Set the base URL to "
+            f"`{DEFAULT_BASE_URL}` and pick ids the endpoint lists, e.g. "
+            "`perplexity/kimi-k3` (main) and `perplexity/glm-5.3-flash` (fast)."
         )
     return ""
 
