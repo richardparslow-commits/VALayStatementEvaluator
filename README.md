@@ -509,8 +509,11 @@ The reviewer is built for full VA claim files, including bundles of 1,000–2,00
 - **Transient-failure tolerance** — a chunk that fails transiently (e.g. a rate
   limit) is retried once; breaker refusals and deterministic rejections (a bad
   key, an unusable model id) are counted but not re-attempted, because an
-  identical call reproduces them. The run aborts only if chunks still fail, and
-  the failing chunks are named.
+  identical call reproduces them. When a rejection proves every remaining call
+  would fail the same way (HTTP 401/403/404), the pass stops early: the chunks
+  that were never sent are reported as not attempted, distinctly from the ones
+  that failed. The run aborts only if chunks still fail, and the failing chunks
+  are named.
 - **Complete extracted-evidence store** — all extracted facts are retained for
   retrieval, saved results, citation checks, timelines, and exports. Only exact
   repetitions are removed; differing sources, quotes, dates, and fact types remain.

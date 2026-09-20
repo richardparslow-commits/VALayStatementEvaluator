@@ -38,6 +38,7 @@ from .llm import (
 )
 from .logging_config import PhaseTimer, get_request_id
 from .pipeline_guard import check_pipeline_cancelled, pipeline_as_completed
+from .preflight import REFUSAL_STATUSES
 from .profiler import get_current_run_profiler, worker_timer
 from .prompt_sanitize import GUARD_NOTE, sanitize_for_prompt
 from .va_gov_export import section_map
@@ -640,7 +641,10 @@ def review_medical_records(
 
     Scales to thousands of pages: chunks are digested in parallel, duplicate
     chunks are skipped, transient failures are retried, and large fact lists are
-    merged hierarchically instead of in one oversized call.
+    merged hierarchically instead of in one oversized call. A rejection that
+    proves every remaining call would fail the same way (a refusal status) ends
+    the pass early, and the chunks that were never sent are reported apart from
+    the ones that failed.
     """
     check_pipeline_cancelled()
     if not documents:
@@ -799,6 +803,9 @@ def review_medical_records(
     # chunks, which says nothing about what to fix. This is the error that does.
     cause: BaseException | None = None
     fail_fast_chunks = 0
+    # Calls never made: the pass stopped when the endpoint refused the run, so
+    # these are reported apart from the chunks that actually failed.
+    not_attempted: set[int] = set()
     _review_t0 = time.perf_counter()
     rid = get_request_id() or "-"
     logger.info(
@@ -819,6 +826,7 @@ def review_medical_records(
     def run_round(pending: list[Chunk], *, retry: bool = False) -> None:
         nonlocal cause, fail_fast_chunks
         done = 0
+        stopped = False
         pool = ThreadPoolExecutor(max_workers=config.RECORDS_CONCURRENCY)
         try:
             future_map = {
@@ -827,7 +835,14 @@ def review_medical_records(
             }
             for future in pipeline_as_completed(future_map):
                 chunk = future_map[future]
+                if future.cancelled():
+                    # Never sent: the pass stopped at a refusal (below). Counted
+                    # apart from failures, and it does not advance the progress
+                    # count, which reports calls actually made.
+                    not_attempted.add(chunk.index)
+                    continue
                 done += 1
+                refused = False
                 try:
                     results[chunk.index] = future.result()
                 except Exception as exc:  # noqa: BLE001 - record and retry later
@@ -837,8 +852,14 @@ def review_medical_records(
                         # made. Counted separately so the summary can say how much
                         # of the failure is cascade, and never reported as the cause.
                         fail_fast_chunks += 1
-                    elif cause is None:
-                        cause = exc
+                    else:
+                        refused = _refused_as_configured(exc)
+                        if refused and not _refused_as_configured(cause):
+                            # The refusal stopped the run, so it — not an earlier
+                            # transient failure the map kept — is the error to quote.
+                            cause = exc
+                        elif cause is None:
+                            cause = exc
                 if progress:
                     # Each round counts against its own targets. Counting the retry
                     # pass against the original total produced "654/327 chunks done…"
@@ -854,8 +875,39 @@ def review_medical_records(
                             0.05 + 0.55 * done / max(total_units, 1),
                             f"Extracting facts — {done}/{total_units} chunks done…",
                         )
+                if refused and not stopped:
+                    # A refusal status means every other chunk would be refused the
+                    # same way — the evidence the endpoint preflight blocks on — so
+                    # the queued calls are canceled instead of visited. Calls already
+                    # in flight (at most workers - 1 of them) still report their own
+                    # outcome.
+                    stopped = True
+                    for queued in future_map:
+                        if queued is not future and not queued.done():
+                            queued.cancel()
         finally:
             pool.shutdown(wait=False, cancel_futures=True)
+        if stopped and not_attempted:
+            logger.warning(
+                "records digest stopped early round=%s attempted=%d not_attempted=%d error=%s",
+                "retry" if retry else "first",
+                done,
+                len(not_attempted),
+                _failure_summary(cause) if cause is not None else "-",
+                extra={
+                    "request_id": rid,
+                    "phase": "records:digest",
+                    "status": "stopped",
+                    "attempted": done,
+                    "not_attempted": len(not_attempted),
+                },
+            )
+            if progress:
+                progress(
+                    0.65 if retry else 0.60,
+                    f"Stopped early — {len(not_attempted)} chunk(s) not attempted after "
+                    "the endpoint refused the run.",
+                )
 
     with tracing.phase_span(
         "records:digest", chunks=total_units, concurrency=config.RECORDS_CONCURRENCY, pages=pages
@@ -901,16 +953,18 @@ def review_medical_records(
         reason_exc = cause if cause is not None else failed[sorted(failed)[0]]
         first_error = _failure_summary(reason_exc)
         logger.error(
-            "records review failed chunks=%s error=%s fail_fast_chunks=%d",
+            "records review failed chunks=%s error=%s fail_fast_chunks=%d not_attempted=%d",
             sorted(failed.keys()),
             first_error,
             fail_fast_chunks,
+            len(not_attempted),
             extra={
                 "request_id": rid,
                 "phase": "records:review",
                 "status": "error",
                 "chunks": len(failed),
                 "fail_fast_chunks": fail_fast_chunks,
+                "not_attempted": len(not_attempted),
                 "error_class": type(reason_exc).__name__,
             },
         )
@@ -921,7 +975,7 @@ def review_medical_records(
         raise LLMError(
             f"Record review failed: {first_error}. "
             f"{_digest_failure_advice(reason_exc, fail_fast_chunks=fail_fast_chunks)} "
-            f"{_failed_chunk_summary(failed, total_units)}"
+            f"{_failed_chunk_summary(failed, total_units, not_attempted=len(not_attempted))}"
         )
 
     # -------------------------------------------- collect facts in doc order
@@ -1049,6 +1103,22 @@ def review_medical_records(
 MAX_FAILED_CHUNK_LABELS = 12
 
 
+def _refused_as_configured(exc: BaseException | None) -> bool:
+    """Whether this failure proves every remaining chunk would be refused too.
+
+    The refusal statuses are the endpoint preflight's own (`app.preflight`): a
+    rejected key, a model the account cannot use, a base URL with no route. One
+    chunk answered that way means the others will, so the pass can stop. A
+    content-moderation 400 is deliberately not here — that rejection is about one
+    chunk's wording, and the next chunk can pass.
+    """
+    return (
+        isinstance(exc, LLMUpstreamError)
+        and isinstance(exc.status_code, int)
+        and exc.status_code in REFUSAL_STATUSES
+    )
+
+
 def _retriable_failure(exc: BaseException) -> bool:
     """Whether one more attempt could plausibly change this chunk's outcome.
 
@@ -1064,19 +1134,29 @@ def _retriable_failure(exc: BaseException) -> bool:
     return bool(getattr(exc, "retriable", True))
 
 
-def _failed_chunk_summary(failed: Mapping[int, BaseException], total_units: int) -> str:
+def _failed_chunk_summary(
+    failed: Mapping[int, BaseException], total_units: int, *, not_attempted: int = 0
+) -> str:
     """How much of the record set failed, without letting the list dominate.
 
     The count answers the question the label list used to: "is this one chunk or
     the whole bundle?" The labels stay, capped, because they say *where* to look.
     Chunks are listed by index across the whole run, so an ellipsis is not hiding
-    anything the user would act on differently.
+    anything the user would act on differently. A stopped pass adds how many
+    chunks were never sent, so "all of them" can never be read from a count that
+    only covers the calls that were made.
     """
     indexes = sorted(failed)
     shown = ", ".join(f"chunk {i}" for i in indexes[:MAX_FAILED_CHUNK_LABELS])
     if len(indexes) > MAX_FAILED_CHUNK_LABELS:
         shown += f", … (+{len(indexes) - MAX_FAILED_CHUNK_LABELS} more)"
-    return f"Chunks affected: {len(indexes)} of {total_units} ({shown})."
+    summary = f"Chunks affected: {len(indexes)} of {total_units} ({shown})."
+    if not_attempted:
+        summary += (
+            f" {not_attempted} more chunk(s) were not attempted after the endpoint "
+            "refused the run."
+        )
+    return summary
 
 
 def _failure_summary(exc: BaseException) -> str:
