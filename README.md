@@ -287,7 +287,11 @@ provider: the app checks `GET {base_url}/models` at startup and warns if `LLM_MO
 > cannot call a configuration healthy that the run buttons would refuse. A few seconds instead
 > of a failed multi-minute run — and the verdict is kept for a few minutes, so the next
 > attempt on the same configuration (the first run after a check, or the run after that)
-> reuses it instead of repeating the same two requests.
+> reuses it instead of repeating the same two requests. The run log keeps the receipt:
+> every attempt leaves one line in `logs/runs.jsonl` — `accepted` when it starts, `rejected`
+> when the check refuses it — carrying `endpoint_check` as `fresh` or `reused` (with the age
+> of a reused check), so the log shows whether the endpoint was probed just now or judged on
+> earlier evidence.
 > A block quotes the HTTP status and the provider's own words, and
 > names what that means for this app: a `401`/`403` is the key and the endpoint belonging to
 > different providers, a `404` is a wrong path in the base URL, and no response at all is the
@@ -301,7 +305,9 @@ configured endpoint can serve the configured models — a `GET {base_url}/models
 one **short chat call** per configured model — or no probes at all for a few minutes after
 that configuration was checked (**Test connection**, or a recent run attempt), whose verdict
 is reused. When a check is reused rather than run, the run says so where it starts — with
-the age of the check behind it — so a skipped probe is never silent. A run that cannot
+the age of the check behind it — so a skipped probe is never silent — and every attempt,
+allowed or refused, leaves one line in `logs/runs.jsonl` recording `endpoint_check` as
+`fresh` or `reused`, so the audit trail answers the same question after the fact. A run that cannot
 possibly work therefore costs a second or two instead of the first minutes of a bundle,
 which is the failure this was built for:
 a rejected key or an unusable model id fails *every* chunk identically, and the run only says so

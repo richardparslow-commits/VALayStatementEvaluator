@@ -2544,6 +2544,18 @@ class TestRenderEffectivenessScore(unittest.TestCase):
 
 
 # --------------------------------------------- failure detail beside the error
+class TestRunLogStatusVocabulary(unittest.TestCase):
+    """The statuses ops.py renders must cover what the gate writes."""
+
+    def test_the_accepted_status_has_an_emoji(self) -> None:
+        """A gate's allowed run is a status an operator reads; it must not fall back
+        to the anonymous bullet."""
+        import app.views.ops as ops
+
+        self.assertEqual(ops._STATUS_EMOJI.get("accepted"), "✅")
+        self.assertEqual(ops._STATUS_EMOJI.get("rejected"), "🚫")
+
+
 class TestRenderFailureDetail(unittest.TestCase):
     """The in-place resolve of a failure's own reference (app/views/ops.py)."""
 

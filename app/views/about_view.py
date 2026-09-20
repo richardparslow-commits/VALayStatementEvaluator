@@ -63,7 +63,7 @@ specific cause can be found in the logs — no run fails without a trace.
 
 | File | What it records |
 |---|---|
-| ``logs/runs.jsonl`` | One JSON line per run event — `start`, `ok`, `error`, `timeout`, or pre-run `rejected` — keyed by the reference id, with the error text and a stack-trace digest. This is the first place to look. |
+| ``logs/runs.jsonl`` | One JSON line per run event — the gate's `accepted` (with `endpoint_check` fresh or reused), `start`, `ok`, `error`, `timeout`, or pre-run `rejected` — keyed by the reference id, with the error text and a stack-trace digest. This is the first place to look. |
 | ``logs/audit.log`` | Audit trail of run outcomes (metadata only: which record sources, page counts, durations, outcome classification). |
 | ``logs/unhandled_errors.log`` | Fallback record for errors outside the run flow (e.g. while rendering results). |
 | ``logs/app.log`` | Structured application log (when file logging is enabled via ``VA_LSE_LOG_DIR``). |

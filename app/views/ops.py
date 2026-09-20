@@ -27,6 +27,7 @@ _STATUS_EMOJI = {
     "error": "❌",
     "timeout": "⏱️",
     "rejected": "🚫",
+    "accepted": "✅",
     "empty": "⚠️",
     "interrupted": "⏹️",
 }

@@ -264,7 +264,10 @@ model and no credits were used — the check itself is a model listing plus one 
 which is what a run's own first call costs. If that configuration was checked moments ago —
 by **Test connection** or an earlier run attempt — its verdict is reused for a few minutes
 instead of probing again; when that reused verdict is what refused the run, the notice
-says how old the check is.
+says how old the check is. The run log (`logs/runs.jsonl`) records every attempt —
+`accepted` when the run starts, `rejected` when the check refuses it — with `endpoint_check`
+naming whether the verdict was fresh or reused, so `grep req_… logs/runs.jsonl` answers
+"was the endpoint actually probed?" even for a run that failed later.
 
 | Message | What it means | What to do |
 |---|---|---|
