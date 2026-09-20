@@ -100,6 +100,88 @@ class TestDraftReviewWarning(unittest.TestCase):
                     self.assertIn("full original draft", st_mock.warning.call_args.args[0])
 
 
+# ------------------------------------------------- draft witness credentials
+class TestWitnessCredentialsUI(unittest.TestCase):
+    """Step 3b: the credential widgets, and the witness dict they produce."""
+
+    def test_lay_witness_gets_no_credential_widgets_and_a_plain_dict(self):
+        from app.views import draft_view
+
+        st_mock, session = _fake_streamlit()
+        st_mock.selectbox.return_value = draft_view.CREDENTIAL_LEVELS[0]
+        with _patch_st(draft_view, st_mock):
+            draft_view._render_witness_credentials()
+            witness = draft_view._witness_details(
+                witness_name="Jane Doe",
+                relationship="Spouse",
+                known_since="2010",
+                contact_frequency="daily",
+                witnessed_event="No",
+            )
+        st_mock.multiselect.assert_not_called()
+        self.assertEqual(witness["name"], "Jane Doe")
+        self.assertEqual(witness["relationship"], "Spouse")
+        self.assertEqual(witness["veteran_name"], "")
+        self.assertEqual(witness.get("credential_level", ""), "")
+        self.assertNotIn("medical_specialties", witness)
+        self.assertNotIn("credentials_detail", witness)
+
+    def test_credentialed_witness_widgets_render_and_fill_the_dict(self):
+        from app.views import draft_view
+
+        st_mock, session = _fake_streamlit()
+        st_mock.selectbox.return_value = draft_view.CREDENTIAL_LEVELS[1]
+        st_mock.columns.return_value = [MagicMock(), MagicMock()]
+        session["draft_vet_name"] = "John Doe"
+        session["draft_cred_level"] = draft_view.CREDENTIAL_LEVELS[1]
+        session["draft_cred_specialties"] = "Psychiatric-mental health nursing"
+        session["draft_cred_detail"] = "RN, BSN, 12 yrs ICU"
+        session["draft_cred_relevance"] = "Daily caregiver"
+        with _patch_st(draft_view, st_mock):
+            draft_view._render_witness_credentials()
+            witness = draft_view._witness_details(
+                witness_name="Jane Doe",
+                relationship="Spouse",
+                known_since="2010",
+                contact_frequency="daily",
+                witnessed_event="No",
+            )
+        st_mock.multiselect.assert_called_once()
+        self.assertEqual(
+            st_mock.multiselect.call_args.kwargs["key"], "draft_cred_specialties"
+        )
+        self.assertEqual(
+            witness["credential_level"], draft_view.CREDENTIAL_LEVELS[1]
+        )
+        self.assertEqual(witness["medical_specialties"], "Psychiatric-mental health nursing")
+        self.assertEqual(witness["credentials_detail"], "RN, BSN, 12 yrs ICU")
+        self.assertEqual(witness["credential_relevance"], "Daily caregiver")
+        self.assertEqual(witness["veteran_name"], "John Doe")
+
+    def test_multiselect_and_inputs_read_state_by_widget_key(self):
+        """The dict mirrors widget state, not the call-time defaults."""
+        from app.views import draft_view
+
+        st_mock, session = _fake_streamlit()
+        session["draft_vet_name"] = "John"
+        session["draft_cred_level"] = draft_view.CREDENTIAL_LEVELS[3]
+        # st.multiselect stores a list in session state — the helper must join it.
+        session["draft_cred_specialties"] = ["Neurology", "Pain management"]
+        # detail/relevance left empty — they must be absent, not empty strings.
+        with _patch_st(draft_view, st_mock):
+            witness = draft_view._witness_details(
+                witness_name="J",
+                relationship="Family member",
+                known_since="2000",
+                contact_frequency="weekly",
+                witnessed_event="Yes",
+            )
+        self.assertEqual(witness["credential_level"], draft_view.CREDENTIAL_LEVELS[3])
+        self.assertEqual(witness["medical_specialties"], "Neurology, Pain management")
+        self.assertNotIn("credentials_detail", witness)
+        self.assertNotIn("credential_relevance", witness)
+
+
 # ---------------------------------------------------------------- shared.py
 class TestFormatErrorForUser(unittest.TestCase):
     def test_includes_reference_when_present(self) -> None:

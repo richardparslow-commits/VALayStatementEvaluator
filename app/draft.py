@@ -37,6 +37,150 @@ REVIEW_MAX_CHARS = 16_000
 # The bound is enforced by shrinking the data, never by slicing the JSON.
 GROUNDING_PROMPT_MAX_CHARS = 25_000
 
+# ---------------------------------------------------------------------------
+# Feature: Witness medical credentials (hybrid statements).
+#
+# A witness who holds a medical credential (e.g. an RN spouse) can write a
+# stronger "hybrid" statement: clinical descriptions of personally observed
+# symptoms, functional/ADL assessment, medication effects. How far the
+# statement may go depends on the credential — under 38 CFR § 3.159 a
+# physician can render diagnoses and nexus opinions that nursing credentials
+# cannot. The UI collects the credentials (app/views/draft_view.py), the
+# helpers below turn them into prompt material, and every drafting prompt
+# carries the scope rule for the witness's own credential level so the
+# statement gains weight without overreaching lay/medical competence.
+# ---------------------------------------------------------------------------
+
+WITNESS_CREDENTIAL_LEVELS = (
+    "None (lay witness)",
+    "Nurse / clinician (RN, LPN, LVN, CNA)",
+    "Advanced clinician (NP, PA, PA-C)",
+    "Physician (MD, DO)",
+    "Other licensed medical professional",
+)
+
+_CREDENTIAL_LAY_LEVEL = WITNESS_CREDENTIAL_LEVELS[0]
+
+# Short scope summary embedded in the credentials block shown to every prompt.
+_CREDENTIAL_SCOPE_SUMMARY = {
+    "Nurse / clinician (RN, LPN, LVN, CNA)": (
+        "May clinically describe personally observed symptoms, functional/ADL "
+        "impact, medication effects, and flare-ups. Must not diagnose, interpret "
+        "imaging/labs, or offer a causation (nexus) opinion."
+    ),
+    "Advanced clinician (NP, PA, PA-C)": (
+        "May clinically describe personally observed symptoms, functional/ADL "
+        "impact, and give a professional assessment within scope of practice. "
+        "A causation (nexus) opinion only if clearly attributed to the witness's "
+        "own professional judgment."
+    ),
+    "Physician (MD, DO)": (
+        "May additionally provide a formal diagnosis and a medical-nexus opinion "
+        "stated to the VA's 'at least as likely as not' standard, attributed to "
+        "the witness's own qualifications and review."
+    ),
+    "Other licensed medical professional": (
+        "May describe observed symptoms and functional impact through that "
+        "professional lens, within the witness's scope of practice. Must not "
+        "render a diagnosis or nexus opinion beyond that scope."
+    ),
+}
+
+# Instruction paragraphs for the drafting/review SYSTEM prompts, per level.
+_CREDENTIAL_SCOPE_DIRECTIVE = {
+    "Nurse / clinician (RN, LPN, LVN, CNA)": (
+        "The witness is a credentialed nurse or clinical caregiver ({level}). "
+        "The statement may use precise clinical vocabulary to describe what the "
+        "witness directly observed: symptom presentation (e.g., apneic episodes, "
+        "antalgic gait, muscle guarding), functional impairment and activities of "
+        "daily living, medication effects, and objective descriptions of flare-ups "
+        "(frequency, duration, visible signs). It must NOT render a formal "
+        "diagnosis, interpret imaging or lab results, or offer a medical-nexus or "
+        "causation opinion. Every clinical statement must be anchored in what the "
+        "witness personally observed."
+    ),
+    "Advanced clinician (NP, PA, PA-C)": (
+        "The witness is an advanced practice clinician ({level}). In addition to "
+        "clinical descriptions of personally observed symptoms and functional "
+        "impact, the statement may include the witness's professional assessment "
+        "of the veteran's condition within their scope of practice. A medical-nexus "
+        "(causation) opinion should appear only if it is clearly attributed to the "
+        "witness's own professional judgment and qualifications. Every statement "
+        "must stay anchored in personal observation."
+    ),
+    "Physician (MD, DO)": (
+        "The witness is a licensed physician ({level}). In addition to clinical "
+        "observation, the statement may include a formal diagnosis and a "
+        "medical-nexus opinion stated to the VA's 'at least as likely as not' "
+        "standard, clearly attributed to the witness's own qualifications and "
+        "professional review of the veteran's records and presentation. It must "
+        "remain grounded in what the witness personally observed and reviewed — "
+        "never fabricate examination findings, imaging interpretations, or record "
+        "citations."
+    ),
+    "Other licensed medical professional": (
+        "The witness holds a licensed medical credential ({level}). The statement "
+        "may describe observed symptoms and functional impact through that "
+        "professional lens, within the witness's scope of practice. It must NOT "
+        "render a formal diagnosis or a medical-nexus/causation opinion beyond "
+        "that scope."
+    ),
+}
+
+
+def _credential_level(witness: dict[str, str]) -> str:
+    """The witness's chosen credential level, or '' for a lay witness.
+
+    Defensive against saved/queued payloads: only a known level counts, so a
+    stale or hand-edited value degrades to lay treatment instead of putting an
+    unknown scope rule into the prompts.
+    """
+    level = witness.get("credential_level", "") or ""
+    return level if level in _CREDENTIAL_SCOPE_DIRECTIVE else ""
+
+
+def witness_credentials_block(witness: dict[str, str]) -> str:
+    """Render the witness's professional credentials as a prompt section.
+
+    Empty for a lay witness, so prompts for the existing purely-lay path stay
+    unchanged. Every field passes through ``sanitize_for_prompt`` — a pasted
+    delimiter sequence or injection directive must not break the enclosing
+    ``<<<``/``>>>`` block any more than observations can.
+    """
+    level = _credential_level(witness)
+    if not level:
+        return ""
+    lines = [
+        "WITNESS PROFESSIONAL CREDENTIALS:",
+        f"- Credential level: {sanitize_for_prompt(level, max_chars=200)}",
+    ]
+    specialties = str(witness.get("medical_specialties", "") or "").strip()
+    if specialties:
+        lines.append(f"- Medical specialties: {sanitize_for_prompt(specialties, max_chars=500)}")
+    detail = str(witness.get("credentials_detail", "") or "").strip()
+    if detail:
+        lines.append(f"- Credentials & certifications: {sanitize_for_prompt(detail, max_chars=500)}")
+    relevance = str(witness.get("credential_relevance", "") or "").strip()
+    if relevance:
+        lines.append(
+            "- How the professional experience relates to the observations: "
+            + sanitize_for_prompt(relevance, max_chars=500)
+        )
+    lines.append(f"- Scope of this statement: {_CREDENTIAL_SCOPE_SUMMARY[level]}")
+    return "\n".join(lines)
+
+
+def witness_scope_directive(witness: dict[str, str]) -> str:
+    """The scope instruction for the drafting/review system prompts.
+
+    Empty for a lay witness — the drafting guide's global lay-competence rules
+    already govern that path unchanged.
+    """
+    level = _credential_level(witness)
+    if not level:
+        return ""
+    return _CREDENTIAL_SCOPE_DIRECTIVE[level].format(level=level)
+
 GROUNDING_SYSTEM = """You are a veterans-claims evidence specialist preparing to draft a \
 lay/witness statement (VA Form 21-10210 style). You must ground every available fact in the \
 medical record digest and the witness's own observations, and honestly flag anything that \
@@ -76,6 +220,7 @@ coverage: mark a topic covered only if the observations genuinely address it.
 CLAIMED CONDITION: {condition}
 CLAIM TYPE: {claim_type}
 WITNESS ROLE/RELATIONSHIP: {relationship}
+{credentials_block}
 WITNESS OBSERVATIONS:
 <<<
 {observations}
@@ -104,12 +249,19 @@ stove left on) and make clear when the caregiver's help is necessary for safety,
 convenient. Include a before/after comparison and symptom progression whenever the observations \
 support them.
 
+When the witness holds a professional credential, apply the witness-specific scope rule \
+in the CREDENTIAL SCOPE section instead of the blanket lay-evidence restrictions in the \
+guide, exactly as far as the rule allows — no farther. When the witness is uncredentialed, \
+follow the guide's lay-evidence rules unchanged.
+
 {guide}
 
 TOPIC CHECKLIST — organize the statement so that every applicable topic the observations \
 support is covered (there is no page limit; be as detailed as the material allows):
 
-{checklist}"""
+{checklist}
+
+{credential_scope}"""
 
 DRAFT_USER = """Draft the lay/witness statement now.
 
@@ -123,6 +275,7 @@ WITNESS INFORMATION:
 - Claim type: {claim_type}
 - Witnessed the in-service event personally: {witnessed_event}
 
+{credentials_block}
 WITNESS OBSERVATIONS:
 <<<
 {observations}
@@ -148,7 +301,10 @@ rubric and the topic checklist. Identify concrete fixes: vagueness, missing spec
 lay-competence violations, missing structure elements, ungrounded facts, or applicable topics \
 from the checklist that the draft fails to cover. Then return the IMPROVED full statement. \
 Where an applicable topic lacks any supplied material, insert a "[Witness to add: ...]" \
-placeholder rather than inventing content."""
+placeholder rather than inventing content. When a witness scope rule is provided below, \
+keep every credential-based assertion within that scope — do not expand claims into \
+diagnoses, nexus opinions, or clinical interpretations the scope rule does not allow, and \
+strip any that exceed it."""
 
 REVIEW_USER = """Improve this draft statement. Preserve all bracketed placeholders \
 (including every [Confirm: ...] and [Witness to add: ...]) and all grounded facts; \
@@ -174,6 +330,8 @@ TOPIC CHECKLIST FOR REFERENCE:
 <<<
 {checklist}
 >>>
+
+{credential_scope}
 
 {guard_note}"""
 
@@ -458,6 +616,7 @@ def _run_draft(
                         condition=sanitize_for_prompt(condition, max_chars=500),
                         claim_type=sanitize_for_prompt(claim_type, max_chars=500),
                         relationship=sanitize_for_prompt(witness.get("relationship", "not specified"), max_chars=500),
+                        credentials_block=witness_credentials_block(witness),
                         observations=sanitize_for_prompt(obs_for_prompt, max_chars=DRAFT_INTERNAL_MAX_CHARS),
                         digest=sanitize_digest_text(result.digest.relevant_facts_text(grounding_query, max_facts=150), max_chars=120_000),
                         checklist=load_knowledge("topic_checklist.md"),
@@ -469,6 +628,12 @@ def _run_draft(
             except Exception as exc:  # noqa: BLE001
                 raise map_drafting_exception(exc, request_id=rid, phase="grounding") from exc
 
+    # Self-contained scope block: heading included only when a rule exists, so
+    # a lay witness's prompts carry nothing extra at all.
+    scope_block = witness_scope_directive(witness)
+    if scope_block:
+        scope_block = f"CREDENTIAL SCOPE:\n{scope_block}"
+
     with tracing.phase_span("draft"), PhaseTimer(logger, "draft", request_id=rid):
         with phase_timer("draft"):
             report(0.68, "Step 3/4 — Drafting the statement…")
@@ -477,6 +642,7 @@ def _run_draft(
                     DRAFT_SYSTEM_TEMPLATE.format(
                         guide=load_knowledge("drafting_guide.md"),
                         checklist=load_knowledge("topic_checklist.md"),
+                        credential_scope=scope_block,
                     ),
                     DRAFT_USER.format(
                         witness_name=sanitize_for_prompt(witness.get("name", "[Witness Name]"), max_chars=500),
@@ -487,6 +653,7 @@ def _run_draft(
                         condition=sanitize_for_prompt(condition, max_chars=500),
                         claim_type=sanitize_for_prompt(claim_type, max_chars=500),
                         witnessed_event=sanitize_for_prompt(witness.get("witnessed_event", "unknown"), max_chars=500),
+                        credentials_block=witness_credentials_block(witness),
                         observations=sanitize_for_prompt(obs_for_prompt, max_chars=DRAFT_INTERNAL_MAX_CHARS),
                         grounding=_grounding_for_prompt(result.grounding),
                         digest_summary=sanitize_digest_text(result.digest.summary or "(no summary)", max_chars=20_000),
@@ -519,6 +686,7 @@ def _run_draft(
                         draft=review_draft,
                         guide=load_knowledge("drafting_guide.md")[:6000],
                         checklist=load_knowledge("topic_checklist.md")[:6000],
+                        credential_scope=scope_block,
                         guard_note=GUARD_NOTE,
                     ),
                     phase="review",

@@ -79,6 +79,140 @@ RELATIONSHIPS = [
     "Other",
 ]
 
+# ---------------------------------------------------------------------------
+# Feature: Witness medical credentials (hybrid statements).
+#
+# A witness who is also an RN, NP/PA, or physician can write a stronger
+# "hybrid" statement — clinical descriptions of what they personally observed,
+# functional/ADL assessment, medication effects — and a physician may add a
+# diagnosis or nexus opinion (38 CFR § 3.159). These widgets collect that
+# professional profile in Step 3; :mod:`app.draft` turns it into prompt material
+# with an explicit scope rule so the statement gains weight without the witness
+# overreaching their credential's competence boundary.
+# ---------------------------------------------------------------------------
+
+CREDENTIAL_LEVELS = [
+    "None (lay witness)",
+    "Nurse / clinician (RN, LPN, LVN, CNA)",
+    "Advanced clinician (NP, PA, PA-C)",
+    "Physician (MD, DO)",
+    "Other licensed medical professional",
+]
+
+CREDENTIAL_SPECIALTIES = [
+    "Family / general practice",
+    "Internal medicine",
+    "Orthopedics",
+    "Neurology",
+    "Cardiology",
+    "Pulmonology",
+    "Psychiatry / mental health",
+    "Psychiatric-mental health nursing",
+    "Physical therapy / rehabilitation",
+    "Occupational therapy",
+    "Emergency medicine",
+    "Oncology",
+    "Pain management",
+    "Pharmacy",
+    "Clinical social work",
+    "Vocational rehabilitation",
+    "Law enforcement / forensic observation",
+    "Human resources / workplace accommodations",
+]
+
+
+def _witness_details(
+    *,
+    witness_name: str,
+    relationship: str,
+    known_since: str,
+    contact_frequency: str,
+    witnessed_event: str,
+) -> dict[str, str]:
+    """Assemble the witness dict from the Step 3/3b widget state.
+
+    Reads credential state by widget key, mirroring how the tab reads its other
+    widgets — so the queued path and the in-process path carry the same dict.
+    Non-level fields are included only when non-empty, so a payload for a lay
+    witness is unchanged from before this feature.
+    """
+    witness = {
+        "name": witness_name.strip(),
+        "relationship": relationship,
+        "known_since": known_since.strip(),
+        "contact_frequency": contact_frequency.strip(),
+        "veteran_name": str(st.session_state.get("draft_vet_name", "") or "").strip(),
+        "witnessed_event": witnessed_event,
+    }
+    level = str(st.session_state.get("draft_cred_level", "") or "")
+    # Store "" for the explicit lay choice too, so a saved/queued payload reads
+    # the same whether the widget was untouched or deliberately set to None.
+    level = "" if level == CREDENTIAL_LEVELS[0] else level
+    witness["credential_level"] = level
+    if not level:
+        return witness
+    for key, state_key in (
+        ("medical_specialties", "draft_cred_specialties"),
+        ("credentials_detail", "draft_cred_detail"),
+        ("credential_relevance", "draft_cred_relevance"),
+    ):
+        value = _state_text(state_key)
+        if value:
+            witness[key] = value
+    return witness
+
+
+def _state_text(state_key: str) -> str:
+    """Read a Step 3b widget value as prompt-ready text.
+
+    ``st.multiselect`` stores a list in session state; join it. Anything else
+    (text inputs, a queued payload replay) is taken as the string it is.
+    """
+    value = st.session_state.get(state_key, "")
+    if isinstance(value, (list, tuple)):
+        return ", ".join(str(item).strip() for item in value if str(item).strip())
+    return str(value or "").strip()
+
+
+def _render_witness_credentials() -> None:
+    """Step 3b: collect the witness's professional credentials (optional)."""
+    st.subheader("Step 3b — Professional credentials (optional, strengthens the statement)")
+    st.caption(
+        "A witness who is also a licensed clinician can write a stronger hybrid "
+        "statement: clinical descriptions of what they personally observed, "
+        "functional/ADL impact, and medication effects. How far the statement may "
+        "go depends on the credential — the app keeps every claim inside the "
+        "credential's scope, so a nurse's statement will not claim a physician's "
+        "diagnosis or nexus opinion."
+    )
+    level = st.selectbox(
+        "Medical credential level",
+        CREDENTIAL_LEVELS,
+        key="draft_cred_level",
+    )
+    if level == CREDENTIAL_LEVELS[0]:
+        return
+    st.multiselect(
+        "Medical specialties / professional expertise (pick all that apply)",
+        CREDENTIAL_SPECIALTIES,
+        key="draft_cred_specialties",
+    )
+    col1, col2 = st.columns(2)
+    col1.text_input(
+        "Licenses / certifications / years of experience (e.g., RN, BSN, 12 yrs ICU)",
+        key="draft_cred_detail",
+    )
+    col2.text_input(
+        "How this expertise relates to what the witness observed",
+        key="draft_cred_relevance",
+    )
+    st.caption(
+        "Included in the statement's introduction (the VA will not assume clinical "
+        "competence — it must be claimed) and used to calibrate how the "
+        "observations are described."
+    )
+
+
 
 def render_draft_tab() -> None:
     """Render the Draft tab (inputs, run button, cached results)."""
@@ -123,6 +257,8 @@ def render_draft_tab() -> None:
         key="draft_witnessed",
     )
 
+    _render_witness_credentials()
+
     st.subheader("Step 4 — What has the witness observed?")
     observations = st.text_area(
         "Describe everything the witness has personally seen, heard, or experienced "
@@ -157,12 +293,13 @@ def render_draft_tab() -> None:
             records=records,
             condition=condition,
             claim_type=claim_type,
-            relationship=relationship,
-            witness_name=witness_name,
-            veteran_name=veteran_name,
-            known_since=known_since,
-            contact_frequency=contact_frequency,
-            witnessed_event=witnessed_event,
+            witness=_witness_details(
+                witness_name=witness_name,
+                relationship=relationship,
+                known_since=known_since,
+                contact_frequency=contact_frequency,
+                witnessed_event=witnessed_event,
+            ),
             observations=observations,
         )
 
@@ -188,12 +325,7 @@ def _run_draft_queued(
     records: list,
     condition: str,
     claim_type: str,
-    relationship: str,
-    witness_name: str,
-    veteran_name: str,
-    known_since: str,
-    contact_frequency: str,
-    witnessed_event: str,
+    witness: dict[str, str],
     observations: str,
 ) -> None:
     """Submit the drafting run to a worker and wait for its result (Pattern C).
@@ -220,14 +352,7 @@ def _run_draft_queued(
         slot="draft",
         job=DraftJob(
             records=records,
-            witness={
-                "name": witness_name.strip(),
-                "relationship": relationship,
-                "known_since": known_since.strip(),
-                "contact_frequency": contact_frequency.strip(),
-                "veteran_name": veteran_name.strip(),
-                "witnessed_event": witnessed_event,
-            },
+            witness=dict(witness),
             observations=observations.strip(),
             condition=condition.strip(),
             claim_type=claim_type,
@@ -331,12 +456,7 @@ def _run_draft_flow(
     records: list,
     condition: str,
     claim_type: str,
-    relationship: str,
-    witness_name: str,
-    veteran_name: str,
-    known_since: str,
-    contact_frequency: str,
-    witnessed_event: str,
+    witness: dict[str, str],
     observations: str,
 ) -> None:
     """Run the pipeline with the pre-minted run id; persist the result."""
@@ -351,12 +471,7 @@ def _run_draft_flow(
             records=records,
             condition=condition,
             claim_type=claim_type,
-            relationship=relationship,
-            witness_name=witness_name,
-            veteran_name=veteran_name,
-            known_since=known_since,
-            contact_frequency=contact_frequency,
-            witnessed_event=witnessed_event,
+            witness=witness,
             observations=observations,
         )
         return
@@ -402,14 +517,6 @@ def _run_draft_flow(
         "draft", "start", request_id=rid, pages=sum(len(d.pages) for d in records),
         observations_chars=len(observations.strip()),
     )
-    witness = {
-        "name": witness_name.strip(),
-        "relationship": relationship,
-        "known_since": known_since.strip(),
-        "contact_frequency": contact_frequency.strip(),
-        "veteran_name": veteran_name.strip(),
-        "witnessed_event": witnessed_event,
-    }
     bar, update = progress_widgets(llm, request_id=rid)
     _profiler_run = (
         RunProfiler(action="draft", request_id=rid, run_start_mono=time.monotonic())

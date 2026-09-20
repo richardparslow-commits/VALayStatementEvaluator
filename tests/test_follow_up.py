@@ -293,12 +293,14 @@ class TestFollowUpRunIntegration(unittest.TestCase):
                 records=[MagicMock(pages=["p1"])],
                 condition="PTSD",
                 claim_type="Service connection",
-                relationship="Spouse",
-                witness_name="Jane Doe",
-                veteran_name="John Doe",
-                known_since="2010",
-                contact_frequency="daily",
-                witnessed_event="No",
+                witness={
+                    "name": "Jane Doe",
+                    "relationship": "Spouse",
+                    "known_since": "2010",
+                    "contact_frequency": "daily",
+                    "veteran_name": "John Doe",
+                    "witnessed_event": "No",
+                },
                 observations="Original observations.",
             )
 

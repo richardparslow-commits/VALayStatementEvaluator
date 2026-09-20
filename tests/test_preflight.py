@@ -1073,12 +1073,14 @@ class TestRunFlowsAreStopped(unittest.TestCase):
                 records=[MagicMock()],
                 condition="knee",
                 claim_type="personal",
-                relationship="",
-                witness_name="",
-                veteran_name="",
-                known_since="",
-                contact_frequency="",
-                witnessed_event="",
+                witness={
+                    "name": "",
+                    "relationship": "",
+                    "known_since": "",
+                    "contact_frequency": "",
+                    "veteran_name": "",
+                    "witnessed_event": "",
+                },
                 observations="obs",
             )
         get_llm.assert_not_called()

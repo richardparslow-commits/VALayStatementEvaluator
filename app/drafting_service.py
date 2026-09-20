@@ -85,6 +85,12 @@ def validate_drafting_request(
         ("Opportunity to observe", witness.get("contact_frequency", "")),
         ("Veteran name", witness.get("veteran_name", "")),
         ("Witnessed event", witness.get("witnessed_event", "")),
+        # Optional credential fields (empty is fine): capped and injection-screened
+        # like every other witness field, on both the in-process and queued paths.
+        ("Credential level", witness.get("credential_level", "")),
+        ("Medical specialties", witness.get("medical_specialties", "")),
+        ("Credentials & certifications", witness.get("credentials_detail", "")),
+        ("Professional relevance", witness.get("credential_relevance", "")),
     ):
         msg = validate_witness_field(str(value or ""), field_name=field_name, max_chars=500)
         if msg:
