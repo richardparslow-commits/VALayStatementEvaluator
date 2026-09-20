@@ -506,8 +506,11 @@ The reviewer is built for full VA claim files, including bundles of 1,000–2,00
 - **Lab and vitals rows kept intact** — padded table columns are rewritten as
   `date | name | value` lines, so the model reads a row's fields in order instead of
   guessing which value belongs to which label.
-- **Transient-failure tolerance** — a chunk that fails (e.g. rate limit) is retried
-  once; the run only aborts if it still fails, and the failing chunks are named.
+- **Transient-failure tolerance** — a chunk that fails transiently (e.g. a rate
+  limit) is retried once; breaker refusals and deterministic rejections (a bad
+  key, an unusable model id) are counted but not re-attempted, because an
+  identical call reproduces them. The run aborts only if chunks still fail, and
+  the failing chunks are named.
 - **Complete extracted-evidence store** — all extracted facts are retained for
   retrieval, saved results, citation checks, timelines, and exports. Only exact
   repetitions are removed; differing sources, quotes, dates, and fact types remain.

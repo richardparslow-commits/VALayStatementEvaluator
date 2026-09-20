@@ -2,8 +2,8 @@
 
 Pipeline:
   documents -> overlapping chunks -> duplicate-chunk skip -> PARALLEL LLM fact
-  extraction (with retry) -> mechanical fact dedup -> hierarchical LLM merge ->
-  capped, ordered digest -> full-coverage narrative summary.
+  extraction (with one retry, transient failures only) -> mechanical fact dedup ->
+  hierarchical LLM merge -> capped, ordered digest -> full-coverage narrative summary.
 
 Both pathways (evaluate and draft) rely on this module to build a structured,
 citable digest of every uploaded medical document.
@@ -639,7 +639,7 @@ def review_medical_records(
     """Run the full exhaustive review over all uploaded records.
 
     Scales to thousands of pages: chunks are digested in parallel, duplicate
-    chunks are skipped, failed chunks are retried, and large fact lists are
+    chunks are skipped, transient failures are retried, and large fact lists are
     merged hierarchically instead of in one oversized call.
     """
     check_pipeline_cancelled()
@@ -799,7 +799,6 @@ def review_medical_records(
     # chunks, which says nothing about what to fix. This is the error that does.
     cause: BaseException | None = None
     fail_fast_chunks = 0
-    completed = 0
     _review_t0 = time.perf_counter()
     rid = get_request_id() or "-"
     logger.info(
@@ -817,8 +816,9 @@ def review_medical_records(
         },
     )
 
-    def run_round(pending: list[Chunk]) -> None:
-        nonlocal completed, cause, fail_fast_chunks
+    def run_round(pending: list[Chunk], *, retry: bool = False) -> None:
+        nonlocal cause, fail_fast_chunks
+        done = 0
         pool = ThreadPoolExecutor(max_workers=config.RECORDS_CONCURRENCY)
         try:
             future_map = {
@@ -827,7 +827,7 @@ def review_medical_records(
             }
             for future in pipeline_as_completed(future_map):
                 chunk = future_map[future]
-                completed += 1
+                done += 1
                 try:
                     results[chunk.index] = future.result()
                 except Exception as exc:  # noqa: BLE001 - record and retry later
@@ -840,10 +840,20 @@ def review_medical_records(
                     elif cause is None:
                         cause = exc
                 if progress:
-                    progress(
-                        0.05 + 0.55 * completed / max(total_units, 1),
-                        f"Extracting facts — {completed}/{total_units} chunks done…",
-                    )
+                    # Each round counts against its own targets. Counting the retry
+                    # pass against the original total produced "654/327 chunks done…"
+                    # on a full-bundle failure (measured live), which reads as
+                    # progress past the end of the run.
+                    if retry:
+                        progress(
+                            0.62 + 0.03 * done / max(len(pending), 1),
+                            f"Retrying failed chunks — {done}/{len(pending)} done…",
+                        )
+                    else:
+                        progress(
+                            0.05 + 0.55 * done / max(total_units, 1),
+                            f"Extracting facts — {done}/{total_units} chunks done…",
+                        )
         finally:
             pool.shutdown(wait=False, cancel_futures=True)
 
@@ -852,25 +862,40 @@ def review_medical_records(
     ):
         run_round(chunks)
 
-    # Retry failed chunks once; parallel bursts can hit transient rate limits.
+    # Retry failed chunks once; parallel bursts can hit transient rate limits — but
+    # only failures a retry could plausibly change are re-attempted. A call the
+    # breaker refused *before making it* meets the same open breaker, and a rejection
+    # the pipeline marked non-retriable (a rejected key, a model the account cannot
+    # use) reproduces itself exactly. Re-attempting those cost a full second pass
+    # over every chunk — hundreds of fail-fast rejections and their warnings — to
+    # reach the conclusion the first pass already had.
     if failed:
-        retry_targets = [c for c in chunks if c.index in failed]
+        retry_targets = [
+            c for c in chunks if c.index in failed and _retriable_failure(failed[c.index])
+        ]
+        not_retried = {i: exc for i, exc in failed.items() if not _retriable_failure(exc)}
         logger.warning(
-            "records digest retry pending=%d failed=%s",
+            "records digest retry pending=%d not_retried=%d failed=%s",
             len(retry_targets),
+            len(not_retried),
             sorted(failed.keys()),
             extra={
                 "request_id": rid,
                 "phase": "records:digest",
                 "status": "retry",
                 "chunks": len(retry_targets),
+                "not_retried": len(not_retried),
             },
         )
         failed.clear()
-        if progress:
-            progress(0.62, f"Retrying {len(retry_targets)} failed chunk(s)…")
-        with tracing.phase_span("records:digest", chunks=len(retry_targets), retry=True):
-            run_round(retry_targets)
+        if retry_targets:
+            if progress:
+                progress(0.62, f"Retrying {len(retry_targets)} failed chunk(s)…")
+            with tracing.phase_span("records:digest", chunks=len(retry_targets), retry=True):
+                run_round(retry_targets, retry=True)
+        # Failures the retry round could not improve stay counted — including the
+        # ones it skipped — so the summary reports what failed, not what ran twice.
+        failed.update(not_retried)
 
     if failed:
         reason_exc = cause if cause is not None else failed[sorted(failed)[0]]
@@ -1022,6 +1047,21 @@ def review_medical_records(
 # Twelve is enough to show the spread across a multi-file bundle (the labels read
 # "chunk 7, chunk 88, chunk 143") while keeping the whole message readable.
 MAX_FAILED_CHUNK_LABELS = 12
+
+
+def _retriable_failure(exc: BaseException) -> bool:
+    """Whether one more attempt could plausibly change this chunk's outcome.
+
+    The retry round exists for transient bursts. Two failures cannot improve on a
+    retry: a call the breaker refused *before making it* meets the same open
+    breaker, and a provider rejection the pipeline marked non-retriable — a
+    rejected key, a model the account cannot use — reproduces itself exactly.
+    Everything else (a timeout, a 5xx, a rate limit, an unparsable reply) is
+    retried as before.
+    """
+    if isinstance(exc, CircuitBreakerOpenError):
+        return False
+    return bool(getattr(exc, "retriable", True))
 
 
 def _failed_chunk_summary(failed: Mapping[int, BaseException], total_units: int) -> str:
