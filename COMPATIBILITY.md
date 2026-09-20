@@ -138,7 +138,9 @@ provider's response body distinguish a rejected key (`401`/`403`) from a wrong p
 URL (`404`) from a host that does not answer, and a listing that answers while every completion
 is refused is caught by the real call instead of being reported as healthy. The verdict is
 remembered for the run gate, so the first run after a check — and the run after that — reuses
-it instead of repeating the same two requests.
+it instead of repeating the same two requests. The run log keeps the receipt: each attempt
+writes one line (`accepted`, or `rejected` when the check refuses) naming `endpoint_check` as
+`fresh` or `reused` with the reused check's age.
 
 See `app/preflight.py` (`check_endpoint`, the shared policy), `app/llm.py` (`probe_models` and
 `probe_chat`) and `app/views/sidebar.py:render_sidebar_settings`.
@@ -153,7 +155,8 @@ serves no completions path at all). Each means every call in the run would be re
 probes cost two requests instead of the first minutes of the bundle's chunks — or none when
 that configuration was just checked (by **Test connection** or a recent run attempt), whose
 verdict is reused for a few minutes — and a run that reuses a check says so where it
-starts, with the age of the check behind it.
+starts, with the age of the check behind it. The same provenance lands in the run log:
+`accepted`/`rejected` events carry `endpoint_check` and the reused check's age.
 
 The second probe is why this section exists in a document about compatibility. A listing is not
 a promise: Perplexity's Router API publishes its ids and then answers every completion with

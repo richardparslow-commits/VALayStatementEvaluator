@@ -222,6 +222,21 @@ def _age_label(seconds: float) -> str:
     return f"{value} {unit}{'' if value == 1 else 's'}"
 
 
+def _accepted_check_fields(reused: bool, age: float | None, verdict: Any) -> dict[str, Any]:
+    """Run-log fields naming how the endpoint check behind a gate decision was made.
+
+    The audit trail must show what evidence a decision ran on: a run that proceeded
+    used to leave no line at all, so ``runs.jsonl`` could not tell a fresh probe from
+    a reused verdict — the asymmetry this closes.
+    """
+    return {
+        "reason": "endpoint_preflight",
+        "endpoint_check": "reused" if reused else "fresh",
+        "check_age_s": None if age is None else round(age, 1),
+        "check_kind": verdict.kind,
+    }
+
+
 def check_endpoint_gate(action: str, *, log_action: str, request_id: str = "") -> bool:
     """Return True when the endpoint can serve the configured models.
 
@@ -235,7 +250,10 @@ def check_endpoint_gate(action: str, *, log_action: str, request_id: str = "") -
     beside it — a user must be able to overrule a check that is wrong about their
     endpoint, because refusing to start a working run is worse than the failure the
     check prevents. A reused check is stated where the run starts — with the age of
-    the check behind it — so a skipped probe is never silent.
+    the check behind it — so a skipped probe is never silent. Every attempt, allowed
+    or refused, also leaves one ``accepted``/``rejected`` line in ``runs.jsonl``
+    carrying ``endpoint_check=fresh|reused``, so the audit trail shows how the
+    endpoint was judged.
     """
     settings = session_settings()
     signature = preflight.signature(settings)
@@ -261,7 +279,14 @@ def check_endpoint_gate(action: str, *, log_action: str, request_id: str = "") -
         None if age is None else round(age, 1),
         extra={"request_id": request_id or "-", "phase": "endpoint_preflight", "status": verdict.kind},
     )
+    check_fields = _accepted_check_fields(reused, age, verdict)
     if not verdict.blocks:
+        # An allowed run leaves its own line — `accepted`, with the check's
+        # provenance — so the trail answers for proceeds the same question
+        # `rejected` answers for refusals: probed just now, or reused evidence?
+        run_log_event(
+            "app", "accepted", request_id=request_id or "-", **check_fields
+        )
         if age is not None:
             st.caption(
                 f"Endpoint preflight: reused the check from {_age_label(age)} ago — "
@@ -279,6 +304,7 @@ def check_endpoint_gate(action: str, *, log_action: str, request_id: str = "") -
             list(verdict.missing),
             extra={"request_id": request_id or "-", "phase": "endpoint_preflight", "status": "waived"},
         )
+        run_log_event(log_action, "accepted", request_id=request_id, **check_fields)
         _clear_endpoint_block(action)
         return True
 
@@ -293,7 +319,7 @@ def check_endpoint_gate(action: str, *, log_action: str, request_id: str = "") -
         "rejected",
         request_id=request_id,
         error=verdict.headline,
-        reason="endpoint_preflight",
+        **check_fields,
     )
     # Put the notice above the button the user just pressed. This raises in real
     # Streamlit; the caller returns on False either way, so nothing depends on it.

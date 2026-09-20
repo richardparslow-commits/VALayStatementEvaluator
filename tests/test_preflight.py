@@ -593,6 +593,15 @@ def _fake_st() -> MagicMock:
 class TestEndpointGate(unittest.TestCase):
     """The gate itself: what it stores, what it logs, and what it clears."""
 
+    def setUp(self) -> None:
+        # Every gate path writes the run log now; mock it per-test so the suite
+        # writes nothing and each test can inspect its own events.
+        self._log_patch = patch.object(
+            __import__("app.views.shared", fromlist=["run_log_event"]), "run_log_event"
+        )
+        self.run_log_event = self._log_patch.start()
+        self.addCleanup(self._log_patch.stop)
+
     def _run(self, shared, st_mock, verdict, *, action="draft", log_action="draft"):
         with patch.object(shared, "st", st_mock), patch.object(
             shared, "session_settings", return_value=_settings()
@@ -610,7 +619,10 @@ class TestEndpointGate(unittest.TestCase):
         allowed, log_event = self._run(st_mock=st_mock, shared=shared, verdict=preflight.Verdict(preflight.OK, "fine"))
         self.assertTrue(allowed)
         self.assertNotIn(shared._endpoint_block_key("draft"), st_mock.session_state)
-        log_event.assert_not_called()
+        # Exactly one line per attempt: accepted, on a fresh probe.
+        (action, status), fields = log_event.call_args[0], log_event.call_args[1]
+        self.assertEqual((action, status), ("app", "accepted"))
+        self.assertEqual(fields["endpoint_check"], "fresh")
 
     def test_a_block_refuses_the_run_logs_it_and_stores_the_verdict(self) -> None:
         import app.views.shared as shared
@@ -625,6 +637,7 @@ class TestEndpointGate(unittest.TestCase):
         self.assertEqual((action, status), ("draft", "rejected"))
         self.assertEqual(log_event.call_args[1]["reason"], "endpoint_preflight")
         self.assertEqual(log_event.call_args[1]["request_id"], "req_1")
+        self.assertEqual(log_event.call_args[1]["endpoint_check"], "fresh")
 
     def test_the_log_action_is_separate_from_the_user_facing_one(self) -> None:
         """The Evaluate tab says "evaluation" to the user and "evaluate" in the log."""
@@ -744,6 +757,85 @@ class TestEndpointGate(unittest.TestCase):
         self.assertIn("no request was sent", note)
         self.assertIn("1 second", note)  # an age of zero reads as a second, never as none
 
+    def test_a_run_that_proceeds_on_a_reused_check_leaves_an_accepted_line(self) -> None:
+        """A run that used to leave no trace at all now names its evidence: the
+        endpoint was not probed — the verdict was reused, and how old it is."""
+        import app.views.shared as shared
+
+        st_mock = _fake_st()
+        preflight.remember_verdict(
+            st_mock.session_state, _settings(), preflight.Verdict(preflight.OK, headline="fine")
+        )
+        self.assertIsNotNone(
+            preflight.reusable_verdict(st_mock.session_state, _settings())
+        )
+        with patch.object(shared, "st", st_mock), patch.object(
+            shared, "session_settings", return_value=_settings()
+        ), patch.object(
+            shared.preflight, "check_endpoint", side_effect=AssertionError("probed anyway")
+        ):
+            self.assertTrue(
+                shared.check_endpoint_gate("draft", log_action="draft", request_id="req_1")
+            )
+        self.run_log_event.assert_called_once()
+        action, status = self.run_log_event.call_args[0][0], self.run_log_event.call_args[0][1]
+        self.assertEqual((action, status), ("app", "accepted"))
+        fields = self.run_log_event.call_args[1]
+        self.assertEqual(fields["request_id"], "req_1")
+        self.assertEqual(fields["reason"], "endpoint_preflight")
+        self.assertEqual(fields["endpoint_check"], "reused")
+        self.assertGreaterEqual(fields["check_age_s"], 0.0)
+        self.assertEqual(fields["check_kind"], "ok")
+
+    def test_a_run_that_proceeds_on_a_fresh_probe_records_the_probe(self) -> None:
+        """The reuse story is only auditable when the fresh path states itself too."""
+        import app.views.shared as shared
+
+        st_mock = _fake_st()
+        with patch.object(shared, "st", st_mock), patch.object(
+            shared, "session_settings", return_value=_settings()
+        ), patch.object(
+            shared.preflight, "check_endpoint", return_value=preflight.Verdict(preflight.OK, "fresh")
+        ) as check:
+            self.assertTrue(
+                shared.check_endpoint_gate("draft", log_action="draft", request_id="req_2")
+            )
+        check.assert_called_once()
+        self.run_log_event.assert_called_once()
+        action, status = self.run_log_event.call_args[0][0], self.run_log_event.call_args[0][1]
+        self.assertEqual((action, status), ("app", "accepted"))
+        fields = self.run_log_event.call_args[1]
+        self.assertEqual(fields["endpoint_check"], "fresh")
+        self.assertIsNone(fields["check_age_s"])
+        self.assertEqual(fields["check_kind"], "ok")
+
+    def test_a_waived_run_records_its_accepted_line(self) -> None:
+        """A user-overruled block is a run decision too, and says what it overruled."""
+        import app.views.shared as shared
+
+        st_mock = _fake_st()
+        verdict = preflight.Verdict(preflight.BLOCKED, headline="The endpoint rejected this API key.")
+        with patch.object(shared, "st", st_mock), patch.object(
+            shared, "session_settings", return_value=_settings()
+        ), patch.object(
+            shared.preflight,
+            "check_endpoint",
+            return_value=verdict,
+        ):
+            from app.preflight import signature as _sig
+
+            st_mock.session_state[shared.endpoint_waiver_key("draft", _sig(_settings()))] = True
+            self.assertTrue(
+                shared.check_endpoint_gate("draft", log_action="draft", request_id="req_3")
+            )
+        self.run_log_event.assert_called_once()
+        action, status = self.run_log_event.call_args[0][0], self.run_log_event.call_args[0][1]
+        self.assertEqual((action, status), ("draft", "accepted"))
+        fields = self.run_log_event.call_args[1]
+        self.assertEqual(fields["request_id"], "req_3")
+        self.assertEqual(fields["endpoint_check"], "fresh")
+        self.assertEqual(fields["check_kind"], "blocked")
+
     def test_a_fresh_probe_reports_no_reuse(self) -> None:
         import app.views.shared as shared
 
@@ -809,6 +901,8 @@ class TestEndpointGate(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertIs(st_mock.session_state[shared._endpoint_block_key("draft")], verdict)
         log_event.assert_called_once()
+        self.assertEqual(log_event.call_args[0][1], "rejected")
+        self.assertEqual(log_event.call_args[1]["endpoint_check"], "reused")
 
     def test_a_waiver_allows_that_configuration_and_clears_the_notice(self) -> None:
         import app.views.shared as shared
@@ -823,7 +917,10 @@ class TestEndpointGate(unittest.TestCase):
         )
         self.assertTrue(allowed)
         self.assertNotIn(shared._endpoint_block_key("draft"), st_mock.session_state)
-        log_event.assert_not_called()
+        # The waived run states what it overrode: accepted, on a blocked verdict.
+        (action, status), fields = log_event.call_args[0], log_event.call_args[1]
+        self.assertEqual((action, status), ("draft", "accepted"))
+        self.assertEqual(fields["check_kind"], "blocked")
 
     def test_a_waiver_does_not_leak_onto_a_different_configuration(self) -> None:
         """Changing the endpoint, key, or models has to ask the user again."""
@@ -849,7 +946,9 @@ class TestEndpointGate(unittest.TestCase):
             verdict=preflight.Verdict(preflight.UNVERIFIED, headline="no answer"),
         )
         self.assertTrue(allowed)
-        log_event.assert_not_called()
+        (action, status), fields = log_event.call_args[0], log_event.call_args[1]
+        self.assertEqual((action, status), ("app", "accepted"))
+        self.assertEqual(fields["check_kind"], "unverified")
 
 
 class TestEndpointNotice(unittest.TestCase):
