@@ -135,6 +135,94 @@ class TestCircuitBreakerUnit(unittest.TestCase):
         self.assertLess(elapsed_ms, 50, f"fail-fast took {elapsed_ms:.1f} ms, should be <50 ms")
 
 
+class TestBreakerRemembersWhyItOpened(unittest.TestCase):
+    """The OPEN message must name the cause, not guess at one.
+
+    The breaker raised its own message while OPEN and had nothing to put in it, so
+    it said "LLM endpoint temporarily unavailable". For the failures that never
+    reach the endpoint — a rejected key, a model id the account cannot use — that
+    is simply wrong, and it sent users off to wait for a recovery that could not
+    arrive. These tests pin the reason on the message.
+    """
+
+    def _open(self, *, reason: str, retriable: bool = True, threshold: int = 3) -> CircuitBreaker:
+        breaker = CircuitBreaker(failure_threshold=threshold, recovery_timeout=60, name="t")
+        with self.assertLogs("app.circuit_breaker", level="WARNING"):
+            for _ in range(threshold):
+                breaker.record_failure(reason=reason, retriable=retriable)
+        return breaker
+
+    def test_open_message_quotes_the_recorded_reason(self) -> None:
+        breaker = self._open(reason="LLMUpstreamError: rejected (status=401)")
+        with self.assertRaises(CircuitBreakerOpenError) as ctx:
+            breaker.check_or_raise()
+        self.assertIn("LLMUpstreamError: rejected (status=401)", str(ctx.exception))
+
+    def test_a_deterministic_rejection_is_not_reported_as_an_outage(self) -> None:
+        """Waiting cannot fix a rejected request, so the message must not ask for it."""
+        breaker = self._open(reason="LLMUpstreamError: bad model id", retriable=False)
+        message = ""
+        with self.assertRaises(CircuitBreakerOpenError) as ctx:
+            breaker.check_or_raise()
+        message = str(ctx.exception)
+        self.assertIn("deterministic", message)
+        self.assertNotIn("temporarily unavailable", message)
+
+    def test_a_transient_failure_keeps_the_self_healing_wording(self) -> None:
+        breaker = self._open(reason="LLMUpstreamError: 503 from gateway", retriable=True)
+        with self.assertRaises(CircuitBreakerOpenError) as ctx:
+            breaker.check_or_raise()
+        message = str(ctx.exception)
+        self.assertIn("LLMUpstreamError: 503 from gateway", message)
+        self.assertNotIn("deterministic", message)
+        self.assertIn("probes again", message)
+
+    def test_no_reason_still_opens_and_says_so(self) -> None:
+        """Callers (and older code) may record a failure with nothing to add."""
+        breaker = CircuitBreaker(failure_threshold=1, recovery_timeout=60, name="t")
+        with self.assertLogs("app.circuit_breaker", level="WARNING"):
+            breaker.record_failure()
+        self.assertEqual(breaker.state, "OPEN")
+        with self.assertRaises(CircuitBreakerOpenError) as ctx:
+            breaker.check_or_raise()
+        self.assertIn("gave no reason", str(ctx.exception))
+
+    def test_success_clears_the_reason_so_it_is_never_quoted_late(self) -> None:
+        """A recovered endpoint's old failure must not explain a later opening."""
+        breaker = self._open(reason="LLMUpstreamError: stale cause", retriable=False)
+        breaker.record_success()
+        self.assertEqual(breaker.last_failure_reason, "")
+        self.assertEqual(breaker.state, "CLOSED")
+        with self.assertLogs("app.circuit_breaker", level="WARNING"):
+            for _ in range(3):
+                breaker.record_failure(reason="LLMTimeoutError: fresh cause", retriable=True)
+        with self.assertRaises(CircuitBreakerOpenError) as ctx:
+            breaker.check_or_raise()
+        message = str(ctx.exception)
+        self.assertIn("fresh cause", message)
+        self.assertNotIn("stale cause", message)
+
+    def test_reset_clears_the_reason_too(self) -> None:
+        breaker = self._open(reason="LLMUpstreamError: leftover")
+        breaker.reset()
+        self.assertEqual(breaker.last_failure_reason, "")
+
+    def test_the_reason_appears_in_the_transition_log(self) -> None:
+        """The log is where an operator looks; a bare failure count is not enough."""
+        with self.assertLogs("app.circuit_breaker", level="WARNING") as cm:
+            breaker = CircuitBreaker(failure_threshold=2, recovery_timeout=60, name="t")
+            breaker.record_failure(reason="LLMUpstreamError: key rejected", retriable=False)
+            breaker.record_failure(reason="LLMUpstreamError: key rejected", retriable=False)
+        self.assertTrue(any("key rejected" in line for line in cm.output), cm.output)
+
+    def test_a_very_long_reason_is_bounded(self) -> None:
+        """The advice sentence after it has to stay reachable."""
+        from app.circuit_breaker import MAX_FAILURE_REASON_CHARS
+
+        breaker = self._open(reason="E: " + "x" * 5000, retriable=False)
+        self.assertEqual(len(breaker.last_failure_reason), MAX_FAILURE_REASON_CHARS)
+
+
 # -------------------------------------------------------------- limiter unit
 
 
