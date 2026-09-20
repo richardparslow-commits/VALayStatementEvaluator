@@ -43,6 +43,11 @@ MODEL_NAME_MAX_CHARS = 127
 # Allow a conservative charset so prompt-injected payloads cannot ride in the
 # model field and influence the prompt.
 _MODEL_NAME_RE = re.compile(r"^[a-zA-Z0-9._\-/:]+$")
+# Sentence punctuation a real model id never ends with. A value copied out of
+# a sentence or list ("… the cheapest is perplexity/glm-5.3-flash.") keeps the
+# full stop, and the provider answers as though the id were simply unknown — so
+# it is caught here, before the endpoint is asked anything.
+_TRAILING_PUNCTUATION = ".,;:"
 
 # Patterns that are typical prompt-injection directives. We do NOT block user
 # text that contains them — that would be both surprising and harmful to the
@@ -156,6 +161,15 @@ def validate_model_name(value: str) -> str | None:
         return "Model name must not contain spaces or line breaks."
     if "<<" in value or ">>" in value or "```" in value:
         return "Model name contains prompt delimiter sequences."
+    # Before the charset check: a value ending in punctuation is a recognizable
+    # mistake with its own fix, and ',' / ';' would otherwise be reported as an
+    # invalid character rather than as the sentence or list it was copied from.
+    if value[-1] in _TRAILING_PUNCTUATION:
+        return (
+            f"Model name ends with {value[-1]!r} — model ids do not end in sentence "
+            "punctuation, so this is nearly always a stray character copied from a "
+            "sentence or a list. Remove it."
+        )
     if not _MODEL_NAME_RE.match(value):
         return "Model name contains invalid characters (allowed: letters, digits, . _ - / :)."
     return None

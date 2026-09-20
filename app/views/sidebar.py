@@ -58,6 +58,11 @@ def render_sidebar_settings() -> None:
             help="Bulk record digests — one call per record chunk, so use the "
             "cheapest model that extracts accurately to keep a large run cheap.",
         )
+        # Both boxes are half-width, so a long id is clipped at the edge — and the
+        # character the clip cuts through can read as part of the id, which is
+        # exactly how "perplexity/glm-5.3-flash" comes to look like it ends in a
+        # stray period. Print the applied ids where they cannot be clipped.
+        st.caption(_model_ids_note(settings))
         st.divider()
         st.subheader("Fetch Sandbox")
         st.session_state.fetch_api_key_input = st.text_input(
@@ -496,6 +501,21 @@ def _field_value(key: str, fallback: str = "") -> str:
     raw: Any = st.session_state.get(key, "")
     value = raw.strip() if isinstance(raw, str) else ""
     return value or fallback
+
+
+def _model_ids_note(settings: Any) -> str:
+    """The model ids a run will use, in full — the boxes above clip long ones.
+
+    The two model fields sit side by side, so a long id is cut off at the box
+    edge. The character the cut lands on can be read as part of the id (a value
+    that appears to end in "."), which sends the user hunting a typo that is not
+    in the value at all — so the ids in use are stated here, where no width limit
+    applies.
+    """
+    return (
+        f"Ids in use: `{settings.model_main}` (main) · `{settings.model_fast}` "
+        "— these boxes clip long ids, so check them here."
+    )
 
 
 def _secrets_source_note(settings: Any) -> None:
