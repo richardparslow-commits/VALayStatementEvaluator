@@ -895,7 +895,141 @@ class TestLargeRecordPipeline(unittest.TestCase):
         docs = [extract_document("a.txt", b"EVT one event recorded here.")]
         digest = review_medical_records(llm, docs)
         self.assertEqual(len(digest.facts), 1)
-        self.assertEqual(llm.digest_calls, 2)  # failed once, succeeded on retry
+    @staticmethod
+    def _multi_chunk_docs():
+        """One record whose text exceeds the digest chunk budget several times."""
+        from app.documents import DEFAULT_CHUNK_CHARS
+
+        parts = [
+            f"SECTION{i} " + (f"word{i} " * ((DEFAULT_CHUNK_CHARS + 800) // 8))
+            for i in range(4)
+        ]
+        return [extract_document("big.txt", ("\n\n".join(parts)).encode())]
+
+    @staticmethod
+    def _chunk_total(messages):
+        import re
+
+        for _, message in messages:
+            match = re.search(r"in (\d+) chunk", message)
+            if match:
+                return int(match.group(1))
+        raise AssertionError(f"no chunk-count message in {messages!r}")
+
+    def test_deterministic_rejection_skips_the_doomed_retry_round(self):
+        """A 403-class rejection is not re-attempted; a retry cannot change it."""
+        from app.llm import LLMError, LLMUpstreamError
+
+        class RefusingLLM(FakeLLM):
+            def __init__(self):
+                super().__init__()
+                self.attempts = 0
+
+            def chat_json(self, system, user, **kwargs):
+                if "CHUNK TEXT" in user:
+                    self.attempts += 1
+                    raise LLMUpstreamError(
+                        "LLM provider rejected the request (Error code: 403)",
+                        retriable=False,
+                        status_code=403,
+                    )
+                return super().chat_json(system, user, **kwargs)
+
+        llm = RefusingLLM()
+        messages = []
+        with self.assertRaises(LLMError) as ctx:
+            review_medical_records(
+                llm, self._multi_chunk_docs(), progress=lambda f, m: messages.append((f, m))
+            )
+        chunk_total = self._chunk_total(messages)
+        self.assertGreaterEqual(chunk_total, 2)
+        self.assertEqual(llm.attempts, chunk_total)  # one attempt per chunk: no retry pass
+        self.assertNotIn("Retrying", "\n".join(m for _, m in messages))
+        error = str(ctx.exception)
+        self.assertIn("which retrying cannot fix", error)
+        self.assertIn(f"Chunks affected: {chunk_total} of {chunk_total}", error)
+
+    def test_transient_failures_retry_with_round_local_counts(self):
+        """Every chunk retries once, and no progress line counts past its round."""
+        import re
+
+        from app.llm import LLMUpstreamError
+
+        class FlakyOnceLLM(FakeLLM):
+            def __init__(self):
+                super().__init__()
+                self.attempts = 0
+                self._seen = set()
+
+            def chat_json(self, system, user, **kwargs):
+                if "CHUNK TEXT" in user:
+                    self.attempts += 1
+                    if user not in self._seen:
+                        self._seen.add(user)
+                        raise LLMUpstreamError(
+                            "transient rate limit", retriable=True, status_code=429
+                        )
+                return super().chat_json(system, user, **kwargs)
+
+        llm = FlakyOnceLLM()
+        messages = []
+        review_medical_records(
+            llm, self._multi_chunk_docs(), progress=lambda f, m: messages.append((f, m))
+        )
+        chunk_total = self._chunk_total(messages)
+        self.assertEqual(llm.attempts, 2 * chunk_total)  # first pass + one retry each
+        retry_lines = [m for _, m in messages if m.startswith("Retrying failed chunks")]
+        self.assertEqual(len(retry_lines), chunk_total)
+        counts = [
+            (int(done), int(total))
+            for _, message in messages
+            for done, total in re.findall(r"— (\d+)/(\d+) ", message)
+        ]
+        self.assertTrue(all(done <= total for done, total in counts))
+        self.assertEqual(max(done for done, _ in counts), chunk_total)
+        fractions = [fraction for fraction, _ in messages]
+        self.assertEqual(fractions, sorted(fractions))  # progress never goes backwards
+
+    def test_fail_fast_rejections_are_skipped_but_still_counted(self):
+        """Breaker refusals are not re-attempted; the summary still counts them."""
+        from app.circuit_breaker import CircuitBreakerOpenError
+        from app.llm import LLMError, LLMUpstreamError
+
+        class MixedLLM(FakeLLM):
+            def __init__(self):
+                super().__init__()
+                self.attempts = 0
+                self._seen = set()
+
+            def chat_json(self, system, user, **kwargs):
+                if "CHUNK TEXT" in user:
+                    self.attempts += 1
+                    if self.attempts <= 2:  # first two calls: refused before a request
+                        raise CircuitBreakerOpenError("Circuit breaker 'llm' is OPEN (test)")
+                    if user not in self._seen:
+                        self._seen.add(user)
+                        raise LLMUpstreamError(
+                            "transient upstream error", retriable=True, status_code=503
+                        )
+                return super().chat_json(system, user, **kwargs)
+
+        llm = MixedLLM()
+        messages = []
+        with self.assertRaises(LLMError) as ctx:
+            review_medical_records(
+                llm, self._multi_chunk_docs(), progress=lambda f, m: messages.append((f, m))
+            )
+        chunk_total = self._chunk_total(messages)
+        self.assertEqual(chunk_total, 4)  # fixture is four sections
+        # Two chunks were refused before a request; two failed transiently and were
+        # retried. The refused two are not re-attempted: 4 + 2 attempts, not 8.
+        self.assertEqual(llm.attempts, chunk_total + 2)
+        self.assertEqual(
+            [m for _, m in messages if m.startswith("Retrying failed chunks")],
+            [f"Retrying failed chunks — {i}/{chunk_total - 2} done…" for i in (1, 2)],
+        )
+        error = str(ctx.exception)
+        self.assertIn(f"Chunks affected: {chunk_total - 2} of {chunk_total}", error)
 
     def test_page_cap_enforced(self):
         original = config.MAX_RECORD_PAGES
