@@ -261,7 +261,8 @@ Key metrics:
 A message ending in **Run not started** above the run button is not a failure: it is the
 preflight refusing to spend a run on a configuration that cannot work. Nothing was sent to the
 model and no credits were used — the check itself is a model listing plus one short chat call,
-which is what a run's own first call costs.
+which is what a run's own first call costs. If **Test connection** just ran that same check on
+the same configuration, its verdict is reused for a few minutes instead of probing again.
 
 | Message | What it means | What to do |
 |---|---|---|

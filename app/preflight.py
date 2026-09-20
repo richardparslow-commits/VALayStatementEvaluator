@@ -27,9 +27,10 @@ a rate limit, a 5xx) leaves the listing's verdict alone.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field, replace
 from hashlib import sha256
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 from urllib.parse import urlparse
 
 from .config import Settings
@@ -53,6 +54,17 @@ ChatProbeFn = Callable[[str, str, str], ChatProbe]
 #: exists (see the module docstring), and a 404 on the completions path is just as
 #: deterministic as a rejected key.
 REFUSAL_STATUSES = (401, 403, 404)
+
+#: How long a verdict may stand in for a fresh probe. **Test connection** in the
+#: sidebar probes the same configuration the run gate probes seconds later, so the
+#: second pair of requests adds nothing inside this window — but a key revoked or
+#: an endpoint that died in between must be re-probed rather than assumed, so the
+#: window is short.
+VERDICT_REUSE_SECONDS = 300.0
+
+#: Session-state key holding the last verdict (see :func:`remember_verdict`). One
+#: entry only: the most recent configuration is the one a run will use.
+VERDICT_SESSION_KEY = "endpoint_preflight_last_verdict"
 
 # ----------------------------------------------------------- Vercel credentials
 #
@@ -416,3 +428,65 @@ def verdict_from_session(value: Any) -> Verdict | None:
     reload, so the shape is checked rather than trusted.
     """
     return value if isinstance(value, Verdict) else None
+
+
+class VerdictStore(Protocol):
+    """The slice of a session-state store these helpers use.
+
+    ``st.session_state`` satisfies it, and so does a plain dict in tests. Reading
+    through ``[]`` rather than ``get`` keeps this to plain methods: ``Mapping.get``
+    is overloaded in typeshed, and an overloaded implementation does not satisfy a
+    single-signature protocol member.
+    """
+
+    def __getitem__(self, key: str) -> Any: ...
+    def __setitem__(self, key: str, value: Any) -> None: ...
+
+
+def remember_verdict(
+    store: VerdictStore,
+    settings: Settings,
+    verdict: Verdict,
+    *,
+    now: float | None = None,
+) -> None:
+    """Record *verdict* as evidence a later check of the same configuration can reuse.
+
+    Called by **Test connection**: it runs the same check the run gate runs, so the
+    gate would otherwise pay for the same two requests seconds later. The verdict is
+    keyed by :func:`signature`, so any change to the endpoint, key or model names
+    makes it unreadable rather than misleading.
+    """
+    store[VERDICT_SESSION_KEY] = {
+        "signature": signature(settings),
+        "at": time.monotonic() if now is None else now,
+        "verdict": verdict,
+    }
+
+
+def reusable_verdict(
+    store: VerdictStore,
+    settings: Settings,
+    *,
+    now: float | None = None,
+) -> Verdict | None:
+    """The stored verdict for *settings*, if recent enough to stand in for a probe.
+
+    ``None`` whenever the entry is missing, describes a different configuration, or
+    is older than :data:`VERDICT_REUSE_SECONDS` — the caller then probes as usual.
+    Session state is shared with other tabs and survives reruns, so the shape and
+    the age are checked rather than trusted.
+    """
+    try:
+        entry = store[VERDICT_SESSION_KEY]
+    except KeyError:
+        return None
+    if not isinstance(entry, dict) or entry.get("signature") != signature(settings):
+        return None
+    at = entry.get("at")
+    if not isinstance(at, (int, float)):
+        return None
+    age = (time.monotonic() if now is None else now) - at
+    if age < 0 or age > VERDICT_REUSE_SECONDS:
+        return None
+    return verdict_from_session(entry.get("verdict"))

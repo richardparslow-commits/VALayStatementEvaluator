@@ -1433,6 +1433,23 @@ class TestSidebarSettingsGuards(unittest.TestCase):
 
         self.assertIs(sidebar.check_endpoint, preflight.check_endpoint)
 
+    def test_the_button_remembers_its_verdict_for_the_run_gate(self) -> None:
+        """The gate checks the same configuration seconds later; the button's verdict
+        is what keeps that from being a second identical pair of requests."""
+        import app.preflight as preflight
+        import app.views.sidebar as sidebar
+
+        st_mock, session = _fake_streamlit()
+        session["base_url_input"] = "https://ws-example.us-east-1.maas.aliyuncs.com"
+        session["api_key_input"] = "test-workspace-key"
+        verdict = self._verdict(OK, "fine")
+        with _patch_st(sidebar, st_mock), patch.object(
+            sidebar, "check_endpoint", return_value=verdict
+        ):
+            sidebar._test_connection_report(self._settings())
+
+        self.assertIs(preflight.reusable_verdict(session, self._settings()), verdict)
+
     def test_connection_renders_the_verdict_and_its_evidence(self) -> None:
         import app.views.sidebar as sidebar
 

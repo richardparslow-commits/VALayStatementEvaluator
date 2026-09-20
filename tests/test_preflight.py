@@ -464,6 +464,81 @@ class TestSignature(unittest.TestCase):
         self.assertIn("no-key", preflight.signature(_settings(api_key="")))
 
 
+class TestVerdictReuse(unittest.TestCase):
+    """A verdict stands in for a probe only for its own configuration, and only briefly."""
+
+    def _verdict(self) -> preflight.Verdict:
+        return preflight.Verdict(preflight.OK, headline="all good")
+
+    def _store(self, settings, verdict, *, now: float) -> dict:
+        store: dict = {}
+        preflight.remember_verdict(store, settings, verdict, now=now)
+        return store
+
+    def test_a_fresh_verdict_for_the_same_configuration_is_reused(self) -> None:
+        settings = _settings()
+        verdict = self._verdict()
+        store = self._store(settings, verdict, now=1_000.0)
+
+        self.assertIs(preflight.reusable_verdict(store, settings, now=1_010.0), verdict)
+
+    def test_a_verdict_goes_stale_after_the_window(self) -> None:
+        settings = _settings()
+        verdict = self._verdict()
+        store = self._store(settings, verdict, now=1_000.0)
+        boundary = 1_000.0 + preflight.VERDICT_REUSE_SECONDS
+
+        self.assertIs(preflight.reusable_verdict(store, settings, now=boundary), verdict)
+        self.assertIsNone(preflight.reusable_verdict(store, settings, now=boundary + 0.001))
+
+    def test_a_verdict_timestamped_in_the_future_is_not_reused(self) -> None:
+        """A clock that went backwards is not evidence that anything was checked."""
+        settings = _settings()
+        store = self._store(settings, self._verdict(), now=1_010.0)
+
+        self.assertIsNone(preflight.reusable_verdict(store, settings, now=1_000.0))
+
+    def test_a_verdict_is_only_evidence_for_its_own_configuration(self) -> None:
+        settings = _settings()
+        store = self._store(settings, self._verdict(), now=1_000.0)
+
+        for changed in (
+            _settings(api_key="other-key"),
+            _settings(base_url="https://elsewhere.example/v1"),
+            _settings(model_main="other-main"),
+            _settings(model_fast="other-fast"),
+        ):
+            with self.subTest(changed=preflight.signature(changed)):
+                self.assertIsNone(preflight.reusable_verdict(store, changed, now=1_010.0))
+
+    def test_a_missing_entry_is_simply_unreusable(self) -> None:
+        self.assertIsNone(preflight.reusable_verdict({}, _settings(), now=1_000.0))
+
+    def test_junk_in_the_store_is_ignored_rather_than_trusted(self) -> None:
+        settings = _settings()
+        key = preflight.VERDICT_SESSION_KEY
+        for junk in (
+            None,
+            "not an entry",
+            {},
+            {"signature": preflight.signature(settings)},
+            {"signature": preflight.signature(settings), "at": "yesterday", "verdict": self._verdict()},
+            {"signature": preflight.signature(settings), "at": 1_000.0, "verdict": {"not": "a verdict"}},
+        ):
+            with self.subTest(junk=repr(junk)[:48]):
+                self.assertIsNone(
+                    preflight.reusable_verdict({key: junk}, settings, now=1_010.0)
+                )
+
+    def test_remembering_again_replaces_the_earlier_verdict(self) -> None:
+        settings = _settings()
+        store = self._store(settings, self._verdict(), now=1_000.0)
+        newer = preflight.Verdict(preflight.BLOCKED, headline="now refused")
+        preflight.remember_verdict(store, settings, newer, now=1_005.0)
+
+        self.assertIs(preflight.reusable_verdict(store, settings, now=1_006.0), newer)
+
+
 class _FakeSession(dict):
     """Mirrors Streamlit's SessionState: item access and attribute access."""
 
@@ -537,6 +612,56 @@ class TestEndpointGate(unittest.TestCase):
         )
         self.assertEqual(log_event.call_args[0][0], "evaluate")
         self.assertIn(shared._endpoint_block_key("evaluation"), st_mock.session_state)
+
+    def test_a_fresh_test_connection_verdict_skips_the_probes(self) -> None:
+        """The button already paid for this exact check; the gate must not pay twice."""
+        import app.views.shared as shared
+
+        st_mock = _fake_st()
+        verdict = preflight.Verdict(preflight.OK, headline="fine")
+        preflight.remember_verdict(st_mock.session_state, _settings(), verdict)
+        with patch.object(shared, "st", st_mock), patch.object(
+            shared, "session_settings", return_value=_settings()
+        ), patch.object(
+            shared.preflight, "check_endpoint", side_effect=AssertionError("probed anyway")
+        ):
+            allowed = shared.check_endpoint_gate("draft", log_action="draft", request_id="req_1")
+        self.assertTrue(allowed)
+        self.assertNotIn(shared._endpoint_block_key("draft"), st_mock.session_state)
+
+    def test_a_verdict_for_another_configuration_does_not_skip_the_probes(self) -> None:
+        import app.views.shared as shared
+
+        st_mock = _fake_st()
+        preflight.remember_verdict(
+            st_mock.session_state,
+            _settings(api_key="some-other-key"),
+            preflight.Verdict(preflight.OK, headline="fine"),
+        )
+        with patch.object(shared, "st", st_mock), patch.object(
+            shared, "session_settings", return_value=_settings()
+        ), patch.object(
+            shared.preflight, "check_endpoint", return_value=preflight.Verdict(preflight.OK, "fresh")
+        ) as check:
+            allowed = shared.check_endpoint_gate("draft", log_action="draft", request_id="req_1")
+        self.assertTrue(allowed)
+        check.assert_called_once()
+
+    def test_a_reused_block_still_refuses_the_run(self) -> None:
+        import app.views.shared as shared
+
+        st_mock = _fake_st()
+        verdict = preflight.Verdict(preflight.BLOCKED, headline="The endpoint rejected this API key.")
+        preflight.remember_verdict(st_mock.session_state, _settings(), verdict)
+        with patch.object(shared, "st", st_mock), patch.object(
+            shared, "session_settings", return_value=_settings()
+        ), patch.object(
+            shared.preflight, "check_endpoint", side_effect=AssertionError("probed anyway")
+        ), patch.object(shared, "run_log_event") as log_event:
+            allowed = shared.check_endpoint_gate("draft", log_action="draft", request_id="req_1")
+        self.assertFalse(allowed)
+        self.assertIs(st_mock.session_state[shared._endpoint_block_key("draft")], verdict)
+        log_event.assert_called_once()
 
     def test_a_waiver_allows_that_configuration_and_clears_the_notice(self) -> None:
         import app.views.shared as shared

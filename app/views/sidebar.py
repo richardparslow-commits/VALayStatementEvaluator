@@ -18,7 +18,7 @@ from .. import watchdog
 from ..config import DEFAULT_BASE_URL, load_settings
 from ..error_report import report_failure
 from ..llm import check_model_availability
-from ..preflight import BLOCKED, OK, Verdict, check_endpoint
+from ..preflight import BLOCKED, OK, Verdict, check_endpoint, remember_verdict
 from ..prompt_sanitize import validate_api_key, validate_model_name
 from .usage import load_usage_history, save_usage_history
 
@@ -554,7 +554,9 @@ def _test_connection_report(settings: Any) -> None:
     preflight runs here too: the same two probes and the same policy that decides whether a
     run starts, so the button cannot promise something the run buttons will refuse. It is
     still the screen where a bad key or endpoint is fixed in seconds, which is why the
-    verdict is rendered whole — headline and fix.
+    verdict is rendered whole — headline and fix. The verdict is also remembered for
+    the run gate, which would otherwise repeat the same two requests seconds later
+    (see :data:`app.preflight.VERDICT_REUSE_SECONDS`).
     """
     base_url = _field_value("base_url_input", settings.base_url)
     api_key = _field_value("api_key_input", settings.api_key)
@@ -574,6 +576,10 @@ def _test_connection_report(settings: Any) -> None:
     )
     with st.spinner("Checking the endpoint — the model listing and a real call…"):
         verdict = check_endpoint(probe_settings)
+
+    # Hand the run gate this verdict: it checks the same configuration seconds later and
+    # should not pay for the same two requests while the evidence is fresh.
+    remember_verdict(st.session_state, probe_settings, verdict)
 
     message = verdict.headline if not verdict.fix else f"{verdict.headline}\n\n{verdict.fix}"
     if verdict.kind == OK:
