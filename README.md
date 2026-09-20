@@ -181,7 +181,7 @@ installs on macOS and Linux CI.
 | Variable | Meaning | Default |
 |---|---|---|
 | `OPENAI_API_KEY` | LLM API key. By default this is a **Perplexity** key, which also serves the Research tab's grounded lookups | (required) |
-| `OPENAI_BASE_URL` | OpenAI-compatible base URL | `https://api.perplexity.ai/router/v1` — Perplexity's Router API (in **private preview**; request access from api@perplexity.ai). Any OpenAI-compatible endpoint works, including Vercel's AI Gateway (`https://ai-gateway.vercel.sh/v1`, with gateway catalog ids) — see COMPATIBILITY.md → *Tested endpoints* |
+| `OPENAI_BASE_URL` | OpenAI-compatible base URL | `https://api.perplexity.ai/v1` — Perplexity's **Agent API** (OpenAI Responses schema at `{base_url}/responses`; routes to first-party models under one Perplexity key). Any OpenAI-compatible endpoint works, including Vercel's AI Gateway (`https://ai-gateway.vercel.sh/v1`, with gateway catalog ids) — see COMPATIBILITY.md → *Tested endpoints* |
 | `LLM_MODEL_MAIN` | Low-volume heavy model (analysis/scoring/drafting) | `perplexity/kimi-k3` |
 | `LLM_MODEL_FAST` | Cheap model for the bulk digest/merge passes | `perplexity/glm-5.3-flash` |
 | `OPENAI_BASE_URL_FALLBACK` | **Optional** second endpoint used when the primary fails for a sustained period; unset = no failover | (empty) |

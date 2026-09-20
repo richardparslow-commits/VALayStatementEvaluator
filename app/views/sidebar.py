@@ -41,10 +41,12 @@ def render_sidebar_settings() -> None:
             "Base URL (OpenAI-compatible)",
             value=settings.base_url or DEFAULT_BASE_URL,
             help=(
-                "Any OpenAI-compatible POST {base_url}/chat/completions endpoint. The "
-                "default is Perplexity's Router API (private preview — request access "
-                "from api@perplexity.ai). One Perplexity key covers both this endpoint "
-                "and the Research tab's grounded lookups."
+                "Perplexity's Agent API is the default — it speaks the OpenAI Responses "
+                "schema at {base_url}/responses and routes to first-party models "
+                "(OpenAI, Anthropic, Google, xAI) under one Perplexity key. Any "
+                "Chat-Completions endpoint also works and is detected automatically. "
+                "One Perplexity key covers both this endpoint and the Research tab's "
+                "grounded lookups."
             ),
         )
         _secrets_source_note(settings)
@@ -568,7 +570,7 @@ def _pending_settings_warning(settings: Any) -> None:
 def _test_connection_report(settings: Any) -> None:
     """Run the same preflight a run does, on the on-screen settings, and show its verdict.
 
-    A listing is not a promise — Perplexity's Router API publishes its ids and then refuses
+    A listing is not a promise — Perplexity's Router API published its ids and then refused
     every completion — so checking ``GET /models`` alone let this button call a dead
     configuration healthy. Going through :func:`app.preflight.check_endpoint` means the whole
     preflight runs here too: the same two probes and the same policy that decides whether a

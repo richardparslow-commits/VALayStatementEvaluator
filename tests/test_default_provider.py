@@ -31,29 +31,29 @@ from app.prompt_sanitize import validate_model_name  # noqa: E402
 from log_isolation import isolate_app_logs  # noqa: E402
 
 # The published Router catalog (https://docs.perplexity.ai/docs/router/models).
-ROUTER_CATALOG = {
+AGENT_API_CATALOG = {
     "perplexity/kimi-k3",
     "perplexity/glm-5.3",
     "perplexity/glm-5.3-flash",
     "perplexity/nemotron-3-ultra-550b-a55b",
 }
 
-ROUTER_BASE_URL = "https://api.perplexity.ai/router/v1"
+AGENT_API_BASE_URL = "https://api.perplexity.ai/v1"
 
 
 class TestDefaultEndpoint(unittest.TestCase):
-    def test_default_base_url_is_the_router_api(self) -> None:
-        self.assertEqual(config.DEFAULT_BASE_URL, ROUTER_BASE_URL)
+    def test_default_base_url_is_the_agent_api(self) -> None:
+        self.assertEqual(config.DEFAULT_BASE_URL, AGENT_API_BASE_URL)
 
     def test_the_endpoints_the_app_builds_resolve_against_it(self) -> None:
-        """``{base}/chat/completions`` (every call) and ``{base}/models`` (/ready probe)."""
+        """``{base}/responses`` (the Responses wire) and ``{base}/models`` (/ready probe)."""
         base = config.DEFAULT_BASE_URL.rstrip("/") + "/"
         self.assertEqual(
-            urljoin(base, "chat/completions"),
-            "https://api.perplexity.ai/router/v1/chat/completions",
+            urljoin(base, "responses"),
+            "https://api.perplexity.ai/v1/responses",
         )
         self.assertEqual(
-            urljoin(base, "models"), "https://api.perplexity.ai/router/v1/models"
+            urljoin(base, "models"), "https://api.perplexity.ai/v1/models"
         )
 
     def test_host_constant_matches_the_default(self) -> None:
@@ -63,8 +63,8 @@ class TestDefaultEndpoint(unittest.TestCase):
 
 class TestDefaultModels(unittest.TestCase):
     def test_both_defaults_are_in_the_published_catalog(self) -> None:
-        self.assertIn(config.DEFAULT_MODEL_MAIN, ROUTER_CATALOG)
-        self.assertIn(config.DEFAULT_MODEL_FAST, ROUTER_CATALOG)
+        self.assertIn(config.DEFAULT_MODEL_MAIN, AGENT_API_CATALOG)
+        self.assertIn(config.DEFAULT_MODEL_FAST, AGENT_API_CATALOG)
 
     def test_the_split_is_actually_a_split(self) -> None:
         """Same model in both slots would mean the bulk digests run at main-model prices."""

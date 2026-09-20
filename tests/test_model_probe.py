@@ -53,7 +53,7 @@ class TestProbeModels(unittest.TestCase):
     def test_a_model_list_is_returned_with_status_200(self) -> None:
         payload = b'{"data": [{"id": "perplexity/kimi-k3"}, {"id": "perplexity/glm-5.3-flash"}]}'
         with _ok(payload):
-            probe = probe_models("https://api.perplexity.ai/router/v1", "k")
+            probe = probe_models("https://api.perplexity.ai/v1", "k")
         self.assertTrue(probe.ok)
         self.assertEqual(probe.status, 200)
         self.assertEqual(probe.models, {"perplexity/kimi-k3", "perplexity/glm-5.3-flash"})
@@ -84,7 +84,7 @@ class TestProbeModels(unittest.TestCase):
     def test_401_reports_the_status_and_the_response_body(self) -> None:
         """The body is where a provider says *why* it refused the key."""
         with patch("urllib.request.urlopen", side_effect=_http_error(401, "invalid api key")):
-            probe = probe_models("https://api.perplexity.ai/router/v1", "k")
+            probe = probe_models("https://api.perplexity.ai/v1", "k")
         self.assertFalse(probe.ok)
         self.assertEqual(probe.status, 401)
         self.assertIn("HTTP 401", probe.error)
@@ -92,7 +92,7 @@ class TestProbeModels(unittest.TestCase):
 
     def test_403_is_kept_distinct_from_401(self) -> None:
         with patch("urllib.request.urlopen", side_effect=_http_error(403, "router access not enabled")):
-            probe = probe_models("https://api.perplexity.ai/router/v1", "k")
+            probe = probe_models("https://api.perplexity.ai/v1", "k")
         self.assertEqual(probe.status, 403)
         self.assertIn("router access not enabled", probe.error)
 
