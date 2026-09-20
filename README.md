@@ -138,12 +138,15 @@ runs the identical tested dependency set. `requirements.txt` stays the human-edi
 > there. It is the last line of `requirements.txt`; `requirements-perplexity.txt` remains
 > as the standalone installer. The app still degrades cleanly if the package is absent.
 
-> This app is tested with QwenCloud Token Plan but works with **any
-> OpenAI-compatible API** (OpenAI, Azure OpenAI via proxy, local Ollama with an
-> OpenAI-compat shim). See [`COMPATIBILITY.md`](COMPATIBILITY.md) for supported
-> endpoints and models and [`MIGRATION.md`](MIGRATION.md) for switching providers.
-> At launch the sidebar warns if your configured models are not listed at
-> `GET {base_url}/models` (non-blocking; network failures are ignored).
+> This app is tested against Perplexity's **Agent API** (the default endpoint) and
+> works with **any OpenAI-compatible API** (OpenAI, Azure OpenAI via proxy, Vercel's
+> AI Gateway, local Ollama with an OpenAI-compat shim). See
+> [`COMPATIBILITY.md`](COMPATIBILITY.md) for supported endpoints and models and
+> [`MIGRATION.md`](MIGRATION.md) for switching providers. At launch the sidebar
+> warns if your configured models are not listed at `GET {base_url}/models`
+> (non-blocking; network failures are ignored). On a Perplexity base URL the
+> endpoint speaks the OpenAI **Responses** schema and `app/llm.py` selects that
+> wire format automatically — no configuration beyond the base URL is needed.
 
 ### Dependency locking
 
@@ -278,8 +281,8 @@ provider: the app checks `GET {base_url}/models` at startup and warns if `LLM_MO
 > **base URL** and **model names** only take effect after clicking **Apply settings** — pressing
 > Enter in a field does not apply them. The sidebar warns while a change is still pending. This
 > matters most on a hosted deployment (`*.streamlit.app`) where `.env` is not present: the app
-> then starts on the default Token Plan base URL, so a key issued for a different endpoint gets
-> sent to the wrong host and is rejected with a generic auth error.
+> then starts on the default Perplexity Agent API base URL, so a key issued for a different
+> endpoint gets sent to the wrong host and is rejected with a generic auth error.
 >
 > Use **Test connection** (next to *Apply settings*) before a long run: it runs the same
 > preflight a run does — the `GET {base_url}/models` listing *and* one real call per configured
@@ -313,10 +316,12 @@ which is the failure this was built for:
 a rejected key or an unusable model id fails *every* chunk identically, and the run only says so
 after the chunks have been paid for.
 
-The chat call is there because a listing is not a promise. Perplexity's Router API is the
-measured case: it answers `/models` with its own ids and then refuses every completion with
-`403 The Router API is currently in limited preview` until the account is granted access, so the
-listing alone called that endpoint healthy and the run failed once per chunk. An answer confirms
+The chat call is there because a listing is not a promise. Perplexity's Router API was the
+measured case when it was the default: it answered `/models` with its own ids and then refused
+every completion with `403 The Router API is currently in limited preview` until the account was
+granted access, so the listing alone called that endpoint healthy and the run failed once per
+chunk. The shipped default is now the Agent API, but any private-preview endpoint can behave the
+same way, which is why the real call stays. An answer confirms
 the configuration — including one that comes back with no visible text because a reasoning model
 spent the budget thinking, which is still a served call — a refusal stops the run with the
 provider's own words, and anything ambiguous leaves the listing's verdict in place.
@@ -544,6 +549,35 @@ The reviewer is built for full VA claim files, including bundles of 1,000–2,00
   weak matches as coverage gaps rather than contradictions. Draft grounding uses
   the full extracted-fact store as its retrieval source.
 
+### How big should each uploaded file be?
+
+The app accepts 1 to ~5,000 pages total, but the **per-file** size is what decides whether a
+run finishes cleanly. Recommended shape of an upload:
+
+| File size | What happens |
+|---|---|
+| **≤ ~200 pages / ~15 MB per file** (recommended) | Comfortably inside every limit; a full Evaluate/Draft run finishes well within the default 30-minute pipeline timeout even at the default 2 parallel workers. |
+| **200–800 pages / 15–50 MB** | Works, but expect long runs: the app warns above **800 pages in one file** (`VA_LSE_RECORD_SIZE_WARN_PAGES`). Digest chunks are ~8,000 characters each and a VA page typically carries 1,500–3,000 characters of text, so 800 pages is on the order of 150–300 digest calls — capable of approaching the default `VA_LSE_PIPELINE_TIMEOUT_SECONDS` (1,800 s) budget on its own at the default 2 parallel workers. |
+| **> 800 pages in one file** | The run will usually hit the pipeline timeout and memory pressure (a 2,000-page bundle peaks near 1.8 GB). Split it before uploading — see below. |
+
+Hard limits, enforced in the UI with clear messages: **50 MB per file**
+(`VA_LSE_MAX_UPLOAD_BYTES` / Streamlit's `maxUploadSize`), **200 MB total per batch**
+(`VA_LSE_MAX_TOTAL_UPLOAD_BYTES`), **5,000 pages** overall
+(`VA_LSE_MAX_RECORD_PAGES`). A `.zip` is fine — each member ≤ 50 MB, ≤ 200 members,
+≤ 200 MB uncompressed.
+
+**Practical suggestion: split large bundles into files of roughly 100–300 pages each**
+(one split per date range or decade works well — `scripts/split_records.py` does exactly
+this, and per-date splitting also makes each run's coverage report easy to read). Several
+moderate files beat one huge file for three reasons: each digest chunk is ~8,000 characters
+(a few pages) no matter how you slice it, so the LLM call count is the same; smaller files
+keep a run inside the pipeline timeout; and if a run fails mid-way, only the files in that
+run need re-uploading. Two further notes: **scanned PDFs have no text layer** — pages with
+no extractable text are reported unreadable until you OCR them (see *Scanned pages and
+OCR* below), and scanned pages process far slower than native-text pages; and if your
+endpoint's plan allows it, raising `VA_LSE_RECORDS_CONCURRENCY` (default `2`) shortens
+large runs proportionally.
+
 Retaining every extracted fact does not guarantee that the model extracted every
 fact in the source records, or that every retained fact fits an individual prompt.
 Existing saved results from capped reviews must be regenerated to recover omitted
@@ -706,7 +740,7 @@ All public helpers in `app/main.py`, `app/fetch_client.py`, `app/evaluate.py` ca
 
 ## QwenCloud Individual Plan Lite tuning
 
-The shipped defaults are Perplexity's Router API (see **Environment variables** above). This
+The shipped defaults are Perplexity's Agent API (see **Environment variables** above). This
 section is the profile for the QwenCloud Individual Plan Lite subscription
 ($8/month, **2,500 Credits per rolling 7-day window**, 1–2 concurrent agents), which was the
 previous default; copy the four `.env` lines at the end of this section to run on it:
@@ -1448,8 +1482,8 @@ with your proxy if the stream is TLS-terminated there.
 
 ## Compatibility & migration
 
-- **Default endpoint & models:** Perplexity's Router API (`perplexity/kimi-k3` for analysis, `perplexity/glm-5.3-flash` for the bulk digest passes). One Perplexity key covers both this endpoint and the Research tab.
-- **Tested endpoints & models:** Perplexity Router API (default), QwenCloud Token Plan (`qwen3.7-max`/`flash`), OpenAI (`gpt-4-turbo`/`gpt-4o-mini`), and any OpenAI-compatible proxy (Ollama via shim) — see [`COMPATIBILITY.md`](COMPATIBILITY.md) for minimum versions, model tables, and breaking-change history.
+- **Default endpoint & models:** Perplexity's Agent API at `https://api.perplexity.ai/v1` (OpenAI Responses schema at `{base_url}/responses`, selected automatically; runs sent with `store: false`) with `perplexity/kimi-k3` for analysis and `perplexity/glm-5.3-flash` for the bulk digest passes. One Perplexity key covers both this endpoint and the Research tab.
+- **Tested endpoints & models:** Perplexity Agent API (default), QwenCloud Token Plan (`qwen3.7-max`/`flash`), OpenAI (`gpt-4-turbo`/`gpt-4o-mini`), and any OpenAI-compatible proxy (Ollama via shim) — see [`COMPATIBILITY.md`](COMPATIBILITY.md) for minimum versions, model tables, and breaking-change history. The retired Router default (`https://api.perplexity.ai/router/v1`) remains a private-preview endpoint and is not recommended.
 - **Switching providers:** see [`MIGRATION.md`](MIGRATION.md) (Perplexity ↔ QwenCloud ↔ OpenAI ↔ local). No code change needed — update `.env`, which overrides every default.
 - **Deployed app outdated?** Check the startup warning: `GET {base_url}/models` is queried; missing `LLM_MODEL_*` values produce a non-blocking sidebar warning linking to `COMPATIBILITY.md`.
 
