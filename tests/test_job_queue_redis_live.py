@@ -58,6 +58,10 @@ FAST_CLAIM = 0.2
 class _UsageStub:
     """Minimal pipeline stub that records usage."""
 
+    # The bulk-model contract member (LLMService): the digest path picks the
+    # cheap model through the public property on any backend.
+    fast_model = "fake-fast"
+
     def __init__(self) -> None:
         from test_evaluate import _FakeLLM
 
