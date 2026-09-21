@@ -23,6 +23,8 @@ outputs/
 logs/
 *.log
 usage_history.json
+# VA.gov downloader failure evidence (signed-in page screenshots/HTML — PHI)
+va_gov_download_artifacts
 
 # macOS “Save As… “ duplicates (foo.py -> “foo 2.py”) and similar stray copies
 * 2.*

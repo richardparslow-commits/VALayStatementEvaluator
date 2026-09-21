@@ -13,7 +13,7 @@ import types
 import unittest
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
@@ -574,11 +574,17 @@ class TestIsLocalRun(unittest.TestCase):
     def test_env_opt_in_forces_true(self) -> None:
         from app.views.records import is_local_run
 
+        import app.views.records as records
+
         st_mock, _ = _fake_streamlit()
-        with _patch_st(__import__("app.views.records", fromlist=["st"]), st_mock), patch.dict(
+        # The guard also requires a loopback-bound server; the stub simulates
+        # `streamlit run --server.address 127.0.0.1`.
+        with _patch_st(records, st_mock), patch.dict(
             "os.environ", {"VA_LSE_ALLOW_LOCAL_PATHS": "1"}
+        ), patch.object(
+            records.local_paths, "server_bind_address", return_value="127.0.0.1"
         ):
-            self.assertTrue(is_local_run())
+            self.assertTrue(records.is_local_run())
 
     def test_request_context_cannot_enable_local_paths(self) -> None:
         import app.views.records as records
@@ -602,6 +608,55 @@ class TestIsLocalRun(unittest.TestCase):
                         if value is not None:
                             os.environ["VA_LSE_ALLOW_LOCAL_PATHS"] = value
                         self.assertFalse(records.is_local_run())
+
+
+class TestLoopbackGuard(unittest.TestCase):
+    """The flag alone is not enough: a server not bound to loopback must keep
+    local imports off (anyone on the network could otherwise read the disk)."""
+
+    def test_non_loopback_binding_refuses_and_warns_once(self) -> None:
+        import app.views.records as records
+
+        for address in (None, "", "0.0.0.0"):
+            with self.subTest(address=address):
+                st_mock, session = _fake_streamlit()
+                with _patch_st(records, st_mock), patch.dict(
+                    "os.environ", {"VA_LSE_ALLOW_LOCAL_PATHS": "1"}
+                ), patch.object(
+                    records.local_paths, "server_bind_address", return_value=address
+                ):
+                    self.assertFalse(records.is_local_run())
+                    self.assertTrue(st_mock.warning.called)
+                    self.assertIn(
+                        "--server.address 127.0.0.1",
+                        str(st_mock.warning.call_args),
+                    )
+                    # Warn once per session, not on every widget interaction.
+                    st_mock.warning.reset_mock()
+                    self.assertFalse(records.is_local_run())
+                    st_mock.warning.assert_not_called()
+
+    def test_loopback_bindings_pass(self) -> None:
+        import app.views.records as records
+
+        for address in ("127.0.0.1", "localhost", "::1"):
+            with self.subTest(address=address):
+                st_mock, _ = _fake_streamlit()
+                with _patch_st(records, st_mock), patch.dict(
+                    "os.environ", {"VA_LSE_ALLOW_LOCAL_PATHS": "1"}
+                ), patch.object(
+                    records.local_paths, "server_bind_address", return_value=address
+                ):
+                    self.assertTrue(records.is_local_run())
+                    st_mock.warning.assert_not_called()
+
+    def test_flag_absent_stays_disabled_without_any_warning(self) -> None:
+        import app.views.records as records
+
+        st_mock, _ = _fake_streamlit()
+        with _patch_st(records, st_mock), patch.dict("os.environ", {}, clear=True):
+            self.assertFalse(records.is_local_run())
+        st_mock.warning.assert_not_called()
 
 
 class TestLocalRecordsAccess(unittest.TestCase):
@@ -650,6 +705,8 @@ class TestLocalRecordsAccess(unittest.TestCase):
         doc = MagicMock(filename="records.txt")
         with _patch_st(records, st_mock), patch.dict(
             "os.environ", {"VA_LSE_ALLOW_LOCAL_PATHS": "1"}
+        ), patch.object(
+            records.local_paths, "server_bind_address", return_value="127.0.0.1"
         ), patch.object(records, "records_from_local_path", return_value=([doc], [])) as read:
             self.assertEqual(records.records_uploader("eval"), [doc])
         self.assertIn("Local folder / file", st_mock.radio.call_args.args[1])

@@ -232,7 +232,7 @@ installs on macOS and Linux CI.
 | `FETCH_SANDBOX_BASE_URL` | Fetch Sandbox base URL (`fetchsandbox.com` or subdomain) | `https://fetchsandbox.com` |
 | `FETCH_SANDBOX_RECORDS_PATH` | GET path for the records endpoint | `/medical_records/{patient_id}` |
 | `FETCH_SANDBOX_MAX_RESPONSE_BYTES` | Max bytes accepted from a Fetch Sandbox HTTP response | `104857600` |
-| `VA_LSE_ALLOW_LOCAL_PATHS` | Explicitly enable local folder/file imports (`1`) for trusted single-user use only; keep unset or `0` on hosted/shared deployments | `0` (disabled) |
+| `VA_LSE_ALLOW_LOCAL_PATHS` | Explicitly enable local folder/file imports (`1`) for trusted single-user use only; the server must also be bound to a loopback address (`--server.address 127.0.0.1`) or imports stay disabled with an explanatory warning; keep unset or `0` on hosted/shared deployments | `0` (disabled) |
 | `VA_LSE_CREDITS_PER_1M_MAIN` | Approx credits per 1M tokens for the main model (enables the credit-burn gauge) | (unset — gauge shows tokens/calls only) |
 | `VA_LSE_CREDITS_PER_1M_FAST` | Approx credits per 1M tokens for the fast model (enables the credit-burn gauge) | (unset — gauge shows tokens/calls only) |
 | `VA_LSE_CREDIT_QUOTA` | Your plan's weekly allowance (in whatever unit the rates above use), to render %-of-quota burn | (unset — burn renders without a percentage) |
@@ -452,6 +452,11 @@ every user of the instance to import supported files readable by its server
 process. On hosted/shared deployments, keep the setting unset or `0` and use
 uploads. Host headers, forwarded headers, and browser URLs do not enable this
 capability.
+
+This is enforced, not just documented: if the flag is set while the server is
+not bound to a loopback address (`server.address` unset means Streamlit listens
+on every interface), local imports stay disabled and the app explains how to
+restart correctly.
 
 ### Evaluate a statement
 
@@ -911,6 +916,16 @@ sign-in (Chrome 136+ requires a non-default profile for remote debugging):
 python scripts/va_records_download.py --cdp http://127.0.0.1:9222
 ```
 
+CDP-attach is safe for what it's for when kept tight: bind the debug port to `127.0.0.1` only
+(never `0.0.0.0`, never tunnel it off-machine — the protocol is plain HTTP + WebSocket that
+lets anything that can reach the port run JavaScript in the browser), use the dedicated
+`--user-data-dir` shown above rather than your daily Chrome profile (Chrome 136+ enforces the
+separate profile; a dedicated one also keeps the blast radius to the VA.gov session you opened
+it for), start Chrome only for the download session and quit it afterwards (the script never
+closes an attached browser), and delete the debug profile to sign out. On failure the script
+writes screenshot + page HTML to `va_gov_download_artifacts/` — signed-in pages, treat as PHI
+(and now git-ignored). Full guidance: [SECURITY.md §9](SECURITY.md#9-local-browser-automation-cdp-attach-and-derived-phi-at-rest).
+
 The script opens a visible Chromium window and **waits while you sign in** through ID.me,
 including the SMS code — it never types, reads, or stores your credentials or code, has no
 headless mode, and does not attempt any MFA/CAPTCHA bypass. Once you are signed in it clicks
@@ -954,7 +969,10 @@ python scripts/ocr_records.py ~/Desktop/va_medical_records.pdf
 
 `--report-only` prints how many pages are image-only without changing anything; the real run
 writes a **new** file (never the input) and re-reads it to confirm how many pages now carry
-text. Upload the `.ocr.pdf` and leave the original where it is. Exit codes: `0` wrote a copy,
+text. Image-only pages are OCRd **in parallel** in the fallback backend (`--jobs`, default one
+worker per CPU up to 8, clamped to the page count; `--jobs 1` restores the old sequential
+behavior) — a 1,000-page scan is hours of sequential subprocess calls otherwise. Upload the
+`.ocr.pdf` and leave the original where it is. Exit codes: `0` wrote a copy,
 `1` nothing to do, `2` no OCR tooling installed, `3` bad input or refused to overwrite.
 
 If you are working in the sandbox image (`DEPLOYMENT.md` §6), none of that install is needed:
@@ -1552,4 +1570,5 @@ with your proxy if the stream is TLS-terminated there.
 - **Secrets are never committed.** `.env`, `.env.local`, `.env.*.local`, and `.streamlit/secrets.toml` are git-ignored (see `SECURITY.md`). Rotate keys after any leak. On a hosted deployment without `.env`, inject secrets through the platform (Streamlit *Settings → Secrets*, K8s/Docker secret, or a cloud secret manager) — never in code or `secrets.toml` in git.
 - **Pre-commit guard.** `scripts/hooks/pre-commit` rejects staged `.env` files, `*.pem`/`*.key`, and key assignments (`OPENAI_API_KEY=`, `sk-*`), and refuses two mistakes the suite would otherwise catch only in CI: a test module not wired into the hermetic harness (`tests/harness_imports.py`), and an app module that reads a Streamlit config option (`tests/streamlit_option_reads.py`). Both are the same rules the suite scans with, read from the *staged* copy, so the hook and CI cannot disagree. Install it as a link (`ln -sfn ../../scripts/hooks/pre-commit .git/hooks/pre-commit`) or with `git config core.hooksPath scripts/hooks` — not a copy, which would keep running whenever it was copied. The hook refuses the commit when the bytes that ran are not this checkout's own `scripts/hooks/pre-commit`, so a stale or borrowed install is named rather than trusted.
 - Medical records stay local: they are only sent to the configured LLM endpoint. VA.gov credentials and session tokens are never written to disk, `.env`, or logs.
+- **Derived PHI at rest:** the audit trail (`logs/runs.jsonl`, PII-scrubbed at write time) and batch-draft state (`outputs/batch-draft/` — resumable extracted-fact shards plus the drafted statement) are real local files. All are git-ignored and unencrypted: keep the checkout on encrypted disk, out of synced folders, and delete `outputs/batch-draft/` once a run's statement is exported. The VA.gov session profile (`~/.va_lse_va_gov_profile`) holds unencrypted session cookies — delete it to sign out and treat it as hot for up to 30 days. The downloader's failure artifacts (`va_gov_download_artifacts/`, signed-in-page HTML) are also git-ignored and are actual PHI, not derived. Inventory and rationale: [SECURITY.md §9](SECURITY.md#9-local-browser-automation-cdp-attach-and-derived-phi-at-rest).
 - See [`SECURITY.md`](SECURITY.md) for full secrets management guidance (local `.env.local` overrides, CI/CD with GitHub Secrets, managed secret stores in production).

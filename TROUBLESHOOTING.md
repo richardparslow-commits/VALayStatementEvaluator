@@ -329,6 +329,20 @@ project. This repo's supported hosting paths are Streamlit Community Cloud (the
 deployed app), Docker Compose, and Kubernetes — see `DEPLOYMENT.md` §2–§4.
 Railway deploys succeed through its own integration and are unaffected.
 
+## VA.gov downloader and CDP attach
+
+`scripts/va_records_download.py` problems, including the Chrome remote-debugging
+(`--cdp`) route. Security context for both: [SECURITY.md §9](SECURITY.md#9-local-browser-automation-cdp-attach-and-derived-phi-at-rest).
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Script never detects sign-in; keeps waiting | You signed in, but the wizard URL was not reached (closed the tab, or VA.gov redirected elsewhere) | Leave the window on `va.gov` after ID.me; the script watches for `/my-health` and `/my-va` paths. Restart the script and sign in again |
+| `--cdp` attach fails with connection refused | Chrome is not listening on the port — it was started without the flag, already exited, or the debug port closed when you quit it | Start Chrome with `--remote-debugging-port=9222 --user-data-dir="$HOME/.va_lse_debug_chrome"` *before* running the script; the port exists only while that Chrome runs |
+| Chrome refuses `--remote-debugging-port` on your normal profile | Chrome 136+ rejects remote debugging against the default profile | Use a dedicated `--user-data-dir` (also the safer setup — the debug port can run JavaScript in whatever profile it is attached to) |
+| A wizard step fails and the script names it | VA.gov changed its markup | Update the selector candidates in the script (`ALL_TIME_OPTIONS`, `SELECT_ALL_RECORDS_OPTIONS`, …) using the screenshot + page HTML it wrote to `va_gov_download_artifacts/`. Treat those artifacts as PHI — they are signed-in pages |
+| Downloaded PDF has no extractable text (the app reports image-only pages) | VA.gov exports scans for some record types | OCR locally first: `python scripts/ocr_records.py <file>` — see README *Scanned pages and OCR* |
+| Signed-in session unexpectedly expired | The profile directory was deleted, or the browser was closed in a way that dropped session cookies | Sign in again (full ID.me + SMS); use `--no-persist` if you want throwaway sessions by design. The session profile `~/.va_lse_va_gov_profile` holds cookies — delete it whenever you want to force sign-out |
+
 ## When to Contact Support
 
 - The endpoint is reachable but returns unexpected errors

@@ -383,5 +383,89 @@ class TestConfigFromArgs(unittest.TestCase):
         self.assertEqual(cfg.batch_timeout_s, 1740)  # default preserved
 
 
+class TestResumableState(unittest.TestCase):
+    """The sharded, atomic state format — and the legacy file it must still read."""
+
+    def _two_batch_state(self) -> dict:
+        from app.medical_review import MedicalDigest, MedicalFact
+
+        digest = batch_draft.digest_to_state(MedicalDigest(
+            facts=[MedicalFact(date="2023-01-01", type="symptom",
+                               description="Nightmares most nights", source="p. 1")],
+            pages_in_files=10, pages_reviewed=10,
+        ))
+        return {"batches": {"batch_01": digest,
+                            "batch_02": {"error": "RuntimeError: digest overflow"}},
+                "final": None}
+
+    def test_save_writes_one_shard_per_batch_plus_index(self) -> None:
+        cfg = _make_cfg(Path(tempfile.mkdtemp()))
+        batch_draft.save_state(cfg, self._two_batch_state())
+        shards = cfg.out_dir / "state"
+        self.assertTrue((shards / "batch_01.json.gz").is_file())
+        self.assertTrue((shards / "batch_02.json.gz").is_file())
+        self.assertTrue((shards / "index.json").is_file())
+        self.assertFalse((shards / "final.json.gz").exists())  # final is None
+        index = json.loads((shards / "index.json").read_text(encoding="utf-8"))
+        self.assertEqual(index["batches"]["batch_01"]["facts"], 1)
+        self.assertIn("digest overflow", index["batches"]["batch_02"]["error"])
+
+    def test_load_reads_shards_without_needing_the_index(self) -> None:
+        cfg = _make_cfg(Path(tempfile.mkdtemp()))
+        state = self._two_batch_state()
+        batch_draft.save_state(cfg, state)
+        (cfg.out_dir / "state" / "index.json").unlink()  # index lost entirely
+        reloaded = batch_draft.load_state(cfg)
+        self.assertEqual(set(reloaded["batches"]), {"batch_01", "batch_02"})
+        back = batch_draft.digest_from_state(reloaded["batches"]["batch_01"])
+        self.assertEqual(back.facts[0].description, "Nightmares most nights")
+
+    def test_a_corrupt_shard_reads_as_absent_instead_of_killing_the_resume(self) -> None:
+        cfg = _make_cfg(Path(tempfile.mkdtemp()))
+        batch_draft.save_state(cfg, self._two_batch_state())
+        (cfg.out_dir / "state" / "batch_02.json.gz").write_bytes(b"truncated garbage")
+        reloaded = batch_draft.load_state(cfg)
+        self.assertEqual(set(reloaded["batches"]), {"batch_01"})
+
+    def test_final_phase_shard_round_trips(self) -> None:
+        cfg = _make_cfg(Path(tempfile.mkdtemp()))
+        state = self._two_batch_state()
+        state["final"] = {"statement": "I certify...", "facts_total": 1}
+        batch_draft.save_state(cfg, state)
+        reloaded = batch_draft.load_state(cfg)
+        self.assertEqual(reloaded["final"]["statement"], "I certify...")
+
+    def test_legacy_monolithic_state_json_still_loads(self) -> None:
+        """Runs interrupted before the sharded format resume unchanged."""
+        cfg = _make_cfg(Path(tempfile.mkdtemp()))
+        legacy = {"batches": {"batch_01": {"facts": [{"description": "old run"}]}},
+                  "final": None}
+        cfg.state_path.write_text(json.dumps(legacy), encoding="utf-8")
+        reloaded = batch_draft.load_state(cfg)
+        self.assertEqual(reloaded["batches"]["batch_01"]["facts"][0]["description"],
+                         "old run")
+
+    def test_a_truncated_legacy_state_json_starts_clean(self) -> None:
+        cfg = _make_cfg(Path(tempfile.mkdtemp()))
+        cfg.state_path.write_text('{"batches": {"batch_01": {"fac', encoding="utf-8")
+        self.assertEqual(batch_draft.load_state(cfg), {"batches": {}, "final": None})
+
+    def test_saving_after_a_legacy_load_reshards_the_run(self) -> None:
+        cfg = _make_cfg(Path(tempfile.mkdtemp()))
+        cfg.state_path.write_text(
+            json.dumps({"batches": {"batch_01": {"facts": [{"description": "old"}]}},
+                       "final": None}),
+            encoding="utf-8",
+        )
+        state = batch_draft.load_state(cfg)
+        state["batches"]["batch_02"] = self._two_batch_state()["batches"]["batch_01"]
+        batch_draft.save_state(cfg, state)
+        shards = cfg.out_dir / "state"
+        self.assertTrue((shards / "batch_01.json.gz").is_file())
+        self.assertTrue((shards / "batch_02.json.gz").is_file())
+        reloaded = batch_draft.load_state(cfg)
+        self.assertEqual(set(reloaded["batches"]), {"batch_01", "batch_02"})
+
+
 if __name__ == "__main__":
     unittest.main()

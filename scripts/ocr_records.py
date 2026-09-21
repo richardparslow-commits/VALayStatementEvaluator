@@ -108,58 +108,106 @@ def ocr_with_ocrmypdf(source: Path, destination: Path) -> None:
     )
 
 
-def ocr_with_tesseract(source: Path, destination: Path, *, dpi: int = 300) -> None:
+def _ocr_page(source: Path, number: int, dpi: int, workdir: Path) -> str | None:
+    """Rasterize and OCR one image-only page; ``None`` on failure (reported)."""
+    prefix = workdir / f"page-{number:05d}"
+    try:
+        _run(
+            [
+                "pdftoppm",
+                "-r",
+                str(dpi),
+                "-f",
+                str(number),
+                "-l",
+                str(number),
+                "-png",
+                str(source),
+                str(prefix),
+            ],
+            what=f"pdftoppm page {number}",
+        )
+    except RuntimeError:
+        _out(f"  page {number}: could not rasterise, left blank", err=True)
+        return None
+    rasterised = sorted(workdir.glob(f"page-{number:05d}*.png"))
+    if not rasterised:
+        _out(f"  page {number}: could not rasterise, left blank", err=True)
+        return None
+    result = subprocess.run(
+        ["tesseract", str(rasterised[0]), "stdout", "--psm", "6"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        _out(f"  page {number}: tesseract failed, left blank", err=True)
+        return None
+    return result.stdout
+
+
+def _ocr_pages_parallel(
+    source: Path, numbers: list[int], *, dpi: int, workdir: Path, jobs: int
+) -> dict[int, str | None]:
+    """OCR *numbers* concurrently; each worker runs real subprocesses, so the
+    GIL never binds this — the speedup tracks the worker count. Failures are
+    per-page and reported, never fatal: a page that fails alone is left blank
+    rather than costing its siblings.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    results: dict[int, str | None] = {}
+    with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
+        futures = {
+            number: pool.submit(_ocr_page, source, number, dpi, workdir)
+            for number in numbers
+        }
+        for number, future in futures.items():
+            try:
+                results[number] = future.result()
+            except Exception as exc:  # noqa: BLE001 - one page must not stop the run
+                _out(f"  page {number}: {type(exc).__name__}: {exc} — left blank", err=True)
+                results[number] = None
+    return results
+
+
+def ocr_with_tesseract(
+    source: Path, destination: Path, *, dpi: int = 300, jobs: int = 0
+) -> None:
     """OCR image-only pages with Poppler + Tesseract into a new text PDF.
 
     Page images are not preserved: the output is a text document that the app can
     read (and the original stays where it is). ``reportlab`` is already an app
     dependency, so this path adds no package of its own.
+
+    Image-only pages are OCRd in parallel — a 1,000-page scan is hours of
+    sequential subprocess calls otherwise. ``jobs`` caps the worker count;
+    ``0`` (default) picks one worker per CPU up to 8, and ``1`` restores the
+    old sequential behavior.
     """
+    import os
     import tempfile
 
     from reportlab.lib.pagesizes import letter
     from reportlab.pdfgen import canvas
-    from pypdf import PdfReader
 
-    reader = PdfReader(str(source))
+    total, image_only = inspect_pdf(source)
+    if jobs <= 0:
+        jobs = min(8, os.cpu_count() or 4)
+    jobs = max(1, min(jobs, max(1, len(image_only))))
     with tempfile.TemporaryDirectory() as workdir:
         work = Path(workdir)
+        ocr_results = _ocr_pages_parallel(
+            source, image_only, dpi=dpi, workdir=work, jobs=jobs
+        )
+        from pypdf import PdfReader
+
+        reader = PdfReader(str(source))
         pdf = canvas.Canvas(str(destination), pagesize=letter)
         width, height = letter
-        for number, page in enumerate(reader.pages, start=1):
-            text = _page_text(page)
-            if not text.strip():
-                prefix = work / f"page-{number:05d}"
-                _run(
-                    [
-                        "pdftoppm",
-                        "-r",
-                        str(dpi),
-                        "-f",
-                        str(number),
-                        "-l",
-                        str(number),
-                        "-png",
-                        str(source),
-                        str(prefix),
-                    ],
-                    what=f"pdftoppm page {number}",
-                )
-                rasterised = sorted(work.glob(f"page-{number:05d}*.png"))
-                if not rasterised:
-                    _out(f"  page {number}: could not rasterise, left blank", err=True)
-                    pdf.showPage()
-                    continue
-                result = subprocess.run(
-                    ["tesseract", str(rasterised[0]), "stdout", "--psm", "6"],
-                    capture_output=True,
-                    text=True,
-                )
-                if result.returncode != 0:
-                    _out(f"  page {number}: tesseract failed, left blank", err=True)
-                    pdf.showPage()
-                    continue
-                text = result.stdout
+        for number in range(1, total + 1):
+            text = ocr_results.get(number)
+            if text is None:
+                text = _page_text(reader.pages[number - 1])
             _write_text_page(pdf, text, height, width)
         pdf.save()
 
@@ -223,6 +271,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=300,
         help="rasterisation DPI for the tesseract backend (default 300)",
     )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=0,
+        help=(
+            "parallel OCR workers for the tesseract backend "
+            "(0 = one per CPU up to 8; 1 = sequential)"
+        ),
+    )
     return parser
 
 
@@ -274,7 +331,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if backend == "ocrmypdf":
             ocr_with_ocrmypdf(source, destination)
         else:
-            ocr_with_tesseract(source, destination, dpi=args.dpi)
+            ocr_with_tesseract(source, destination, dpi=args.dpi, jobs=args.jobs)
     except RuntimeError as exc:
         _out(f"✖ {exc}", err=True)
         return EXIT_BAD_INPUT
