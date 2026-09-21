@@ -1583,6 +1583,100 @@ class TestSidebarSettingsGuards(unittest.TestCase):
         st_mock.warning.assert_called_once()
         self.assertIn("AI Gateway", str(st_mock.warning.call_args[0][0]))
 
+    def test_the_banner_offers_a_one_click_repair(self) -> None:
+        """The repair lives in the banner: the diagnosis and the fix in one place."""
+        import app.views.sidebar as sidebar
+
+        st_mock, session = _fake_streamlit()
+        st_mock.button.return_value = False
+        with _patch_st(sidebar, st_mock):
+            sidebar._retired_endpoint_warning(
+                self._settings(base_url="https://ai-gateway.vercel.sh/v1")
+            )
+        st_mock.warning.assert_called_once()
+        buttons = [
+            str(call.args[0]) for call in st_mock.button.call_args_list if call.args
+        ]
+        self.assertTrue(any("Apply Perplexity defaults" in b for b in buttons))
+
+    def test_a_supported_configuration_offers_no_repair_and_stays_quiet(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, session = _fake_streamlit()
+        st_mock.button.return_value = False
+        with _patch_st(sidebar, st_mock):
+            sidebar._retired_endpoint_warning(
+                self._settings(
+                    base_url="https://api.perplexity.ai/v1",
+                    model_main="perplexity/kimi-k3",
+                    model_fast="perplexity/glm-5.3-flash",
+                )
+            )
+        st_mock.warning.assert_not_called()
+        st_mock.button.assert_not_called()
+        st_mock.success.assert_not_called()
+
+    def test_perplexity_key_shape_is_recognised(self) -> None:
+        import app.views.sidebar as sidebar
+
+        self.assertTrue(sidebar._looks_like_perplexity_key("pplx-abc123"))
+        self.assertTrue(sidebar._looks_like_perplexity_key("  PPLX-Abc123 "))
+        self.assertFalse(sidebar._looks_like_perplexity_key("vck_abc123"))
+        self.assertFalse(sidebar._looks_like_perplexity_key("other-provider-key"))
+        self.assertFalse(sidebar._looks_like_perplexity_key(""))
+
+    def _run_repair(self, api_key: str):
+        """Render the sidebar once with the repair flag set; return (st, session)."""
+        import app.views.sidebar as sidebar
+
+        st_mock, session = _fake_streamlit()
+        session["settings"] = self._settings(
+            base_url="https://ai-gateway.vercel.sh/v1",
+            model_main="moonshotai/kimi-k3",
+            model_fast="alibaba/qwen3.7-flash",
+            api_key=api_key,
+            fetch_api_key="",
+            fetch_base_url="https://fetchsandbox.com",
+            fetch_records_path="/medical_records/{patient_id}",
+        )
+        session["_apply_perplexity_defaults"] = True
+        st_mock.columns.return_value = (MagicMock(), MagicMock())
+        st_mock.button.return_value = False
+        with (
+            _patch_st(sidebar, st_mock),
+            patch.object(sidebar, "_pending_settings_warning"),
+            patch.object(sidebar, "_compat_model_warning"),
+            patch.object(sidebar, "_credit_calibration_widget"),
+            patch.object(sidebar, "_job_queue_panel"),
+            patch.object(sidebar, "_audit_backup_panel"),
+            patch.object(sidebar, "_llm_failover_panel"),
+        ):
+            sidebar.render_sidebar_settings()
+        return st_mock, session
+
+    def test_the_repair_applies_the_current_defaults_and_consumes_the_flag(self) -> None:
+        import app.views.sidebar as sidebar
+        from app.config import DEFAULT_BASE_URL, DEFAULT_MODEL_FAST, DEFAULT_MODEL_MAIN
+
+        st_mock, session = self._run_repair(api_key="vck_gateway_key")
+        settings = session["settings"]
+        self.assertEqual(settings.base_url, DEFAULT_BASE_URL)
+        self.assertEqual(settings.model_main, DEFAULT_MODEL_MAIN)
+        self.assertEqual(settings.model_fast, DEFAULT_MODEL_FAST)
+        self.assertNotIn("_apply_perplexity_defaults", session)
+        # The banner is gone (config fixed) and the one-shot confirmation shows.
+        warnings = [str(c.args[0]) for c in st_mock.warning.call_args_list]
+        self.assertFalse(any("AI Gateway" in w for w in warnings))
+        st_mock.success.assert_called_once()
+        self.assertIn("Test connection", str(st_mock.success.call_args[0][0]))
+
+    def test_the_repair_keeps_a_perplexity_key_and_clears_a_foreign_one(self) -> None:
+        _st, session = self._run_repair(api_key="pplx-real-key")
+        self.assertEqual(session["settings"].api_key, "pplx-real-key")
+
+        _st, session = self._run_repair(api_key="vck_gateway_key")
+        self.assertEqual(session["settings"].api_key, "")
+
     def test_the_test_connection_evidence_names_a_retired_provider_on_a_green_verdict(self) -> None:
         """A healthy probe on a retired provider is exactly the trap — a green
         verdict must still name the finding in its evidence line."""
