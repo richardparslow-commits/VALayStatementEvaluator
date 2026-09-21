@@ -290,7 +290,12 @@ provider: the app checks `GET {base_url}/models` at startup and warns if `LLM_MO
 > `alibaba/qwen3.7-flash`, `openai/gpt-4.1-nano`). Both providers worked here once and were
 > retired — the gateway's free tier rate-limits per model and the Router refuses completions
 > without preview entitlement — so the banner states the measured failure and the fix instead
-> of letting a doomed run rediscover it. See [`COMPATIBILITY.md`](COMPATIBILITY.md).
+> of letting a doomed run rediscover it. See [`COMPATIBILITY.md`](COMPATIBILITY.md). The
+> finding travels with the endpoint check, not just the banner: every run gate decision
+> (`accepted`/`rejected` in `logs/runs.jsonl`) records `retired_endpoint` and
+> `retired_provider` when the configuration names one, a run started despite the banner says
+> so at the run button, and **Test connection**'s evidence line carries the same flag on a
+> green verdict — a healthy probe on a retired provider is exactly the trap.
 >
 > Use **Test connection** (next to *Apply settings*) before a long run: it runs the same
 > preflight a run does — the `GET {base_url}/models` listing *and* one real call per configured

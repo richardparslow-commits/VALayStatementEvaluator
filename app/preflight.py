@@ -167,6 +167,35 @@ def _stripped_lower(value: str) -> str:
     return (value or "").strip().lower()
 
 
+RETIRED_PROVIDER_KINDS = {
+    "vercel_ai_gateway": "Vercel AI Gateway",
+    "perplexity_router": "Perplexity Router API",
+    "gateway_era_model_ids": "gateway-era model ids",
+}
+
+
+def retired_endpoint_kind(settings: Settings) -> str:
+    """Which retired provider *settings* name — ``""`` when they name none.
+
+    The machine-readable counterpart of :func:`retired_endpoint_kind`'s prose twin
+    :func:`retired_endpoint_reason`, for audit fields and tests, and the reason text
+    is derived from it — one set of signals, two representations, no drift. The kinds
+    are exactly the three signals documented there, checked in the same order so the
+    strongest signal wins.
+    """
+    if _is_vercel_gateway_url(settings.base_url):
+        return "vercel_ai_gateway"
+    if _is_router_url(settings.base_url):
+        return "perplexity_router"
+    ids = (
+        _stripped_lower(settings.model_main),
+        _stripped_lower(settings.model_fast),
+    )
+    if RETIRED_MODEL_IDS & set(ids):
+        return "gateway_era_model_ids"
+    return ""
+
+
 def retired_endpoint_reason(settings: Settings) -> str:
     """Why the configuration is a retired provider, or "" when it is not.
 
@@ -191,7 +220,10 @@ def retired_endpoint_reason(settings: Settings) -> str:
     any other OpenAI-compatible endpoint the user has chosen — an advisory must not
     name a working setup as retired.
     """
-    if _is_vercel_gateway_url(settings.base_url):
+    kind = retired_endpoint_kind(settings)
+    if not kind:
+        return ""
+    if kind == "vercel_ai_gateway":
         return (
             "⚠️ The base URL is Vercel's **AI Gateway**, which this app has retired in "
             "favour of Perplexity's Agent API. The gateway's free tier is rate-limited "
@@ -199,7 +231,7 @@ def retired_endpoint_reason(settings: Settings) -> str:
             "as `429` — so runs here are expected to fail. Set the base URL to "
             f"`{DEFAULT_BASE_URL}` with a `pplx-` key."
         )
-    if _is_router_url(settings.base_url):
+    if kind == "perplexity_router":
         return (
             "⚠️ The base URL is Perplexity's **Router API**, a private preview this app "
             "has retired: the models route answers, but every completion is refused with "
@@ -210,16 +242,15 @@ def retired_endpoint_reason(settings: Settings) -> str:
         _stripped_lower(settings.model_main),
         _stripped_lower(settings.model_fast),
     )
-    if retired := sorted(RETIRED_MODEL_IDS & set(ids)):
-        return (
-            "⚠️ "
-            + ", ".join(f"`{m}`" for m in retired)
-            + " is a retired model id (Vercel AI Gateway / Router era) — this app's default "
-            f"models now live on Perplexity's Agent API. Set the base URL to "
-            f"`{DEFAULT_BASE_URL}` and pick ids the endpoint lists, e.g. "
-            "`perplexity/kimi-k3` (main) and `perplexity/glm-5.3-flash` (fast)."
-        )
-    return ""
+    retired = sorted(RETIRED_MODEL_IDS & set(ids))
+    return (
+        "⚠️ "
+        + ", ".join(f"`{m}`" for m in retired)
+        + " is a retired model id (Vercel AI Gateway / Router era) — this app's default "
+        f"models now live on Perplexity's Agent API. Set the base URL to "
+        f"`{DEFAULT_BASE_URL}` and pick ids the endpoint lists, e.g. "
+        "`perplexity/kimi-k3` (main) and `perplexity/glm-5.3-flash` (fast)."
+    )
 
 
 @dataclass(frozen=True)
@@ -239,6 +270,13 @@ class Verdict:
     # "checked 2 against 4 listed" reads very differently from "checked 0".
     checked: tuple[str, ...] = field(default_factory=tuple)
     listed: int = 0
+    # Set when the *configuration* names a provider this app has retired, whatever
+    # the probes found — see :func:`retired_endpoint_kind` and
+    # :func:`retired_endpoint_reason`. Stamped on every verdict
+    # :func:`check_endpoint` produces, so a reused verdict carries it too and the
+    # audit trail can record a run that started on a retired configuration anyway.
+    retired: str = ""
+    retired_kind: str = ""
 
     @property
     def blocks(self) -> bool:
@@ -370,6 +408,20 @@ def _verified_by_a_call(
     return allowed
 
 
+def _stamp_retired(settings: Settings, verdict: Verdict) -> Verdict:
+    """Carry the retired-provider finding on *verdict*, whatever the probes found.
+
+    The advisory does not change the verdict — a healthy gateway stays ``ok``, and
+    the run gate keeps its own policy — but the finding must travel with the
+    verdict object so the gate's audit fields and the run buttons can report it,
+    including when the verdict is a *reused* one that skipped today's probes.
+    """
+    kind = retired_endpoint_kind(settings)
+    if not kind or verdict.retired_kind:
+        return verdict
+    return replace(verdict, retired_kind=kind, retired=retired_endpoint_reason(settings))
+
+
 def check_endpoint(
     settings: Settings,
     *,
@@ -382,7 +434,24 @@ def check_endpoint(
     socket, and so a caller can reuse a result it already has. The chat probe is the
     second half of the check because the first half is only a listing; see the module
     docstring for the endpoint that makes that difference matter.
+
+    Every verdict this function produces also states whether the *configuration*
+    names a provider this app has retired (:func:`retired_endpoint_kind`) — a
+    finding the probes themselves cannot make, stamped so a reused verdict and the
+    audit trail carry it without re-deriving it.
     """
+    return _stamp_retired(
+        settings, _probe_endpoint(settings, probe=probe, chat_probe=chat_probe)
+    )
+
+
+def _probe_endpoint(
+    settings: Settings,
+    *,
+    probe: ProbeFn = probe_models,
+    chat_probe: ChatProbeFn = probe_chat,
+) -> Verdict:
+    """The probe-and-judge half of :func:`check_endpoint`, without the retired stamp."""
     models = tuple(
         m.strip() for m in (settings.model_main, settings.model_fast) if m and m.strip()
     )

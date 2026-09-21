@@ -21,6 +21,7 @@ from ..llm import check_model_availability
 from ..preflight import (
     BLOCKED,
     OK,
+    RETIRED_PROVIDER_KINDS,
     Verdict,
     check_endpoint,
     remember_verdict,
@@ -645,6 +646,12 @@ def _render_preflight_evidence(verdict: Verdict, base_url: str) -> None:
         parts.append(f"{verdict.listed:,} models listed")
     if verdict.checked:
         parts.append("checked " + ", ".join(f"`{m}`" for m in verdict.checked))
+    retired_kind = getattr(verdict, "retired_kind", "")
+    if retired_kind:
+        # The verdict carries the retired finding even when a green one — a healthy
+        # probe on a retired provider is exactly the trap — so the evidence names it.
+        label = RETIRED_PROVIDER_KINDS.get(retired_kind, retired_kind)
+        parts.append(f"⚠️ retired provider: {label}")
     st.caption("Preflight: " + " · ".join(parts) + ".")
 
 

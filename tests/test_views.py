@@ -1583,6 +1583,32 @@ class TestSidebarSettingsGuards(unittest.TestCase):
         st_mock.warning.assert_called_once()
         self.assertIn("AI Gateway", str(st_mock.warning.call_args[0][0]))
 
+    def test_the_test_connection_evidence_names_a_retired_provider_on_a_green_verdict(self) -> None:
+        """A healthy probe on a retired provider is exactly the trap — a green
+        verdict must still name the finding in its evidence line."""
+        import app.views.sidebar as sidebar
+
+        st_mock, _session = _fake_streamlit()
+        verdict = Verdict(
+            OK,
+            "fine",
+            retired="⚠️ retired",
+            retired_kind="gateway_era_model_ids",
+        )
+        with _patch_st(sidebar, st_mock):
+            sidebar._render_preflight_evidence(verdict, "https://llm.internal.test/v1")
+        caption = " ".join(str(c.args[0]) for c in st_mock.caption.call_args_list)
+        self.assertIn("retired provider: gateway-era model ids", caption)
+
+    def test_the_test_connection_evidence_stays_quiet_for_supported_configs(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, _session = _fake_streamlit()
+        with _patch_st(sidebar, st_mock):
+            sidebar._render_preflight_evidence(Verdict(OK, "fine"), "https://api.perplexity.ai/v1")
+        caption = " ".join(str(c.args[0]) for c in st_mock.caption.call_args_list)
+        self.assertNotIn("retired", caption)
+
     def _verdict(self, kind: str, headline: str, fix: str = "", **over: object) -> Verdict:
         fields: dict = dict(
             kind=kind,
