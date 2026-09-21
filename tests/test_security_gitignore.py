@@ -92,6 +92,41 @@ class TestGitignoreSecrets(unittest.TestCase):
             or _ignored_by_gitignore("secrets.toml", patterns)
         )
 
+    def test_va_gov_download_artifacts_ignored(self):
+        """The VA.gov downloader writes signed-in-page screenshots/HTML here on
+        failure — actual PHI, not derived. The directory must never be
+        committable, wherever the script happens to be run from."""
+        patterns = _gitignore_patterns()
+        must_ignore = [
+            "va_gov_download_artifacts",
+            "subdir/va_gov_download_artifacts",
+        ]
+        for path in must_ignore:
+            self.assertTrue(
+                _ignored_by_gitignore(path, patterns),
+                msg=f"{path} should be ignored by .gitignore patterns {patterns}",
+            )
+
+    def test_va_gov_download_artifacts_ignored_by_real_git(self):
+        """Ground truth: real git agrees the downloader's failure evidence
+        (signed-in pages) is not committable."""
+        for path in (
+            "va_gov_download_artifacts",
+            "va_gov_download_artifacts/inspect-20260921-101500.txt",
+            "va_gov_download_artifacts/select-all-20260921-101500.png",
+        ):
+            result = subprocess.run(
+                ["git", "check-ignore", "--quiet", path],
+                cwd=str(PROJECT_ROOT),
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                msg=f"git check-ignore did not ignore {path}: {result.stderr}",
+            )
+
     def test_actual_git_check_ignore(self):
         """Ground truth: ask real git check-ignore for the paths that matter."""
         cases_should_ignore = [".env", ".env.local", ".env.dev.local"]

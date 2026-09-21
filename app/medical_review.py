@@ -1283,8 +1283,18 @@ def _chunk_sections(
     return ", ".join(found[:6]) if found else default
 
 
-MERGE_BATCH_SIZE = 200
-MERGE_SINGLE_LIMIT = 250
+# Merge batches must fit the model's OUTPUT budget, not just its input window:
+# _merge_once asks the model to echo every distinct fact of the batch as JSON,
+# and a real fact renders to roughly 180 chars (~48 tokens) of output. At the
+# old batch size of 200 that demanded ~17k output tokens against a max_tokens
+# of 8000 — every response truncated mid-JSON and 100% of merge calls failed
+# (observed live 2026-09-21: 13/13 batches unparseable, ~10k chars each). At 48
+# facts the echo is ~2.3k tokens: comfortably inside the budget.
+MERGE_BATCH_SIZE = 48
+# Same arithmetic for the single-call path: 8,000 output tokens / ~48 tokens
+# per fact ≈ 165 facts maximum; 120 leaves margin for prompt preamble and
+# model verbosity.
+MERGE_SINGLE_LIMIT = 120
 
 
 def _merge_facts(

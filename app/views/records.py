@@ -11,6 +11,7 @@ from typing import Any
 import streamlit as st
 
 from .. import config
+from .. import local_paths
 from .. import telemetry
 from .. import va_gov_client
 from .. import va_gov_export
@@ -35,13 +36,42 @@ CITATION_INDEX_KEY = "citation_index"
 def is_local_run() -> bool:
     """Whether the server explicitly permits local record imports.
 
-    The legacy name is retained for callers. Request headers and URLs cannot
-    establish that a browser is local, so only the server-side opt-in counts.
-    Enable this only for a trusted, single-user installation bound to loopback.
+    Enable this only for a trusted, single-user installation bound to loopback:
+    the flag alone is not enough. The bind check comes from the process's own
+    argv (``--server.address``) backed by the committed ``.streamlit/config.toml``
+    — app code must not read Streamlit's ambient configuration — and an address
+    absent from both means Streamlit listens on every interface, so local
+    imports stay disabled, warning once with the restart command that fixes
+    it. See ``app/local_paths.py`` for the derivation.
     """
     import os
 
-    return os.getenv("VA_LSE_ALLOW_LOCAL_PATHS", "").strip() == "1"
+    if os.getenv("VA_LSE_ALLOW_LOCAL_PATHS", "").strip() != "1":
+        return False
+    address = local_paths.server_bind_address()
+    if local_paths.is_loopback(address):
+        return True
+    _warn_loopback_required(address)
+    return False
+
+
+def _warn_loopback_required(address: Any) -> None:
+    """Explain, once per session, why the local-import flag is not taking effect."""
+    if st.session_state.get("local_paths_loopback_warned"):
+        return
+    st.session_state["local_paths_loopback_warned"] = True
+    shown = (
+        "unset, so Streamlit is listening on every interface"
+        if address in (None, "")
+        else f"set to {address!r}"
+    )
+    st.warning(
+        "VA_LSE_ALLOW_LOCAL_PATHS=1 is set, but the server is not bound to the "
+        f"loopback interface (server.address is {shown}). Records read from local "
+        "paths could then be requested by any machine that can reach this server, "
+        "so local imports stay disabled. Restart bound to loopback: "
+        "`streamlit run run_app.py --server.address 127.0.0.1`"
+    )
 
 
 def _track_selector_impression(slot: str) -> None:

@@ -91,6 +91,12 @@ access. Setting `VA_LSE_ALLOW_LOCAL_PATHS=1` grants every user of that app acces
 to supported files readable by the server process; it is not per-user authorization.
 Enable it only for trusted single-user use with Streamlit bound to `127.0.0.1`,
 without a public reverse proxy or tunnel. See README for the local launch command.
+This is enforced at runtime: with the flag set and the server not bound to a
+loopback address (including the default all-interfaces bind), local imports stay
+disabled and the app tells the operator how to restart correctly. The bind check
+derives the address from the process's own launch argv (`--server.address`)
+backed by the committed `.streamlit/config.toml` — app code deliberately does
+not read Streamlit's runtime configuration (see `app/local_paths.py`).
 
 For any hosted / multi-user deployment (Agiloop, Streamlit Cloud, Docker, etc.):
 
@@ -232,7 +238,73 @@ context root, unlike `.gitignore` patterns, so `*.pem` matches only a top-level
 file while `**/*.pem` matches any depth. The first version of this file got that
 wrong in four places and the test caught every one.
 
-## 9. Reporting a vulnerability
+## 9. Local browser automation (CDP attach) and derived PHI at rest
+
+The VA.gov downloader (`scripts/va_records_download.py`) and the Streamlit app touch
+complementary but different data at rest. The boundary matters:
+
+**CDP attach — how the local automation boundary works.** When you use
+`python scripts/va_records_download.py --cdp http://127.0.0.1:9222`, Playwright talks to a
+Chrome you launched yourself with `--remote-debugging-port=9222 --user-data-dir=...`. The
+protocol is plain HTTP + WebSocket on that port. Anyone or anything that can reach the port
+can run arbitrary JavaScript in the browser (including reading the page). Practical guidance:
+
+- Attach only to `127.0.0.1` — the loopback bind is the entire security boundary. Never
+  `--remote-debugging-port` on `0.0.0.0` or a non-loopback interface, and never expose the
+  port through SSH tunnels to shared machines, reverse proxies, or port-forwarding configs.
+- **Use a dedicated `--user-data-dir`** — Chrome requires this (it refuses remote debugging
+  on the default profile since Chrome 136), and it is also the right containment: the
+  debugging port plus a *daily-driver* profile is the worst case (cookies and sessions for
+  every site you use are one JavaScript evaluation away). A dedicated profile keeps the blast
+  radius to the VA.gov session you opened it for. The script never closes an attached
+  browser — quit Chrome yourself when done; closing it kills the debug port.
+- **Start the port only for the download session** and close Chrome after — a lingering
+  listener is standing attack surface for anything else running on your machine.
+- **A local process does not need the port to read your session.** Malware running as your
+  user can read the profile directory directly. CDP raises convenience here, not the local
+  threat model. The port matters when you run the downloader on a machine you share with
+  other software you do not fully trust.
+- **On failure the script writes signed-in-page evidence** — screenshot + page HTML + URL to
+  `va_gov_download_artifacts/` (default). That HTML is a live signed-in VA.gov page and can
+  contain medical data. Treat the directory as PHI: keep it local, share contents only with
+  explicit intent, and delete it after debugging. The Streamlit app itself never uses CDP
+  and never reads or writes browser profiles; its VA.gov source is a sandbox client only.
+
+**Profile-cookie TTL — the profile at `~/.va_lse_va_gov_profile`.** This is the one place
+VA.gov session cookies persist on disk (the app writes no sessions anywhere). Understand its
+lifetime rather than trusting it:
+
+- Cookies are stored unencrypted in `Cookies` (SQLite) inside the profile, so the profile is
+  only as strong as the filesystem underneath it — put it on FileVault-encrypted disk.
+- VA.gov session and SSO cookies carry their own expiry (session cookies die with the
+  browser; persistent ID.me/VA SSO cookies are typically hours to weeks by issuer policy).
+- Treat the profile as **hot for up to 30 days** regardless — if the disk or a backup of it
+  leaks, assume the session inside is still usable. Manage lifetime explicitly:
+  delete the profile to sign out (`rm -rf ~/.va_lse_va_gov_profile`, or
+  `rm -rf ~/.va_lse_debug_chrome` for the CDP-attach profile); pass `--no-persist` for a
+  one-shot throwaway session (full MFA each time); and re-authenticate deliberately when a
+  session older than a few weeks is reused.
+- Do not back the profile up, sync it (iCloud/Dropbox), or copy it between machines.
+
+**Derived PHI at rest — what this repo's tooling writes to local disk.** All of it is
+unencrypted; keep the whole checkout on encrypted disk and out of synced folders.
+`logs/` and `outputs/` are already git-ignored:
+
+| Path | Content | Notes |
+|---|---|---|
+| `logs/runs.jsonl` (+ `logs/audit.log`) | Per-run audit trail: request ids, phase timings, counts, scrubbed error text | PII-shaped tokens are redacted at write time (`app/audit.py`); scrubbing happens only at write — a future field added without scrubbing is not protected by the old scrubber |
+| `outputs/batch-draft/state/batch_NN.json.gz` | **Resumable digest state: compressed per-batch extracted facts — derived PHI** | Written atomically (fsync + rename). Batch-fact shards hold the extracted medical evidence itself |
+| `outputs/batch-draft/staging/` | Extracted record text staged per batch group | Derived PHI; remove with the run output when done |
+| `outputs/batch-draft/…final` artifacts | The drafted statement, merge summaries, and full fact lists | Derived PHI |
+| `va_gov_download_artifacts/` | Signed-in-page screenshots/HTML from downloader failures | **Actual** signed-in PHI, not derived; now git-ignored — it was not before |
+| `~/.va_lse_va_gov_profile` | VA.gov session cookies | See profile-cookie TTL above |
+| `usage_history.json` (repo root; `VA_LSE_WATCHDOG_PATH` overrides) | Token/cost counters, no record content | Aggregates only |
+
+Retention guidance: delete `outputs/batch-draft/` when a run's statement has been exported;
+treat `logs/runs.jsonl` as the long-lived record (scrubbed by design) and rotate or delete
+`logs/` on your own schedule; never commit, sync, or back up any of these paths.
+
+## 10. Reporting a vulnerability
 
 Do not open a public issue for security-sensitive findings. See the
 `## Security notes` section in `README.md` for the private channel.

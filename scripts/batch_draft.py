@@ -26,9 +26,12 @@ state) and the rest of its group survives. The review pass is treated the way
 ``run_draft`` treats it: a failure there keeps the finished draft and records
 the miss instead of discarding hours of work.
 
-State is resumable: every completed batch is persisted to ``state.json`` inside
-the output directory and re-runs skip it. Delete the file (or pass ``--fresh``)
-to start over.
+State is resumable: every completed batch is persisted as its own gzipped
+shard under ``<out>/state/`` (plus a human-readable ``index.json`` summary),
+each written atomically — a crash costs at most the shard being written,
+never the whole run. Re-runs read the shards back and skip completed
+batches; a legacy monolithic ``state.json`` from an older run still loads.
+Delete the ``state/`` directory (or pass ``--fresh``) to start over.
 
 Run:
     .venv/bin/python scripts/batch_draft.py --records "path/to/records" \\
@@ -43,8 +46,10 @@ field omits falls back to the same placeholder the Draft tab uses.
 from __future__ import annotations
 
 import argparse
+import gzip
 import inspect
 import json
+import os
 import shutil
 import string
 import sys
@@ -138,14 +143,129 @@ def _facts_text_kwargs(digest_obj: Any) -> dict[str, Any]:
     return kwargs
 
 
+STATE_SCHEMA = 2
+SHARD_DIR_NAME = "state"
+FINAL_SHARD_NAME = "final.json.gz"
+
+
+def _fsync_path(path: Path) -> None:
+    """Flush one file's contents to disk before it is renamed into place."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _atomic_write_bytes(destination: Path, payload: bytes) -> None:
+    """Write *payload* so *destination* is never a partial file.
+
+    The write goes to a sibling temp file, is fsynced, and is renamed over the
+    destination — ``os.replace`` is atomic on POSIX and Windows. A crash mid-
+    write therefore leaves the previous good file intact, which is the whole
+    point: this state is hours of LLM spend, and a truncated rewrite used to
+    destroy every completed batch at once.
+    """
+    tmp = destination.with_name(f".{destination.name}.tmp")
+    tmp.write_bytes(payload)
+    _fsync_path(tmp)
+    os.replace(tmp, destination)
+
+
+def _shard_payload(key: str, batch: dict) -> bytes:
+    body = json.dumps(
+        {"schema": STATE_SCHEMA, "key": key, "batch": batch},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return gzip.compress(body, mtime=0)
+
+
+def _read_shard(path: Path) -> tuple[str, dict] | None:
+    """Decode one shard; a corrupt shard reads as absent, never fatal."""
+    try:
+        data = json.loads(gzip.decompress(path.read_bytes()))
+        if isinstance(data, dict) and isinstance(data.get("batch"), dict):
+            return str(data.get("key") or path.stem), data["batch"]
+    except (OSError, ValueError):
+        return None
+    return None
+
+
 def save_state(cfg: BatchConfig, state: dict) -> None:
-    cfg.state_path.write_text(json.dumps(state, indent=1), encoding="utf-8")
+    """Persist run state as one gzip shard per batch plus ``index.json``.
+
+    The shards (``<out>/state/batch_*.json.gz``, ``<out>/state/final.json.gz``)
+    are the authoritative copy: each is written atomically, so a crash can
+    cost at most the shard being written, never the whole run. ``index.json``
+    is a human-readable summary, not a source of truth — ``load_state`` never
+    reads it. A pre-sharding ``state.json`` is left untouched; ``load_state``
+    still reads it so older runs resume, and the next save re-shards them.
+    """
+    shards = cfg.out_dir / SHARD_DIR_NAME
+    shards.mkdir(parents=True, exist_ok=True)
+    index: dict[str, Any] = {"schema": STATE_SCHEMA, "batches": {}, "final": False}
+    for key, batch in state.get("batches", {}).items():
+        if not isinstance(batch, dict) or not ("facts" in batch or "error" in batch):
+            continue
+        _atomic_write_bytes(shards / f"{key}.json.gz", _shard_payload(key, batch))
+        index["batches"][key] = {
+            "facts": len(batch.get("facts", [])) if "facts" in batch else None,
+            "error": batch.get("error"),
+        }
+    final = state.get("final")
+    if final is not None:
+        _atomic_write_bytes(
+            shards / FINAL_SHARD_NAME,
+            gzip.compress(
+                json.dumps({"schema": STATE_SCHEMA, "final": final}, separators=(",", ":")).encode("utf-8"),
+                mtime=0,
+            ),
+        )
+        index["final"] = True
+    index["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    _atomic_write_bytes(
+        shards / "index.json",
+        json.dumps(index, indent=1, sort_keys=True).encode("utf-8"),
+    )
 
 
 def load_state(cfg: BatchConfig, fresh: bool = False) -> dict:
-    if not fresh and cfg.state_path.exists():
-        loaded: dict = json.loads(cfg.state_path.read_text(encoding="utf-8"))
-        return loaded
+    """Read run state back; shards win, legacy ``state.json`` is the fallback.
+
+    A corrupt or truncated shard is skipped — the resume then redigests that
+    one batch instead of failing the run. A legacy monolithic ``state.json``
+    (written by the pre-shard format, including runs interrupted before this
+    change) loads as before when no shards exist.
+    """
+    if fresh:
+        return {"batches": {}, "final": None}
+    shards = cfg.out_dir / SHARD_DIR_NAME
+    batches: dict[str, dict] = {}
+    final: dict | None = None
+    if shards.is_dir():
+        for path in sorted(shards.glob("batch_*.json.gz")):
+            decoded = _read_shard(path)
+            if decoded is not None:
+                batches[decoded[0]] = decoded[1]
+        final_path = shards / FINAL_SHARD_NAME
+        if final_path.exists():
+            try:
+                data = json.loads(gzip.decompress(final_path.read_bytes()))
+                if isinstance(data, dict) and data.get("final") is not None:
+                    final = data["final"]
+            except (OSError, ValueError):
+                final = None
+    if batches or final is not None:
+        return {"batches": batches, "final": final}
+    if cfg.state_path.exists():
+        try:
+            loaded: dict = json.loads(cfg.state_path.read_text(encoding="utf-8"))
+            return loaded
+        except (OSError, ValueError):
+            # A truncated legacy file must read as "start clean", not crash the
+            # resume: the operator loses the run either way, but a crash also
+            # hides the message that would have said so.
+            return {"batches": {}, "final": None}
     return {"batches": {}, "final": None}
 
 

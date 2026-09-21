@@ -3,6 +3,7 @@
 Run from project root: .venv/bin/python -m unittest discover -s tests -v
 """
 import io
+import json
 import os
 import sys
 import unittest
@@ -1177,6 +1178,65 @@ class TestLargeRecordPipeline(unittest.TestCase):
         second = paragraph_index(doc)
         self.assertIs(first, second)
         self.assertEqual(len(first), 2)
+
+
+class TestMergeOutputBudget(unittest.TestCase):
+    """Merge batches must fit the model's OUTPUT budget, not just its input.
+
+    _merge_once asks the model to echo every distinct fact of the batch as
+    JSON. With the old 200-fact batches the echo demanded ~17k output tokens
+    against max_tokens=8000, so every response truncated mid-JSON and every
+    merge call failed (live 2026-09-21: 13/13 unparseable). The batch sizing
+    must keep the expected echo within the output budget.
+    """
+
+    def test_merge_batches_never_exceed_output_budget(self):
+        # Live-run shape: near-duplicate variants of the same underlying
+        # events, so the model has real consolidation work and the batch
+        # input is realistically large (~140k chars at the old size).
+        facts = [
+            MedicalFact(
+                date=f"2024-{(i % 12) + 1:02d}-1{i % 9}",
+                type="symptom",
+                description=f"Nightmare episode variant {i}: woke thrashing, "
+                f"disoriented, removed CPAP; grounded within {5 + i % 20} minutes.",
+                source=f"9:18:26_Part{i % 91 + 1}.pdf p.{i % 20 + 1}",
+                quote="Quote text sized like a real extraction " * 2,
+            )
+            for i in range(1501)
+        ]
+        digest = MedicalDigest(facts=facts)
+
+        class SizeRecordingLLM(FakeLLM):
+            """Pass-through merge that records the input size of each call."""
+
+            def __init__(self):
+                super().__init__()
+                self.merge_sizes: list[int] = []
+
+            def _merge_facts(self, facts_list):  # noqa: ARG002 - signature only
+                return facts_list
+
+            def chat_json(self, system, user, **kwargs):
+                if "Deduplicate and consolidate" in user:
+                    # Mirrors _merge_once's parsing: strip the prompt header.
+                    payload = user.rsplit("\n\n", 1)[-1]
+                    self.merge_sizes.append(len(payload))
+                    try:
+                        return {"facts": json.loads(payload)}
+                    except json.JSONDecodeError:
+                        return {"facts": []}
+                return super().chat_json(system, user, **kwargs)
+
+        llm = SizeRecordingLLM()
+        merged = _merge_facts(llm, digest)
+        self.assertEqual(len(merged), 1501)  # pass-through loses nothing
+        self.assertGreater(len(llm.merge_sizes), 0)
+        for size in llm.merge_sizes:
+            # ~48 tokens per echoed fact against the 8,000-token output
+            # budget -> the payload must stay far below what the old
+            # 200-fact batches produced (~140k chars, 100% truncation).
+            self.assertLess(size, 30_000)
 
 
 if __name__ == "__main__":

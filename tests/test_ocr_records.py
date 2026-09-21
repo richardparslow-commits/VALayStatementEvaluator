@@ -10,6 +10,7 @@ import io
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 from unittest.mock import patch
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -188,6 +189,156 @@ class TestMain(unittest.TestCase):
             ):
                 code = self._run([str(path), "--out", str(out)])
         self.assertEqual(code, 3)
+
+
+class TestParallelFallback(unittest.TestCase):
+    """The tesseract fallback OCRs pages concurrently — a 1,000-page scan is
+    hours of sequential subprocess calls otherwise."""
+
+    def _two_image_pages(self, tmp: Path) -> Path:
+        path = tmp / "records.pdf"
+        path.write_bytes(_pdf_bytes(["", ""]))  # both pages image-only
+        return path
+
+    def test_workers_run_concurrently_and_all_pages_arrive(self) -> None:
+        import threading
+        import tempfile
+        import time as time_module
+
+        with tempfile.TemporaryDirectory() as workdir:
+            tmp = Path(workdir)
+            path = self._two_image_pages(tmp)
+            barrier = threading.Barrier(2, timeout=10)
+            started: list[None] = []
+
+            def fake_run(command: list[str], *, what: str) -> None:
+                if command[0] == "pdftoppm":
+                    started.append(None)
+                    try:
+                        barrier.wait()  # proves 2 workers inside subprocesses at once
+                    except threading.BrokenBarrierError:  # pragma: no cover
+                        pass
+                    # Write the rasterized page the driver looks for.
+                    prefix = Path(command[-1])
+                    prefix.with_name(prefix.name + "-1.png").write_bytes(b"png")
+
+            with patch.object(ocr_records, "_run", side_effect=fake_run), patch(
+                "scripts.ocr_records.subprocess.run",
+                return_value=mock.Mock(returncode=0, stdout="OCR text."),
+            ):
+                out = tmp / "out.pdf"
+                ocr_records.ocr_with_tesseract(path, out, dpi=72, jobs=2)
+                # Assert while the TemporaryDirectory still exists.
+                self.assertEqual(len(started), 2)
+                self.assertTrue(out.is_file())
+                self.assertEqual(len(ocr_records.inspect_pdf(out)[1]), 0)  # both pages have text
+
+    def test_one_failed_page_leaves_only_itself_blank(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as workdir:
+            tmp = Path(workdir)
+            path = self._two_image_pages(tmp)
+
+            def fake_run(command: list[str], *, what: str) -> None:
+                if command[0] == "pdftoppm" and "page-00001" in str(command[-1]):
+                    raise RuntimeError("pdftoppm failed (exit 1)")
+                if command[0] == "pdftoppm":
+                    prefix = Path(command[-1])
+                    prefix.with_name(prefix.name + "-1.png").write_bytes(b"png")
+
+            with patch.object(ocr_records, "_run", side_effect=fake_run), patch(
+                "scripts.ocr_records.subprocess.run",
+                return_value=mock.Mock(returncode=0, stdout="OCR text."),
+            ):
+                out = tmp / "out.pdf"
+                ocr_records.ocr_with_tesseract(path, out, dpi=72, jobs=2)
+                total, image_only = ocr_records.inspect_pdf(out)
+                self.assertEqual((total, image_only), (2, [1]))  # page 1 blank, page 2 OCRd
+
+    def test_jobs_one_is_sequential(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as workdir:
+            tmp = Path(workdir)
+            path = self._two_image_pages(tmp)
+            order: list[str] = []
+            active = threading_local_max = 0
+
+            def fake_run(command: list[str], *, what: str) -> None:
+                nonlocal active, threading_local_max
+                if command[0] != "pdftoppm":
+                    return
+                active += 1
+                threading_local_max = max(threading_local_max, active)
+                time.sleep(0.02)
+                prefix = Path(command[-1])
+                prefix.with_name(prefix.name + "-1.png").write_bytes(b"png")
+                active -= 1
+                order.append(str(command[-1]))
+
+            import time
+
+            with patch.object(ocr_records, "_run", side_effect=fake_run), patch(
+                "scripts.ocr_records.subprocess.run",
+                return_value=mock.Mock(returncode=0, stdout="OCR text."),
+            ):
+                out = tmp / "out.pdf"
+                ocr_records.ocr_with_tesseract(path, out, dpi=72, jobs=1)
+                self.assertEqual(threading_local_max, 1)
+                self.assertTrue(out.is_file())
+
+    def test_jobs_zero_derives_workers_from_cpu_count(self) -> None:
+        """jobs=0 means one worker per CPU capped at 8, then clamped to the
+        number of image-only pages — derived at call time on a real 10-page
+        image-only PDF, so the full chain min(8, cpu_count) applies."""
+        from concurrent.futures import ThreadPoolExecutor
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as workdir:
+            tmp = Path(workdir)
+            path = tmp / "records.pdf"
+            path.write_bytes(_pdf_bytes([""] * 10))  # 10 image-only pages
+            seen_workers: list[int] = []
+
+            class SpyPool(ThreadPoolExecutor):
+                def __init__(self, max_workers=None, *args, **kwargs):
+                    seen_workers.append(max_workers)
+                    super().__init__(max_workers=max_workers, *args, **kwargs)
+
+            with patch.object(
+                ocr_records, "_ocr_page", return_value="OCR text."
+            ), patch("os.cpu_count", return_value=16), patch(
+                "concurrent.futures.ThreadPoolExecutor", SpyPool
+            ):
+                out = tmp / "out.pdf"
+                ocr_records.ocr_with_tesseract(path, out, dpi=72, jobs=0)
+                self.assertTrue(out.is_file())
+                self.assertEqual(seen_workers[-1], 8)  # min(8, cpu_count=16)
+
+    def test_pool_is_clamped_to_the_image_only_page_count(self) -> None:
+        """Two image-only pages never justify eight workers."""
+        from concurrent.futures import ThreadPoolExecutor
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as workdir:
+            tmp = Path(workdir)
+            path = self._two_image_pages(tmp)
+            seen_workers: list[int] = []
+
+            class SpyPool(ThreadPoolExecutor):
+                def __init__(self, max_workers=None, *args, **kwargs):
+                    seen_workers.append(max_workers)
+                    super().__init__(max_workers=max_workers, *args, **kwargs)
+
+            with patch.object(
+                ocr_records, "_ocr_page", return_value="OCR text."
+            ), patch("os.cpu_count", return_value=16), patch(
+                "concurrent.futures.ThreadPoolExecutor", SpyPool
+            ):
+                out = tmp / "out.pdf"
+                ocr_records.ocr_with_tesseract(path, out, dpi=72, jobs=0)
+                self.assertEqual(seen_workers[-1], 2)
 
 
 if __name__ == "__main__":
