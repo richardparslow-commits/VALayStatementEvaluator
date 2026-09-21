@@ -19,7 +19,7 @@ from .documents import (
     ExtractedDocument,
     MAX_OBSERVATIONS_CHARS,
 )
-from .llm import LLMClient, LLMError, LLMParseError
+from .llm import LLMClient, LLMError, LLMService, LLMParseError
 from . import tracing
 from .logging_config import PhaseTimer, get_request_id
 from .profiler import phase_timer
@@ -358,7 +358,7 @@ class DraftResult:
 
 
 def run_draft(
-    llm: LLMClient,
+    llm: LLMService,
     records: list[ExtractedDocument],
     witness: dict[str, str],
     observations: str,
@@ -555,7 +555,7 @@ def _normalize_grounding(raw: Any) -> dict[str, Any]:
 
 
 def _run_draft(
-    llm: LLMClient,
+    llm: LLMService,
     records: list[ExtractedDocument],
     witness: dict[str, str],
     observations: str,

@@ -77,6 +77,8 @@ def _large_grounding(rows: int = 120, field_chars: int = 800) -> dict:
 
 
 class _FakeLLM:
+    fast_model = "fake-fast"
+
     def __init__(self, overrides: dict | None = None):
         self._settings = MagicMock(model_fast="fake-fast", model_main="fake-main")
         self.overrides = overrides or {}

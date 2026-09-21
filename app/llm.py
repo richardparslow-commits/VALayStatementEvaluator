@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, Protocol, runtime_checkable
 from urllib.parse import urlparse
 
 from openai import NOT_GIVEN, OpenAI
@@ -39,6 +39,7 @@ logger = logging.getLogger("app.llm")
 # Re-export for callers that want to catch these specifically.
 __all__ = [
     "LLMClient",
+    "LLMService",
     "LLMError",
     "LLMConfigurationError",
     "LLMUpstreamError",
@@ -941,6 +942,57 @@ def _failure_reason(error: BaseException | None) -> str:
     return f"{type(error).__name__}: {error}"
 
 
+@runtime_checkable
+class LLMService(Protocol):
+    """The surface every pipeline component consumes — the app's LLM boundary.
+
+    Phase-1 abstraction: nothing outside this module may import an LLM SDK or
+    speak HTTP to a provider. Components (draft, evaluate, medical_review,
+    views, worker) type their ``llm`` parameter as ``LLMService`` and call only
+    these methods, which is what makes the endpoint a *setting*: today the
+    concrete implementation is :class:`LLMClient` (any OpenAI-compatible
+    host — Perplexity Agent API, Azure OpenAI under a BAA, Ollama, a gateway),
+    and a future backend (a brokered HIPAA service, a batch API) satisfies the
+    same Protocol without a single call-site change.
+
+    Keep this Protocol minimal on purpose: every method here is a promise a
+    replacement backend must keep, including the JSON-repair behaviour of
+    :meth:`chat_json` and the cancellation-aware retry semantics the pipeline
+    guard relies on.
+    """
+
+    def chat(
+        self,
+        system: str,
+        user: str,
+        *,
+        model: str | None = None,
+        temperature: float = 0.2,
+        max_tokens: int = 8000,
+        phase: str = "general",
+    ) -> str: ...
+
+    def chat_json(
+        self,
+        system: str,
+        user: str,
+        *,
+        model: str | None = None,
+        temperature: float = 0.1,
+        max_tokens: int = 8000,
+        phase: str = "general",
+    ) -> Any: ...
+
+    @property
+    def fast_model(self) -> str: ...
+    """Model id for bulk/cheap calls (the digest's workhorse).
+
+    Part of the contract, not a setting leak: the pipeline's cost shape
+    depends on bulk work going to the cheap model, so any backend must say
+    which of its models plays that role.
+    """
+
+
 class LLMClient:
     """Thin wrapper around any OpenAI-compatible endpoint.
 
@@ -952,6 +1004,11 @@ class LLMClient:
     **concurrency limiter** with a bounded queue (see ``app/circuit_breaker.py``
     and ``app/config.py``).
     """
+
+    @property
+    def fast_model(self) -> str:
+        """The cheap model for bulk passes (the :class:`LLMService` contract)."""
+        return self._settings.model_fast
 
     def __init__(self, settings: Settings) -> None:
         _validate_settings(settings)

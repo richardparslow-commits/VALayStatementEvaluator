@@ -32,6 +32,7 @@ from .llm import (
     CircuitBreakerOpenError,
     LLMClient,
     LLMError,
+    LLMService,
     LLMTimeoutError,
     LLMUpstreamError,
     QueueFullError,
@@ -633,7 +634,7 @@ def _dedupe_facts(facts: list[MedicalFact]) -> list[MedicalFact]:
 
 
 def review_medical_records(
-    llm: LLMClient,
+    llm: LLMService,
     documents: list[ExtractedDocument],
     progress: ProgressCallback | None = None,
 ) -> MedicalDigest:
@@ -751,7 +752,7 @@ def review_medical_records(
                         chunk_text=sanitize_for_prompt(chunk.text, max_chars=1_000_000),
                         guard_note=GUARD_NOTE,
                     ),
-                    model=llm._settings.model_fast,
+                    model=llm.fast_model,
                     max_tokens=8000,
                     phase="records:digest",
                 )
@@ -1262,7 +1263,7 @@ MERGE_SINGLE_LIMIT = 250
 
 
 def _merge_facts(
-    llm: LLMClient,
+    llm: LLMService,
     digest: MedicalDigest,
     progress: ProgressCallback | None = None,
 ) -> list[MedicalFact]:
@@ -1367,14 +1368,14 @@ def _merge_facts(
     return current
 
 
-def _merge_once(llm: LLMClient, facts: list[MedicalFact]) -> list[MedicalFact]:
+def _merge_once(llm: LLMService, facts: list[MedicalFact]) -> list[MedicalFact]:
     """One merge call over a batch-sized fact list (fast model)."""
     data = llm.chat_json(
         MERGE_SYSTEM,
         "Deduplicate and consolidate these extracted medical facts. Keep every DISTINCT fact "
         "with its source. Return JSON: {\"facts\": [{\"date\",\"type\",\"description\",\"source\",\"quote\"}]}\n\n"
         + json.dumps([vars(f) for f in facts]),
-        model=llm._settings.model_fast,
+        model=llm.fast_model,
         max_tokens=8000,
         phase="records:merge",
     )
@@ -1387,7 +1388,7 @@ def _merge_once(llm: LLMClient, facts: list[MedicalFact]) -> list[MedicalFact]:
     return merged
 
 
-def _summarize(llm: LLMClient, digest: MedicalDigest) -> str:
+def _summarize(llm: LLMService, digest: MedicalDigest) -> str:
     return llm.chat(
         "You are a medical-records analyst. Write a concise narrative summary (max 250 words) "
         "of the record set: key diagnoses, treatment history, notable events, and current "
@@ -2093,7 +2094,7 @@ def _event_from_fact(fact: MedicalFact, *, iso_date: str | None, precision: str)
 
 
 def _infer_dates_once(
-    llm: LLMClient, batch: list[MedicalFact]
+    llm: LLMService, batch: list[MedicalFact]
 ) -> list[Any] | None:
     """One inference call for a batch; ``None`` when the call itself failed."""
     items = [
@@ -2106,7 +2107,7 @@ def _infer_dates_once(
             "Infer dates for these facts. Return JSON exactly as: "
             '{"dates": [{"index": <int>, "date": "YYYY" | "YYYY-MM" | null}]}\n\n'
             + json.dumps(items),
-            model=llm._settings.model_fast,
+            model=llm.fast_model,
             # Budget per fact, not a flat cap: a fixed 2000-token ceiling over a
             # few hundred undated facts truncates the JSON mid-array and loses the
             # entire batch.
@@ -2130,7 +2131,7 @@ def _infer_dates_once(
 
 
 def _llm_infer_undated(
-    llm: LLMClient, facts: list[MedicalFact]
+    llm: LLMService, facts: list[MedicalFact]
 ) -> dict[int, tuple[str, str] | None]:
     """Best-effort LLM date inference for facts regex could not date.
 
@@ -2218,7 +2219,7 @@ def _empty_timeline_data(request_id: str, *, error: bool = False) -> dict[str, A
 
 def build_timeline_data(
     digest: MedicalDigest,
-    llm: LLMClient | None = None,
+    llm: LLMService | None = None,
     *,
     feature_id: str | None = None,
 ) -> dict[str, Any]:

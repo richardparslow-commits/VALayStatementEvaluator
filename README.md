@@ -188,6 +188,7 @@ installs on macOS and Linux CI.
 | `LLM_MODEL_MAIN` | Low-volume heavy model (analysis/scoring/drafting) | `perplexity/kimi-k3` |
 | `LLM_MODEL_FAST` | Cheap model for the bulk digest/merge passes | `perplexity/glm-5.3-flash` |
 | `OPENAI_BASE_URL_FALLBACK` | **Optional** second endpoint used when the primary fails for a sustained period; unset = no failover | (empty) |
+| `LLM_PROVIDER_URL` / `LLM_API_KEY` | Provider-neutral aliases for `OPENAI_BASE_URL` / `OPENAI_API_KEY` — for platforms provisioned with generic names. The canonical `OPENAI_*` value wins when both are set | (unset) |
 | `OPENAI_API_KEY_FALLBACK` | Key for the fallback endpoint (usually a different provider) | primary key |
 | `LLM_MODEL_MAIN_FALLBACK` / `LLM_MODEL_FAST_FALLBACK` | The fallback provider's model names for the two roles | primary models |
 | `LLM_ENDPOINT_FALLBACK_TIMEOUT_SECONDS` | How long the primary must fail before failover engages (a grace period, not an HTTP timeout) | `300` |

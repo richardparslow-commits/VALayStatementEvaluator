@@ -816,6 +816,8 @@ class _FakeSettings:
 class FakeLLM:
     """Deterministic stand-in for LLMClient."""
 
+    fast_model = _FakeSettings.model_fast  # "fake-fast"
+
     def __init__(self, fail_digest_once: bool = False) -> None:
         self._settings = _FakeSettings()
         self.digest_calls = 0

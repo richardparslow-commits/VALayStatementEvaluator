@@ -55,10 +55,10 @@ def _base_stub() -> Any:
 class _UsageStub:
     """Wraps the evaluate stub so it also records usage like LLMClient does."""
 
+    fast_model = "fake-fast"  # the bulk-model contract member (LLMService)
+
     def __init__(self, base: Any | None = None) -> None:
         self._base = base if base is not None else _base_stub()
-        # The record-review path reads llm._settings.model_fast to pick the cheap
-        # digest model, so a stub without it fails every job.
         self._settings = MagicMock(model_fast="fake-fast", model_main="fake-main")
         self.usage = UsageTracker()
         self.fail_with: BaseException | None = None
