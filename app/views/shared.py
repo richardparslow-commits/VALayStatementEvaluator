@@ -228,13 +228,28 @@ def _accepted_check_fields(reused: bool, age: float | None, verdict: Any) -> dic
     The audit trail must show what evidence a decision ran on: a run that proceeded
     used to leave no line at all, so ``runs.jsonl`` could not tell a fresh probe from
     a reused verdict — the asymmetry this closes.
+
+    A retired-provider finding is recorded with it: ``retired_endpoint`` names the
+    kind (``vercel_ai_gateway`` | ``perplexity_router`` | ``gateway_era_model_ids``)
+    and ``retired_provider`` the human label. The run gate does not block on the
+    finding — retirement is an advisory, and the probes decide the gate — but a run
+    that starts on a retired configuration anyway must be answerable from the trail
+    without re-deriving it. Fields are omitted entirely for a supported
+    configuration so the schema stays meaningful.
     """
-    return {
+    fields: dict[str, Any] = {
         "reason": "endpoint_preflight",
         "endpoint_check": "reused" if reused else "fresh",
         "check_age_s": None if age is None else round(age, 1),
         "check_kind": verdict.kind,
     }
+    retired_kind = getattr(verdict, "retired_kind", "")
+    if retired_kind:
+        fields["retired_endpoint"] = retired_kind
+        fields["retired_provider"] = preflight.RETIRED_PROVIDER_KINDS.get(
+            retired_kind, retired_kind
+        )
+    return fields
 
 
 def check_endpoint_gate(action: str, *, log_action: str, request_id: str = "") -> bool:
@@ -287,6 +302,17 @@ def check_endpoint_gate(action: str, *, log_action: str, request_id: str = "") -
         run_log_event(
             "app", "accepted", request_id=request_id or "-", **check_fields
         )
+        if getattr(verdict, "retired", ""):
+            # The advisory did not stop the run — the gate's policy is the probes'
+            # — but the user chose to run on a retired configuration with the
+            # banner on screen, so the choice is named where the run starts.
+            kind = getattr(verdict, "retired_kind", "")
+            label = preflight.RETIRED_PROVIDER_KINDS.get(kind, kind)
+            st.warning(
+                "This run is using a retired provider configuration — "
+                f"{label} is not recommended. Runs here are expected to fail; "
+                "the audit trail records it."
+            )
         if age is not None:
             st.caption(
                 f"Endpoint preflight: reused the check from {_age_label(age)} ago — "
@@ -343,6 +369,13 @@ def render_endpoint_preflight_notice(action: str) -> None:
         _clear_endpoint_block(action)
         return
     st.error(f"⛔ Run not started — {verdict.headline}\n\n{verdict.fix}")
+    if getattr(verdict, "retired", ""):
+        # A blocked run on a retired provider is the commonest shape (the Router
+        # refuses everything; the gateway rate-limits mid-run), so the block names
+        # it even when the provider's own error was the blocker, not retirement.
+        kind = getattr(verdict, "retired_kind", "")
+        label = preflight.RETIRED_PROVIDER_KINDS.get(kind, kind)
+        st.caption(f"This configuration is also a retired provider ({label}) — see the sidebar banner.")
     age = st.session_state.get(_endpoint_age_key(action))
     if isinstance(age, (int, float)):
         st.caption(

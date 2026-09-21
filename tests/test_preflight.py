@@ -1234,6 +1234,198 @@ class TestRetiredEndpointBanner(unittest.TestCase):
         )
         self.assertEqual(reason, "")
 
+    def test_check_endpoint_stamps_the_finding_on_a_green_verdict(self) -> None:
+        """A healthy probe on a retired provider is exactly the trap — the verdict
+        must carry the finding so the audit trail and the run button can name it."""
+        verdict = preflight.check_endpoint(
+            _settings(
+                base_url=preflight.VERCEL_GATEWAY_BASE_URL,
+                model_main="moonshotai/kimi-k3",
+                model_fast="alibaba/qwen3.7-flash",
+            ),
+            probe=lambda base_url, api_key: _probe(
+                {"moonshotai/kimi-k3", "alibaba/qwen3.7-flash"}, 200
+            ),
+            chat_probe=lambda base_url, api_key, model: _ANSWERED,
+        )
+        self.assertEqual(verdict.kind, preflight.OK)
+        self.assertEqual(verdict.retired_kind, "vercel_ai_gateway")
+        self.assertIn("AI Gateway", verdict.retired)
+
+    def test_check_endpoint_stamps_nothing_on_a_supported_configuration(self) -> None:
+        verdict = preflight.check_endpoint(
+            _settings(
+                base_url=preflight.DEFAULT_BASE_URL,
+                model_main="perplexity/kimi-k3",
+                model_fast="perplexity/glm-5.3-flash",
+            ),
+            probe=lambda base_url, api_key: _probe(
+                {"perplexity/kimi-k3", "perplexity/glm-5.3-flash"}, 200
+            ),
+            chat_probe=lambda base_url, api_key, model: _ANSWERED,
+        )
+        self.assertEqual(verdict.kind, preflight.OK)
+        self.assertEqual(verdict.retired_kind, "")
+        self.assertEqual(verdict.retired, "")
+
+
+class TestRetiredAuditTrail(unittest.TestCase):
+    """The retired finding follows the configuration into the run gate's audit line.
+
+    Retirement is advisory — the probes decide whether a run starts — but a run
+    that starts on a retired configuration anyway must be answerable from
+    ``runs.jsonl`` without re-deriving the finding.
+    """
+
+    def setUp(self) -> None:
+        # Mirror TestEndpointGate: mock the run log per-test so the suite writes
+        # nothing and each test inspects its own events.
+        self._log_patch = patch.object(
+            __import__("app.views.shared", fromlist=["run_log_event"]), "run_log_event"
+        )
+        self.run_log_event = self._log_patch.start()
+        self.addCleanup(self._log_patch.stop)
+
+    def test_the_kind_matches_each_signal(self) -> None:
+        cases = [
+            (_settings(base_url=preflight.VERCEL_GATEWAY_BASE_URL), "vercel_ai_gateway"),
+            (_settings(base_url="https://api.perplexity.ai/router/v1"), "perplexity_router"),
+            (
+                _settings(
+                    base_url="https://llm.internal.test/v1",
+                    model_main="openai/gpt-4.1-nano",
+                    model_fast="model-fast",
+                ),
+                "gateway_era_model_ids",
+            ),
+            (
+                _settings(
+                    base_url=preflight.DEFAULT_BASE_URL,
+                    model_main="perplexity/kimi-k3",
+                    model_fast="perplexity/glm-5.3-flash",
+                ),
+                "",
+            ),
+        ]
+        for settings, expected in cases:
+            with self.subTest(base_url=settings.base_url, main=settings.model_main):
+                self.assertEqual(preflight.retired_endpoint_kind(settings), expected)
+
+    def test_the_strongest_signal_wins(self) -> None:
+        """A gateway URL with gateway-era ids is the gateway, not the ids."""
+        kind = preflight.retired_endpoint_kind(
+            _settings(
+                base_url=preflight.VERCEL_GATEWAY_BASE_URL,
+                model_main="moonshotai/kimi-k3",
+                model_fast="alibaba/qwen3.7-flash",
+            )
+        )
+        self.assertEqual(kind, "vercel_ai_gateway")
+
+    def test_reason_and_kind_agree(self) -> None:
+        """One set of signals, two representations — they cannot disagree."""
+        for settings in (
+            _settings(base_url=preflight.VERCEL_GATEWAY_BASE_URL),
+            _settings(base_url="https://api.perplexity.ai/router/v1"),
+            _settings(
+                base_url="https://llm.internal.test/v1",
+                model_main="moonshotai/kimi-k3",
+                model_fast="model-fast",
+            ),
+            _settings(base_url=preflight.DEFAULT_BASE_URL),
+        ):
+            with self.subTest(kind=preflight.retired_endpoint_kind(settings)):
+                kind = preflight.retired_endpoint_kind(settings)
+                self.assertEqual(
+                    bool(preflight.retired_endpoint_reason(settings)), bool(kind)
+                )
+                if kind:
+                    self.assertIn(
+                        preflight.RETIRED_PROVIDER_KINDS[kind],
+                        preflight.RETIRED_PROVIDER_KINDS.values(),
+                    )
+
+    def _gate_run(self, verdict, *, waived=False):
+        import app.views.shared as shared
+
+        st_mock = _fake_st()
+        if waived:
+            from app.preflight import signature as _sig
+
+            st_mock.session_state[
+                shared.endpoint_waiver_key("draft", _sig(_settings()))
+            ] = True
+        with patch.object(shared, "st", st_mock), patch.object(
+            shared, "session_settings", return_value=_settings()
+        ), patch.object(shared.preflight, "check_endpoint", return_value=verdict):
+            allowed = shared.check_endpoint_gate(
+                "draft", log_action="draft", request_id="req_r"
+            )
+        return allowed, st_mock
+
+    def test_an_allowed_run_on_a_retired_configuration_records_it(self) -> None:
+        verdict = preflight.Verdict(
+            preflight.OK,
+            "fine",
+            retired="⚠️ retired: AI Gateway",
+            retired_kind="vercel_ai_gateway",
+        )
+        allowed, st_mock = self._gate_run(verdict)
+        self.assertTrue(allowed)
+        (action, status), fields = self.run_log_event.call_args[0], self.run_log_event.call_args[1]
+        self.assertEqual((action, status), ("app", "accepted"))
+        self.assertEqual(fields["retired_endpoint"], "vercel_ai_gateway")
+        self.assertEqual(fields["retired_provider"], "Vercel AI Gateway")
+        # The run was named where it started, too.
+        warnings = [str(call.args[0]) for call in st_mock.warning.call_args_list]
+        self.assertTrue(any("retired provider configuration" in w for w in warnings))
+
+    def test_a_waived_run_on_a_retired_configuration_records_it(self) -> None:
+        verdict = preflight.Verdict(
+            preflight.BLOCKED,
+            "refused",
+            retired="⚠️ retired: Perplexity Router API",
+            retired_kind="perplexity_router",
+        )
+        allowed, _ = self._gate_run(verdict, waived=True)
+        self.assertTrue(allowed)
+        fields = self.run_log_event.call_args[1]
+        self.assertEqual(fields["retired_endpoint"], "perplexity_router")
+        self.assertEqual(fields["retired_provider"], "Perplexity Router API")
+        self.assertEqual(fields["check_kind"], "blocked")
+
+    def test_a_supported_configuration_adds_no_retired_fields(self) -> None:
+        verdict = preflight.Verdict(preflight.OK, "fine")
+        allowed, st_mock = self._gate_run(verdict)
+        self.assertTrue(allowed)
+        fields = self.run_log_event.call_args[1]
+        self.assertNotIn("retired_endpoint", fields)
+        self.assertNotIn("retired_provider", fields)
+        st_mock.warning.assert_not_called()
+
+    def test_a_stored_block_on_a_retired_configuration_says_so(self) -> None:
+        import app.views.shared as shared
+
+        st_mock = _fake_st()
+        verdict = preflight.Verdict(
+            preflight.BLOCKED,
+            "The endpoint refused a real call.",
+            retired="⚠️ retired: Vercel AI Gateway",
+            retired_kind="vercel_ai_gateway",
+        )
+        from app.preflight import signature as _sig
+
+        st_mock.session_state[shared._endpoint_block_key("draft")] = verdict
+        st_mock.session_state[
+            shared._endpoint_block_key("draft") + "_sig"
+        ] = _sig(_settings())
+        with patch.object(shared, "st", st_mock), patch.object(
+            shared, "session_settings", return_value=_settings()
+        ):
+            shared.render_endpoint_preflight_notice("draft")
+        captions = [str(c.args[0]) for c in st_mock.caption.call_args_list]
+        self.assertTrue(any("retired provider (Vercel AI Gateway)" in c for c in captions))
+
 
 if __name__ == "__main__":
     unittest.main()
