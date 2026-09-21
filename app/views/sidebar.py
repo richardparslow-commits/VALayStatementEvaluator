@@ -15,7 +15,12 @@ import streamlit as st
 
 from .. import config
 from .. import watchdog
-from ..config import DEFAULT_BASE_URL, load_settings
+from ..config import (
+    DEFAULT_BASE_URL,
+    DEFAULT_MODEL_FAST,
+    DEFAULT_MODEL_MAIN,
+    load_settings,
+)
 from ..error_report import report_failure
 from ..llm import check_model_availability
 from ..preflight import (
@@ -31,11 +36,52 @@ from ..prompt_sanitize import validate_api_key, validate_model_name
 from .usage import load_usage_history, save_usage_history
 
 
+def _looks_like_perplexity_key(api_key: str) -> bool:
+    """Whether *api_key* is shaped like a Perplexity key (``pplx-…``).
+
+    The shape, not the truth: only the endpoint can validate a key. But it is
+    exactly enough to decide what the one-click repair should do with the
+    configured key — keep a credential for the endpoint it is being pointed at,
+    clear one that provably belongs elsewhere (a ``vck_…`` gateway key) so the
+    right one gets pasted instead of silently failing.
+    """
+    return (api_key or "").strip().lower().startswith("pplx-")
+
+
 def render_sidebar_settings() -> None:
     """Render the LLM/Fetch settings sidebar, mutating session settings in place."""
     if "settings" not in st.session_state:
         st.session_state.settings = load_settings()
     settings = st.session_state.settings
+
+    # One-click repair for a retired configuration (the banner below carries the
+    # button). Handled here — before the widgets below instantiate — because
+    # Streamlit's text inputs read their ``value=`` argument only on the first
+    # run and adopt the session value afterwards: mutating ``settings`` alone
+    # would fix what runs use while the boxes kept showing the retired values,
+    # a desync worse than the problem being repaired.
+    if st.session_state.pop("_apply_perplexity_defaults", False):
+        # Keep the key only when it is shaped for the endpoint it is about to
+        # target; a gateway or empty key would turn one clear problem (retired
+        # endpoint) into a second confusing one (401 from the right endpoint).
+        keep_key = _looks_like_perplexity_key(settings.api_key)
+        new_key = settings.api_key if keep_key else ""
+        settings.base_url = DEFAULT_BASE_URL
+        settings.model_main = DEFAULT_MODEL_MAIN
+        settings.model_fast = DEFAULT_MODEL_FAST
+        settings.api_key = new_key
+        for key, value in (
+            ("base_url_input", DEFAULT_BASE_URL),
+            ("model_main_input", DEFAULT_MODEL_MAIN),
+            ("model_fast_input", DEFAULT_MODEL_FAST),
+            ("api_key_input", new_key),
+        ):
+            st.session_state[key] = value
+        # No second ``st.rerun()`` here: the session keys above are synced before
+        # the widgets instantiate in this very pass, so they adopt the new values
+        # as they render, the banner goes quiet (the config is fixed), and the
+        # one-shot confirmation below shows on the same paint.
+        st.session_state["_applied_perplexity_defaults"] = True
 
     with st.sidebar:
         st.title("⚙️ LLM Settings")
@@ -705,10 +751,35 @@ def _retired_endpoint_warning(settings: Any) -> None:
     private-preview entitlement. ``retired_endpoint_reason`` is pure string matching,
     so the banner renders on every paint with no network call and no session state —
     visible before the user reaches for a run button, which is the point.
+
+    The banner carries the **repair**, not just the diagnosis: one button fills in
+    the app's current defaults, so fixing a stale deployment is a click instead of
+    retyping four fields — the exact friction that let retired configurations
+    survive on hosted deployments where ``.env`` is unreachable.
     """
     reason = retired_endpoint_reason(settings)
     if reason:
         st.warning(reason)
+        if st.button(
+            "Apply Perplexity defaults",
+            help=(
+                "Sets the base URL and both model ids to this app's defaults "
+                f"({DEFAULT_BASE_URL}, {DEFAULT_MODEL_MAIN}, {DEFAULT_MODEL_FAST}) "
+                "and keeps your API key if it is shaped like a Perplexity key "
+                "(pplx-…); otherwise clears it so the right key gets pasted. "
+                "Run Test connection afterwards."
+            ),
+            key="apply_perplexity_defaults",
+        ):
+            st.session_state["_apply_perplexity_defaults"] = True
+            st.rerun()
+    elif st.session_state.pop("_applied_perplexity_defaults", False):
+        # One-shot confirmation: the flag is consumed here, so it shows exactly
+        # once — the paint after the repair — and never gets stale on screen.
+        st.success(
+            "✅ Perplexity defaults applied — the endpoint, model ids and key fields "
+            "are set. Run **Test connection** to confirm the endpoint answers."
+        )
 
 
 def _credit_calibration_widget() -> None:
