@@ -343,6 +343,10 @@ class EvaluateJob:
     # Record-source labels ("Upload", "VA.gov", …) carried so the worker's audit
     # event says where the pages came from, exactly like the in-process path.
     record_sources: list[str] = field(default_factory=list)
+    # Witness metadata dict — consumed only for its structured ``aa_*``
+    # Aid & Attendance intake answers (see app/aa_intake.py). Empty default
+    # keeps every pre-existing payload byte-identical on the wire.
+    witness: dict[str, str] = field(default_factory=dict)
     # W3C trace context (``traceparent``/``tracestate``) from the web pod's submit
     # span, so the worker's spans join that trace instead of starting a new one.
     # Empty whenever tracing is off — see app/tracing.py.
@@ -417,6 +421,10 @@ def _job_envelope(kind: str, job: EvaluateJob | DraftJob) -> dict[str, Any]:
         base["trace_context"] = trace_context
     if isinstance(job, EvaluateJob):
         base["statement_text"] = job.statement_text
+        # Present only when the caller supplied intake answers, so pre-existing
+        # payloads stay byte-identical.
+        if job.witness:
+            base["witness"] = dict(job.witness)
     else:
         base["observations"] = job.observations
         base["condition"] = job.condition
@@ -488,6 +496,7 @@ def decode_job(
             records=records,
             request_id=request_id,
             record_sources=sources,
+            witness=_str_map(data.get("witness")),
             trace_context=_str_map(data.get("trace_context")),
         )
     if kind == KIND_DRAFT:

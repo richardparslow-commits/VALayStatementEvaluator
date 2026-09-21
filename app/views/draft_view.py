@@ -19,6 +19,7 @@ from ..documents import (
     MAX_OBSERVATIONS_CHARS,
 )
 from ..draft import DraftResult, grounding_markdown, run_draft
+from .aa_form import collect_aa_answers, render_aa_intake_wizard
 from ..job_payload import DraftJob
 from ..logging_config import get_logger
 from ..pdf_export import detect_unconfirmed_placeholders, generate_statement_pdf
@@ -259,6 +260,11 @@ def render_draft_tab() -> None:
 
     _render_witness_credentials()
 
+    # Step 3c — the structured A&A evidence matrix (optional). Its answers
+    # ride the witness dict as aa_* keys; see app/aa_intake.py.
+    st.subheader("Step 3c — Aid & Attendance intake (optional)")
+    render_aa_intake_wizard("draft")
+
     st.subheader("Step 4 — What has the witness observed?")
     observations = st.text_area(
         "Describe everything the witness has personally seen, heard, or experienced "
@@ -293,13 +299,18 @@ def render_draft_tab() -> None:
             records=records,
             condition=condition,
             claim_type=claim_type,
-            witness=_witness_details(
-                witness_name=witness_name,
-                relationship=relationship,
-                known_since=known_since,
-                contact_frequency=contact_frequency,
-                witnessed_event=witnessed_event,
-            ),
+            witness={
+                **_witness_details(
+                    witness_name=witness_name,
+                    relationship=relationship,
+                    known_since=known_since,
+                    contact_frequency=contact_frequency,
+                    witnessed_event=witnessed_event,
+                ),
+                # Intake answers merge in last so a slug collision (there is
+                # none today) could not silently drop a credential field.
+                **collect_aa_answers("draft"),
+            },
             observations=observations,
         )
 

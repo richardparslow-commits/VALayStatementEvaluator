@@ -67,6 +67,9 @@ scripts/
   extract_pdfs.py         Build reference_docs/extracted/*.txt from source PDFs
   smoke_test.py           End-to-end pipeline test against the live LLM endpoint
   scale_sim.py            Offline 2,000-page pipeline simulation (no API calls)
+  batch_draft.py          Batched, resumable drafting over a local record folder
+                          too large for one run (see *Batched drafting over a
+                          full C-file* below)
   split_records.py        Split an oversized record file into uploadable chunks
                           (see TROUBLESHOOTING.md → *Split Large Record Sets*)
   ocr_records.py          Add a text layer to a scanned record PDF so the app can
@@ -192,7 +195,7 @@ installs on macOS and Linux CI.
 | `OPENAI_API_KEY_FALLBACK` | Key for the fallback endpoint (usually a different provider) | primary key |
 | `LLM_MODEL_MAIN_FALLBACK` / `LLM_MODEL_FAST_FALLBACK` | The fallback provider's model names for the two roles | primary models |
 | `LLM_ENDPOINT_FALLBACK_TIMEOUT_SECONDS` | How long the primary must fail before failover engages (a grace period, not an HTTP timeout) | `300` |
-| `VA_LSE_MAX_RECORD_PAGES` | Max total pages across uploaded record files | `5000` |
+| `VA_LSE_MAX_RECORD_PAGES` | Max total pages across uploaded record files; over the limit the app refuses the run and points hosted deployments at the local tier, while a local run (`VA_LSE_ALLOW_LOCAL_PATHS=1`) is told to raise this setting | `5000` |
 | `VA_LSE_EXTRACTOR` | Where record text is read: `in-process` (this app's reader) or `sandbox` (the box, which can OCR a scan) | `in-process` |
 | `VA_LSE_EXTRACTOR_RUNNER` | Command that runs `scripts/ocr_and_extract.py` in the box, with `{work}` for the staged directory; stdout must end with its report JSON. `python scripts/vercel_sandbox_runner.py {work}` drives a Vercel Sandbox (see *Scanned pages and OCR*) | (empty = in-process) |
 | `VA_LSE_EXTRACTOR_TIMEOUT_SECONDS` | Ceiling for one file's box work (never past the run's own budget) | `900` |
@@ -644,6 +647,37 @@ encoding. Changed values, dates, negations, and near-matching clinical templates
 remain in the review. The former `VA_LSE_DUPLICATE_PAGE_SIMILARITY` setting is
 ignored. Keeping these pages may increase review time and model usage, but avoids
 treating distinct clinical evidence as redundant.
+
+## Batched drafting over a full C-file
+
+A single Draft run digests every record chunk in one process. Measured on a
+1,814-page set (2026-09-20): ~3.3 chunks/min sustained, ~100 minutes total —
+past the pipeline timeout (`VA_LSE_PIPELINE_TIMEOUT_SECONDS`, default 1800s).
+`scripts/batch_draft.py` solves this locally: it digests the record set in
+timeout-sized batches, saves resumable state after each batch, then drafts once
+over the combined evidence using the app's own prompts and budgets:
+
+```bash
+.venv/bin/python scripts/batch_draft.py \
+  --records "~/Desktop/VA Medical Records" \
+  --glob "9:18:26_Part*.pdf" \
+  --condition PTSD \
+  --claim-type "Initial claim - service connection" \
+  --observations observations.txt \
+  --witness-json witness.json \
+  --out outputs/batch-draft
+```
+
+The witness file is JSON — `"witness"` holds the same fields the Draft tab
+collects (name, relationship, known_since, contact_frequency, veteran_name,
+witnessed_event, plus optional credential fields), and its `condition`,
+`claim_type`, and `observations` act as defaults that flags override. Useful
+variants: `--no-final` digests only (then a later invocation without it drafts
+over the saved state); `--fresh` ignores previous state and starts over;
+`--parts-per-batch` controls the digest granularity. Outputs land in `--out`:
+`statement.md`, `grounding.md`, and `state.json` (the resume point, which also
+lists any file the bisect policy had to quarantine — one unreadable file never
+discards its batch-mates).
 
 ## Tests
 

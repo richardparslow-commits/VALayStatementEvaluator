@@ -34,6 +34,7 @@ from .medical_review import (
     retrieve_evidence,
     review_medical_records,
 )
+from .aa_intake import care_gaps_text
 
 # Feature: Condition-Specific Templates
 FEATURE_ID = "02f0935a-ee5e-4083-88a2-10e11753ccc9"  # condition-specific-templates
@@ -407,8 +408,16 @@ def run_evaluation(
     statement_text: str,
     records: list[ExtractedDocument],
     progress: ProgressCallback | None = None,
+    witness: dict[str, str] | None = None,
 ) -> EvaluationResult:
-    """Execute the full evaluation pipeline."""
+    """Execute the full evaluation pipeline.
+
+    *witness* is the optional witness-metadata dict (the same one the draft
+    pathway carries). Only its ``aa_*`` keys are read — the structured Aid &
+    Attendance intake answers — and they feed the recommendations phase's
+    care-coverage gaps. ``None`` keeps every prompt byte-identical to the
+    pre-intake pipeline.
+    """
     rid = get_request_id() or "-"
     t0 = time.perf_counter()
     pages = sum(len(d.pages) for d in records)
@@ -424,7 +433,7 @@ def run_evaluation(
         "evaluate", files=len(records), pages=pages, chars=len(statement_text)
     ):
         try:
-            result = _run_evaluation(llm, statement_text, records, progress)
+            result = _run_evaluation(llm, statement_text, records, progress, witness or {})
             duration_ms = int((time.perf_counter() - t0) * 1000)
             logger.info(
                 "evaluate done duration_ms=%d claims=%d verifications=%d contradictions=%d",
@@ -556,6 +565,7 @@ def _run_evaluation(
     statement_text: str,
     records: list[ExtractedDocument],
     progress: ProgressCallback | None,
+    witness: dict[str, str],
 ) -> EvaluationResult:
     result = EvaluationResult()
     result.input_chars = len(statement_text)
@@ -676,7 +686,7 @@ def _run_evaluation(
     with tracing.phase_span("score"), PhaseTimer(logger, "score", request_id=rid):
         with phase_timer("score"):
             report(0.92, "Step 7/8 — Computing effectiveness score and recommendations…")
-            _score_and_recommend(llm, result, report)
+            _score_and_recommend(llm, result, report, witness)
 
     with tracing.phase_span("report"), PhaseTimer(logger, "report", request_id=rid):
         with phase_timer("report"):
@@ -1143,6 +1153,11 @@ TOPIC COVERAGE GAPS:
 {topic_gaps}
 >>>
 
+AID & ATTENDANCE INTAKE COVERAGE:
+<<<
+{care_gaps}
+>>>
+
 {guard_note}"""
 
 
@@ -1273,7 +1288,7 @@ def _pad_recommendations(items: list[dict], result: "EvaluationResult", minimum:
 
 
 def generate_improvement_recommendations(
-    result: "EvaluationResult", llm: LLMService,
+    result: "EvaluationResult", llm: LLMService, witness: dict[str, str] | None = None,
 ) -> list[dict]:
     """Generate 3-5 ranked improvement recommendations via exactly one LLM call.
 
@@ -1291,6 +1306,11 @@ def generate_improvement_recommendations(
     improvements_text = (
         _json.dumps(result.improvements[:6], indent=1) if result.improvements else "(none)"
     )
+    # Structured A&A intake answers the statement does not yet address. When
+    # the caller supplied none, the section says so explicitly — the slot in
+    # RECOMMENDATIONS_USER is a fixed part of the prompt; what varies is its
+    # content.
+    care_gaps = care_gaps_text(witness or {}) or "(no structured intake answers were provided)"
     data = llm.chat_json(
         RECOMMENDATIONS_SYSTEM,
         RECOMMENDATIONS_USER.format(
@@ -1298,6 +1318,7 @@ def generate_improvement_recommendations(
             verifications=sanitize_for_prompt(_verifications_text(result), max_chars=8_000),
             improvements=sanitize_for_prompt(improvements_text, max_chars=4_000),
             topic_gaps=sanitize_for_prompt(topic_gaps, max_chars=2_000),
+            care_gaps=care_gaps,
             guard_note=GUARD_NOTE,
         ),
         phase="recommendations",
@@ -1308,7 +1329,10 @@ def generate_improvement_recommendations(
     return items[:5]
 
 
-def _score_and_recommend(llm: LLMService, result: "EvaluationResult", report: ProgressCallback) -> None:
+def _score_and_recommend(
+    llm: LLMService, result: "EvaluationResult", report: ProgressCallback,
+    witness: dict[str, str] | None = None,
+) -> None:
     """Compute the effectiveness score and improvement recommendations.
 
     Telemetry call sites for the Statement Effectiveness Score & Improvement
@@ -1320,7 +1344,7 @@ def _score_and_recommend(llm: LLMService, result: "EvaluationResult", report: Pr
     """
     result.effectiveness_score = compute_effectiveness_score(result)
     try:
-        result.recommendations = generate_improvement_recommendations(result, llm)
+        result.recommendations = generate_improvement_recommendations(result, llm, witness)
     except Exception as exc:  # noqa: BLE001 - feature-error boundary
         logger.warning(
             "recommendation generation unavailable error=%s",

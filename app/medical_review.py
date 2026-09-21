@@ -27,7 +27,13 @@ import time
 
 from . import config, tracing
 from .agiloop_telemetry import track_feature_error, track_goal
-from .documents import Chunk, ExtractedDocument, chunk_page_labelled_text, paragraph_index
+from .documents import (
+    Chunk,
+    ExtractedDocument,
+    chunk_page_labelled_text,
+    page_limit_message,
+    paragraph_index,
+)
 from .llm import (
     CircuitBreakerOpenError,
     LLMClient,
@@ -268,20 +274,26 @@ class MedicalDigest:
         return "\n".join(lines)
 
     def condensed_timeline(self, max_entries: int = 400) -> str:
-        """Evenly sample the full timeline so summaries cover the whole record set.
+        """Chronological, evenly strided sample of the timeline for summaries.
 
-        With thousands of facts, taking only the head of the timeline would bias
-        summaries toward the earliest documents; striding keeps every era visible.
+        Facts are ordered by date first (undated last, stable for ties), so a
+        summary model reads the record set as a progression rather than in
+        upload order. With thousands of facts, taking only the head of the
+        timeline would bias summaries toward the earliest documents; striding
+        keeps every era visible.
         """
-        facts = self.facts
-        if len(facts) <= max_entries:
-            return self.timeline_text()
-        step = len(facts) / max_entries
-        picked = [facts[int(i * step)] for i in range(max_entries)]
-        if facts[-1] is not picked[-1]:
-            picked[-1] = facts[-1]
-        lines = [f"[{f.date}] ({f.type}) {f.description}  — {f.source}" for f in picked]
-        return "\n".join(lines)
+        ordered = sorted(self.facts, key=lambda f: _normalize_date_for_sort(f.date))
+
+        def _lines(facts: list[MedicalFact]) -> list[str]:
+            return [f"[{f.date}] ({f.type}) {f.description}  — {f.source}" for f in facts]
+
+        if len(ordered) <= max_entries:
+            return "\n".join(_lines(ordered))
+        step = len(ordered) / max_entries
+        picked = [ordered[int(i * step)] for i in range(max_entries)]
+        if ordered[-1] is not picked[-1]:
+            picked[-1] = ordered[-1]
+        return "\n".join(_lines(picked))
 
     def relevant_facts_text(
         self,
@@ -290,6 +302,7 @@ class MedicalDigest:
         max_facts: int = 150,
         budget_chars: int = 90_000,
         always_include_types: tuple[str, ...] = ("in_service_event", "hospitalization"),
+        sort_dates: bool = False,
     ) -> str:
         """Return digest facts ranked by relevance to a claim/observation query.
 
@@ -297,6 +310,12 @@ class MedicalDigest:
         sets the evidence relevant to a given claim can sit anywhere in thousands
         of facts, so each verification/grounding prompt receives the facts that
         actually match it (plus all high-priority event types), within a budget.
+
+        With ``sort_dates=True`` the retained facts are *presented* in
+        chronological order (undated last; relevance order breaks ties), while
+        selection is still relevance-ranked — the right facts are kept, and a
+        drafting prompt reads them as a timeline. Verification prompts keep the
+        default relevance order: for judging a claim, best evidence first.
         """
         query_tokens = set(_tokens(query))
         if not self.facts:
@@ -335,16 +354,20 @@ class MedicalDigest:
 
         limit = max(0, min(max_facts, config.MAX_DIGEST_FACTS, len(self.facts)))
 
-        def selection_header(count: int) -> str:
+        def selection_header(count: int, *, chronological: bool = False) -> str:
+            order = ", presented in chronological order" if chronological else ""
             return (
-                f"({count} of {len(self.facts)} retained facts selected for relevance; "
+                f"({count} of {len(self.facts)} retained facts selected for relevance{order}; "
                 "this bounded selection is not the full evidence store)"
             )
 
+        # Budget accounting uses the worst-case header so the chronological
+        # variant can never push the body past the budget before the final slice.
         lines: list[str] = []
-        used = len(selection_header(limit)) + 1
+        used = len(selection_header(limit, chronological=sort_dates)) + 1
+        entries: list[tuple[str, str, int]] = []  # (date_sort_key, line, selection_rank)
         count = 0
-        for _, _, fact in matches + fillers:
+        for rank, (_, _, fact) in enumerate(matches + fillers):
             if count >= limit:
                 break
             line = f"[{fact.date}] ({fact.type}) {fact.description} — {fact.source}"
@@ -352,10 +375,14 @@ class MedicalDigest:
                 line += f" | quote: \"{fact.quote}\""
             if used + len(line) + 1 > budget_chars:
                 continue
-            lines.append(line)
             used += len(line) + 1
             count += 1
-        return (selection_header(len(lines)) + "\n" + "\n".join(lines))[:max(0, budget_chars)]
+            entries.append((_normalize_date_for_sort(fact.date), line, rank))
+        if sort_dates:
+            entries.sort(key=lambda item: (item[0], item[2]))
+        lines = [line for _, line, _ in entries]
+        header = selection_header(len(lines), chronological=sort_dates)
+        return (header + "\n" + "\n".join(lines))[:max(0, budget_chars)]
 
 
 # "[clinic.pdf — page 7]" / "[clinic.pdf — block 3]" as a whole citation.
@@ -658,9 +685,7 @@ def review_medical_records(
     pages_in_files = sum(doc.source_page_count for doc in documents)
     if pages_in_files > config.MAX_RECORD_PAGES:
         raise ValueError(
-            f"Record set is {pages_in_files:,} pages, over the configured limit of "
-            f"{config.MAX_RECORD_PAGES:,}. Split the records into smaller sets or raise "
-            "VA_LSE_MAX_RECORD_PAGES."
+            page_limit_message(pages_in_files, config.MAX_RECORD_PAGES)
         )
 
     # Drop duplicate pages (across and within files) BEFORE chunking: record

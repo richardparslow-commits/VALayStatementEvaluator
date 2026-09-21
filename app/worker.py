@@ -162,7 +162,9 @@ def _run_pipeline(
     from .evaluate import run_evaluation
 
     if isinstance(job, EvaluateJob):
-        evaluation = run_evaluation(llm, job.statement_text, job.records, progress=progress)
+        evaluation = run_evaluation(
+            llm, job.statement_text, job.records, progress=progress, witness=job.witness
+        )
         return RunResult(
             kind=kind, result=evaluation, usage=llm.usage, request_id=job.request_id
         )

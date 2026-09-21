@@ -19,6 +19,7 @@ from ..documents import (
     ExtractionError,
     SearchResult,
     export_citation_index,
+    page_limit_message,
     records_from_local_path,
     search_records,
 )
@@ -111,11 +112,7 @@ def records_uploader(slot: str) -> list:
     # very few readable pages and must not look like a small record set.
     total_pages = sum(d.source_page_count for d in documents)
     if documents and total_pages > config.MAX_RECORD_PAGES:
-        st.error(
-            f"Record set is {total_pages:,} pages, which exceeds the configured limit of "
-            f"{config.MAX_RECORD_PAGES:,} pages. Remove some files or raise "
-            "VA_LSE_MAX_RECORD_PAGES."
-        )
+        st.error(page_limit_message(total_pages, config.MAX_RECORD_PAGES))
         return []
     render_record_volume_warning(documents, slot=slot)
     remember_source_records(slot, "Upload", documents)

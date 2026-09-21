@@ -19,11 +19,12 @@ from .documents import (
     ExtractedDocument,
     MAX_OBSERVATIONS_CHARS,
 )
-from .llm import LLMClient, LLMError, LLMService, LLMParseError
+from .llm import LLMClient, LLMError, LLMParseError, LLMService
 from . import tracing
 from .logging_config import PhaseTimer, get_request_id
 from .profiler import phase_timer
 from .pipeline_guard import check_pipeline_cancelled
+from .aa_intake import care_observation_block
 from .prompt_sanitize import GUARD_NOTE, sanitize_digest_text, sanitize_for_prompt, validate_witness_field
 
 logger = logging.getLogger("app.draft")
@@ -221,6 +222,7 @@ CLAIMED CONDITION: {condition}
 CLAIM TYPE: {claim_type}
 WITNESS ROLE/RELATIONSHIP: {relationship}
 {credentials_block}
+{care_block}
 WITNESS OBSERVATIONS:
 <<<
 {observations}
@@ -247,7 +249,9 @@ observations. Never fabricate dates, events, or details. Where applicable to thi
 translate symptoms into concrete observable dangers (e.g., memory loss -> double-dosing risk, \
 stove left on) and make clear when the caregiver's help is necessary for safety, not merely \
 convenient. Include a before/after comparison and symptom progression whenever the observations \
-support them.
+support them. The record evidence is presented in chronological order — within the guide's \
+required sections, tell what was observed in that order (earliest first) so the statement \
+reads as a faithful progression of the condition over time, not a list of isolated incidents.
 
 When the witness holds a professional credential, apply the witness-specific scope rule \
 in the CREDENTIAL SCOPE section instead of the blanket lay-evidence restrictions in the \
@@ -276,6 +280,7 @@ WITNESS INFORMATION:
 - Witnessed the in-service event personally: {witnessed_event}
 
 {credentials_block}
+{care_block}
 WITNESS OBSERVATIONS:
 <<<
 {observations}
@@ -301,10 +306,11 @@ rubric and the topic checklist. Identify concrete fixes: vagueness, missing spec
 lay-competence violations, missing structure elements, ungrounded facts, or applicable topics \
 from the checklist that the draft fails to cover. Then return the IMPROVED full statement. \
 Where an applicable topic lacks any supplied material, insert a "[Witness to add: ...]" \
-placeholder rather than inventing content. When a witness scope rule is provided below, \
-keep every credential-based assertion within that scope — do not expand claims into \
-diagnoses, nexus opinions, or clinical interpretations the scope rule does not allow, and \
-strip any that exceed it."""
+placeholder rather than inventing content. Preserve the draft's chronological narrative \
+order (earliest events first) — do not reorder the events it recounts. When a witness scope \
+rule is provided below, keep every credential-based assertion within that scope — do not \
+expand claims into diagnoses, nexus opinions, or clinical interpretations the scope rule \
+does not allow, and strip any that exceed it."""
 
 REVIEW_USER = """Improve this draft statement. Preserve all bracketed placeholders \
 (including every [Confirm: ...] and [Witness to add: ...]) and all grounded facts; \
@@ -617,8 +623,14 @@ def _run_draft(
                         claim_type=sanitize_for_prompt(claim_type, max_chars=500),
                         relationship=sanitize_for_prompt(witness.get("relationship", "not specified"), max_chars=500),
                         credentials_block=witness_credentials_block(witness),
+                        care_block=care_observation_block(witness),
                         observations=sanitize_for_prompt(obs_for_prompt, max_chars=DRAFT_INTERNAL_MAX_CHARS),
-                        digest=sanitize_digest_text(result.digest.relevant_facts_text(grounding_query, max_facts=150), max_chars=120_000),
+                        # Chronological presentation: the drafting narrative
+                        # follows the records' timeline, not keyword order.
+                        digest=sanitize_digest_text(
+                            result.digest.relevant_facts_text(grounding_query, max_facts=150, sort_dates=True),
+                            max_chars=120_000,
+                        ),
                         checklist=load_knowledge("topic_checklist.md"),
                         guard_note=GUARD_NOTE,
                     ),
@@ -654,6 +666,7 @@ def _run_draft(
                         claim_type=sanitize_for_prompt(claim_type, max_chars=500),
                         witnessed_event=sanitize_for_prompt(witness.get("witnessed_event", "unknown"), max_chars=500),
                         credentials_block=witness_credentials_block(witness),
+                        care_block=care_observation_block(witness),
                         observations=sanitize_for_prompt(obs_for_prompt, max_chars=DRAFT_INTERNAL_MAX_CHARS),
                         grounding=_grounding_for_prompt(result.grounding),
                         digest_summary=sanitize_digest_text(result.digest.summary or "(no summary)", max_chars=20_000),

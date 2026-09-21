@@ -733,6 +733,41 @@ def extract_uploaded_documents(
     return documents, skipped
 
 
+def _page_limit_reason() -> str:
+    """The deployment-aware remedy sentence for a record-page-cap rejection.
+
+    Reads the environment at call time so a test (or an operator flipping
+    ``VA_LSE_ALLOW_LOCAL_PATHS``) changes the message without a restart.
+    """
+    import os
+
+    if os.getenv("VA_LSE_ALLOW_LOCAL_PATHS", "").strip() == "1":
+        return (
+            "To change this limit, set VA_LSE_MAX_RECORD_PAGES in your .env and restart."
+        )
+    return (
+        "This deployment is hosted, so the limit cannot be changed from the app. "
+        "For a record set this size, download and run the app locally — the local "
+        "tier keeps your records on your machine and has no fixed page cap "
+        "(see the project README; scripts/batch_draft.py handles very large "
+        "record sets there)."
+    )
+
+
+def page_limit_message(actual_pages: int, limit: int | None = None) -> str:
+    """One shared rejection for the record-page cap (hosted-aware).
+
+    The upload gate, the volume warning, and the run-time backstop all show
+    this, so a hosted user is always pointed at the local tier instead of an
+    operator environment variable they cannot touch.
+    """
+    limit_n = config.MAX_RECORD_PAGES if limit is None else limit
+    return (
+        f"Record set is {actual_pages:,} pages, over the limit of {limit_n:,} pages "
+        f"for this deployment — the run will be refused. {_page_limit_reason()}"
+    )
+
+
 def records_from_local_path(path: str) -> tuple[list[ExtractedDocument], list[str]]:
     """Read supported record files directly from a local file or folder path.
 

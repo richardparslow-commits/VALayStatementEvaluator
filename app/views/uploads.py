@@ -11,7 +11,7 @@ from typing import Any
 import streamlit as st
 
 from .. import config
-from ..documents import extract_uploaded_documents
+from ..documents import extract_uploaded_documents, page_limit_message
 from ..error_report import report_failure
 from ..logging_config import get_logger
 
@@ -170,11 +170,7 @@ def render_record_volume_warning(documents: list[Any], *, slot: str) -> None:
     except Exception:  # noqa: BLE001 - defensive: any doc shape
         total_pages = text_pages
     if total_pages > config.MAX_RECORD_PAGES:
-        st.error(
-            f"⚠️ This record set is {total_pages:,} pages, over the configured limit of "
-            f"{config.MAX_RECORD_PAGES:,}. The run will be refused — split the files or "
-            "raise VA_LSE_MAX_RECORD_PAGES."
-        )
+        st.error(f"⚠️ {page_limit_message(total_pages, config.MAX_RECORD_PAGES)}")
     elif total_pages > config.RECORD_SIZE_WARN_PAGES:
         st.warning(
             f"⚠️ Large record set ({total_pages:,} pages): the review will take a long time "

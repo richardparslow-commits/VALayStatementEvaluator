@@ -65,6 +65,7 @@ from .follow_up import (
 )
 
 from . import job_runner
+from .aa_form import collect_aa_answers, render_aa_intake_wizard
 from .ops import render_failure_detail
 from .shared import (
     FEATURE_ID,
@@ -179,6 +180,13 @@ def render_evaluate_tab() -> None:
 
     render_condition_selector_for_slot("eval")
 
+    # Optional structured A&A intake — the same 16-question wizard the Draft
+    # tab uses. Answers feed the recommendations phase: the model recommends
+    # the statement cover care observations the witness has already attested
+    # to, which is usually the highest-impact edit available.
+    st.subheader("Aid & Attendance intake (optional)")
+    render_aa_intake_wizard("eval")
+
     if job_runner.queue_mode_active():
         st.caption(
             f"⚙️ This run is processed by a background worker ({job_runner.queue_status_line()}). "
@@ -193,7 +201,7 @@ def render_evaluate_tab() -> None:
     if run:
         if not _validate_evaluate_inputs(statement_text, records):
             return
-        _run_evaluation_flow(statement_text, records)
+        _run_evaluation_flow(statement_text, records, collect_aa_answers("eval"))
 
     # A queued run outlives this browser session, so re-attach to one started
     # earlier (a reload mid-digest would otherwise look like nothing happened).
@@ -285,8 +293,14 @@ def _validate_evaluate_inputs(statement_text: str, records: list) -> bool:
 
 
 # -------------------------------------------------------------- run pipeline
-def _run_evaluation_flow(statement_text: str, records: list) -> None:
-    """Mint a run id, gate shutdown, run the pipeline, persist the result."""
+def _run_evaluation_flow(statement_text: str, records: list, witness: dict[str, str] | None = None) -> None:
+    """Mint a run id, gate shutdown, run the pipeline, persist the result.
+
+    *witness* carries the structured A&A intake answers (``aa_*`` keys); it
+    flows to the recommendations phase on both the in-process and queued
+    paths. ``None``/``{}`` keeps every prompt byte-identical to the
+    pre-intake pipeline.
+    """
     # Before anything is spent: a configuration whose every call is rejected is
     # detectable in one request. This is the only entry point into the pipeline, so
     # the queued path is covered too, and the worker never re-checks inside its own
@@ -294,7 +308,7 @@ def _run_evaluation_flow(statement_text: str, records: list) -> None:
     if not check_endpoint_gate("evaluation", log_action="evaluate"):
         return
     if job_runner.queue_mode_active():
-        _run_evaluation_queued(statement_text, records)
+        _run_evaluation_queued(statement_text, records, witness or {})
         return
     rid = new_run_request_id()
     llm = get_llm()
@@ -349,6 +363,7 @@ def _run_evaluation_flow(statement_text: str, records: list) -> None:
             append_follow_up_answers(statement_text.strip(), slot="eval"),
             records,
             progress=update,
+            witness=witness or {},
         )
     except MemoryError as mem_exc:
         bar.empty()
@@ -548,7 +563,9 @@ def _run_evaluation_flow(statement_text: str, records: list) -> None:
 
 
 # ------------------------------------------------------------------ results UI
-def _run_evaluation_queued(statement_text: str, records: list) -> None:
+def _run_evaluation_queued(
+    statement_text: str, records: list, witness: dict[str, str] | None = None
+) -> None:
     """Submit the run to a worker and wait for its result (Pattern C).
 
     No audit start is emitted here: the worker writes the start/ok/error pair so
@@ -579,6 +596,7 @@ def _run_evaluation_queued(statement_text: str, records: list) -> None:
             records=records,
             request_id=rid,
             record_sources=_sources,
+            witness=dict(witness or {}),
         ),
         request_id=rid,
         condition=_condition,
