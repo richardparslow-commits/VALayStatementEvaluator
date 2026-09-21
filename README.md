@@ -1390,7 +1390,11 @@ Typical causes now surface as distinct log categories:
   `VA_LSE_LLM_CALL_TIMEOUT_SECONDS`
 - `error_kind=upstream_error` with `retryable=true` — transient upstream/network/rate-limit style
   failure; retry after a short delay
-- `error_kind=parse_error` — the model returned invalid JSON for a structured drafting step
+- `error_kind=parse_error` — the model returned invalid JSON for a structured drafting step.
+  `chat_json` re-asks once with a strict JSON-only nudge before giving up (skipped when the
+  first response is too large to re-send — above ~25k chars — so a huge payload still fails
+  fast); only a second consecutive unparseable response raises `LLMParseError` and, in the
+  digest, drops that chunk as before
 - `error_kind=payload_too_large` / `payload_invalid` — shorten the observations or fix malformed
   witness/claim fields before retrying
 - `error_kind=config_error` — check `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `LLM_MODEL_MAIN`,

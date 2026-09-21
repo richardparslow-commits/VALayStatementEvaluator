@@ -751,7 +751,14 @@ class LLMTimeoutError(LLMUpstreamError):
 
 
 class LLMParseError(LLMError):
-    """Raised when the model response cannot be parsed into the expected format."""
+    """Raised when the model response cannot be parsed into the expected format.
+
+    The model's output is sampled stochastically — the identical prompt can yield
+    valid JSON on one call and unparseable text on the next (measured 2026-09-20:
+    5 of 149 digest chunks in one run) — so :meth:`LLMClient.chat_json` re-asks
+    once before raising. The failure stays logged with the raw shape for
+    diagnosis, and one re-ask cannot recurse.
+    """
 
 
 class _ModerationFilteredError(LLMUpstreamError):
@@ -1441,6 +1448,20 @@ class LLMClient:
                 limiter.release()
 
     # ------------------------------------------------------------------ json
+
+    #: Upper bound on the first response that may be re-asked. A small response
+    #: that fails to parse is sampling noise; a ~16k-character one is more often
+    #: the model writing an essay — and re-asking with the full user payload
+    #: doubles the spend on a call that is likely to miss again. Above the cap the
+    #: original fail-fast behavior stands (a digest chunk is dropped, the run
+    #: proceeds — that policy is unchanged).
+    JSON_REASK_MAX_CHARS = 8_000
+
+    #: One bounded re-ask: stochastically malformed output is worth a second
+    #: chance; identical input is not worth a third (the moderation-nudge precedent:
+    #: one attempt, then surface the failure).
+    JSON_REASK_ATTEMPTS = 1
+
     def chat_json(
         self,
         system: str,
@@ -1451,9 +1472,21 @@ class LLMClient:
         max_tokens: int = 8000,
         phase: str = "general",
     ) -> Any:
-        """Chat completion that must return a JSON document; parses it."""
+        """Chat completion that must return a JSON document; parses it.
+
+        When the first response cannot be parsed, the call is retried once with a
+        repair instruction appended — malformed JSON is a *stochastic* model
+        failure (the same prompt yields valid JSON on most calls), so a second
+        draw usually recovers a chunk that would otherwise be dropped from the
+        run's evidence. Every :meth:`chat` call inside goes through the usual
+        retry/breaker/cancellation machinery, and the re-ask is bounded: after
+        one retry the original :class:`LLMParseError` is raised unchanged, and
+        responses above ``JSON_REASK_MAX_CHARS`` are not re-asked at all (a
+        16k-character essay is more likely a wrong output mode than noise).
+        """
+        json_system = system + "\n\nRespond with ONLY valid JSON — no markdown fences, no commentary."
         text = self.chat(
-            system + "\n\nRespond with ONLY valid JSON — no markdown fences, no commentary.",
+            json_system,
             user,
             model=model,
             temperature=temperature,
@@ -1463,9 +1496,37 @@ class LLMClient:
         try:
             return _parse_json(text)
         except LLMParseError as exc:
-            raise LLMParseError(
+            failure = LLMParseError(
                 f"Could not parse JSON for phase '{phase}' (response chars={len(text)})."
-            ) from exc
+            )
+            if (
+                self.JSON_REASK_ATTEMPTS <= 0
+                or len(text) > self.JSON_REASK_MAX_CHARS
+            ):
+                raise failure from exc
+            logger.warning(
+                "json parse failed — one re-ask before giving up phase=%s chars=%d",
+                phase,
+                len(text),
+                extra={"phase": phase, "status": "retry"},
+            )
+            reask_system = json_system + (
+                "\n\nYour previous response was not valid JSON. Return ONLY the JSON "
+                "document — no prose, no markdown fences, no trailing commentary — "
+                "matching the structure asked for."
+            )
+            retry_text = self.chat(
+                reask_system,
+                user,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                phase=phase,
+            )
+            try:
+                return _parse_json(retry_text)
+            except LLMParseError as retry_exc:
+                raise failure from retry_exc
 
 
 def _parse_json(text: str) -> Any:
