@@ -25,6 +25,7 @@ from app.llm import (  # noqa: E402
     MODERATION_NUDGE_MAX_USER_CHARS,
     LLMClient,
     LLMError,
+    LLMParseError,
     LLMTimeoutError,
     LLMUpstreamError,
     _is_moderation_filtered,
@@ -51,6 +52,148 @@ class _ProviderError(Exception):
         if status_code is not None:
             self.status_code = status_code
         self.response = MagicMock(status_code=status_code)
+
+
+class TestChatJsonReask(unittest.TestCase):
+    """One unparseable JSON response must not permanently drop a chunk.
+
+    Model output is sampled stochastically — measured 2026-09-20, 5 of 149 digest
+    chunks in one run returned ~16k characters the JSON parser rejected while the
+    same prompt parsed on retry. ``chat_json`` therefore re-asks once with a
+    repair instruction before raising: bounded, logged, cancellation-aware (the
+    re-ask goes through the ordinary ``chat`` path), and skipped entirely for
+    oversized first responses where a second full-payload call is more likely to
+    miss again than to recover.
+    """
+
+    def setUp(self) -> None:
+        reset_all_for_tests()
+        self.addCleanup(reset_all_for_tests)
+
+    def _client(self, responses: list[str]) -> LLMClient:
+        """A client whose ``chat`` pops scripted responses in order."""
+        client = LLMClient(_FakeSettings())  # type: ignore[arg-type]
+        script = iter(responses)
+        chat_mock = MagicMock(side_effect=lambda *a, **k: next(script))
+        client.chat = chat_mock  # type: ignore[method-assign]
+        return client
+
+    def test_a_malformed_response_is_recovered_by_one_reask(self) -> None:
+        client = self._client(
+            ["Here is the analysis you asked for, in prose, not JSON.", '{"ok": true}']
+        )
+        self.assertEqual(client.chat_json("sys", "user", phase="records:digest"), {"ok": True})
+        self.assertEqual(client.chat.call_count, 2)
+
+    def test_the_reask_carries_a_repair_instruction(self) -> None:
+        client = self._client(["garbage", "[]"])
+        client.chat_json("sys", "user")
+        second_system = client.chat.call_args_list[1][0][0]
+        self.assertIn("not valid JSON", second_system)
+        self.assertIn("ONLY", second_system)
+
+    def test_two_bad_responses_raise_with_the_original_message(self) -> None:
+        client = self._client(["garbage one", "garbage two"])
+        with self.assertRaises(LLMParseError) as ctx:
+            client.chat_json("sys", "user", phase="grounding")
+        self.assertIn("phase 'grounding'", str(ctx.exception))
+        self.assertEqual(client.chat.call_count, 2, "bounded: exactly one re-ask")
+
+    def test_an_oversized_response_is_not_reasked(self) -> None:
+        """A ~16k-character essay is a wrong output mode, not sampling noise."""
+        big_garbage = "x" * (LLMClient.JSON_REASK_MAX_CHARS + 1)
+        client = self._client([big_garbage, "should never be consumed"])
+        with self.assertRaises(LLMParseError):
+            client.chat_json("sys", "user")
+        self.assertEqual(client.chat.call_count, 1)
+
+    def test_a_response_at_the_cap_is_reasked(self) -> None:
+        at_cap = "x" * LLMClient.JSON_REASK_MAX_CHARS
+        client = self._client([at_cap, '{"ok": 1}'])
+        self.assertEqual(client.chat_json("sys", "user"), {"ok": 1})
+
+    def test_valid_json_on_the_first_try_is_not_reasked(self) -> None:
+        client = self._client(['{"ok": true}'])
+        self.assertEqual(client.chat_json("sys", "user"), {"ok": True})
+        self.assertEqual(client.chat.call_count, 1)
+
+    def test_the_reask_flows_through_the_real_chat_path(self) -> None:
+        """The re-ask must observe cancellation and the breaker like any other call.
+
+        Proven against the *real* ``chat`` machinery: the first provider response is
+        unparseable prose, the second is valid JSON — and no stubbing of ``chat``
+        itself, so the re-ask demonstrably passes through retries, the limiter and
+        the breaker.
+        """
+        client = LLMClient(_FakeSettings())  # type: ignore[arg-type]
+        responses = iter(["prose, not json", "[1, 2]"])
+        create_mock = MagicMock(
+            side_effect=lambda **kwargs: MagicMock(
+                choices=[MagicMock(message=MagicMock(content=next(responses)))],
+                usage=MagicMock(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+            )
+        )
+        client._client.chat.completions.create = create_mock  # type: ignore[attr-defined]
+        self.assertEqual(client.chat_json("sys", "user"), [1, 2])
+        self.assertEqual(create_mock.call_count, 2)
+
+
+class TestDigestSurvivesOneBadChunk(unittest.TestCase):
+    """End to end through the digest worker: a parse-blip chunk is recovered."""
+
+    def test_the_chunk_that_once_died_now_parses_on_the_reask(self) -> None:
+        import json as _json
+        from unittest.mock import MagicMock as _MagicMock
+
+        from tests.test_core import FakeLLM
+        from app.documents import extract_document
+        from app.medical_review import review_medical_records
+
+        payload = {
+            "facts": [
+                {
+                    "date": "2020-01",
+                    "type": "symptom",
+                    "description": "EVT one knee pain noted.",
+                    "source": "",
+                    "quote": "EVT one knee pain noted.",
+                }
+            ],
+            "conditions_mentioned": ["knee pain"],
+            "providers_and_facilities": [],
+            "notes": "",
+        }
+
+        class ParseBlipLLM(FakeLLM):
+            """FakeLLM, but the first digest chunk runs through a *real* client
+
+            whose provider responses are scripted: prose first (the measured
+            failure), valid JSON second — so the production re-ask path, not a
+            stub of it, is what recovers the chunk.
+            """
+
+            def __init__(self) -> None:
+                super().__init__()
+                self._blipped = False
+                self._real = LLMClient(_FakeSettings())
+                responses = iter(["prose essay, no json here", _json.dumps(payload)])
+                self._real.chat = _MagicMock(side_effect=lambda *a, **k: next(responses))
+
+            def chat_json(self, system, user, **kwargs):
+                if "CHUNK TEXT" in user and not self._blipped:
+                    self._blipped = True
+                    return self._real.chat_json(system, user, **kwargs)
+                return super().chat_json(system, user, **kwargs)
+
+        llm = ParseBlipLLM()
+        doc = extract_document("a.txt", b"EVT one knee pain noted.")
+        digest = review_medical_records(llm, [doc])
+        self.assertEqual(digest.pages_reviewed, 1)
+        self.assertEqual(llm._real.chat.call_count, 2, "the blip forced exactly one re-ask")
+        self.assertTrue(
+            any("knee pain" in f.description for f in digest.facts),
+            "the chunk's facts must survive in the digest",
+        )
 
 
 def _client_with_create_raises(exc: Exception) -> tuple[LLMClient, MagicMock]:
