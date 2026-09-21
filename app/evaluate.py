@@ -19,7 +19,7 @@ from .documents import (
     MAX_STATEMENT_CHARS,
 )
 from .exporter import parse_source
-from .llm import LLMClient, LLMError, LLMParseError
+from .llm import LLMClient, LLMError, LLMParseError, LLMService
 from . import tracing
 from .logging_config import PhaseTimer, get_request_id
 from .profiler import phase_timer
@@ -403,7 +403,7 @@ DIMENSION_LABELS = {
 
 
 def run_evaluation(
-    llm: LLMClient,
+    llm: LLMService,
     statement_text: str,
     records: list[ExtractedDocument],
     progress: ProgressCallback | None = None,
@@ -552,7 +552,7 @@ def _pages_to_source(records: list[ExtractedDocument]) -> list[dict]:
 
 
 def _run_evaluation(
-    llm: LLMClient,
+    llm: LLMService,
     statement_text: str,
     records: list[ExtractedDocument],
     progress: ProgressCallback | None,
@@ -703,7 +703,7 @@ def _citation_index_snapshot() -> list[dict[str, str]]:
 
 
 def _analyze_topics(
-    llm: LLMClient,
+    llm: LLMService,
     result: EvaluationResult,
     statement_text: str,
     report: ProgressCallback,
@@ -744,7 +744,7 @@ def _analyze_topics(
 
 
 def _draft_revision(
-    llm: LLMClient,
+    llm: LLMService,
     result: EvaluationResult,
     statement_text: str,
     report: ProgressCallback,
@@ -802,7 +802,7 @@ def _draft_revision(
 
 
 def _verify_claims(
-    llm: LLMClient,
+    llm: LLMService,
     claims: list[dict],
     digest: MedicalDigest,
     records: list[ExtractedDocument],
@@ -1272,7 +1272,9 @@ def _pad_recommendations(items: list[dict], result: "EvaluationResult", minimum:
     return items
 
 
-def generate_improvement_recommendations(result: "EvaluationResult", llm: LLMClient) -> list[dict]:
+def generate_improvement_recommendations(
+    result: "EvaluationResult", llm: LLMService,
+) -> list[dict]:
     """Generate 3-5 ranked improvement recommendations via exactly one LLM call.
 
     Each item has ``title``, ``impact``, and ``explanation`` (plus an
@@ -1306,7 +1308,7 @@ def generate_improvement_recommendations(result: "EvaluationResult", llm: LLMCli
     return items[:5]
 
 
-def _score_and_recommend(llm: LLMClient, result: "EvaluationResult", report: ProgressCallback) -> None:
+def _score_and_recommend(llm: LLMService, result: "EvaluationResult", report: ProgressCallback) -> None:
     """Compute the effectiveness score and improvement recommendations.
 
     Telemetry call sites for the Statement Effectiveness Score & Improvement

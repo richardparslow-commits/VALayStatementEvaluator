@@ -70,6 +70,8 @@ def _fake_digest() -> MedicalDigest:
 class _FakeLLM:
     """Deterministic stub; dispatch on phase. Accepts per-phase overrides."""
 
+    fast_model = "fake-fast"
+
     def __init__(self, overrides: dict | None = None):
         self._settings = MagicMock(model_fast="fake-fast", model_main="fake-main")
         self.overrides = overrides or {}

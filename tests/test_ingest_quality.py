@@ -538,6 +538,8 @@ class TestDateHygiene(unittest.TestCase):
 class _StubLLM:
     """Minimal LLMClient surface used by ``_llm_infer_undated``."""
 
+    fast_model = "fast-model"
+
     def __init__(self, responses: list[object]) -> None:
         self.responses = list(responses)
         self.calls: list[dict] = []

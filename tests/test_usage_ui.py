@@ -35,6 +35,8 @@ class _FakeSettings:
 class _FakeLLM:
     """Stub LLMClient that returns minimal valid pipeline results."""
 
+    fast_model = "fake-fast"
+
     def __init__(self) -> None:
         self._settings = _FakeSettings()
         self.usage = UsageTracker()

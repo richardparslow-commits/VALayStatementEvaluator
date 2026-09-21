@@ -15,6 +15,8 @@ from app.medical_review import MedicalDigest, MedicalFact, _merge_facts, review_
 
 
 class _EvidenceLLM:
+    fast_model = "fake-fast"
+
     def __init__(self, facts, *, lossy_merge=False):
         self._settings = SimpleNamespace(model_fast="fake-fast", model_main="fake-main")
         self.facts = facts

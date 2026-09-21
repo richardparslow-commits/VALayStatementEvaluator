@@ -151,6 +151,8 @@ class TestPromptTemplatesGuardNote(unittest.TestCase):
     def _llm(self):
         # lightweight stub; chat_json/chat return JSON/text and record prompts
         class _Fake:
+            fast_model = "fake-fast"
+
             def __init__(self):
                 self.calls: list[tuple[str, str, str]] = []
 

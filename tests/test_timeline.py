@@ -26,6 +26,8 @@ from app.medical_review import (  # noqa: E402
 class _FakeLLM:
     """Deterministic stub for the undated-date-inference LLM call."""
 
+    fast_model = "fake-fast"
+
     def __init__(self, response: dict | Exception | None = None):
         self._settings = MagicMock(model_fast="fake-fast")
         self._response = response

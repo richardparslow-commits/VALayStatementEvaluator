@@ -325,8 +325,24 @@ def load_settings() -> Settings:
     # Resolved first because the Perplexity key decision below depends on which
     # endpoint the app is actually pointed at.
     base_url = _setting("OPENAI_BASE_URL", DEFAULT_BASE_URL, from_secrets)
+    # Provider-neutral aliases (``LLM_PROVIDER_URL`` / ``LLM_API_KEY``). The
+    # canonical names stay ``OPENAI_*``: every deployment guide, .env.example,
+    # and existing install spells them that way. The aliases exist so the
+    # future BAA-covered hosted tier can be provisioned with the generic
+    # names a platform engineer would naturally reach for, without a config
+    # diff counting as a code change. Precedence: the explicit canonical name
+    # beats its alias (same value under both is the common case and is fine).
+    alias_url = _setting("LLM_PROVIDER_URL", "", from_secrets)
+    if not _setting("OPENAI_BASE_URL", "", from_secrets) and alias_url:
+        base_url = alias_url
+    from_secrets.discard("LLM_PROVIDER_URL")  # provenance tracks the effective name only
+    key_env = _setting("OPENAI_API_KEY", "", from_secrets)
+    alias_key = _setting("LLM_API_KEY", "", from_secrets)
+    if not key_env and alias_key:
+        key_env = alias_key
+    from_secrets.discard("LLM_API_KEY")
     return Settings(
-        api_key=_setting("OPENAI_API_KEY", "", from_secrets),
+        api_key=key_env,
         base_url=base_url,
         model_main=_setting("LLM_MODEL_MAIN", DEFAULT_MODEL_MAIN, from_secrets),
         model_fast=_setting("LLM_MODEL_FAST", DEFAULT_MODEL_FAST, from_secrets),
@@ -348,7 +364,7 @@ def load_settings() -> Settings:
         ),
         # Perplexity Agent API (optional). An empty key leaves the research tab
         # in its "how to enable" state rather than failing at call time.
-        perplexity_api_key=_perplexity_api_key_setting(base_url, from_secrets),
+        perplexity_api_key=_perplexity_api_key_setting(base_url, key_env, from_secrets),
         perplexity_preset=_perplexity_preset_setting(from_secrets),
         perplexity_model=_setting("PERPLEXITY_MODEL", "", from_secrets),
         perplexity_max_output_tokens=_positive_int_env(
@@ -366,14 +382,18 @@ def load_settings() -> Settings:
     )
 
 
-def _perplexity_api_key_setting(base_url: str, from_secrets: set[str]) -> str:
-    """Resolve the Agent API key, aliasing ``OPENAI_API_KEY`` when the primary is Perplexity.
+def _perplexity_api_key_setting(
+    base_url: str, primary_key: str, from_secrets: set[str]
+) -> str:
+    """Resolve the Agent API key, aliasing the primary key when the primary is Perplexity.
 
     One Perplexity API key serves both the main endpoint (Responses/Chat, set as
-    ``OPENAI_API_KEY``) and the Agent API (web-grounded research), and the default base URL
-    is now Perplexity's. Requiring the *same* string under a second variable would leave a
-    correctly configured install reporting "research is not configured" — so when, and only
-    when, the configured endpoint is Perplexity's, the primary key is reused.
+    ``OPENAI_API_KEY`` — or its ``LLM_API_KEY`` alias, already resolved into
+    ``primary_key`` by the caller) and the Agent API (web-grounded research), and the
+    default base URL is now Perplexity's. Requiring the *same* string under a second
+    variable would leave a correctly configured install reporting "research is not
+    configured" — so when, and only when, the configured endpoint is Perplexity's, the
+    primary key is reused.
 
     The condition is the point. Under any other primary (QwenCloud, OpenAI, Ollama) the
     primary key is a credential for a *different* provider, and forwarding it to
@@ -385,7 +405,7 @@ def _perplexity_api_key_setting(base_url: str, from_secrets: set[str]) -> str:
         return explicit
     if PERPLEXITY_HOST not in base_url:
         return ""
-    return _setting("OPENAI_API_KEY", "", from_secrets)
+    return primary_key
 
 
 def _perplexity_preset_setting(from_secrets: set[str]) -> str:

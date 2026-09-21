@@ -144,7 +144,13 @@ def session_settings() -> Any:
 
 
 def get_llm() -> LLMClient | None:
-    """Build the session's LLMClient, or show the reason and return None."""
+    """Build the session's LLMClient, or show the reason and return None.
+
+    Returns the concrete client (the view layer is the usage-reporting
+    consumer); the *pipeline* it is handed to is typed against the
+    :class:`~app.llm.LLMService` boundary, which is what keeps the backend
+    swappable.
+    """
     rid = st.session_state.get(REQUEST_ID_KEY, "") or get_request_id() or "-"
     settings = session_settings()
     if not settings.configured:

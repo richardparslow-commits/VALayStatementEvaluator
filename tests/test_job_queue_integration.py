@@ -86,6 +86,8 @@ class _FakeUpstashHandler(BaseHTTPRequestHandler):
 class _UsageStub:
     """Minimal pipeline stub: records usage and answers every phase."""
 
+    fast_model = "fake-fast"
+
     def __init__(self) -> None:
         self._settings = MagicMock(model_fast="fake-fast", model_main="fake-main")
         self.usage = UsageTracker()
