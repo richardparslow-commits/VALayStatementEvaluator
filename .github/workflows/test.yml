@@ -423,6 +423,72 @@ jobs:
       - name: Run live smoke test (Evaluate + Draft)
         run: python scripts/smoke_test.py all
 
+  # Gate for the live research job below. Same shape and same reason as
+  # live-credentials: a job-level `if` cannot read the secrets context, and reading it
+  # there invalidates the whole workflow file.
+  perplexity-credentials:
+    name: Check for a Perplexity key
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    outputs:
+      present: ${{ steps.check.outputs.present }}
+    steps:
+      - name: Is a Perplexity API key configured?
+        id: check
+        env:
+          HAS_PPLX: ${{ secrets.PERPLEXITY_API != '' }}
+        run: |
+          echo "present=$HAS_PPLX" >> "$GITHUB_OUTPUT"
+          if [ "$HAS_PPLX" != "true" ]; then
+            echo "PERPLEXITY_API is not set — skipping the live Agent API test."
+          fi
+
+  # The Agent API half of the app, which the smoke job above does not reach:
+  # ``scripts/smoke_test.py`` drives Evaluate and Draft, while the Research tab and the
+  # framework-currency check go through ``app/perplexity_agent.py``. Those have only ever
+  # been exercised against an ``httpx.MockTransport`` — and a mock pins this repository's
+  # *request* shape, not that a real ``pplx-`` key is accepted by api.perplexity.ai, that
+  # the web_search tool actually runs for it, that a live response still carries
+  # ``search_results`` in the shape ``_collect_citations`` reads, or that the configured
+  # preset resolves to a model the account may call. ``tests/test_perplexity_live.py``
+  # runs the app's own ``research()`` against the real API, so this job is what turns
+  # those four assumptions into checks.
+  #
+  # Dispatch-only and skipped without a key, exactly like the smoke job: the Agent API is
+  # billed per model token AND per tool invocation, so running it on a push would spend
+  # credits to learn nothing about this repository's diff. The key is handed over under
+  # the ``VA_LSE_TEST_*`` prefix (``tests/hermetic.py`` strips ambient ``VA_LSE_*``
+  # configuration but keeps that prefix as the runner's sanctioned opt-in), and the
+  # module is written never to print, log, or embed it in a failure message.
+  perplexity-live:
+    name: Live Perplexity Agent API test
+    needs: perplexity-credentials
+    if: ${{ needs.perplexity-credentials.outputs.present == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements.lock
+
+      # The lock alone: the Perplexity SDK is in the core set (``requirements.txt``),
+      # so this job needs none of the dev extras the offline suite installs.
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --require-hashes -r requirements.lock
+
+      - name: Run the live Agent API test
+        env:
+          VA_LSE_TEST_PERPLEXITY_KEY: ${{ secrets.PERPLEXITY_API }}
+        run: python -m unittest tests.test_perplexity_live -v
+
   # The sandbox stage is the one build artifact nothing else here exercises.
   # tests/test_sandbox_image.py asserts the Dockerfile as *text* and the offline suite
   # fakes the Sandbox CLI, so a base image — or an apt/pip resolution the stage can no

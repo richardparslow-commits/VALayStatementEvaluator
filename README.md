@@ -25,23 +25,11 @@ A Streamlit application that performs **exhaustive medical-record review** to:
 - Competent lay evidence: 38 C.F.R. § 3.159(a)(2); *Jandreau v. Nicholson*, 492 F.3d 1372 (Fed. Cir. 2007)
 - Benefit of the doubt: 38 U.S.C. § 5107(b); *Gilbert v. Derwinski*
 - Combat presumption & duty to consider all lay evidence: 38 U.S.C. § 1154(a); *Buchanan v. Nicholson*, 451 F.3d 1331
-- Absence from records ≠ negative evidence: *Buczynski v. Shinseki*; *Horn v. Shinseki*; M21-1 V.ii.1.A
-- Lay competence for readily observable conditions: *Barr v. Nicholson*; *Jandreau v. Nicholson*
-- Basis of knowledge: a witness is competent to what they personally experienced or observed, so
-  a secondhand account is evidence of what was said rather than proof of the inner state —
-  38 U.S.C. § 1154(a); 38 C.F.R. § 3.159(a)(2)
+- Absence from records ≠ negative evidence: *Barr v. Nicholson*; *Buczynski v. Shinseki*
 - Nexus lay competence limits: *Layno v. Brown*; *Kahana v. Shinseki*; *Davidson v. Shinseki*
 
 Key design rule: a claim absent from the records is reported as **NOT FOUND**, never as
-contradicted, and a **CONTRADICTED** verdict must name the record entry it conflicts with —
-verification downgrades an uncited contradiction to a record-coverage gap rather than show a
-veteran a conflict no record makes.
-
-Second design rule: every claim is recorded with its **basis of knowledge** (`experienced`,
-`observed`, `reported`, `provider_statement`, `conclusion`). The verifier, the rubric and the
-rewrite all see how the witness knows the fact, and a **NOT FOUND** claim is rewritten in the
-witness's own voice — attributed, never hedged, and never promoted into a diagnosis, cause or
-rating the records did not supply.
+contradicted; only an explicit record conflict is **CONTRADICTED**.
 
 ## Architecture
 
@@ -65,7 +53,7 @@ app/
   draft.py                Grounding + topic coverage -> draft -> self-review pipeline
   condition_selector.py   Claimed-condition selector: body-system radio buttons + searchable
                           condition dropdown -> auto pre-selects relevant topics from the
-                          15-topic checklist; A&A/SMC-L toggle forces topics B, C, E, J
+                          12-topic checklist; A&A/SMC-L toggle forces topics B, C, E, J
   condition_topics.json   Body-system -> condition -> topic-checklist mapping (34 conditions)
   agiloop_telemetry.py    Agiloop Inspect telemetry client (impression/interaction/error/goal)
   job_queue.py            Distributed job queue (Redis / Upstash REST / in-process) for Pattern C
@@ -93,8 +81,6 @@ scripts/
                           Read one staged file on a Vercel Sandbox and print the
                           report JSON — the VA_LSE_EXTRACTOR_RUNNER command for
                           VA_LSE_EXTRACTOR=sandbox (see *Scanned pages and OCR*)
-  check_sandbox.py        Would a box be reached from this host? One verdict — runner
-                          line, CLI, credential, scope — and it creates no box
   va_records_download.py  Walk VA.gov's records-download wizard locally (you sign
                           in); writes a provenance manifest beside the PDF
 tests/                    Offline unit tests (no API key required)
@@ -210,8 +196,8 @@ installs on macOS and Linux CI.
 | `LLM_MODEL_MAIN_FALLBACK` / `LLM_MODEL_FAST_FALLBACK` | The fallback provider's model names for the two roles | primary models |
 | `LLM_ENDPOINT_FALLBACK_TIMEOUT_SECONDS` | How long the primary must fail before failover engages (a grace period, not an HTTP timeout) | `300` |
 | `VA_LSE_MAX_RECORD_PAGES` | Max total pages across uploaded record files; over the limit the app refuses the run and points hosted deployments at the local tier, while a local run (`VA_LSE_ALLOW_LOCAL_PATHS=1`) is told to raise this setting | `5000` |
-| `VA_LSE_EXTRACTOR` | Where record text is read: `in-process` (this app's reader) or `sandbox` (the box, which can OCR a scan). Reported by `GET /health → extractor` and in the sidebar, together with any files that had to fall back | `in-process` |
-| `VA_LSE_EXTRACTOR_RUNNER` | Command that runs `scripts/ocr_and_extract.py` in the box, with `{work}` for the staged directory; stdout must end with its report JSON. `python scripts/vercel_sandbox_runner.py {work}` drives a Vercel Sandbox (see *Scanned pages and OCR*); a first word naming a Python interpreter the host lacks — a bare `python`/`python3` or a venv path that is gone — is resolved to the interpreter running the app, and logged | (empty = in-process) |
+| `VA_LSE_EXTRACTOR` | Where record text is read: `in-process` (this app's reader) or `sandbox` (the box, which can OCR a scan) | `in-process` |
+| `VA_LSE_EXTRACTOR_RUNNER` | Command that runs `scripts/ocr_and_extract.py` in the box, with `{work}` for the staged directory; stdout must end with its report JSON. `python scripts/vercel_sandbox_runner.py {work}` drives a Vercel Sandbox (see *Scanned pages and OCR*) | (empty = in-process) |
 | `VA_LSE_EXTRACTOR_TIMEOUT_SECONDS` | Ceiling for one file's box work (never past the run's own budget) | `900` |
 | `VA_LSE_JOB_QUEUE` | Run Evaluate/Draft on worker pods instead of in-process (Pattern C) | `0` |
 | `VA_LSE_REDIS_URL` | Redis backend for the job queue | (empty) |
@@ -237,10 +223,8 @@ installs on macOS and Linux CI.
 | `VA_LSE_RUN_LOG_BACKUPS` | Rotated run logs kept | `5` |
 | `VA_LSE_DISK_MIN_FREE_BYTES` | Log-volume floor reported by `/health → disk` | `268435456` |
 | `VA_LSE_RECORDS_CONCURRENCY` | Parallel chunk-digest workers | `2` (Lite plan fits 1–2 concurrent agents) |
-| `VA_LSE_LLM_MIN_INTERVAL_SECONDS` | Minimum spacing between LLM call starts — paces requests so 429s are prevented, not retried; `0` disables | `0` |
-| `VA_LSE_LLM_MAX_RPM` | Alternative spacing knob: derives the interval as 60/RPM; the stricter of the two wins, `0` disables | `0` |
 | `VA_LSE_MAX_DIGEST_FACTS` | Default JSON prompt-view limit and maximum relevance-selected facts per prompt; does not cap stored evidence | `1500` |
-| `VA_LSE_DIGEST_CHUNK_CHARS` | Characters per record chunk; clamped to `1600`–`100000` (at or below the 400-char overlap a chunk would advance one character at a time) | `8000` |
+| `VA_LSE_DIGEST_CHUNK_CHARS` | Characters per record chunk | `8000` |
 | `VA_LSE_DOCX_MAX_INTERNAL_FILE_BYTES` | Max uncompressed bytes allowed for a single DOCX internal file | `52428800` |
 | `VA_LSE_DOCX_MAX_TOTAL_UNCOMPRESSED_BYTES` | Max total uncompressed bytes allowed across all DOCX internal files | `209715200` |
 | `VA_LSE_DOCX_MAX_INTERNAL_FILE_COUNT` | Max number of internal files allowed in a DOCX archive | `10000` |
@@ -488,7 +472,7 @@ restart correctly.
      rejected to prevent decompression-bomb memory exhaustion.
 3. Pick the **claimed condition**: choose a body system (radio buttons), then search and
    select one or more conditions from the filtered dropdown. The app automatically
-   pre-selects the relevant 15-topic-checklist topics (union across all selected
+   pre-selects the relevant 12-topic-checklist topics (union across all selected
    conditions); toggle **Aid & Attendance / SMC-L** to force topics B, C, E, and J as
    mandatory. Adjust the pre-selection freely, then click **Proceed**.
 4. Click **Run exhaustive evaluation** — watch chunked record review, claim verification,
@@ -656,10 +640,7 @@ folder or the archive.
 
 Tuning: raise `VA_LSE_RECORDS_CONCURRENCY` if your endpoint allows more parallel
 requests; lower `VA_LSE_DIGEST_CHUNK_CHARS` for extra recall on very dense pages (at the
-cost of more LLM calls). The chunk budget is clamped to `1600`–`100000`: the 400-char
-overlap is carried from the previous chunk, so a budget at or below it would advance one
-character per chunk — one chunk per character of record text, which is how a typo'd
-`=8` (for `8000`) turns a large bundle into a memory-death run. `scripts/scale_sim.py` runs an offline 2,000-page simulation of
+cost of more LLM calls). `scripts/scale_sim.py` runs an offline 2,000-page simulation of
 the pipeline (no API calls) to verify orchestration at scale. Ingest quality is tunable too:
 `VA_LSE_DOCUMENT_BLOCK_CHARS`, `VA_LSE_PARAGRAPH_MAX_CHARS`, `VA_LSE_PDF_LAYOUT_EXTRACTION`,
 `VA_LSE_EVIDENCE_WEAK_OVERLAP`,
@@ -712,7 +693,6 @@ pip install --target /tmp/sl-dev --no-deps -U streamlit   # a developer's instal
 PYTHONPATH=/tmp/sl-dev python -m tests.devlayout          # …the same suite, run in it
 pip install -U streamlit && python -m unittest discover -s tests    # …on the newest Streamlit
 python -m mypy app                             # strict type check (see pyproject.toml)
-python scripts/check_sandbox.py                # can a box be reached from here? (creates nothing)
 python scripts/smoke_test.py all               # live end-to-end (needs valid .env)
 python scripts/live_draft_e2e.py                # one real Draft run against your endpoint
 python scripts/rehearse_failover.py --expect-idle   # is the failover path really armed?
@@ -813,7 +793,11 @@ All public helpers in `app/main.py`, `app/fetch_client.py`, `app/evaluate.py` ca
 > `OPENAI_API_KEY` or `PERPLEXITY_API` (a key created in the Perplexity console
 > under that name works as-is; the job maps it onto the app's primary-key
 > variable); the optional `OPENAI_BASE_URL`, `LLM_MODEL_MAIN`, and `LLM_MODEL_FAST` secrets override the endpoint and
-> models in that job if set (see `.env.example`). The sandbox image is built on every event
+> models in that job if set (see `.env.example`). A second dispatch-only job runs the live
+> **Agent API** test (`tests/test_perplexity_live.py`) under that same `PERPLEXITY_API` secret:
+> the smoke run above exercises Evaluate and Draft, so the Research tab and the
+> framework-currency check — which go through `app/perplexity_agent.py` — are only ever reached
+> there. The sandbox image is built on every event
 > (nothing pushed), and a manual dispatch builds and pushes it to Vercel Container Registry and
 > then reads a record on a real box — that job needs a `VERCEL_TOKEN` secret and skips itself
 > without one, exactly like the smoke test (`DEPLOYMENT.md` §6).
@@ -1016,27 +1000,9 @@ export VA_LSE_EXTRACTOR_RUNNER="python scripts/vercel_sandbox_runner.py {work}"
 export VA_LSE_SANDBOX_TOKEN=vcp_...   # a Vercel access token, or run `sandbox login` once
 ```
 
-The runner command is a subprocess, so its first word matters: on macOS there is `python3` and
-no `python`, and a virtualenv is not on `PATH` unless it is activated. A first word that names a
-Python interpreter this host does not have is resolved to the interpreter running the app,
-logged once — a bare spelling that is not on `PATH` (`python`, `python3`, `python3.x`, `py`) at
-INFO, and an interpreter *path* that is not on disk (a venv that was moved) at WARNING — so the
-line above works either way. Name an absolute path (`…/venv/bin/python`) to pin which Python
-runs the runner once you have one you trust.
-Check it before you rely on it, rather than reading the warning after a run:
-
-```bash
-.venv/bin/python scripts/check_sandbox.py          # exit 1 = a run would fall back in-process
-.venv/bin/python scripts/check_sandbox.py --json   # the same verdict, for a script
-```
-
-One verdict, and it creates no box: the runner line resolved the way a run resolves it, that
-command executed with `--check`, the Sandbox CLI on `PATH`, and one authenticated `sandbox list`
-for your scope and project. The one question it will not answer is whether the image is in the
-registry — the Sandbox CLI has no command that lists images — so it reports that as `unproven`
-and names both ways to settle it (`vercel vcr image ls <repo>`, or the opt-in live test that
-boots a real box). It reads `.env` the way the app does, so run it where the app runs.
-
+The runner command is a subprocess, so its first word has to exist: on macOS there is
+`python3` and no `python`, and a virtualenv is not on `PATH` unless it is activated — use an
+absolute interpreter path there, or every file falls back in-process with one warning.
 `scripts/vercel_sandbox_runner.py` also needs the Sandbox CLI (`npm i -g sandbox`) and the image
 pushed (`DEPLOYMENT.md` §6 has that build line, the image/timeout/team/project knobs, and what
 happens when a box is killed mid-file). Its credential is a Vercel **access token** (or a
@@ -1049,14 +1015,15 @@ itself can come from CI: on manual dispatch a job builds, pushes and then reads 
 on a real box, so nothing has to be built locally. Failure is fail-open by design: records are
 still read and the run still finishes.
 
-Two opt-in live tests cover the halves a fake cannot: `tests/test_ai_gateway_live.py` for the
-LLM endpoint (`VA_LSE_TEST_AI_GATEWAY_KEY`) and `tests/test_vercel_sandbox_live.py` for the box
-(`VA_LSE_TEST_VERCEL_SANDBOX_TOKEN`, plus the team/project and `VA_LSE_TEST_VERCEL_SANDBOX_CLI`
-if the CLI is not on `PATH`). The box module does not stop at the credential: it boots real
-boxes to read a staged record through the **app's own extractor**, to fail open when the box
-cannot run the entrypoint, and to OCR a *scanned* page this process refuses — that last one is
-what proves the pushed image really carries an OCR engine (`DEPLOYMENT.md` §6). Both skip
-without their variable, so CI is unaffected.
+Three opt-in live tests cover the halves a fake cannot: `tests/test_ai_gateway_live.py` for a
+generic LLM endpoint (`VA_LSE_TEST_AI_GATEWAY_KEY`), `tests/test_perplexity_live.py` for the
+**Agent API** — the Research tab and the framework-currency check, which the Evaluate/Draft
+smoke run never reaches (`VA_LSE_TEST_PERPLEXITY_KEY`) — and `tests/test_vercel_sandbox_live.py`
+for the box (`VA_LSE_TEST_VERCEL_SANDBOX_TOKEN`, plus the team/project and
+`VA_LSE_TEST_VERCEL_SANDBOX_CLI` if the CLI is not on `PATH`). All three skip without their
+variable, so ordinary CI is unaffected; the Agent API and the box each have a dispatch-only job
+that supplies it (`.github/workflows/test.yml` → `perplexity-live`, `sandbox-image-push`), and
+the gateway one is run locally against an account that has a key for it.
 
 `scripts/va_records_download.py` also inspects what it just downloaded — page count,
 text-vs-image balance, sha256 — prints a warning when the export is implausibly small or mostly
@@ -1071,7 +1038,7 @@ orchestrator-friendly probes on `$VA_LSE_HEALTH_HOST:$VA_LSE_HEALTH_PORT` (defau
 
 | Endpoint | Meaning | Status | Latency |
 |---|---|---|---|
-| `GET /health` | **Liveness** — the process is up | `200` with `{status:"ok", service, uptime_s}` plus `cache`, `job_queue`, `tracing`, `audit`, `audit_backup`, `disk`, `restore`, `llm_failover`, `extractor` | < 50 ms |
+| `GET /health` | **Liveness** — the process is up | `200` with `{status:"ok", service, uptime_s}` plus `cache`, `job_queue`, `tracing`, `audit`, `audit_backup`, `disk`, `restore` | < 50 ms |
 | `GET /ready` | **Readiness** — LLM endpoint + configured models are reachable (`GET {base_url}/models`) | `200` when ready, `503` when not (JSON always includes `ready` + `detail`) | < 2 s (probe timeout 1.4 s, cached 30 s) |
 | `GET /metrics` | **Prometheus** text format (v0.0.4) over the same payload — see [DEPLOYMENT.md §16](DEPLOYMENT.md#metrics-for-alerting-get-metrics) | `200`, `text/plain; version=0.0.4` | same as `/health` |
 | `HEAD /health`, `HEAD /ready`, `HEAD /metrics` | Same as GET but no body — for probes that use HEAD | same | same |
@@ -1084,21 +1051,7 @@ requests on the Upstash tier and one `LLEN` per kind on Redis, so `/health` repo
 because a reported `0` during an outage is worse than a missing series. Add `?probe=1` to
 `/health` or `/metrics` when you want that read performed.
 
-`/health → extractor` says which reader this process is using (`in-process` or `sandbox`), the
-runner command and timeout it was given, any configuration that cannot work, and how many files
-the box has already refused, with the last one's reason. That block exists because the sandbox
-mode fails *open*: a box that cannot be reached finishes the run with its scanned pages simply
-empty, so the one failure this app has that looks exactly like success is also the one worth
-reporting where you already look. It never makes `/health` unhealthy — records were read, just
-not there. The sidebar says the same thing, with the reader stated before an upload rather than
-after one, and `scripts/check_sandbox.py` answers the question a run cannot: whether a box would
-be reached from this host at all.
-
 ```bash
-# Which reader is this pod actually using?
-curl -s http://localhost:8001/health | python -c "import sys,json; print(json.load(sys.stdin)['extractor'])"
-# Which reader is this pod actually using?
-curl -s http://localhost:8001/health | python -c "import sys,json; print(json.load(sys.stdin)['extractor'])"
 # Local quick check
 curl -s http://localhost:8001/health | python -m json.tool
 curl -s -w "%{http_code}\n" http://localhost:8001/ready

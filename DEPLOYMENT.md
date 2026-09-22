@@ -1605,6 +1605,9 @@ names only take effect after clicking it (the sidebar warns while a change is pe
 - [ ] Perplexity SDK present in `requirements.txt` (makes the Research tab and the
       framework-currency check loadable on the platform); no `pip install` step is possible here
 - [ ] `PERPLEXITY_API_KEY` set if the base URL is *not* Perplexity's, or the Research tab is off
+- [ ] Live Agent API check run once against that key:
+      `VA_LSE_TEST_PERPLEXITY_KEY=… python -m unittest tests.test_perplexity_live` (the
+      dispatch-only `perplexity-live` CI job runs the same module)
 - [ ] App rebooted after editing secrets
 - [ ] Sidebar **Test connection** reports a real call answered on the deployed URL
 - [ ] Sidebar captions the values as `🔐 From Streamlit secrets:`
@@ -2317,3 +2320,7 @@ python scripts/rehearse_failover.py --expect-idle
 - [ ] `VA_LSE_AUDIT_ERROR_MESSAGES=0` if audit logs go to a third-party destination
 - [ ] The LLM failover drill has been run to completion ([§17](#17-llm-endpoint-failover-optional)) — an
       untested failover path fails on the day it is needed, not before
+- [ ] The live Agent API test has been run once against the deployed key
+      (`VA_LSE_TEST_PERPLEXITY_KEY=… python -m unittest tests.test_perplexity_live`) — the
+      offline tests fake the transport, so only this proves the key is accepted, the
+      `web_search` tool runs, and a live answer really carries citations
