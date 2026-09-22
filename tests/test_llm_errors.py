@@ -30,6 +30,7 @@ from app.llm import (  # noqa: E402
     LLMUpstreamError,
     _is_moderation_filtered,
     _is_transient_provider_error,
+    _is_transient_status,
     _moderation_nudge_user,
     _normalize_provider_error,
     _provider_status_code,
@@ -248,6 +249,17 @@ class TestNormalizeProviderError(unittest.TestCase):
         self.assertTrue(_is_transient_provider_error(_ProviderError("x", 429)))
         self.assertFalse(_is_transient_provider_error(_ProviderError("x", 401)))
         self.assertFalse(_is_transient_provider_error(_ProviderError("x", 404)))
+
+    def test_499_client_disconnected_is_retriable(self):
+        # 2026-09-22, req 8ed45557: a digest call died 166 s in with 499
+        # client_disconnected and was classified as deterministic — no retry,
+        # a ~20-chunk batch discarded, 3 files re-digested. A dropped
+        # connection is a transport event, not a property of the request;
+        # retrying the identical request plausibly succeeds.
+        self.assertTrue(_is_transient_status(499))
+        normalized = _normalize_provider_error(_ProviderError("Request canceled", 499))
+        self.assertIsInstance(normalized, LLMUpstreamError)
+        self.assertTrue(normalized.retriable, msg=str(normalized))
 
     def test_status_extraction(self):
         self.assertEqual(_provider_status_code(_ProviderError("x", 418)), 418)

@@ -8,6 +8,14 @@ Three guarantees, each with a reason to exist:
   makes the endpoint a *setting* — the future BAA-covered hosted tier is a
   configuration change, not a rewrite. Nothing stopped a view from
   ``import openai`` until now except discipline.
+* **Lazy SDK import.** Importing ``app.llm`` must not load the OpenAI SDK —
+  measured at ~32 MB of peak RSS on the import ladder (see
+  ``.freebuff/profile/_memprofile.py --ladder``: the ``import app.llm`` rung
+  dropped 103.2 -> 70.9 MB) — because every launch pays the floor while only
+  a run or failover actually needs the SDK. The SDK is resolved on first use
+  through :func:`app.llm._sdk_name` and the module ``__getattr__``; the
+  subprocess tests exist because other tests in this session may already
+  have loaded the SDK into their own process.
 * **Protocol conformance.** ``LLMService`` is the typed surface components
   consume. The concrete client satisfies it, and so must any replacement
   backend (brokered HIPAA service, batch API, local runner).
@@ -35,6 +43,7 @@ from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests
 from log_isolation import isolate_app_logs  # noqa: E402
 
 from app import config  # noqa: E402
+from app import llm as app_llm  # noqa: E402
 from app.llm import LLMClient, LLMService  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -75,6 +84,67 @@ class TestSdkIsolation(unittest.TestCase):
         """Positive control: the guard above must actually see the real import."""
         text = (PROJECT_ROOT / "app" / "llm.py").read_text(encoding="utf-8")
         self.assertTrue(_SDK_IMPORT_RE.search(text))
+
+
+class TestLazySdkImport(unittest.TestCase):
+    """Importing app.llm must not pull the SDK in (subprocess: import isolation)."""
+
+    def test_importing_app_llm_does_not_load_openai(self) -> None:
+        import subprocess
+
+        code = (
+            "import sys; import app.llm; "
+            "print('openai_loaded=', 'openai' in sys.modules)"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            cwd=PROJECT_ROOT,
+            check=True,
+        )
+        self.assertIn("openai_loaded= False", proc.stdout)
+
+    def test_first_use_loads_the_sdk_and_caches_the_name(self) -> None:
+        import subprocess
+
+        code = (
+            "import sys\n"
+            "import app.llm\n"
+            "from app.llm import OpenAI, NOT_GIVEN\n"
+            "assert 'openai' in sys.modules\n"
+            "import openai\n"
+            "assert app.llm.OpenAI is openai.OpenAI\n"
+            "assert app.llm.NOT_GIVEN is openai.NOT_GIVEN\n"
+            "print('cached-and-identity-ok')"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            cwd=PROJECT_ROOT,
+            check=True,
+        )
+        self.assertIn("cached-and-identity-ok", proc.stdout)
+
+    def test_patch_app_llm_openai_still_works(self) -> None:
+        """The historical patch target keeps working: the attribute resolves
+        for the patch's getattr, the mock replaces the cached global, and
+        LLMClient.__init__ builds mock clients without loading the real SDK."""
+        from app import llm as llm_module
+
+        with patch("app.llm.OpenAI") as sdk:
+            self.assertEqual(sdk.call_count, 0)
+            LLMClient(_FakeSettings())
+        # _FakeSettings configures no fallback endpoint, so exactly one client.
+        self.assertEqual(sdk.call_count, 1)
+
+    def test_not_given_sentinel_is_the_sdk_object(self) -> None:
+        """NOT_GIVEN comparisons at runtime must see the SDK's real sentinel,
+        or a timeout would be silently dropped from every request."""
+        import openai
+
+        self.assertIs(app_llm.NOT_GIVEN, openai.NOT_GIVEN)
 
 
 class MinimalBackend:

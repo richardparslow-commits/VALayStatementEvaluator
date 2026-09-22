@@ -1,17 +1,17 @@
 {
-  "_comment": "Maps body systems to claimed conditions, each with the union of topic-checklist letters (A-L, see app/knowledge/topic_checklist.md) that are typically relevant. Conditions mapped to null fall back to the DEFAULT_FALLBACK_TOPICS in app/condition_selector.py. This file introduces no external dependency and is loaded once at startup with json.load.",
+  "_comment": "Maps body systems to claimed conditions, each with the union of topic-checklist letters (A-O, see app/knowledge/topic_checklist.md) that are typically relevant. Conditions mapped to null fall back to the DEFAULT_FALLBACK_TOPICS in app/condition_selector.py. This file introduces no external dependency and is loaded once at startup with json.load.",
   "body_systems": {
     "Musculoskeletal": {
       "conditions": {
-        "Lumbar strain / degenerative disc disease": ["F", "G", "H", "K"],
-        "Cervical strain / degenerative disc disease": ["F", "G", "H", "K"],
-        "Knee condition (patellofemoral syndrome / meniscus tear)": ["F", "G", "H"],
-        "Shoulder impingement / rotator cuff condition": ["F", "G", "H"],
-        "Plantar fasciitis / foot condition": ["F", "G", "H"],
-        "Fibromyalgia": ["F", "G", "H", "I", "K"],
-        "Rheumatoid arthritis": ["A", "F", "G", "H", "I", "K"],
-        "Hip osteoarthritis": ["F", "G", "H", "K"],
-        "Carpal tunnel syndrome": ["F", "H", "K"],
+        "Lumbar strain / degenerative disc disease": ["F", "G", "H", "K", "M", "N", "O"],
+        "Cervical strain / degenerative disc disease": ["F", "G", "H", "K", "M", "N", "O"],
+        "Knee condition (patellofemoral syndrome / meniscus tear)": ["F", "G", "H", "M", "N", "O"],
+        "Shoulder impingement / rotator cuff condition": ["F", "G", "H", "M", "N", "O"],
+        "Plantar fasciitis / foot condition": ["F", "G", "H", "M", "N", "O"],
+        "Fibromyalgia": ["F", "G", "H", "I", "K", "M", "N", "O"],
+        "Rheumatoid arthritis": ["A", "F", "G", "H", "I", "K", "M", "N", "O"],
+        "Hip osteoarthritis": ["F", "G", "H", "K", "M", "N", "O"],
+        "Carpal tunnel syndrome": ["F", "H", "K", "M", "N", "O"],
         "Other / not listed": null
       }
     },

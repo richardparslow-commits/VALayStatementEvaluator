@@ -112,6 +112,36 @@ class TestPreflightPolicy(unittest.TestCase):
         verdict = _check(_probe({"model-main"}, 200), _settings(model_main="model-main-turbo"))
         self.assertTrue(verdict.blocks)
 
+    def test_a_name_continuation_is_not_a_variant(self) -> None:
+        """`gpt-4o` is not satisfied by `gpt-4o-mini`: the tail is more model, not a version."""
+        verdict = _check(_probe({"model-main-mini", "model-fast:latest"}, 200))
+        self.assertTrue(verdict.blocks)
+        self.assertEqual(verdict.missing, ("model-main",))
+
+    def test_a_run_over_digits_is_not_a_variant(self) -> None:
+        """A raw prefix match would satisfy `gpt-4` with `gpt-40`; a boundary does not."""
+        verdict = _check(_probe({"model-main0", "model-fast:latest"}, 200))
+        self.assertTrue(verdict.blocks)
+        self.assertEqual(verdict.missing, ("model-main",))
+
+    def test_a_non_version_tail_is_not_a_variant(self) -> None:
+        """`-preview`/`-chat` style tails are different offerings, not the same model dated."""
+        for tail in ("-preview", "-chat", "-experimental"):
+            with self.subTest(tail=tail):
+                verdict = _check(_probe({f"model-main{tail}", "model-fast:latest"}, 200))
+                self.assertTrue(verdict.blocks)
+                self.assertEqual(verdict.missing, ("model-main",))
+
+    def test_version_shaped_tails_still_count(self) -> None:
+        """Beyond the dated snapshot: semver, `v` prefixed, and provider tag forms."""
+        for candidate in ("model-main-1.0.3", "model-main-v2", "model-main:2024-11-20"):
+            with self.subTest(candidate=candidate):
+                verdict = _check(
+                    _probe({candidate, "other"}, 200),
+                    _settings(model_fast="model-main"),
+                )
+                self.assertEqual(verdict.kind, preflight.OK)
+
     def test_a_rejected_key_blocks_and_names_the_status(self) -> None:
         for status in (401, 403):
             with self.subTest(status=status):

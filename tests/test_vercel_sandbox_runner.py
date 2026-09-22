@@ -132,6 +132,27 @@ class RunnerTestCase(unittest.TestCase):
             code = runner.main([str(self.work)])
         return code, out.getvalue(), err.getvalue()
 
+    def run_check(
+        self, env: dict[str, str] | None = None, argv: list[str] | None = None
+    ) -> tuple[int, str, str]:
+        """``--check``, which creates nothing — so its stdout is a verdict, not a report."""
+        out, err = io.StringIO(), io.StringIO()
+        with patch.dict(os.environ, {**self.env, **(env or {})}, clear=False), redirect_stdout(
+            out
+        ), redirect_stderr(err):
+            code = runner.main(argv if argv is not None else ["--check"])
+        return code, out.getvalue(), err.getvalue()
+
+    def verdict(self, env: dict[str, str] | None = None) -> tuple[int, dict[str, Any], str]:
+        code, out, err = self.run_check(env)
+        return code, json.loads(out) if out.strip() else {}, err
+
+    def check_named(self, payload: dict[str, Any], name: str) -> dict[str, Any]:
+        for check in payload.get("checks", []):
+            if check["name"] == name:
+                return check
+        raise AssertionError(f"no {name} check in {[c['name'] for c in payload.get('checks', [])]}")
+
     def calls(self) -> list[dict[str, Any]]:
         if not self.journal.exists():
             return []
@@ -565,6 +586,136 @@ class TestVercelSandboxCredentials(RunnerTestCase):
 
         self.assertEqual(code, 0, err)
         self.assertIsNone(self.token_used())
+
+
+class TestBoxFreeCheck(RunnerTestCase):
+    """``--check``: what a run would reach, answered without spending a box.
+
+    The promise to an operator is "run this first and it costs nothing", so the
+    load-bearing assertion is the journal: the only subcommand a check may reach is
+    ``list`` — never ``create``, never an ``exec``, never a ``copy``.
+    """
+
+    def test_it_reports_the_cli_the_credential_and_the_image_and_creates_nothing(self) -> None:
+        code, payload, err = self.verdict()
+
+        self.assertEqual(code, 0, err)
+        self.assertTrue(payload["reachable"])
+        self.assertEqual([c["name"] for c in payload["checks"]], ["cli", "credential", "image"])
+        self.assertEqual(self.steps(), ["list"], "a check ran something other than list")
+        self.assertNotIn("create", json.dumps(self.calls()))
+
+    def test_the_verdict_names_the_slot_the_scope_and_the_project(self) -> None:
+        code, payload, err = self.verdict(
+            {
+                "VA_LSE_SANDBOX_TOKEN": "example-token-value",
+                "VA_LSE_SANDBOX_SCOPE": "my-team",
+                "VA_LSE_SANDBOX_PROJECT": "my-project",
+            }
+        )
+
+        self.assertEqual(code, 0, err)
+        detail = self.check_named(payload, "credential")["detail"]
+        self.assertIn("VA_LSE_SANDBOX_TOKEN", detail)
+        self.assertIn("scope my-team", detail)
+        self.assertIn("project my-project", detail)
+        self.assertNotIn("example-token-value", json.dumps(payload), "the token reached the verdict")
+
+    def test_the_authenticated_question_carries_the_scope_the_project_and_the_token(self) -> None:
+        _, _, err = self.verdict(
+            {
+                "VA_LSE_SANDBOX_TOKEN": "example-token-value",
+                "VA_LSE_SANDBOX_SCOPE": "my-team",
+                "VA_LSE_SANDBOX_PROJECT": "my-project",
+            }
+        )
+
+        argv = self.call_for("list")["argv"]
+        self.assertEqual(argv[argv.index("--scope") + 1], "my-team")
+        self.assertEqual(argv[argv.index("--project") + 1], "my-project")
+        self.assertEqual(argv[argv.index("--token") + 1], "example-token-value")
+        self.assertNotIn("example-token-value", err, "the token reached the log")
+
+    def test_a_missing_cli_is_reported_with_its_remedy_and_asks_nothing(self) -> None:
+        code, payload, err = self.verdict(
+            {"VA_LSE_SANDBOX_CLI": "definitely-not-installed-anywhere"}
+        )
+
+        self.assertEqual(code, 1, err)
+        cli = self.check_named(payload, "cli")
+        self.assertEqual(cli["status"], "failed")
+        self.assertIn("npm i -g sandbox", cli["remedy"])
+        # Nothing is asked of a CLI that is not here: the second question could only
+        # repeat the first answer.
+        self.assertEqual([c["name"] for c in payload["checks"]], ["cli", "image"])
+        self.assertEqual(self.calls(), [])
+
+    def test_a_refused_credential_quotes_the_cli_and_names_what_to_fix(self) -> None:
+        code, payload, _err = self.verdict({"FAKE_SANDBOX_FAIL": "list"})
+
+        self.assertEqual(code, 1)
+        credential = self.check_named(payload, "credential")
+        self.assertEqual(credential["status"], "failed")
+        self.assertIn("list failed on purpose", credential["detail"])
+        self.assertIn("VA_LSE_SANDBOX_TOKEN", credential["remedy"])
+        self.assertIn("AI Gateway key does not authenticate one", credential["remedy"])
+
+    def test_a_cli_waiting_for_a_login_prompt_does_not_hang_the_check(self) -> None:
+        """With no credential the CLI prompts to log in; there is no terminal here."""
+        settings = runner.Settings(
+            cli=("sh", "-c", "sleep 30"),
+            image="none",
+            timeout="20m",
+            scope="",
+            project="",
+            token="",
+        )
+
+        result = runner.self_check(settings, timeout=0.5)
+
+        credential = next(c for c in result.checks if c.name == "credential")
+        self.assertEqual(credential.status, "failed")
+        self.assertIn("did not answer within", credential.detail)
+        self.assertIn("sandbox login", credential.remedy)
+        self.assertFalse(result.reachable)
+
+    def test_a_gateway_key_is_refused_by_the_check_too(self) -> None:
+        code, out, err = self.run_check({"VERCEL_TOKEN": "vck_example-not-a-sandbox-token"})
+
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "", "a refused credential still printed a verdict")
+        self.assertIn("Vercel AI Gateway key", err)
+        self.assertEqual(self.calls(), [], "a refused credential must not reach the CLI")
+
+    def test_the_image_is_unproven_with_both_ways_to_settle_it(self) -> None:
+        _, payload, _err = self.verdict()
+
+        image = self.check_named(payload, "image")
+        self.assertEqual(image["status"], "unproven")
+        self.assertIn("vercel vcr image ls va-lse-sandbox", image["remedy"])
+        self.assertIn("test_vercel_sandbox_live", image["remedy"])
+
+    def test_the_default_runtime_needs_no_registry_image(self) -> None:
+        _, payload, _err = self.verdict({"VA_LSE_SANDBOX_IMAGE": "none"})
+
+        image = self.check_named(payload, "image")
+        self.assertEqual(image["status"], "ok")
+        self.assertIn("default runtime", image["detail"])
+
+    def test_check_wins_over_a_staged_directory_that_is_right_there(self) -> None:
+        """A diagnostic asked for must not spend a box because a file was waiting."""
+        self.stage("progress_note.pdf", _pdf_bytes([TYPED]))
+
+        code, _out, err = self.run_check(argv=["--check", str(self.work)])
+
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.steps(), ["list"])
+
+    def test_the_staging_directory_is_still_required_for_a_real_run(self) -> None:
+        with self.assertRaises(SystemExit) as caught:
+            self.run_check(argv=[])
+
+        self.assertEqual(caught.exception.code, 2)
 
 
 if __name__ == "__main__":

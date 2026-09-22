@@ -14,8 +14,11 @@ bare render fails the suite rather than shipping.
 """
 import ast
 import sys
+import threading
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
@@ -315,6 +318,39 @@ class TestReferenceHelpers(unittest.TestCase):
             format_error_for_user(ValueError("boom"), "req_abc"), "boom (reference: req_abc)"
         )
         self.assertEqual(format_error_for_user(ValueError("boom"), "-"), "boom")
+
+    def test_mark_once_is_atomic_when_two_renders_race(self):
+        """Two sessions repainting the same broken panel are two threads.
+
+        ``_mark_once`` is a check-then-add on a process-global set: without the
+        lock, both threads see "not seen yet" and both report a first occurrence,
+        which is the duplicate-log-per-rerun noise ``once`` exists to remove. The
+        set below sleeps inside ``__contains__`` so the window is wide open — with
+        the lock, the second caller cannot even reach its check.
+        """
+        from app import error_report
+
+        class _SlowContains(set):
+            def __contains__(self, item):  # noqa: D105 - test double
+                present = super().__contains__(item)
+                time.sleep(0.05)
+                return present
+
+        with patch.object(error_report, "_ONCE_SEEN", _SlowContains()):
+            results: list[bool] = []
+            barrier = threading.Barrier(4)
+
+            def render() -> None:
+                barrier.wait()
+                results.append(error_report._mark_once("sidebar", "same message"))
+
+            threads = [threading.Thread(target=render) for _ in range(4)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        self.assertEqual(results.count(True), 1)
 
     def test_the_context_id_is_used_when_present(self):
         set_request_id("req_context99")

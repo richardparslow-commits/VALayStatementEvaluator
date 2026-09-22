@@ -14,6 +14,20 @@ invent. This is that command, for Vercel Sandbox:
     VA_LSE_EXTRACTOR=sandbox
     VA_LSE_EXTRACTOR_RUNNER="python scripts/vercel_sandbox_runner.py {work}"
 
+That first word may be a ``python`` this host does not have — macOS ships ``python3``
+and no ``python`` — so ``app.extractors.resolve_python_interpreter`` replaces a
+Python interpreter the host lacks (that spelling, or a venv path that has moved)
+with the interpreter running the app, and logs which one took over. The command
+above is therefore the supported spelling on every host; an absolute path is only
+needed to pin a *particular* Python.
+
+``--check`` answers a different question with no box at all: can a box be reached from
+this host. It reports the CLI it would invoke, asks the account one authenticated
+question (``list``, the cheapest read in the CLI reference), and says plainly what it
+*cannot* know from here — whether the image is in the registry — instead of guessing.
+``scripts/check_sandbox.py`` is the operator-facing half of that: it checks the runner
+line the app is configured with and folds this verdict in, as one answer.
+
 What one invocation does — one file, one box, removed in a ``finally``:
 
     sandbox create --name va-lse-ocr-<id> --image va-lse-sandbox:latest \\
@@ -72,6 +86,7 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -393,6 +408,262 @@ class SandboxCli:
             _log(f"! {exc} — the box stops itself at its --timeout ({self.settings.timeout})")
 
 
+# -- what can be known without a box -----------------------------------------
+
+#: The command ``--check`` uses to ask the account a question: the cheapest one in
+#: the published reference, an authenticated read, and it creates nothing. Kept as
+#: a constant so a test can assert this is the only subcommand a check ever runs.
+CHECK_SUBCOMMAND = "list"
+
+#: How long that question may take. With no credential at all the CLI *prompts to
+#: log in* (its reference: "we'll use a stored token or prompt you to log in"), and a
+#: prompt with no terminal to read must not be able to hang a diagnostic whose whole
+#: purpose is to answer before a run does.
+CHECK_TIMEOUT_SECONDS = 60.0
+
+#: One glyph per status, so ``--check`` and ``scripts/check_sandbox.py`` print the
+#: same marks for the same findings. ``off`` is not a verdict about the box at all —
+#: it is configuration that says no box will be used — which is why it is its own
+#: status rather than a failure (nothing is broken) or an ``ok`` (nothing was proven).
+CHECK_GLYPHS = {"ok": "✓", "failed": "✗", "unproven": "?", "off": "·"}
+
+
+@dataclass(frozen=True)
+class Check:
+    """One thing a box-free probe can say — including what it cannot say.
+
+    ``status`` is ``ok`` (proven to work from here), ``failed`` (proven not to), or
+    ``unproven``, which is a real answer rather than a shrug: when no local probe can
+    settle something, saying so and naming what *would* settle it is the only honest
+    verdict, and it must not be dressed up as either of the others.
+    """
+
+    name: str
+    status: str
+    detail: str
+    remedy: str = ""
+
+    def to_json(self) -> dict[str, str]:
+        return {
+            "name": self.name,
+            "status": self.status,
+            "detail": self.detail,
+            "remedy": self.remedy,
+        }
+
+    def render(self) -> str:
+        """The check as one operator-facing paragraph, remedy included."""
+        line = f"{CHECK_GLYPHS.get(self.status, '?')} {self.name}: {self.detail}"
+        if self.status != "ok" and self.remedy:
+            line += f"\n    → {self.remedy}"
+        return line
+
+
+@dataclass(frozen=True)
+class SelfCheck:
+    """The box-free verdict: every check, and whether a box would be reached."""
+
+    checks: list[Check]
+
+    @property
+    def failed(self) -> list[Check]:
+        return [check for check in self.checks if check.status == "failed"]
+
+    @property
+    def unproven(self) -> list[Check]:
+        return [check for check in self.checks if check.status == "unproven"]
+
+    @property
+    def off(self) -> list[Check]:
+        return [check for check in self.checks if check.status == "off"]
+
+    @property
+    def reachable(self) -> bool:
+        """True when nothing that *can* be checked would make a run fall back."""
+        return not self.failed
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "reachable": self.reachable,
+            "checks": [check.to_json() for check in self.checks],
+        }
+
+    def verdict(self) -> str:
+        """The one sentence the operator reads, and the reason it says what it says."""
+        if self.off:
+            return (
+                "no box would be used: the app is configured to read records in-process, so "
+                "nothing below can affect a run"
+            )
+        if self.failed:
+            names = ", ".join(check.name for check in self.failed)
+            return (
+                f"a box would be skipped and records read in-process: {names} "
+                f"{'is' if len(self.failed) == 1 else 'are'} wrong for a run from here"
+            )
+        if self.unproven:
+            names = ", ".join(check.name for check in self.unproven)
+            return (
+                "a box can be reached from here as far as anything local can tell; "
+                f"{names} can only be proven by a box"
+            )
+        return "a box can be reached from here"
+
+
+def token_source() -> str:
+    """Which variable the credential came from, or "" for the CLI's stored session."""
+    for name in TOKEN_ENV_NAMES:
+        if os.getenv(name, "").strip():
+            return name
+    return ""
+
+
+def self_check(settings: Settings, *, timeout: float = CHECK_TIMEOUT_SECONDS) -> SelfCheck:
+    """What this host can and cannot prove about a box, without creating one.
+
+    Three questions are answerable away from Vercel: is the CLI the operator named
+    actually here, does it accept the credential for this scope and project, and is
+    the image in the registry. The third has no local answer (see :func:`_check_image`)
+    and is reported as unproven rather than guessed.
+
+    Answering the second question costs one command — ``list`` — and that is the
+    point: an unaccepted token, a team the token cannot see, or a project that does
+    not exist all surface *before* a file is uploaded, instead of as one warning per
+    run afterwards. When the CLI is not here the second question is not asked: it
+    could only repeat the first answer.
+    """
+    checks = [_check_cli(settings)]
+    if checks[0].status == "ok":
+        checks.append(_check_account(settings, timeout=timeout))
+    checks.append(_check_image(settings))
+    return SelfCheck(checks)
+
+
+def _check_cli(settings: Settings) -> Check:
+    """Is the CLI the operator named on this host at all?"""
+    program = settings.cli[0]
+    found = shutil.which(program)
+    if found is None:
+        return Check(
+            "cli",
+            "failed",
+            f"{program!r} (VA_LSE_SANDBOX_CLI={shlex.join(settings.cli)}) is not on PATH",
+            remedy=(
+                "install it (`npm i -g sandbox`) and log in, or point "
+                "VA_LSE_SANDBOX_CLI at the command that works here"
+            ),
+        )
+    return Check("cli", "ok", f"{shlex.join(settings.cli)} → {found}")
+
+
+def _check_account(settings: Settings, *, timeout: float) -> Check:
+    """Ask the account one authenticated question: does ``list`` answer?
+
+    This is what separates "the CLI is installed" from "the CLI can do anything for
+    this deployment": a refused token, a team it cannot see and a project that does
+    not exist each fail here, and each one is exactly what would turn every upload
+    into an in-process fallback.
+    """
+    argv = [*settings.cli, CHECK_SUBCOMMAND, *SandboxCli(settings).common(), "--limit", "1"]
+    _log(f"  $ {_masked(argv)}")
+    try:
+        proc = subprocess.run(  # noqa: S603 - argv, no shell; the CLI is the operator's
+            argv,
+            capture_output=True,
+            text=True,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            timeout=timeout,
+        )
+    except FileNotFoundError as exc:
+        return Check("credential", "failed", f"the sandbox CLI could not be run: {exc}")
+    except subprocess.TimeoutExpired:
+        return Check(
+            "credential",
+            "failed",
+            f"`{shlex.join(settings.cli)} {CHECK_SUBCOMMAND}` did not answer within "
+            f"{timeout:.0f}s",
+            remedy=(
+                "a CLI with no credential prompts to log in and there is no terminal here "
+                "to answer it: run `sandbox login` once, or set VA_LSE_SANDBOX_TOKEN"
+            ),
+        )
+    if proc.returncode != 0:
+        return Check(
+            "credential",
+            "failed",
+            f"`{CHECK_SUBCOMMAND}` was refused (exit {proc.returncode}): {_detail(proc)}",
+            remedy=_credential_remedy(settings),
+        )
+    return Check("credential", "ok", _account_detail(settings))
+
+
+def _credential_remedy(settings: Settings) -> str:
+    """What to fix when the account refuses to answer, in the order to fix it."""
+    named = ""
+    where = [
+        part
+        for part in (
+            f"scope {settings.scope}" if settings.scope else "",
+            f"project {settings.project}" if settings.project else "",
+        )
+        if part
+    ]
+    if where:
+        named = f" — this check used {' and '.join(where)}"
+    return (
+        "a sandbox takes a Vercel access token (dashboard → Account Settings → Tokens, "
+        "scoped to the team) in VA_LSE_SANDBOX_TOKEN, or a `sandbox login` session; an "
+        "AI Gateway key does not authenticate one. Then confirm VA_LSE_SANDBOX_SCOPE and "
+        f"VA_LSE_SANDBOX_PROJECT name a team and project the credential can see{named}"
+    )
+
+
+def _account_detail(settings: Settings) -> str:
+    """What answered, naming the settings a later failure would blame."""
+    source = token_source()
+    how = source if source else "the CLI's stored `sandbox login` session"
+    where = f"scope {settings.scope}" if settings.scope else "the account's default scope"
+    project = (
+        f"project {settings.project}" if settings.project else "the linked/default project"
+    )
+    return f"`{CHECK_SUBCOMMAND}` answered for {where} and {project}, authenticated by {how}"
+
+
+def _check_image(settings: Settings) -> Check:
+    """The one question no local probe can settle, said honestly.
+
+    The Sandbox CLI has no command that lists Vercel Container Registry images (its
+    published reference, 4.4.0: list/create/fork/run/exec/connect/copy/stop/remove/
+    config/sessions/snapshot/snapshots/drives/login/logout), so "is
+    ``va-lse-sandbox:latest`` pushed?" is answerable only by reading the registry or by
+    booting a box. Reported as ``unproven`` with both ways to settle it, because a
+    guessed "✓ pushed" sends the operator to a run that falls back and a guessed
+    "✗ missing" sends them off to rebuild an image that was already there.
+    """
+    if settings.image.lower() in ("", "none"):
+        return Check(
+            "image",
+            "ok",
+            "VA_LSE_SANDBOX_IMAGE=none — the box boots the CLI's default runtime, so no "
+            "registry image is involved",
+        )
+    repository = settings.image.split(":", 1)[0]
+    return Check(
+        "image",
+        "unproven",
+        f"{settings.image} is or is not in Vercel Container Registry, and nothing on "
+        "this host can tell: the Sandbox CLI has no command that lists images",
+        remedy=(
+            f"read the registry (`vercel vcr image ls {repository}` — the Vercel CLI, not "
+            "the sandbox one), build and push it (DEPLOYMENT.md §6), or prove it end to "
+            "end with the opt-in live test (`VA_LSE_TEST_VERCEL_SANDBOX_TOKEN=… python -m "
+            "unittest tests.test_vercel_sandbox_live`)"
+        ),
+    )
+
+
 def read_manifest(work_dir: Path) -> Staged:
     """What the app staged: a label to answer under, and the bytes to read."""
     manifest = work_dir / MANIFEST_NAME
@@ -517,13 +788,44 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "work",
         type=Path,
+        nargs="?",
         help="the staging directory the app handed over (holds manifest.json)",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help=(
+            "report whether a box can be reached from this host and exit: the CLI, the "
+            "credential with this scope and project, and whether the image can be "
+            "known. Creates nothing; prints its verdict as JSON on stdout"
+        ),
     )
     return parser
 
 
+def _run_check() -> int:
+    """``--check``: the box-free verdict, as JSON on stdout and words on stderr."""
+    _log("sandbox self-check — no box is created, nothing is uploaded")
+    try:
+        result = self_check(Settings.from_env())
+    except SandboxError as exc:
+        _log(f"✗ {exc}")
+        return EXIT_FAILED
+    for check in result.checks:
+        _log(f"  {check.render()}")
+    _log(f"verdict: {result.verdict()}")
+    sys.stdout.write(json.dumps(result.to_json(), indent=2) + "\n")
+    sys.stdout.flush()
+    return EXIT_OK if result.reachable else EXIT_FAILED
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.check:
+        return _run_check()
+    if args.work is None:
+        parser.error("the staging directory is required unless --check is used")
     _install_cleanup_on_termination()
     try:
         settings = Settings.from_env()

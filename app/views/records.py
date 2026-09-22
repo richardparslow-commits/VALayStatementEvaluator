@@ -37,12 +37,14 @@ def is_local_run() -> bool:
     """Whether the server explicitly permits local record imports.
 
     Enable this only for a trusted, single-user installation bound to loopback:
-    the flag alone is not enough. The bind check comes from the process's own
-    argv (``--server.address``) backed by the committed ``.streamlit/config.toml``
-    — app code must not read Streamlit's ambient configuration — and an address
-    absent from both means Streamlit listens on every interface, so local
-    imports stay disabled, warning once with the restart command that fixes
-    it. See ``app/local_paths.py`` for the derivation.
+    the flag alone is not enough. The bind check reads the OS socket table
+    via ``app/local_paths.py`` — the bind address of the socket identified as
+    the Streamlit UI (Streamlit-marker probe over loopback; the health
+    sidecar's own wide bind is that subsystem's contract, not the gate's
+    concern) — with the committed ``.streamlit/config.toml`` as fallback. An
+    address absent from both means the UI bind cannot be proven loopback, so
+    local imports stay disabled, warning once with the restart command that
+    fixes it.
     """
     import os
 

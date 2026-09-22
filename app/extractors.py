@@ -48,11 +48,15 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
-from dataclasses import dataclass
+import threading
+import time
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -70,8 +74,94 @@ logger = logging.getLogger("app.extractors")
 _RUNNER_HELP = (
     "Set VA_LSE_EXTRACTOR_RUNNER to the command that runs "
     "scripts/ocr_and_extract.py in the box (see DEPLOYMENT.md → Sandbox), or "
-    "leave VA_LSE_EXTRACTOR unset to read records in-process."
+    "leave VA_LSE_EXTRACTOR unset to read records in-process. "
+    "`python scripts/check_sandbox.py` answers the same question before a run does, "
+    "without creating a box."
 )
+
+#: How a bare Python interpreter is spelled in a runner command: ``python``,
+#: ``python3``, ``python3.12``, or Windows' ``py`` launcher, with or without ``.exe``.
+_PYTHON_PROGRAM = re.compile(r"^(?:python(?:3(?:\.\d+)?)?|py)(?:\.exe)?$", re.IGNORECASE)
+
+#: A Python interpreter named by *path* (``…/.venv/bin/python``), as opposed to a
+#: bare name. Matched on the last component so a directory called ``python-bin``
+#: or a runner named ``python-lint`` is not mistaken for an interpreter.
+_PYTHON_INTERPRETER_PATH = re.compile(r"[/\\](?:python(?:3(?:\.\d+)?)?|py)(?:\.exe)?$", re.IGNORECASE)
+
+#: A leading ``VAR=value`` word (``PYTHONPATH=. python scripts/… {work}``), which
+#: ``shlex.split`` hands over as an ordinary token.
+_ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+@dataclass(frozen=True)
+class InterpreterSwap:
+    """A first word that named an interpreter this host does not have, and its stand-in.
+
+    ``severity`` is what the operator needs to hear, and the two reasons differ: a
+    bare ``python`` on a host that spells it ``python3`` is normal and is news at
+    INFO, while a *configured path* that is not on disk is a broken deployment and
+    deserves a WARNING before it costs a run. Both say which interpreter took over,
+    so the line is actionable either way.
+    """
+
+    written: str
+    resolved: str
+    reason: str
+    severity: str
+
+    def message(self) -> str:
+        return (
+            f"the runner command starts with {self.written!r}, which is {self.reason} — "
+            f"running it with {self.resolved}"
+        )
+
+
+def resolve_python_interpreter(argv: list[str]) -> tuple[list[str], InterpreterSwap | None]:
+    """Use this process's interpreter when a runner command names one the host lacks.
+
+    ``VA_LSE_EXTRACTOR_RUNNER="python scripts/vercel_sandbox_runner.py {work}"`` is
+    the command ``.env.example`` and the docs show, and on a host that exposes only
+    ``python3`` — macOS, most Debian images, and this repository's own virtualenv —
+    it used to die in ``subprocess.run`` with ``the runner command does not exist
+    (python)``, so the very first attempt on a real box fell back for a reason that
+    had nothing to do with the box. The same happens to a configured interpreter
+    path that has moved or been deleted (``…/.venv-sandbox/bin/python``).
+
+    The app is already running under an interpreter that exists, and the runner is
+    stdlib-only operator tooling, so in both cases that interpreter is what the
+    command means. A spelling that *is* on ``PATH`` — or a path that *is* on disk —
+    is left exactly as written (the operator picked it, version pin included), and a
+    word that names no interpreter is never touched: a non-Python runner, an
+    environment assignment in front, and ``PYTHONPATH=. python3 …`` all behave as
+    before.
+
+    Returns the argv to run and what was swapped (with the sentence to log), or
+    ``None`` when the command was already runnable as written.
+    """
+    program = 0
+    while program < len(argv) and _ENV_ASSIGNMENT.match(argv[program]):
+        program += 1
+    if program >= len(argv):
+        return argv, None
+    # ``sys.executable`` is empty in embedded interpreters, which leaves the command
+    # alone: the FileNotFoundError message then names the word the operator wrote,
+    # which is the truth about that command, and nothing here could improve on it.
+    if not sys.executable:
+        return argv, None
+    written = argv[program]
+    if _PYTHON_PROGRAM.match(written):
+        if shutil.which(written) is not None:
+            return argv, None
+        reason, severity = "not on PATH", "INFO"
+    elif _PYTHON_INTERPRETER_PATH.search(written):
+        if Path(written).exists():
+            return argv, None
+        reason, severity = "not on this host", "WARNING"
+    else:
+        return argv, None
+    resolved = list(argv)
+    resolved[program] = sys.executable
+    return resolved, InterpreterSwap(written, sys.executable, reason, severity)
 
 
 class SandboxUnavailable(RuntimeError):
@@ -133,8 +223,17 @@ class CommandBoxRunner:
             raise SandboxUnavailable(f"No runner command configured. {_RUNNER_HELP}")
 
     def command_for(self, work_dir: Path) -> list[str]:
-        """The argv for one file, with ``{work}`` substituted and nothing else."""
-        return [part.replace("{work}", str(work_dir)) for part in shlex.split(self.template)]
+        """The argv for one file, with ``{work}`` substituted and nothing else.
+
+        The first word can be normalized: a bare ``python``/``python3`` this host
+        does not expose becomes the interpreter running this app
+        (:func:`resolve_python_interpreter`), because the documented runner command
+        says ``python`` and hosts that only have ``python3`` are the common case.
+        """
+        argv, swapped = resolve_python_interpreter(shlex.split(self.template))
+        if swapped is not None:
+            getattr(logger, swapped.severity.lower())("%s", swapped.message())
+        return [part.replace("{work}", str(work_dir)) for part in argv]
 
     def run(self, staged: StagedFile, work_dir: Path, timeout: float) -> str:
         try:
@@ -325,6 +424,131 @@ class SandboxExtractor:
         )
 
 
+# -- which reader this process runs, and how that has gone ---------------------
+
+
+def _now() -> str:
+    """Wall clock in the shape ``/health`` uses: UTC, second resolution."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+@dataclass(frozen=True)
+class Fallback:
+    """One file the box could not read, and the box's own reason for it."""
+
+    label: str
+    reason: str
+    at: str
+
+    def to_json(self) -> dict[str, str]:
+        return {"label": self.label, "reason": self.reason, "at": self.at}
+
+
+@dataclass(frozen=True)
+class ExtractionStatus:
+    """Which reader this process runs, and whether it has already fallen back.
+
+    Reported by ``/health`` and by the sidebar, because otherwise the failure this
+    describes is invisible: ``sandbox`` mode falls back *per file* by design, so a box
+    that cannot be reached produces a finished run whose scans simply have no text,
+    and the only evidence is one warning in the log.
+
+    Configuration plus outcome, no probing: the image, the credential and the scope
+    belong to the runner (``scripts/vercel_sandbox_runner.py`` reads them), and
+    ``scripts/check_sandbox.py`` reports those. This is what *this* process decided and
+    what has happened since — the two things a run cannot be trusted to tell you.
+    """
+
+    mode: str = "in-process"
+    runner: str = ""
+    timeout_seconds: float = 0.0
+    problem: str = ""
+    fallbacks: int = 0
+    last_fallback: Fallback | None = None
+
+    @property
+    def on_the_box(self) -> bool:
+        """True when the app *means* to read on a box; ``problem`` says whether it can."""
+        return self.mode == "sandbox"
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "runner": self.runner,
+            "timeout_seconds": self.timeout_seconds,
+            "problem": self.problem,
+            "fallbacks": self.fallbacks,
+            "last_fallback": self.last_fallback.to_json() if self.last_fallback else None,
+        }
+
+
+#: The one status this process has. Written where the decision is made
+#: (:func:`build_extractor`) and where the fallback happens (:class:`FailOpenExtractor`),
+#: under a lock because Streamlit runs one thread per browser session and the health
+#: sidecar is a third.
+_status_lock = threading.Lock()
+_status = ExtractionStatus()
+
+
+def extraction_status() -> ExtractionStatus:
+    """A consistent snapshot, for anything that reports it (``/health``, the sidebar)."""
+    with _status_lock:
+        return _status
+
+
+def extraction_health() -> dict[str, Any]:
+    """The ``/health`` shape of :func:`extraction_status` — configuration, no probe."""
+    return extraction_status().to_json()
+
+
+def record_configuration(
+    *, mode: str, runner: str = "", timeout_seconds: float = 0.0, problem: str = ""
+) -> None:
+    """What this process decided to read records with, recorded where it decided it.
+
+    Called by :func:`build_extractor` on every branch, including the two broken ones, so
+    "the app is configured for a sandbox it cannot reach" is visible *before* a run
+    rather than as a warning after one.
+
+    Re-recording keeps the fallback history: the entry module can be imported more than
+    once in a process (a Streamlit reload, tests), and a re-install that silently wiped
+    the evidence of a box that already failed would hide exactly what this is for. Only
+    :func:`reset_extraction_status` clears it.
+    """
+    global _status
+    with _status_lock:
+        _status = replace(
+            _status,
+            mode=mode,
+            runner=runner,
+            timeout_seconds=timeout_seconds,
+            problem=problem,
+        )
+
+
+def record_fallback(reason: str, label: str) -> None:
+    """One file read here instead of on the box: counted, with the last reason kept.
+
+    Only the last reason is kept on purpose — the sidebar cannot show twenty, the count
+    says how widespread it is, and the log has every one of them (``report_failure``,
+    once per distinct reason).
+    """
+    global _status
+    with _status_lock:
+        _status = replace(
+            _status,
+            fallbacks=_status.fallbacks + 1,
+            last_fallback=Fallback(label=label, reason=reason, at=_now()),
+        )
+
+
+def reset_extraction_status() -> None:
+    """Back to "in-process, nothing has failed" — for tests, and for a fresh start."""
+    global _status
+    with _status_lock:
+        _status = ExtractionStatus()
+
+
 class FailOpenExtractor:
     """``RecordExtractor`` that tries the box and falls back to this process.
 
@@ -341,6 +565,10 @@ class FailOpenExtractor:
         try:
             return self.box.extract(label, data)
         except SandboxUnavailable as exc:
+            # Recorded before it is reported: the warning is once per distinct reason
+            # (below), and "the sandbox is failing" has to be visible without the log —
+            # on /health and in the sidebar — because the run itself looks fine.
+            record_fallback(str(exc), label)
             # One warning per distinct reason, not per file: a box that is down
             # turns a 20-file bundle into 20 identical failures, and the point of
             # the line is that the operator finds it, once. The file that fell back
@@ -365,12 +593,21 @@ def build_extractor() -> RecordExtractor | None:
     """
     mode = (config.EXTRACTOR_MODE or "in-process").strip().lower()
     if mode in ("", "in-process", "inprocess", "local"):
+        record_configuration(mode="in-process", timeout_seconds=config.EXTRACTOR_TIMEOUT_SECONDS)
         return None
     if mode != "sandbox":
         logger.warning(
             "VA_LSE_EXTRACTOR=%r is not a mode this app knows (in-process | sandbox); "
             "reading records in-process",
             mode,
+        )
+        record_configuration(
+            mode="in-process",
+            timeout_seconds=config.EXTRACTOR_TIMEOUT_SECONDS,
+            problem=(
+                f"VA_LSE_EXTRACTOR={mode!r} is not a mode this app knows "
+                "(in-process | sandbox) — records are read in-process"
+            ),
         )
         return None
     from .blob_store import get_blob_store  # local: only a sandbox needs the store
@@ -379,6 +616,9 @@ def build_extractor() -> RecordExtractor | None:
     if not runner_template:
         # Reported, not raised: an app that will not start because a box is
         # misconfigured is worse than an app that reads records itself and says so.
+        record_configuration(
+            mode="sandbox", problem=f"VA_LSE_EXTRACTOR=sandbox but no runner is set. {_RUNNER_HELP}"
+        )
         report_failure(
             f"⚠️ VA_LSE_EXTRACTOR=sandbox but no runner is configured. {_RUNNER_HELP}",
             phase="extractor_sandbox",
@@ -389,12 +629,18 @@ def build_extractor() -> RecordExtractor | None:
     try:
         runner = CommandBoxRunner(runner_template)
     except SandboxUnavailable as exc:
+        record_configuration(mode="sandbox", runner=runner_template, problem=str(exc))
         report_failure(
             f"⚠️ {exc}", phase="extractor_sandbox", exc=exc, severity="warning", once=True
         )
         return None
 
     store = get_blob_store()
+    record_configuration(
+        mode="sandbox",
+        runner=runner_template,
+        timeout_seconds=config.EXTRACTOR_TIMEOUT_SECONDS,
+    )
     logger.info(
         "extract records on the sandbox (timeout %ss, blob store %s)",
         config.EXTRACTOR_TIMEOUT_SECONDS,

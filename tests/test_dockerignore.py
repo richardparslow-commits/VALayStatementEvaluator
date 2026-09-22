@@ -46,10 +46,26 @@ SENSITIVE_PREFIXES = (
     ".git/",
     ".streamlit/secrets",
     ".streamlit/config.local",
+    # VA.gov scraper outputs: signed-in medical-record pages, screenshots and
+    # Chrome profiles holding the VA.gov session (PHI/PII — see the ignore
+    # file's scraper section). The artifacts dir defaults to a relative path,
+    # so it can genuinely materialize inside the checkout.
+    "va_gov_download_artifacts/",
+    ".va_lse_debug_chrome/",
+    ".va_lse_va_gov_profile/",
 )
 
 #: Names that are sensitive wherever they appear.
 SENSITIVE_NAMES = (".env", "usage_history.json", "secrets.toml")
+
+#: Directory names that are sensitive as *any* path segment, not just at the
+#: root — the VA.gov scraper can be run from any cwd, so its artifacts and
+#: Chrome-profile directories can materialize at any depth.
+SENSITIVE_DIR_NAMES = (
+    "va_gov_download_artifacts",
+    ".va_lse_debug_chrome",
+    ".va_lse_va_gov_profile",
+)
 
 #: Suffixes that carry key material.
 SENSITIVE_SUFFIXES = (".pem", ".key")
@@ -74,6 +90,13 @@ SENSITIVE_PATH_EXAMPLES = (
     ".git/config",
     ".git/objects/ab/cdef",
     "app/__pycache__/main.cpython-312.pyc",
+    # VA.gov scraper artifacts, at the root and nested (the tool can be run
+    # from any cwd, so the artifacts dir can appear at any depth).
+    "va_gov_download_artifacts/C.plist",
+    "va_gov_download_artifacts/session-2026-09-21/records.pdf",
+    "deploy/notes/va_gov_download_artifacts/screenshots/page.png",
+    ".va_lse_debug_chrome/Default/Cookies",
+    ".va_lse_va_gov_profile/Default/Preferences",
 )
 
 #: Files the stages ask for by name. An ignore file that swallowed one of these
@@ -95,9 +118,11 @@ MUST_SURVIVE = (
     "tests/test_health.py",
     "tests/dockerfile.py",
     "scripts/scale_sim.py",
+    "scripts/va_records_download.py",
     "deploy/monitoring/prometheus.yml",
     "nginx/nginx.conf",
     "examples/sample_lay_statement.txt",
+    "examples/sample_medical_records.txt",
 )
 
 
@@ -118,6 +143,8 @@ def is_sensitive(path: str) -> bool:
     if parts[-1].endswith(SENSITIVE_SUFFIXES):
         return True
     if "__pycache__" in parts:
+        return True
+    if any(seg in SENSITIVE_DIR_NAMES for seg in parts[:-1]):
         return True
     for prefix in SENSITIVE_PREFIXES:
         if path == prefix.rstrip("/") or path.startswith(prefix):

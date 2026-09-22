@@ -127,6 +127,51 @@ class TestGitignoreSecrets(unittest.TestCase):
                 msg=f"git check-ignore did not ignore {path}: {result.stderr}",
             )
 
+    def test_medical_record_pdfs_ignored(self):
+        """Users drop C-file PDFs in the project root to run the local OCR
+        script, and its output lands alongside the input as <name>.ocr.pdf
+        (scripts/ocr_records.py default_output_path). Both are the veteran's
+        medical history — unencrypted PHI — and neither may be committable,
+        wherever in the tree they sit."""
+        patterns = _gitignore_patterns()
+        must_ignore = [
+            "records.pdf",
+            "C-file-2026.pdf",
+            "subdir/records.pdf",
+            "deep/nested/scan.pdf",
+            "records.ocr.pdf",
+            "subdir/records.ocr.pdf",
+            "deep/nested/scan.ocr.pdf",
+        ]
+        for path in must_ignore:
+            self.assertTrue(
+                _ignored_by_gitignore(path, patterns),
+                msg=f"{path} should be ignored by .gitignore patterns {patterns}",
+            )
+
+    def test_medical_record_pdfs_ignored_by_real_git(self):
+        """Ground truth: real git agrees record PDFs and OCR output are not
+        committable — including the OCR naming the script actually writes."""
+        for path in (
+            "records.pdf",
+            "subdir/records.pdf",
+            "records.ocr.pdf",
+            "subdir/records.ocr.pdf",
+            "va_gov_download_artifacts/BL5-2026.pdf",
+            ".freebuff/batch-run-20260921/staging/batch_01a/Part1.pdf",
+        ):
+            result = subprocess.run(
+                ["git", "check-ignore", "--quiet", path],
+                cwd=str(PROJECT_ROOT),
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                msg=f"git check-ignore did not ignore {path}: {result.stderr}",
+            )
+
     def test_actual_git_check_ignore(self):
         """Ground truth: ask real git check-ignore for the paths that matter."""
         cases_should_ignore = [".env", ".env.local", ".env.dev.local"]

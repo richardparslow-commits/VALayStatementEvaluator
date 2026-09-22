@@ -23,14 +23,25 @@ from app.documents import (  # noqa: E402
     document_from_text,
 )
 from app.evaluate import (  # noqa: E402
+    CLAIM_BASES,
+    CLAIMS_SYSTEM,
+    CLAIMS_USER,
     DIMENSION_LABELS,
+    REVISE_SYSTEM,
+    REVISE_USER,
+    RUBRIC_SYSTEM_TEMPLATE,
+    TOPIC_SYSTEM_TEMPLATE,
+    UNKNOWN_CLAIM_BASIS,
     VERDICTS,
     VERIFICATION_MAX_ATTEMPTS,
+    VERIFY_SYSTEM,
     VerificationIncompleteError,
     EvaluationResult,
     _citation_index_snapshot,
+    _contradiction_downgrade_reason,
     _fallback_recommendations,
     _infer_record_type,
+    _normalize_claim_basis,
     _normalize_claims,
     _truncate_for_prompt,
     _verifications_text,
@@ -545,6 +556,315 @@ class TestVerifyClaims(unittest.TestCase):
         self.assertEqual(result[0]["verdict"], "CONTRADICTED")
         self.assertEqual(gaps, [])
 
+    def test_an_uncited_contradiction_is_a_gap_even_when_records_cover_the_topic(self):
+        """Overlapping record text must not stand in for the cited conflict.
+
+        The batch here plainly documents knee pain, so the ``evidence_absent`` rule
+        does not apply — the verdict is unsubstantiated purely because it names no
+        conflicting record entry. Letting that through would penalise the score, print
+        a conflict in the report, and instruct the reviser to rewrite the claim to match
+        records nobody cited.
+        """
+        llm = _FakeLLM(overrides={
+            "verify": {"verifications": [
+                {"id": 1, "verdict": "CONTRADICTED", "record_reference": "", "note": "No record of this."},
+            ]}
+        })
+        claims = [{"id": 1, "text": "Knee pain began in service."}]
+        result, gaps = _verify_claims(llm, claims, _fake_digest(), [_doc()], lambda f, m: None)
+        self.assertEqual(result[0]["verdict"], "NOT FOUND")
+        self.assertIn("Downgraded from CONTRADICTED", result[0]["note"])
+        self.assertIn("no conflicting record entry was cited", result[0]["note"])
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("no conflicting record entry was cited", gaps[0]["reason"])
+
+    def test_a_whitespace_only_citation_is_not_a_citation(self):
+        llm = _FakeLLM(overrides={
+            "verify": {"verifications": [
+                {"id": 1, "verdict": "CONTRADICTED", "record_reference": "   ", "note": "Wrong date."},
+            ]}
+        })
+        claims = [{"id": 1, "text": "Knee pain began in service."}]
+        result, gaps = _verify_claims(llm, claims, _fake_digest(), [_doc()], lambda f, m: None)
+        self.assertEqual(result[0]["verdict"], "NOT FOUND")
+        self.assertEqual(len(gaps), 1)
+
+    def test_an_uncited_supporting_verdict_is_not_downgraded(self):
+        """Only the contradiction direction is enforced here.
+
+        An uncited SUPPORTED verdict cannot put a false conflict in front of the
+        witness; it is the evidence-density component that reports the missing
+        citation, so verification must leave the verdict itself alone.
+        """
+        llm = _FakeLLM(overrides={
+            "verify": {"verifications": [
+                {"id": 1, "verdict": "SUPPORTED", "record_reference": "", "note": "Matches."},
+            ]}
+        })
+        claims = [{"id": 1, "text": "Knee pain began in service."}]
+        result, gaps = _verify_claims(llm, claims, _fake_digest(), [_doc()], lambda f, m: None)
+        self.assertEqual(result[0]["verdict"], "SUPPORTED")
+        self.assertEqual(gaps, [])
+
+
+class TestContradictionDowngradeReason(unittest.TestCase):
+    """The legal rule in code: absence of evidence is not negative evidence.
+
+    Horn v. Shinseki; M21-1 V.ii.1.A — reflected in the rubric and framework and
+    enforced here, so an uncited contradiction cannot reach the veteran.
+    """
+
+    _cited = {"verdict": "CONTRADICTED", "record_reference": "a.txt p.2"}
+
+    def test_a_cited_contradiction_stands(self):
+        self.assertEqual(_contradiction_downgrade_reason(self._cited, evidence_absent=False), "")
+
+    def test_silence_is_a_gap(self):
+        reason = _contradiction_downgrade_reason(self._cited, evidence_absent=True)
+        self.assertIn("no matching record text", reason)
+
+    def test_an_uncited_contradiction_is_a_gap(self):
+        bare = {"verdict": "CONTRADICTED", "record_reference": "  "}
+        self.assertIn(
+            "no conflicting record entry was cited",
+            _contradiction_downgrade_reason(bare, evidence_absent=False),
+        )
+
+    def test_the_two_gaps_are_distinguishable(self):
+        silence = _contradiction_downgrade_reason(self._cited, evidence_absent=True)
+        uncited = _contradiction_downgrade_reason(
+            {"verdict": "CONTRADICTED", "record_reference": ""}, evidence_absent=False
+        )
+        self.assertNotEqual(silence, uncited)
+
+    def test_other_verdicts_are_left_alone(self):
+        for verdict in ("SUPPORTED", "PARTIALLY SUPPORTED", "NOT FOUND"):
+            with self.subTest(verdict=verdict):
+                self.assertEqual(
+                    _contradiction_downgrade_reason({"verdict": verdict}, False), ""
+                )
+
+
+class TestVerifyPromptContract(unittest.TestCase):
+    """What the prompt must say for the code's rule to be followable.
+
+    The downgrade in ``_verify_claims`` is a backstop, not a substitute: a model that is
+    never told a contradiction must be cited will keep producing bare ones, and each one
+    costs an evidence gap and a rewrite pass.
+    """
+
+    def test_a_contradiction_must_name_the_record_entry(self):
+        self.assertIn("MUST name the conflicting record", VERIFY_SYSTEM)
+
+    def test_the_absence_rule_names_the_right_authority(self):
+        # Barr v. Nicholson is a lay-competence case (readily observable conditions).
+        # Citing it for absence-of-evidence is what the previous prompt did.
+        self.assertIn("Buczynski v. Shinseki", VERIFY_SYSTEM)
+        self.assertIn("Horn v. Shinseki", VERIFY_SYSTEM)
+        self.assertIn("M21-1", VERIFY_SYSTEM)
+        self.assertNotIn("Barr", VERIFY_SYSTEM)
+
+    def test_silence_that_would_normally_be_recorded_is_still_not_found(self):
+        """The foundation test must not become a licence to contradict."""
+        self.assertIn("one that would normally be noted or reported", VERIFY_SYSTEM)
+        self.assertIn("even then the verdict is NOT FOUND", VERIFY_SYSTEM)
+
+    def test_a_normal_static_exam_does_not_contradict_a_symptom(self):
+        self.assertIn("A normal finding does not contradict a symptom", VERIFY_SYSTEM)
+        self.assertIn("4.59", VERIFY_SYSTEM)
+
+    def test_not_found_is_not_reported_as_a_record_finding(self):
+        self.assertIn('never write that the records "show no"', VERIFY_SYSTEM)
+
+    def test_the_verdict_depends_on_how_the_writer_knows_the_fact(self):
+        """A relay, a provider's reported words and a layperson's conclusion are not
+        weighed like the writer's own firsthand account."""
+        self.assertIn("and the verdict must respect it", VERIFY_SYSTEM)
+        self.assertIn("SUPPORTS that he said it", VERIFY_SYSTEM)
+        self.assertIn("use PARTIALLY SUPPORTED", VERIFY_SYSTEM)
+        self.assertIn("competence rather than accuracy is the issue", VERIFY_SYSTEM)
+
+
+class TestClaimsPromptContract(unittest.TestCase):
+    """Extraction must not launder how the writer knows a fact.
+
+    The verifier, the rubric and the reviser can only weigh a relay against a firsthand
+    observation if extraction keeps the difference (38 C.F.R. § 3.159(a)(2)), so the
+    prompt that produces the claims has to ask for it in words the model can act on.
+    """
+
+    def test_every_basis_is_named_in_the_prompt_and_the_schema(self):
+        for basis in sorted(CLAIM_BASES):
+            with self.subTest(basis=basis):
+                self.assertIn(basis, CLAIMS_SYSTEM)
+                self.assertIn(basis, CLAIMS_USER)
+
+    def test_the_writers_attribution_words_must_survive(self):
+        self.assertIn("Preserve the writer's attribution", CLAIMS_SYSTEM)
+        self.assertIn('"he told me"', CLAIMS_SYSTEM)
+
+    def test_a_relay_never_becomes_a_firsthand_observation(self):
+        self.assertIn("becomes the writer's own observation", CLAIMS_SYSTEM)
+
+    def test_a_sentence_carrying_two_bases_is_split(self):
+        self.assertIn("TWO claims", CLAIMS_SYSTEM)
+        self.assertIn("emit two claims, one per basis", CLAIMS_USER)
+
+    def test_an_unknown_basis_is_omitted_rather_than_guessed(self):
+        self.assertIn("omit the field rather than guess", CLAIMS_USER)
+
+
+class TestClaimBasisCarriesThrough(unittest.TestCase):
+    """The basis has to reach the prompts that do the weighing, not just the schema."""
+
+    def test_a_firsthand_observation_and_a_relay_stay_distinguishable(self):
+        claims = _normalize_claims([
+            {"id": 1, "text": "I watched him stop after half a block.",
+             "type": "functional_impact", "basis": "observed"},
+            {"id": 2, "text": "He told me the pain was a 9.", "type": "symptom",
+             "basis": "reported"},
+        ])
+        self.assertEqual([c["basis"] for c in claims], ["observed", "reported"])
+
+    def test_a_lay_conclusion_is_recorded_not_reworded(self):
+        claims = _normalize_claims([
+            {"id": 1, "text": "His arthritis is service-connected.",
+             "type": "diagnosis_reference", "basis": "conclusion"},
+        ])
+        self.assertEqual(claims[0]["basis"], "conclusion")
+        self.assertIn("service-connected", claims[0]["text"])
+
+    def test_every_documented_basis_is_accepted_and_normalized(self):
+        for basis in sorted(CLAIM_BASES):
+            with self.subTest(basis=basis):
+                self.assertEqual(_normalize_claim_basis(f"  {basis.upper()} "), basis)
+
+    def test_an_omitted_or_invented_basis_degrades_quietly(self):
+        for value in (None, "", "  ", "sideways", 7, [], {"basis": "observed"}, True):
+            with self.subTest(value=value):
+                self.assertEqual(_normalize_claim_basis(value), UNKNOWN_CLAIM_BASIS)
+        self.assertEqual(
+            _normalize_claims([{"id": 1, "text": "Pain."}])[0]["basis"],
+            UNKNOWN_CLAIM_BASIS,
+        )
+
+    def test_the_verifier_receives_the_basis_with_each_claim(self):
+        seen = {}
+
+        def capture(system, user, kwargs):
+            seen["user"] = user
+            return {"verifications": [{"id": 1, "verdict": "NOT FOUND",
+                                       "record_reference": "", "note": "records are silent."}]}
+
+        claims = [{"id": 1, "text": "He told me the pain was a 9.", "type": "symptom",
+                   "basis": "reported"}]
+        _verify_claims(_FakeLLM(overrides={"verify": capture}), claims, _fake_digest(),
+                       [_doc()], lambda f, m: None)
+        self.assertIn('"basis": "reported"', seen["user"])
+
+    def test_the_rubric_and_revision_prompts_receive_it_too(self):
+        result = EvaluationResult(
+            claims=[{"id": 1, "text": "I watched him stop.", "type": "functional_impact",
+                     "basis": "observed"}],
+            verifications=[{"id": 1, "verdict": "NOT FOUND", "record_reference": "",
+                            "note": "records are silent."}],
+        )
+        self.assertIn("| basis: observed", _verifications_text(result))
+
+    def test_an_unknown_basis_is_not_rendered_as_a_finding(self):
+        result = EvaluationResult(
+            claims=[{"id": 1, "text": "Knee pain.", "type": "symptom"}],
+            verifications=[{"id": 1, "verdict": "NOT FOUND", "record_reference": "",
+                            "note": "records are silent."}],
+        )
+        self.assertNotIn("basis", _verifications_text(result))
+
+
+class TestRewritePromptContract(unittest.TestCase):
+    """The NOT FOUND rewrite rules: keep the claim, show the basis, invent nothing."""
+
+    def test_lay_attribution_is_mandatory_on_not_found_claims(self):
+        self.assertIn("LAY ATTRIBUTION — mandatory on every NOT FOUND claim", REVISE_SYSTEM)
+
+    def test_the_basis_of_knowledge_is_not_hedging(self):
+        self.assertIn("Attribution is the basis of knowledge, NOT doubt", REVISE_SYSTEM)
+        self.assertIn('"I felt", "I noticed", "I still cannot", "it wakes me"', REVISE_SYSTEM)
+        self.assertIn('"I saw", "I watched", "I was there when", "I heard"', REVISE_SYSTEM)
+
+    def test_an_unverified_symptom_must_not_become_a_diagnosis(self):
+        self.assertIn("NO UPGRADE TO DIAGNOSIS", REVISE_SYSTEM)
+        for forbidden in ('"was diagnosed with"', '"due to"', '"caused by"',
+                          '"service-connected"', '"% disabled"', '"the records show"'):
+            with self.subTest(forbidden=forbidden):
+                self.assertIn(forbidden, REVISE_SYSTEM)
+        self.assertIn("A symptom ", REVISE_SYSTEM)
+
+    def test_a_relay_stays_a_relay(self):
+        self.assertIn("keep the relay", REVISE_SYSTEM)
+        self.assertIn("3.159(a)(2)", REVISE_SYSTEM)
+
+    def test_a_lay_incompetent_claim_is_rewritten_not_asserted(self):
+        self.assertIn("Jandreau v. Nicholson", REVISE_SYSTEM)
+        self.assertIn("[Confirm: ...]", REVISE_SYSTEM)
+
+    def test_every_not_found_claim_must_be_accounted_for(self):
+        """An inventory of the NOT FOUND claims, as entries in the existing changes list.
+
+        Deliberately not a second array of quoted sentences: the revision call has a
+        bounded output budget, and a field that duplicates the revised text overruns it
+        (measured against the configured endpoint: an 8,911-character response, cut off
+        mid-string). The audit trail rides on ``changes``, which is short per entry.
+        """
+        self.assertIn("lay_attribution", REVISE_USER)
+        self.assertIn("for EVERY claim the verification", REVISE_USER)
+        self.assertIn("no extra fields, no commentary", REVISE_USER)
+        self.assertNotIn("not_found_attribution", REVISE_USER)
+
+
+class TestRubricPromptContract(unittest.TestCase):
+    """The three misreadings the rubric prompt has to head off."""
+
+    def test_absence_is_not_evidence(self):
+        self.assertIn("Treating absence as evidence", RUBRIC_SYSTEM_TEMPLATE)
+        self.assertIn("Horn v. Shinseki", RUBRIC_SYSTEM_TEMPLATE)
+        self.assertIn("Buczynski v. Shinseki", RUBRIC_SYSTEM_TEMPLATE)
+
+    def test_an_unmeasured_exam_does_not_rebut_a_symptom(self):
+        self.assertIn("Reading a static examination as rebuttal", RUBRIC_SYSTEM_TEMPLATE)
+        self.assertIn("DeLuca v. Brown", RUBRIC_SYSTEM_TEMPLATE)
+        self.assertIn("Sharp v. Shulkin", RUBRIC_SYSTEM_TEMPLATE)
+        self.assertIn("4.59", RUBRIC_SYSTEM_TEMPLATE)
+
+    def test_competent_lay_evidence_is_credited(self):
+        self.assertIn("Diluting competent lay evidence", RUBRIC_SYSTEM_TEMPLATE)
+        self.assertIn("Jandreau v. Nicholson", RUBRIC_SYSTEM_TEMPLATE)
+        self.assertIn("3.159(a)(2)", RUBRIC_SYSTEM_TEMPLATE)
+
+    def test_the_basis_guides_the_competence_and_credibility_scores(self):
+        for basis in sorted(CLAIM_BASES):
+            with self.subTest(basis=basis):
+                self.assertIn(basis, RUBRIC_SYSTEM_TEMPLATE)
+
+
+class TestTopicPromptContract(unittest.TestCase):
+    """Topic gaps must ask for lay detail, never for lay-incompetent conclusions."""
+
+    def test_function_and_flare_ups_decide_a_musculoskeletal_topic(self):
+        self.assertIn("DeLuca v. Brown", TOPIC_SYSTEM_TEMPLATE)
+        self.assertIn("Sharp v. Shulkin", TOPIC_SYSTEM_TEMPLATE)
+        self.assertIn("a missing range-of-motion number is not the gap", TOPIC_SYSTEM_TEMPLATE)
+
+    def test_the_witness_is_never_asked_for_a_diagnosis_or_a_rating(self):
+        self.assertIn("no diagnosis, no cause, no prognosis, no rating", TOPIC_SYSTEM_TEMPLATE)
+        self.assertIn("no measured range-of-motion", TOPIC_SYSTEM_TEMPLATE)
+
+    def test_record_silence_is_not_a_gap_in_the_statement(self):
+        self.assertIn("Silence in the medical records is not a gap", TOPIC_SYSTEM_TEMPLATE)
+
+    def test_forcing_an_inapplicable_topic_is_a_finding_to_avoid(self):
+        self.assertIn('an inapplicable topic is "not applicable", not a gap',
+                      TOPIC_SYSTEM_TEMPLATE)
+
 
 class TestClaimSchemaBoundary(unittest.TestCase):
     def test_invalid_claim_shapes_and_ids_fail_before_verification(self):
@@ -561,7 +881,8 @@ class TestClaimSchemaBoundary(unittest.TestCase):
 
     def test_valid_claims_keep_their_unique_ids_and_normalize_types(self):
         self.assertEqual(_normalize_claims([{"id": " 07 ", "text": " Pain. ", "type": " Symptom "}]),
-                         [{"id": 7, "text": "Pain.", "type": "symptom"}])
+                         [{"id": 7, "text": "Pain.", "type": "symptom",
+                           "basis": UNKNOWN_CLAIM_BASIS}])
         self.assertEqual(_normalize_claims([]), [])
 
     @patch("app.evaluate.review_medical_records", return_value=_fake_digest())

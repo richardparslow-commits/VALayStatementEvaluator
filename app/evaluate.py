@@ -50,14 +50,55 @@ CLAIM_TYPES = frozenset({
     "in_service_event", "onset", "symptom", "diagnosis_reference",
     "treatment_reference", "date_or_place", "functional_impact", "continuity", "other",
 })
+# How the writer knows each fact. Evidentiary weight turns on this: the writer's own
+# experience or a firsthand observation is competent lay evidence (38 U.S.C. § 1154(a);
+# 38 C.F.R. § 3.159(a)(2)), a relay of what someone else said is evidence of the
+# statement made rather than of the inner state, and a diagnosis, cause or rating
+# assertion is outside lay competence (Jandreau v. Nicholson). Asked for in
+# ``CLAIMS_USER``, carried into the verifier prompt with the claims themselves, and
+# surfaced to the rubric and revision prompts by ``_verifications_text``.
+CLAIM_BASES = frozenset({
+    "experienced", "observed", "reported", "provider_statement", "conclusion",
+})
+# What a basis is recorded as when the model omits it or invents a value. The basis
+# guides the reviewer and the downstream prompts; it is never a reason to fail an
+# evaluation whose records have already been read, so anything unexpected degrades to
+# this quietly instead of raising.
+UNKNOWN_CLAIM_BASIS = "unspecified"
 
 
 class VerificationIncompleteError(LLMParseError):
     """Verification could not produce a complete, unambiguous set of verdicts."""
 
 CLAIMS_SYSTEM = """You are a VA claims evidence analyst. Decompose a lay/witness statement \
-into atomic factual assertions so each can be checked against medical records. Distinguish \
-firsthand observations from hearsay and from medical/legal conclusions."""
+into atomic factual assertions so each can be checked against medical records, and record the \
+BASIS OF KNOWLEDGE for each one — how the writer knows it. Evidentiary weight turns on that \
+basis, so it must be captured exactly as written, never smoothed over:
+- "experienced": the writer's own sensation, thought or capacity ("I felt it catch", "I still \
+  cannot lift a gallon of milk", "I wake at 3 a.m."). Competent lay evidence.
+- "observed": the writer personally saw, heard or smelled it ("I watched him stop after half a \
+  block", "I heard him cry out"). Competent lay evidence.
+- "reported": the writer relays what another person said about that person's own inner state \
+  ("he told me his back was burning"). This is competent evidence THAT THE STATEMENT WAS \
+  MADE; it is weaker proof of the inner state than the person's own account, and it never \
+  becomes the writer's own observation.
+- "provider_statement": the writer relays what a medical provider said or did ("the doctor told \
+  him a nerve was pinched", "they gave him shots"). Evidence of what the provider said, not \
+  proof of the clinical fact.
+- "conclusion": the writer's own diagnosis, cause, prognosis or rating assertion ("his \
+  arthritis is service-connected", "he meets the criteria for 100%"). Outside lay competence \
+  (Jandreau v. Nicholson). Still capture it — the reviewer must see it — and do not reword it \
+  into a symptom or into later "fact".
+Rules that make the rest of the pipeline trustworthy:
+- Preserve the writer's attribution in the claim text. Keep the words that show who perceived \
+  it: "I saw", "he told me", "the doctor said". NEVER upgrade a relay into a firsthand fact \
+  ("he told me his knee gave out" is not "his knee gave out") and never restate an \
+  observation as a diagnosis.- One assertion that carries two bases is TWO claims — split it. "I saw him limp and he told \
+me the pain was a 9" is one observation and one report, and they are weighed differently, so \
+splitting is required; re-labeling a merged assertion with one basis loses the distinction.
+- Stay in the writer's own vantage point. A veteran's "I" and a spouse's "he" are different \
+  witnesses: quote the statement's point of view, do not swap or convert it.
+- Do not decide whether a claim is credible or true here. This pass is decomposition only."""
 
 CLAIMS_USER = """Decompose the following lay/witness statement into atomic factual claims.
 
@@ -68,13 +109,19 @@ Return JSON:
   "claims": [
     {{
       "id": 1,
-      "text": "the single factual assertion, quoted/paraphrased faithfully",
-      "type": "in_service_event | onset | symptom | diagnosis_reference | treatment_reference | date_or_place | functional_impact | continuity | other"
+      "text": "the single factual assertion, quoted/paraphrased faithfully, keeping the writer's attribution words (I saw, he told me, the doctor said)",
+      "type": "in_service_event | onset | symptom | diagnosis_reference | treatment_reference | date_or_place | functional_impact | continuity | other",
+      "basis": "experienced | observed | reported | provider_statement | conclusion"
     }}
   ]
 }}
 Rules: capture EVERY checkable assertion (events, dates, places, symptoms, treatments,
-providers, facilities). Keep each claim to one assertion. Number ids sequentially.
+providers, facilities). Keep each claim to one assertion, and set "basis" from how the writer
+knows the fact — not from how strong it sounds. If one sentence holds both what the writer
+observed and what someone reported, emit two claims, one per basis. Number ids sequentially.
+Set a basis whenever the text shows one; if the sentence genuinely does not show how the writer
+knows the fact, omit the field rather than guess — the tool records an omitted basis as unknown,
+and a guessed basis would be weighed as if the witness had actually said it.
 
 STATEMENT:
 <<<
@@ -89,12 +136,52 @@ records and (2) raw record excerpts. Be rigorous but fair:
 - SUPPORTED: a record entry clearly supports the claim.
 - PARTIALLY SUPPORTED: supported in substance but with a discrepancy (e.g., date off by a
   year, different facility name).
-- CONTRADICTED: a record entry clearly conflicts with the claim.
-- NOT FOUND: nothing in the records confirms or denies it. IMPORTANT: under Buchanan v.
-  Nicholson and Barr v. Nicholson, absence from records is NOT negative evidence — many lay
-  facts (home symptoms, undocumented events) will legitimately be NOT FOUND. Never treat
-  NOT FOUND as an error; only CONTRADICTED findings are accuracy failures.
-Cite the supporting/conflicting record fact (with its source label and date) whenever possible."""
+- CONTRADICTED: a record entry AFFIRMATIVELY states the opposite — a dated normal finding, \
+  "denies pain", "no tenderness", "gait normal", the other side, an incompatible date or \
+  facility. A contradiction is an affirmative finding, so it MUST name the conflicting record \
+  entry in record_reference. If you cannot point to that specific record text, the verdict is \
+  NOT FOUND, not CONTRADICTED; the tool downgrades an uncited contradiction to a record gap.
+- NOT FOUND: nothing in the records confirms or denies it. This is the correct verdict for \
+  silence, and it is not an accuracy failure. Absence of evidence on a question is not \
+  substantive negative evidence against a claimant (Buczynski v. Shinseki; Horn v. Shinseki; \
+  M21-1 V.ii.1.A), and the absence of contemporaneous records is not, standing alone, a \
+  reason to reject lay evidence (Buchanan v. Nicholson). Many lay facts (home symptoms, \
+  unrecorded events) will legitimately be NOT FOUND. Silence counts against a claim only \
+  where the fact is one that would normally be noted or reported (Buczynski v. Shinseki) — \
+  and even then the verdict is NOT FOUND, because a missing entry means the record set may \
+  be incomplete, not that the claim is false. Never treat NOT FOUND as an error; only \
+  CONTRADICTED findings are accuracy failures.
+A normal finding does not contradict a symptom: a static exam recording normal range of \
+motion, a normal gait, or "no acute distress" never measured painful motion, functional \
+loss, or flare-ups, so it does not conflict with a claim about them (38 C.F.R. §§ 4.40, 4.45, \
+4.59; DeLuca v. Brown). Mark those claims NOT FOUND.
+Each claim arrives with a "basis" field — how the writer knows it — and the verdict must \
+respect it:
+- experienced / observed: a competent lay account of a symptom, an event, or functional loss \
+  (38 U.S.C. § 1154(a); 38 C.F.R. § 3.159(a)(2)). Records are commonly silent on these, and \
+  silence is NOT FOUND. A record entry that restates what the veteran reported supports that \
+  the report was made, not the clinical fact, so say so in the note rather than treating it as \
+  corroboration of the medicine.
+- reported: verify the fact that it was said, not a third person's inner state. A record entry \
+  documenting the veteran's own complaint SUPPORTS that he said it, even where the examiner's \
+  own findings were normal. Only a dated, specific entry about the same symptom can CONTRADICT \
+  it.
+- provider_statement: SUPPORTED only where a record entry documents the provider saying or \
+  doing that; the clinical fact behind it is not thereby established, so record that in the \
+  note. Where the record shows the same conversation differently, that is a discrepancy in what \
+  was said, so use PARTIALLY SUPPORTED — not CONTRADICTED.
+- conclusion: judge only the checkable part against the record (does the record name that \
+  condition? does it record that event?). An inference a layperson is not competent to draw is \
+  NOT FOUND, with a note that competence rather than accuracy is the issue, because the rubric \
+  grades competence separately. Never mark it CONTRADICTED merely because a lay witness could \
+  not assert it, and never mark it SUPPORTED merely because the record repeats the writer's own \
+  words back to them.
+Cite the supporting or conflicting record fact, with its source label and date, on every \
+verdict: a named record entry for SUPPORTED, PARTIALLY SUPPORTED and CONTRADICTED; empty is \
+correct only for NOT FOUND.
+Do not describe a NOT FOUND claim as unsupported, unverified, inaccurate or inconsistent, and \
+never write that the records "show no" or "contain no record of" the fact — write that the \
+provided records do not address it."""
 
 VERIFY_USER = """Verify each claim below against the medical record digest and raw excerpts.
 Return exactly one verdict for EVERY submitted claim id, with no duplicates or extra ids.
@@ -132,6 +219,31 @@ CLAIMS TO VERIFY:
 
 RUBRIC_SYSTEM_TEMPLATE = """You are a senior veterans-claims advocate grading a lay/witness \
 statement. Apply this rubric strictly and specifically, quoting the statement where useful.
+
+THREE WAYS THIS RUBRIC IS MISAPPLIED — avoid all three:
+1. Treating absence as evidence. A claim the records do not address is NOT FOUND: it is not a \
+discrepancy and it does not lower factual accuracy. Only an affirmative contradiction does \
+(Buczynski v. Shinseki; Horn v. Shinseki; M21-1 V.ii.1.A; Buchanan v. Nicholson). A claim the \
+records merely fail to corroborate was weighed as evidence, not left unsupported.
+2. Reading a static examination as rebuttal. A normal range of motion, a normal gait or "no \
+acute distress" never measured painful motion, functional loss or flare-ups, so it cannot \
+contradict a statement about them (38 C.F.R. §§ 4.40, 4.45, 4.59; DeLuca v. Brown; Sharp v. \
+Shulkin). Where the record holds no such measurement, the statement's functional detail is \
+unimpeached, and the missing measurement is a development question — not a credibility defect \
+in the witness.
+3. Diluting competent lay evidence. A witness describing what they personally felt, saw or \
+could not do is giving competent evidence (38 U.S.C. § 1154(a); 38 C.F.R. § 3.159(a)(2); \
+Jandreau v. Nicholson). Do not withhold credit because no medical opinion joins it, and do not \
+reward a diagnosis, a cause, a prognosis or a rating the witness is not competent to give. \
+Penalize both errors, and supplied the reword for each.
+Each claim carries a "basis" field (experienced, observed, reported, provider_statement, \
+conclusion). Use it when judging lay competence and credibility: a firsthand account is \
+competent evidence even when the records are silent, a relay of what someone else said shows \
+the statement was made rather than proving the inner state, and a provider's reported words \
+are evidence of what was said — worth noting, and worth asking that the underlying treatment \
+record be obtained.
+Score each dimension on the statement as written, tie every rationale to its actual text, and \
+treat the claim-verification results as findings to grade rather than verdicts to re-derive.
 
 {rubric}
 
@@ -195,9 +307,35 @@ before signing MUST be wrapped in [Confirm: ...] placeholders.
 fact noted for them). If the witness might genuinely remember it differently, correct to the \
 record and append a [Confirm: ...] note.
 - Claims PARTIALLY SUPPORTED: align the disputed detail (date, place, name) with the records.
-- Claims NOT FOUND: KEEP them — absence from records is not negative evidence (Buchanan v. \
-Nicholson; Barr v. Nicholson). You may sharpen their wording but must not delete firsthand \
-observations merely because the records are silent.
+- Claims NOT FOUND: KEEP them — absence from records is not negative evidence (Horn v. \
+Shinseki; M21-1 V.ii.1.A; Buchanan v. Nicholson). You may sharpen their wording but must not \
+delete firsthand observations merely because the records are silent, and you must not describe \
+them as unverified, inaccurate or unsupported.
+- LAY ATTRIBUTION — mandatory on every NOT FOUND claim. Because the records say nothing about \
+it, the wording is the only thing the reader has, so every sentence carrying a NOT FOUND claim \
+must show HOW THE WITNESS KNOWS IT. State the basis of knowledge in the witness's own voice:
+
+  * veteran writing about himself — "I felt", "I noticed", "I still cannot", "it wakes me";
+  * a witness describing the veteran — "I saw", "I watched", "I was there when", "I heard";
+  * something the veteran told the witness — keep it a relay: "he told me", "she described".
+
+Attribution is the basis of knowledge, NOT doubt. Never hedge a competent observation \
+("I believe I may have had trouble sleeping" -> "I woke three times a night and could not fall \
+back asleep"), and never attach "unverified", "allegedly", "claimed", "reportedly" or \
+"supposedly" to the witness's own account.
+- NO UPGRADE TO DIAGNOSIS on a NOT FOUND claim. Never convert an unverified symptom into a \
+diagnosis, a cause, a prognosis or a rating, and never imply the records support it: do not \
+write "was diagnosed with", "due to", "caused by", "service-connected", "% disabled", "the \
+records show", "it is documented", or any condition name the witness did not use. A symptom \
+stays a symptom — "pain that wakes me at 3 a.m." — described in terms of what the witness \
+perceived and could not do.
+- If a NOT FOUND claim is a medical or legal conclusion the writer is not competent to give, \
+reword it to the observation behind it (Jandreau v. Nicholson: lay competence reaches what the \
+witness personally observed, and conditions that are simple and readily observable) and put the \
+unverified clinical part in a [Confirm: ...] placeholder instead of asserting it.
+- When the writer is relaying another person's inner state, keep the relay: a witness cannot \
+testify to what someone else felt or thought (38 C.F.R. § 3.159(a)(2)), so "he told me the pain \
+was a 9" stays as he said it and never becomes "he was in severe pain".
 - Keep the writer's voice, grammatical person, and relationship (a coworker writes as a coworker).
 - Stay inside lay competence: observations, symptoms, events, and functional impact only. Reword \
 medical or legal conclusions as observations or attributed statements ("he told me his doctor \
@@ -222,7 +360,7 @@ Return JSON:
   "revision_notes": "2-3 sentences explaining your revision strategy",
   "changes": [
     {{
-      "category": "contradiction_fix | alignment | specificity | lay_competence | structure | record_addition",
+      "category": "contradiction_fix | alignment | specificity | lay_competence | lay_attribution | structure | record_addition",
       "original": "quoted or summarized original passage (empty string if pure addition)",
       "revised": "the replacement or added text",
       "reason": "why, tied to the verification result or rubric finding"
@@ -232,6 +370,14 @@ Return JSON:
   "added_facts_to_verify": ["each record-sourced fact you added that the witness must confirm"]
 }}
 Include one changes entry per meaningful change, in statement order (typically 5-15 entries).
+Return only the structure above — no extra fields, no commentary — and keep every entry short.
+lay_attribution is a required entry, not an optional one: for EVERY claim the verification
+results mark NOT FOUND, add one changes entry with category lay_attribution whose `revised` field
+is the sentence that now carries the claim and whose `reason` quotes the words that state the
+witness's basis of knowledge ("I watched him stop", "he told me the pain was a 9"). Those entries
+are how the witness checks, before signing, that an unverified claim reads as their own account
+rather than as a diagnosis — and if the original sentence already stated the basis, say so in the
+reason and change nothing about it.
 
 ORIGINAL STATEMENT:
 <<<
@@ -278,12 +424,27 @@ Rules:
 - First identify the statement's claim focus, then decide which checklist topics are APPLICABLE \
 to it. Physical-condition claims rarely need medication-mismanagement or self-harm topics; \
 mental-health / caregiver-necessity / aid-and-attendance claims usually need most of them. \
-Never force inapplicable topics onto a claim.
+Never force inapplicable topics onto a claim: an inapplicable topic is "not applicable", not a \
+gap, and a physical claim is never deficient for lacking hazard or self-harm detail.
 - For each applicable topic, judge coverage from the STATEMENT TEXT itself: "covered" (concrete \
 examples present), "partial" (mentioned vaguely or without specifics), "absent" (not addressed).
+- Judge coverage by OBSERVABLE DETAIL, not by medical language. For a musculoskeletal or \
+physical claim, "covered" requires the function: what the pain stops him from doing and for how \
+long, pain on movement rather than only at rest, what a flare-up costs him and how often it \
+occurs, and what has changed over time (38 C.F.R. §§ 4.40, 4.45, 4.59; DeLuca v. Brown; Sharp v. \
+Shulkin). A statement that reports only a static limitation is "partial" at best, even when it \
+names the condition — and a missing range-of-motion number is not the gap.
+- Never ask the witness for what a layperson is not competent to give: no diagnosis, no cause, \
+no prognosis, no rating or percentage, no measured range-of-motion values (Jandreau v. \
+Nicholson; 38 C.F.R. § 3.159(a)(2)). Ask for what the witness personally observed, or for what \
+the veteran could not do.
+- Silence in the medical records is not a gap in the statement (Buczynski v. Shinseki; Horn v. \
+Shinseki): judge the statement on what it says, and never fault it because the records do not \
+mention the topic.
 - Quote short evidence from the statement where present.
 - Each gap_note must be a concrete, implementable suggestion for what the witness should \
-describe or add if it is true.
+describe or add if it is true, phrased as something the witness can supply in their own voice \
+(describe how far he could walk before stopping) rather than as a fact to be established.
 - critical_gaps: the missing/weak applicable topics whose absence most weakens THIS claim (max 5).
 - NEVER propose adding facts the witness may not know; gap notes prompt recollection or flag \
 the topic for the witness to address if true."""
@@ -295,7 +456,7 @@ Return JSON:
   "claim_focus": "one-line description of what this statement supports (condition + claim angle)",
   "topics": [
     {{
-      "topic": "checklist topic label (A-L)",
+      "topic": "checklist topic label (A-O)",
       "applicable": true | false,
       "coverage": "covered | partial | absent | not applicable",
       "evidence": "short quote/paraphrase from the statement, or empty string",
@@ -305,7 +466,7 @@ Return JSON:
   "critical_gaps": ["up to 5 highest-impact missing or weak applicable topics and why they matter"],
   "notes": "1-2 sentence overall coverage assessment"
 }}
-Return one topics entry per checklist topic (A through L), in checklist order.
+Return one topics entry per checklist topic (A through O), in checklist order.
 
 STATEMENT UNDER REVIEW:
 <<<
@@ -490,6 +651,19 @@ def _normalize_claim_id(value: Any) -> int:
     raise LLMParseError("Claim ids must be positive integers or decimal integer strings.")
 
 
+def _normalize_claim_basis(value: Any) -> str:
+    """The claim's basis of knowledge, or ``UNKNOWN_CLAIM_BASIS`` if unrecognised.
+
+    Deliberately lenient: the basis sharpens how a claim is weighed downstream, but a
+    missing or invented label must never invalidate an evaluation whose records have
+    already been read, so anything unexpected degrades to a neutral value instead of
+    raising the way a malformed id, text or type does.
+    """
+    if isinstance(value, str) and value.strip().lower() in CLAIM_BASES:
+        return value.strip().lower()
+    return UNKNOWN_CLAIM_BASIS
+
+
 def _normalize_claims(data: Any) -> list[dict]:
     if not isinstance(data, list):
         raise LLMParseError("Claim extraction is incomplete: expected a claims list.")
@@ -507,7 +681,12 @@ def _normalize_claims(data: Any) -> list[dict]:
             raise LLMParseError("Claim extraction is incomplete: a claim has no valid text.")
         if not isinstance(claim_type, str) or claim_type.strip().lower() not in CLAIM_TYPES:
             raise LLMParseError("Claim extraction is incomplete: invalid claim type.")
-        normalized.append({"id": claim_id, "text": text.strip(), "type": claim_type.strip().lower()})
+        normalized.append({
+            "id": claim_id,
+            "text": text.strip(),
+            "type": claim_type.strip().lower(),
+            "basis": _normalize_claim_basis(item.get("basis")),
+        })
         seen.add(claim_id)
     return normalized
 
@@ -718,7 +897,7 @@ def _analyze_topics(
     statement_text: str,
     report: ProgressCallback,
 ) -> None:
-    """Audit the statement against the topic checklist (A–L).
+    """Audit the statement against the topic checklist (A–O).
 
     Like the revision step, a failure here must not discard the completed
     evaluation, so errors are swallowed and the fields stay empty.
@@ -811,6 +990,39 @@ def _draft_revision(
     report(0.94, "Improvement suggestions drafted.")
 
 
+def _contradiction_downgrade_reason(verification: dict, evidence_absent: bool) -> str:
+    """Why a CONTRADICTED verdict cannot stand, or ``""`` when it can.
+
+    A contradiction is an affirmative finding about the record, so it has to point at the
+    record text that makes it — the same requirement the rubric, the legal framework and
+    ``VERIFY_SYSTEM`` state for the model itself (absence of evidence is not substantive
+    negative evidence: Horn v. Shinseki, 25 Vet. App. 231, 239 n.7 (2012); M21-1, Part V,
+    Subpart ii, Ch. 1, § A). Two cases leave a CONTRADICTED verdict with no evidence:
+
+    * nothing in this record set matches the claim (``evidence_absent``); or
+    * the verifier named no conflicting record entry, so there is nothing to check.
+
+    The second case is the one that survives the first test, and that is why it is checked
+    separately: a batch can hold plenty of overlapping record text about a *different* fact
+    and still receive a bare CONTRADICTED verdict for a claim the records never address.
+    Accepting that verdict would penalise the claim's score, print a conflict in the report,
+    and instruct the reviser to rewrite the claim to match records it never cited.
+    """
+    if str(verification.get("verdict", "")).upper() != "CONTRADICTED":
+        return ""
+    if evidence_absent:
+        return (
+            "no matching record text was retrieved for this claim, so it is a "
+            "record-coverage gap rather than a contradiction."
+        )
+    if not str(verification.get("record_reference", "")).strip():
+        return (
+            "no conflicting record entry was cited, and a contradiction must point at the "
+            "record text that makes it, so it is a record-coverage gap."
+        )
+    return ""
+
+
 def _verify_claims(
     llm: LLMService,
     claims: list[dict],
@@ -820,12 +1032,14 @@ def _verify_claims(
 ) -> tuple[list[dict], list[dict]]:
     """Verify claims in small batches so each prompt stays focused.
 
-    Returns ``(verifications, evidence_gaps)``. ``evidence_gaps`` lists the claims
-    whose batch found no raw record text at all: for those, a CONTRADICTED verdict
-    is downgraded to NOT FOUND, because "the records disagree" and "nothing in the
+    Returns ``(verifications, evidence_gaps)``. ``evidence_gaps`` lists the claims a
+    CONTRADICTED verdict could not be substantiated for — either the batch found no
+    raw record text at all, or the verifier cited no conflicting record entry. Both
+    are downgraded to NOT FOUND, because "the records disagree" and "nothing in the
     records addresses this" are different findings and only one of them is true.
     Reporting a coverage gap as a contradiction would put a false statement in front
-    of a veteran who is about to sign it.
+    of a veteran who is about to sign it (see
+    :func:`_contradiction_downgrade_reason`).
 
     Each batch must pass schema, identity, uniqueness and coverage validation.
     Invalid batches are retried in full; exhaustion raises an explicit incomplete
@@ -898,20 +1112,19 @@ def _verify_claims(
                 )
         for item in verified:
             claim_id = item["id"]
-            if evidence_absent and str(item.get("verdict", "")).upper() == "CONTRADICTED":
+            downgrade_reason = _contradiction_downgrade_reason(item, evidence_absent)
+            if downgrade_reason:
                 item = dict(item)
                 item["verdict"] = "NOT FOUND"
                 item["note"] = (
                     f"{str(item.get('note', '')).strip()} "
-                    "[Downgraded from CONTRADICTED: no matching record text was "
-                    "retrieved for this claim, so it is a record-coverage gap rather "
-                    "than a contradiction.]"
+                    f"[Downgraded from CONTRADICTED: {downgrade_reason}]"
                 ).strip()
                 evidence_gaps.append(
                     {
                         "id": claim_id,
                         "claim": claim_text_by_id.get(claim_id, ""),
-                        "reason": "no matching record text retrieved",
+                        "reason": downgrade_reason,
                     }
                 )
             verdict_by_id[claim_id] = item
@@ -1003,13 +1216,26 @@ def build_evidence_dashboard(
 
 
 def _verifications_text(result: EvaluationResult) -> str:
+    """One line per verdict, carrying the claim's basis of knowledge when it is known.
+
+    The basis travels with the finding because the rubric, the topic audit and the
+    reviser all have to know whether the writer experienced, saw, was told about, or
+    concluded the fact. Without it, the claim text alone cannot show whether a silent
+    record leaves competent lay evidence intact or leaves a relay unproven (see
+    ``CLAIM_BASES``); a claim whose basis is unknown simply omits the field.
+    """
     lines = []
     claim_text = {c["id"]: c.get("text", "") for c in result.claims}
+    claim_basis = {c["id"]: c.get("basis", UNKNOWN_CLAIM_BASIS) for c in result.claims}
     for v in result.verifications:
-        lines.append(
+        line = (
             f"- Claim {v.get('id')}: \"{claim_text.get(v.get('id'), '')}\" => "
             f"{v.get('verdict')} | ref: {v.get('record_reference', '')} | {v.get('note', '')}"
         )
+        basis = claim_basis.get(v.get("id"), UNKNOWN_CLAIM_BASIS)
+        if basis != UNKNOWN_CLAIM_BASIS:
+            line += f" | basis: {basis}"
+        lines.append(line)
     return "\n".join(lines) or "(no claims extracted)"
 
 
@@ -1056,7 +1282,7 @@ def _verdict_component(result: "EvaluationResult") -> float:
 
     SUPPORTED claims boost the score and CONTRADICTED claims penalize it;
     NOT FOUND is neutral — absence from records is not negative evidence
-    (Buchanan v. Nicholson; Barr v. Nicholson). With zero verifications this
+    (Horn v. Shinseki; M21-1 V.ii.1.A). With zero verifications this
     is the neutral midpoint (50) rather than dividing by zero.
     """
     if not result.verifications:
@@ -1592,7 +1818,11 @@ def build_report(
     lines.append("")
     lines.append(
         "_⚪ NOT FOUND is not a failure — lay facts like home symptoms or undocumented events "
-        "often legitimately do not appear in medical records (Buchanan v. Nicholson; Barr v. Nicholson)._"
+        "often legitimately do not appear in medical records, and the absence of evidence is "
+        "not negative evidence (Horn v. Shinseki; M21-1 V.ii.1.A; Buchanan v. Nicholson). Where "
+        "the records hold no measurement of painful motion, functional loss or flare-ups, a "
+        "normal examination does not contradict them either (38 C.F.R. §§ 4.40, 4.45, 4.59; "
+        "DeLuca v. Brown)._"
     )
     lines.append("")
 

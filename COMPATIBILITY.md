@@ -39,6 +39,7 @@ Override any of the above via `OPENAI_API_KEY` / `OPENAI_BASE_URL` /
 - `GET {base_url}/models` (optional; used for the startup availability warning)
 - JSON-mode helper appends `Respond with ONLY valid JSON` to the system prompt — the model must obey JSON output (all modern instruction models do)
 - Non-streaming responses with `response.choices[0].message.content` and optional `response.usage.prompt_tokens / completion_tokens`
+- Structured responses that are not truncated: a provider that stops generating below the requested `max_tokens` reports an **incomplete** run or hands back an unparseable document (measured on the configured Perplexity endpoint). Keep JSON schemas compact — a field that restates text already in the response is what pushes a long answer over that edge.
 
 If your provider deviates, add a compatibility shim (proxy) rather than forking the app.
 
@@ -73,6 +74,7 @@ both at the expensive model unless you accept the cost.
 
 | App version / commit | Change | Impact |
 |----------------------|--------|--------|
+| Lay-attribution rewrite rules and per-claim `basis` (this commit) | `CLAIMS_SYSTEM`/`CLAIMS_USER` now record *how the writer knows* each fact (`basis`: `experienced \| observed \| reported \| provider_statement \| conclusion`), `VERIFY_SYSTEM`/`RUBRIC_SYSTEM_TEMPLATE`/`TOPIC_SYSTEM_TEMPLATE` are tightened on the same authorities, and `REVISE_SYSTEM` requires every NOT FOUND claim to be rewritten with its basis of knowledge and never promoted into a diagnosis, cause or rating | Claims gain an optional `basis` key: saved results and job payloads from earlier versions load unchanged (an absent basis is recorded `unspecified` and is not rendered), and exports are unaffected. The revision response grows by one short `lay_attribution` entry per NOT FOUND claim; do not add a field that restates the revised text — that truncated the JSON at the endpoint's effective output ceiling (measured: an 8,911-character response, cut mid-string) |
 | `main` @ 2026-09-18 (`DEFAULT_BASE_URL` → Router API, `model_{main,fast}` → `perplexity/*`) | Defaults moved from QwenCloud Token Plan to Perplexity's Router API, with the fast/main split mapped onto that catalog | **An existing `.env` is unaffected** — environment and sidebar values override every default, so a deployment that names its endpoint keeps running exactly as before. Only a fresh clone with no `.env` changes behaviour. When the base URL is Perplexity's, `OPENAI_API_KEY` is reused as the Agent API key, so one key serves both the chat endpoint and the Research tab |
 | `main` @ 2026-09-14 (`DEFAULT_BASE_URL` → Token Plan, `model_{main,fast}` → `qwen3.7-*`) | Defaults moved from generic OpenAI to QwenCloud Token Plan | Existing `.env` pointing at OpenAI continues to work (env overrides defaults). New clones without `.env` defaulted to QwenCloud — set `OPENAI_BASE_URL` explicitly if you mean OpenAI. |
 | Prompt injection hardening (`app/prompt_sanitize.py`) | User/record text is escaped before prompt interpolation; `>>>/<<</``` sanitized; guard note added | No API break; model output may be marginally different (safer). |

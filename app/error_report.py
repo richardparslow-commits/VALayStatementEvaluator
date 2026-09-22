@@ -22,6 +22,7 @@ has to be usable from all of them.
 """
 from __future__ import annotations
 
+import threading
 from typing import Any, Literal
 
 from .logging_config import get_logger, get_request_id, new_request_id, set_request_id
@@ -32,7 +33,15 @@ Severity = Literal["error", "warning"]
 
 # Phases already reported in this process, for callers that opt into ``once``.
 # Bounded because these live for the process lifetime.
+#
+# Guarded by a lock because ``report_failure(once=True)`` is called while
+# *rendering*, and Streamlit runs each session's script on its own thread — two
+# browser tabs repainting the same broken sidebar are two threads inside
+# ``_mark_once``. The lock makes the check-then-add atomic, so "first time" means
+# first time rather than first-to-win; it is also what keeps this correct on a
+# free-threaded interpreter.
 _ONCE_SEEN: set[tuple[str, str]] = set()
+_ONCE_LOCK = threading.Lock()
 _ONCE_LIMIT = 512
 
 
@@ -105,9 +114,10 @@ def report_failure(
 def _mark_once(phase: str, message: str) -> bool:
     """True the first time this (phase, message) is seen in the process."""
     key = (phase, message)
-    if key in _ONCE_SEEN:
-        return False
-    if len(_ONCE_SEEN) >= _ONCE_LIMIT:
-        _ONCE_SEEN.clear()
-    _ONCE_SEEN.add(key)
-    return True
+    with _ONCE_LOCK:
+        if key in _ONCE_SEEN:
+            return False
+        if len(_ONCE_SEEN) >= _ONCE_LIMIT:
+            _ONCE_SEEN.clear()
+        _ONCE_SEEN.add(key)
+        return True

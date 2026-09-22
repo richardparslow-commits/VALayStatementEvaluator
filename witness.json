@@ -1,0 +1,13 @@
+{
+  "condition": "PTSD",
+  "claim_type": "Initial claim - service connection",
+  "observations": "I have lived with my husband every day since we married in 2009, so I see his behavior up close. At night, I am often woken by his screaming; this happens about twice a week, and when I reach him he is sitting up in bed, sweating, and does not respond to me for several seconds. On those mornings he is withdrawn and will not talk about what woke him. Around the house, I watch him struggle with ordinary physical tasks: he cannot bend over far enough to put on his own socks, so I kneel and put them on him, and I have stopped asking him to carry laundry baskets because he has to sit down after a flight of stairs. Socially, the change is unmistakable. Our son played Little League through the 2019 season and my husband attended every game; he has not been to a single game since the 2019 season ended, and he now waits in the car in the driveway until the noise inside dies down before coming in. I also noticed last Thanksgiving that when more than a few family members were talking at once, he left the table and sat alone in the garage for over an hour. I am describing only what I have personally seen and heard; I am not a medical professional and I am not offering any diagnosis.",
+  "witness": {
+    "name": "[Witness Name]",
+    "relationship": "Spouse",
+    "known_since": "2009 (married); knew him two years before that",
+    "contact_frequency": "Live together; together nearly every day",
+    "veteran_name": "[Veteran Name]",
+    "witnessed_event": "The 2019 change in behavior and the ongoing sleep disturbances"
+  }
+}

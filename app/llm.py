@@ -5,14 +5,19 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Any, NamedTuple, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast, runtime_checkable
 from urllib.parse import urlparse
-
-from openai import NOT_GIVEN, OpenAI
 
 from . import tracing
 from . import metrics
-from .circuit_breaker import CircuitBreakerOpenError, QueueFullError, get_llm_breaker, get_llm_limiter
+from .circuit_breaker import (
+    CircuitBreakerOpenError,
+    QueueFullError,
+    RateGateTimeoutError,
+    get_llm_breaker,
+    get_llm_limiter,
+    get_llm_rate_gate,
+)
 from .config import (
     DEFAULT_BASE_URL,
     FALLBACK_ENDPOINT,
@@ -36,6 +41,52 @@ except ImportError:  # pragma: no cover - httpx not always installed in tests
 
 logger = logging.getLogger("app.llm")
 
+# Static-only names from the OpenAI SDK: at runtime the SDK is imported
+# lazily (module ``__getattr__`` below) on the first client construction or
+# ``NOT_GIVEN`` use. Importing this module must not pay the SDK's import
+# floor — measured 2026-09-21 at ~32 MB of peak RSS on the import ladder
+# (.freebuff/profile/_memprofile.py --ladder: the ``import app.llm`` rung
+# dropped 103.2 -> 70.9 MB) — because every launch pays that floor while only
+if TYPE_CHECKING:
+    from openai import NOT_GIVEN, OpenAI
+
+
+def _sdk_name(name: str) -> Any:
+    """Resolve ``OpenAI``/``NOT_GIVEN`` through the module global, lazily.
+
+    The module global is consulted FIRST, not last: an active
+    ``patch("app.llm.OpenAI")`` must win, exactly as it did when the import
+    was eager. Only when the global is unbound does this import the SDK and
+    cache the real object, so subsequent lookups are ordinary and free.
+    Internal ``LOAD_GLOBAL`` lookups never reach the module ``__getattr__``
+    (PEP 562 serves external attribute access only), so runtime use sites go
+    through this helper instead. Returns ``Any`` on purpose: the cached value
+    is whatever the SDK (or a test patch) put in the global slot, and callers
+    that hand it to typed surfaces cast at their own call site.
+    """
+    value = globals().get(name)
+    if value is None:
+        import openai
+
+        value = getattr(openai, name)
+        globals()[name] = value
+    return value
+
+
+def __getattr__(name: str) -> Any:
+    """Resolve ``OpenAI`` / ``NOT_GIVEN`` from the SDK on first use (PEP 562).
+
+    This serves *external* attribute access — ``from app.llm import OpenAI``,
+    ``patch("app.llm.OpenAI")``'s getattr, ``app.llm.NOT_GIVEN``. Internal
+    use sites call :func:`_sdk_name` instead. The resolved value is written
+    back into the module globals, so lookups after the first are ordinary
+    (fast) and the patch/restore cycle behaves exactly as it did when the
+    import was eager.
+    """
+    if name in ("OpenAI", "NOT_GIVEN"):
+        return _sdk_name(name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 # Re-export for callers that want to catch these specifically.
 __all__ = [
     "LLMClient",
@@ -47,6 +98,7 @@ __all__ = [
     "LLMParseError",
     "CircuitBreakerOpenError",
     "QueueFullError",
+    "RateGateTimeoutError",
     "ModelProbe",
     "ChatProbe",
     "check_model_availability",
@@ -842,8 +894,14 @@ def _is_timeout_error(exc: BaseException) -> bool:
 
 
 def _is_transient_status(status_code: int | None) -> bool:
+    # 499 (nginx/Cloudflare "client closed request" / client_disconnected) is a
+    # *transport* event — the connection died mid-flight, here after 166 s of a
+    # live digest — not a judgment about the payload, so a retry of the identical
+    # request plausibly succeeds. It must be listed explicitly: it is 4xx, which
+    # the 5xx clause does not reach.
     return bool(
-        status_code is not None and (status_code in {408, 409, 425, 429} or 500 <= status_code < 600)
+        status_code is not None
+        and (status_code in {408, 409, 425, 429, 499} or 500 <= status_code < 600)
     )
 
 
@@ -1011,11 +1069,17 @@ class LLMClient:
         return self._settings.model_fast
 
     def __init__(self, settings: Settings) -> None:
+        # First real client construction is the moment the SDK's import floor
+        # is paid. Both names are bound into module globals here so every
+        # later use site — including the bare NOT_GIVEN in the request loop —
+        # resolves them the same way it did when the import was eager.
+        OpenAI_cls = _sdk_name("OpenAI")
+        _sdk_name("NOT_GIVEN")
         _validate_settings(settings)
         _validate_fallback_settings(settings)
         self._settings = settings
         _timeout_s = _configured_timeout_seconds()
-        self._client = OpenAI(
+        self._client = cast("type[OpenAI]", OpenAI_cls)(
             api_key=settings.api_key, base_url=settings.base_url, timeout=max(1.0, _timeout_s),
             max_retries=0,  # Application retries must observe pipeline cancellation.
         )
@@ -1024,7 +1088,7 @@ class LLMClient:
         self._fallback_client: OpenAI | None = None
         fallback = _fallback_target(settings)
         if fallback.configured:
-            self._fallback_client = OpenAI(
+            self._fallback_client = cast("type[OpenAI]", OpenAI_cls)(
                 api_key=fallback.api_key,
                 base_url=fallback.base_url,
                 timeout=max(1.0, _timeout_s),
@@ -1246,9 +1310,11 @@ class LLMClient:
 
         Raises ``CircuitBreakerOpenError`` (fail-fast, <2 s, no network) when this
         endpoint's breaker is OPEN, ``QueueFullError`` when the concurrency queue
-        is full or times out, and ``LLMError`` when the provider call exhausts its
-        retries. The breaker counts only *logical* call failures (one per call that
-        exhausts retries), not per-attempt retries.
+        is full or times out or the rate gate's pacing budget is exceeded (a
+        ``RateGateTimeoutError``, also a ``QueueFullError``), and ``LLMError``
+        when the provider call exhausts its retries. The breaker counts only
+        *logical* call failures (one per call that exhausts retries), not
+        per-attempt retries.
         """
         model = self._resolve_model(endpoint, model)  # noqa: A001 - reassign param
         rid = get_request_id() or "-"
@@ -1265,6 +1331,23 @@ class LLMClient:
             raise
 
         limiter = get_llm_limiter()
+        # Preventive pacing BEFORE taking a concurrency slot: the gate spaces
+        # admissions so the provider's 429s are avoided rather than retried,
+        # and its wait must not hold a limiter slot that other calls could use.
+        # The wait budget is capped at the pipeline's remaining time exactly
+        # like the limiter queue wait below, so a paced call can never be the
+        # reason a pipeline run blows its own wall clock.
+        rate_gate = get_llm_rate_gate()
+        if rate_gate.enabled:
+            remaining = pipeline_remaining_seconds()
+            try:
+                if remaining is None:
+                    rate_gate.wait()
+                else:
+                    rate_gate.wait(timeout=min(rate_gate.queue_timeout, remaining))
+            except RateGateTimeoutError:
+                check_pipeline_cancelled()
+                raise
         # Acquire a concurrency slot (queues up to max_queue_depth, else QueueFullError).
         remaining = pipeline_remaining_seconds()
         try:

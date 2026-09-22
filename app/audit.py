@@ -22,13 +22,32 @@ Privacy contract — audit entries **never** contain: statement / observations /
 record text / veteran or witness names / file content. Only counts,
 classifications and source labels are recorded.
 
-One field sits outside that guarantee and is called out deliberately:
-``error_message`` is arbitrary ``str(exc)`` from an upstream library, and a
-library can put anything in an exception message. It is scrubbed of
-PII-shaped tokens and whitespace-collapsed, and it can be omitted entirely with
-``VA_LSE_AUDIT_ERROR_MESSAGES=0`` — which is what a deployment shipping audit
-logs to third-party storage should do (see DEPLOYMENT.md → Audit log backup).
-``error_class`` is always recorded and is always safe.
+No traceback is ever written here — only ``error_class`` and, when enabled,
+``error_message`` — so exception frames and local variables cannot reach this
+stream at all. ``error_message`` is the one field outside the "counts and
+classifications only" guarantee, and it is the one an upstream library controls:
+``str(exc)`` from an HTTP client can contain a response body, and providers
+do echo request content back on validation or content-filter rejections.
+
+It is handled in two layers:
+
+* **Known exception classes are described in this module's own words.**
+  ``_SAFE_REASON_BY_CLASS`` maps the app's own errors (extraction, LLM taxonomy,
+  timeouts, cancellation, memory, blob/job payloads) to a short PHI-free reason,
+  with numeric extras (upstream status) preserved. The full text still reaches
+  ``app.log`` and ``logs/runs.jsonl``, where diagnosis happens; it does not reach
+the stream that gets shipped off-pod.
+* **Unknown classes are scrubbed.** Free text is stripped of control and invisible
+  characters, whitespace-collapsed, and redacted for PII-shaped tokens: SSNs
+  (dashed, spaced/dotted, or bare 9 digits), long digit runs, emails, URLs,
+  filesystem paths, record-file names, and phone numbers. It is then truncated.
+
+Both layers can be bypassed entirely with ``VA_LSE_AUDIT_ERROR_MESSAGES=0``,
+which is what a deployment shipping audit logs to third-party storage should set
+(see DEPLOYMENT.md → Audit log backup). ``error_class`` is always recorded and is
+always safe. The residual risk is honest and stated: a *name* written in a
+provider's error text cannot be found by shape, which is exactly why the known
+classes never carry provider text and why the off switch exists.
 
 Configuration via env (see ``.env.example``):
 
@@ -82,25 +101,162 @@ _write_failures = 0
 _last_write_error = ""
 
 # PII-shaped tokens that can turn up inside an arbitrary exception message.
-_SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
+#
+# The shapes matter as much as the patterns: an SSN is written "123-45-6789" on a
+# form, "123 45 6789" in a note typed into a web form, and "123456789" in a
+# pasted export, so all three are covered. Names are deliberately absent from this
+# list because a name cannot be found by shape — the answer for names is the
+# curated-reason layer below, not a cleverer regex.
+_SSN_DASHED_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
+_SSN_SPACED_RE = re.compile(r"\b\d{3}[ .]\d{2}[ .]\d{4}\b")
 _LONG_DIGITS_RE = re.compile(r"\b\d{7,}\b")
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
+_URL_RE = re.compile(r"\b(?:https?|s3|gs|ftp)://\S+", re.IGNORECASE)
+# Filesystem paths — absolute POSIX and Windows — which routinely name the user
+# (``/Users/rich/Desktop/John Doe VA Records/clinic.pdf``). Directory segments may
+# contain spaces, because that is exactly how a name gets into a path; the final
+# segment may not, so the match stops at the filename and ``_RECORD_FILE_RE``
+# takes that over. A leading separator is required, so prose that happens to
+# contain slashes ("PTSD/depression", "knee/back") is left alone.
+_PATH_RE = re.compile(
+    r"(?:(?<!\S)[A-Za-z]:\\(?:[^\\\n\r\"'|;,()]{1,80}\\){1,6}[^\s\\\n\r\"'|;,()]{0,80}"
+    r"|(?<!\S)/(?:[^/\n\r\"'|;,()]{1,80}/){1,6}[^\s/\n\r\"'|;,()]{0,80})"
+)
+# A record file name. Veterans name their bundles after themselves
+# ("John Doe VA Records 2024.pdf"), and extraction errors interpolate the file
+# name into their message, so this shape is PII in practice even though the
+# module's other fields are careful to log only source *labels*.
+_RECORD_FILE_RE = re.compile(
+    r"\b[\w.\-()' ]{1,64}?\.(?:pdf|docx?|xlsx?|csv|txt|md|zip|jsonl?|log|tiff?|png|jpe?g)\b",
+    re.IGNORECASE,
+)
+# Phone numbers, including the parenthesised form a form produces: the leading
+# ``(`` arrives before the country/area code, so the pattern must allow it there.
+# A person's name cannot be found by shape, and pretending otherwise would be
+# worse than not trying (it would invite treating this field as safe). What *is*
+# worth doing is the cue-based case, because error text names people the way forms
+# do: "veteran John Doe", "patient: Jane Q Doe", "witness Mary Roe reported".
+# Only capitalised runs after an explicit cue are touched, so "Read Timeout" and
+# "Patient reported knee pain" (lowercase continuation) are left intact.
+_NAME_AFTER_CUE_RE = re.compile(
+    r"\b(?i:veteran|patient|claimant|witness|spouse|name)\b([:\s]+)"
+    r"(?:[A-Z][\w'.-]*\s+){0,2}[A-Z][\w'.-]+",
+)
+_PHONE_RE = re.compile(
+    r"(?:(?:\+?\d{1,3}[ .\-]?)?\(?\d{3}\)?[ .\-]?\d{3}[ .\-]?\d{4})\b"
+)
 _NEWLINE_RE = re.compile(r"\s+")
+# Control characters (log-injection: a forged newline splits one JSON record into
+# two) and the invisible characters used to hide a payload from human review.
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_INVISIBLE_RE = re.compile(
+    "[\u00ad\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff"
+    "\U000e0000-\U000e007f]"
+)
+
+# Curated, code-owned reasons for the app's own exception classes. This is the
+# default-deny layer: for these classes no upstream text is echoed at all, so the
+# provider cannot put a veteran's name in the audit stream — the diagnosis lives
+# in app.log, which stays on the host.
+_SAFE_REASON_BY_CLASS: dict[str, str] = {
+    "ExtractionError": "the record file could not be read or held no extractable text",
+    "LLMParseError": "the model response could not be parsed as JSON",
+    "LLMTimeoutError": "the model endpoint did not answer within the configured timeout",
+    "LLMConfigurationError": "the model endpoint rejected the configuration",
+    "LLMUpstreamError": "the model endpoint rejected the request",
+    "_ModerationFilteredError": "the provider's content filter rejected the request",
+    "CircuitBreakerOpenError": "the endpoint was marked unhealthy; no request was sent",
+    "QueueFullError": "the app's concurrent-call cap was reached; no request was sent",
+    "PipelineTimeoutError": "the run exceeded its wall-clock budget",
+    "PipelineCancelledError": "the run was cancelled before it finished",
+    "MemoryError": "the host ran out of memory during the run",
+    "BlobStoreError": "a stored payload could not be read or written",
+    "JobPayloadError": "the queued job payload could not be decoded",
+    "VerificationIncompleteError": "claim verification did not complete",
+}
 
 
 def _note_write_failure(exc: BaseException) -> None:
     global _write_failures, _last_write_error  # noqa: PLW0603
     with _write_lock:
         _write_failures += 1
-        _last_write_error = f"{type(exc).__name__}: {exc}"[:300]
+        # Scrubbed like every other free-text field: a handler error can carry a
+        # path or a file name, and this value is served by /health.
+        _last_write_error = _scrub_error_message(f"{type(exc).__name__}: {exc}")[:300]
 
 
 def _scrub_error_message(text: str) -> str:
     """Collapse whitespace and redact PII-shaped tokens from free-text errors."""
-    scrubbed = _NEWLINE_RE.sub(" ", text or "").strip()
-    for pattern in (_SSN_RE, _EMAIL_RE, _LONG_DIGITS_RE):
+    scrubbed = _CONTROL_RE.sub("", text or "")
+    scrubbed = _INVISIBLE_RE.sub("", scrubbed)
+    scrubbed = _NEWLINE_RE.sub(" ", scrubbed).strip()
+    for pattern in (
+        _SSN_DASHED_RE,
+        _SSN_SPACED_RE,
+        _EMAIL_RE,
+        _URL_RE,
+        _PATH_RE,
+        _RECORD_FILE_RE,
+        _PHONE_RE,
+        _NAME_AFTER_CUE_RE,
+        _LONG_DIGITS_RE,
+    ):
         scrubbed = pattern.sub("[redacted]", scrubbed)
     return _safe_truncate(scrubbed, 300)
+
+
+# A mixed-case capitalised word ("John", "Doe", "Agency") — deliberately not an
+# acronym, so PTSD/TBI/DD-214/VA.gov survive. Used to keep person names out of
+# the classification fields, where free text should not be reaching anyway.
+_CAP_WORD = r"[A-Z][a-z][\w'’.-]*"
+_CAP_RUN_RE = re.compile(rf"\b{_CAP_WORD}(?:[ \t]+{_CAP_WORD})+\b")
+_CAP_SINGLE_RE = re.compile(rf"^\s*{_CAP_WORD}\s*$")
+
+
+def _scrub_classification(text: str, *, limit: int) -> str:
+    """Scrub a field whose contract is "a classification, never PII text".
+
+    ``condition`` is built from the condition selector's vocabulary, so the shape
+    that matters is the one that should never appear: a person's name typed into (or
+    pasted over) the field. A run of two or more mixed-case capitalised words, or a
+    field that is nothing but one such word, is replaced with ``[name]``.
+
+    The trade-off is deliberate and worth stating: a title-cased or proper-noun
+    condition ("Agent Orange") is replaced too, because that cost is smaller than
+    logging a name, and the fix for it is the caller passing a classification rather
+    than the field guessing. Single lowercase words and acronyms are untouched, and
+    the shape scrubber runs first, so an SSN in the field is redacted either way.
+    """
+    scrubbed = _CAP_RUN_RE.sub("[name]", _scrub_error_message(text))
+    if _CAP_SINGLE_RE.match(scrubbed or ""):
+        return "[name]"
+    return _safe_truncate(scrubbed, limit)
+
+
+def scrub_free_text(text: str) -> str:
+    """Public entry point for the scrubber, for any stream that logs free text.
+
+    ``logs/runs.jsonl`` (``app/run_log.py``) is documented as carrying scrubbed
+    error text, and it wrote whatever ``str(exc)`` it was given. One implementation
+    exists on purpose: two copies of "PII-shaped token" is how one of them silently
+    drifts from the other, and the drift is invisible until a log review.
+    """
+    return _scrub_error_message(text)
+
+
+def _safe_error_text(exc: BaseException) -> str:
+    """Audit-safe description of a failure: our words for our errors, else scrubbed.
+
+    Numeric extras (the upstream HTTP status) are preserved for the curated path:
+    they are what makes "rejected the request" actionable, and a status code is not
+    PII.
+    """
+    reason = _SAFE_REASON_BY_CLASS.get(type(exc).__name__)
+    if reason is None:
+        return _scrub_error_message(str(exc))
+    status = getattr(exc, "status_code", None)
+    suffix = f" (upstream status {int(status)})" if isinstance(status, int) else ""
+    return _safe_truncate(reason + suffix, 300)
 
 # ``research`` covers the Perplexity Agent API panel (app/perplexity_agent.py): a
 # web-grounded lookup against the legal framework, which shares this stream's
@@ -380,6 +536,7 @@ def audit_event(
     outcome: dict[str, Any] | None = None,
     error_class: str | None = None,
     error_message: str | None = None,
+    error: BaseException | None = None,
     llm_endpoints: list[str] | None = None,
 ) -> None:
     """Emit one audit log entry (best-effort, never raises).
@@ -387,6 +544,12 @@ def audit_event(
     Only metadata and classifications are recorded — no statement text,
     observations, or record content. ``condition`` is truncated to 120 chars;
     ``error_message`` to 300 chars.
+
+    Pass ``error=exc`` rather than ``str(exc)``: the class name and the description
+    are then derived here, where the curated-reason table lives, so an upstream
+    exception never has to be trusted by the caller. ``error_class``/
+    ``error_message`` remain for callers that hold only text (the research panel)
+    and for tests; ``error_message`` is scrubbed either way.
 
     ``llm_endpoints`` names the endpoints that served the run (``primary`` when a
     single endpoint was used). It is here because a failover silently changes
@@ -398,13 +561,16 @@ def audit_event(
         audit_logger = get_audit_logger()
         # Resolve session id lazily when caller does not supply one.
         sess_id = (user_session_id or "").strip() or get_audit_session_id()
-        # Normalize condition — never log names/PII, only the claim type.
-        cond = _safe_truncate(condition or "", 120) if condition else ""
+        # Normalize condition — never log names/PII, only the claim type. Scrubbed
+        # rather than merely truncated: this field is caller text (a condition the
+        # user typed or selected), so a name or an SSN written into it would
+        # otherwise be logged verbatim, and truncation is not a privacy control.
+        cond = _scrub_classification(condition, limit=120) if condition else ""
         # Normalize sources — only labels, not filenames/paths that might leak.
         sources: list[str] = []
         if record_sources:
             for s in record_sources:
-                label = _safe_truncate(str(s), 40)
+                label = _safe_truncate(_scrub_error_message(str(s)), 40)
                 if label:
                     sources.append(label)
 
@@ -437,7 +603,11 @@ def audit_event(
             # Shallow-copy and ensure JSON-serializable primitives only.
             safe_outcome: dict[str, Any] = {}
             for k, v in outcome.items():
-                if isinstance(v, (str, int, float, bool)) or v is None:
+                if isinstance(v, str):
+                    # Caller-supplied: scrubbed like every other free-text field, so
+                    # a future outcome key cannot become a PHI channel by default.
+                    safe_outcome[str(k)] = _scrub_error_message(v)
+                elif isinstance(v, (int, float, bool)) or v is None:
                     safe_outcome[str(k)] = v
                 elif isinstance(v, (list, dict)):
                     try:
@@ -448,6 +618,11 @@ def audit_event(
                 else:
                     safe_outcome[str(k)] = repr(v)
             payload["outcome"] = safe_outcome
+        if error is not None:
+            # The exception object is the trustworthy input: class from the type,
+            # description from the curated table (our words for our errors).
+            error_class = error_class or type(error).__name__
+            error_message = error_message or _safe_error_text(error)
         if error_class:
             payload["error_class"] = _safe_truncate(error_class, 80)
         # Free-text upstream error text is the one field outside the module's
@@ -530,8 +705,7 @@ def audit_evaluate_error(
         record_files=record_files,
         record_pages=record_pages,
         duration_ms=duration_ms,
-        error_class=type(error).__name__,
-        error_message=str(error),
+        error=error,
     )
 
 
@@ -604,6 +778,5 @@ def audit_draft_error(
         record_files=record_files,
         record_pages=record_pages,
         duration_ms=duration_ms,
-        error_class=type(error).__name__,
-        error_message=str(error),
+        error=error,
     )

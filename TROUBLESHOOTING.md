@@ -64,7 +64,7 @@ the rejection. Two kinds of cause behave differently:
 |---|---|---|
 | `status=401` / `403`, "rejected the request" | The endpoint refused the request — key, model id, or endpoint. No number of retries changes this | Fix the settings, then re-run. Waiting will not help |
 | `status=400` naming a model, against Perplexity's Router API | The model is not in the account's catalog. Router API is in **private preview** and the published catalog *is* the allowlist, so a correct-looking `perplexity/…` id can still be refused | Request Router access (api@perplexity.ai), or point the sidebar fields at a provider the key already serves. See `COMPATIBILITY.md` |
-| `status=429` | Rate-limited, and the call's own retries were already spent | Wait a little, lower `VA_LSE_MAX_CONCURRENT_LLM_CALLS`, then re-run |
+| `status=429` | Rate-limited, and the call's own retries were already spent | Wait a little, lower `VA_LSE_RECORDS_CONCURRENCY`, or prevent recurrence by pacing requests: set `VA_LSE_LLM_MIN_INTERVAL_SECONDS` (e.g. `2` = one call every 2 s) or `VA_LSE_LLM_MAX_RPM` (e.g. `30`) so calls are spaced rather than retried |
 | `status=5xx`, timeouts, connection errors | A provider-side problem | Wait for the recovery timeout and re-run |
 | Nothing quoted — `fail_fast` only | The endpoint never answered during this run, and the breaker was already open when the first chunk ran | Wait for the recovery timeout, then re-run |
 
@@ -294,7 +294,7 @@ the same **What happened?** panel as any other failure.
 |---------|--------------|-----|
 | All chunks fail immediately | API key/base URL mismatch | Verify key matches endpoint provider |
 | The run will not start at all ("Run not started") | The preflight proved the configuration cannot work | See **The run did not start** above |
-| Fails after some successful calls | Rate limiting | Reduce `VA_LSE_RECORDS_CONCURRENCY` or wait |
+| Fails after some successful calls | Rate limiting | Reduce `VA_LSE_RECORDS_CONCURRENCY`, or set `VA_LSE_LLM_MIN_INTERVAL_SECONDS` / `VA_LSE_LLM_MAX_RPM` to space calls and prevent the 429s instead of absorbing them |
 | Intermittent failures | Provider outage or network issue | Configure fallback endpoint |
 | Fails only on large files | Timeout or payload too large | Split records or increase `VA_LSE_LLM_CALL_TIMEOUT_SECONDS` |
 | **Apply settings** rejects a model name ("ends with '.'") | A model id copied out of a sentence or list kept its punctuation ("… the cheapest is `perplexity/glm-5.3-flash`.") | Delete the trailing `.` — copy ids from the provider's own model list, never from running prose. The same check refuses the run before any call is made. If the field only *looks* like it ends in punctuation, it is clipped, not mistyped — the applied ids are printed in full beneath the model boxes |

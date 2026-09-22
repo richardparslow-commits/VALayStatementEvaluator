@@ -472,6 +472,28 @@ def _positive_int_env(name: str, default: int) -> int:
     return value if value > 0 else default
 
 
+def _bounded_int_env(name: str, default: int, *, low: int, high: int) -> int:
+    """Read an int env var and clamp it into ``[low, high]``.
+
+    For knobs where a wrong value is not merely suboptimal but *destructive*.
+    ``DIGEST_CHUNK_CHARS`` is the case that motivated this: ``VA_LSE_DIGEST_
+    CHUNK_CHARS=8`` (a plausible typo for ``8000``) is below the cutter's 400-char
+    overlap, so every chunk would advance the cursor by one character — measured
+    1,048,576 chunks per MB of record text, i.e. ~12 million chunks and gigabytes
+    of ``Chunk`` objects on a 5,000-page bundle. A value outside the band is
+    clamped, never honored, and never silently replaced by the default: the
+    operator's intent ("smaller chunks") survives, its blast radius does not.
+    """
+    value = _int_env(name, default)
+    return max(low, min(high, value))
+
+
+# Floor for the digest chunk budget, shared with ``app/documents.MIN_CHUNK_CHARS``
+# (kept as a literal here so ``config`` stays import-free of ``documents``; a test
+# asserts the two agree).
+_MIN_DIGEST_CHUNK_CHARS = 1600
+
+
 def _non_negative_int_env(name: str, default: int) -> int:
     """Like ``_positive_int_env``, but ``0`` is a valid setting. Never negative.
 
@@ -565,7 +587,16 @@ EVIDENCE_WEAK_OVERLAP = _float_env("VA_LSE_EVIDENCE_WEAK_OVERLAP", 0.05) or 0.05
 
 # Characters per record chunk. Smaller chunks => more LLM calls but better
 # recall on dense pages (nothing gets truncated mid-extraction).
-DIGEST_CHUNK_CHARS = _int_env("VA_LSE_DIGEST_CHUNK_CHARS", 8000)
+# Clamped to the band ``app/documents`` can actually cut in: at or below the 400-char
+# overlap every chunk advances one character (~1M chunks per MB of text), and above
+# the ceiling a single chunk stops fitting any context window. The floor is the same
+# constant the cutters enforce on their own, so the env knob and a direct call agree.
+DIGEST_CHUNK_CHARS = _bounded_int_env(
+    "VA_LSE_DIGEST_CHUNK_CHARS",
+    8000,
+    low=_MIN_DIGEST_CHUNK_CHARS,
+    high=100_000,
+)
 
 # .zip upload expansion bounds. An uploaded archive is untrusted input and its
 # members are held in memory as soon as they are extracted, so every dimension is
@@ -651,6 +682,16 @@ LLM_CB_RECOVERY_SECONDS = _positive_int_env("VA_LSE_CB_RECOVERY_SECONDS", 60)
 LLM_MAX_CONCURRENT = _positive_int_env("VA_LSE_MAX_CONCURRENT_LLM_CALLS", 20)
 LLM_QUEUE_MAX_DEPTH = _positive_int_env("VA_LSE_LLM_QUEUE_MAX_DEPTH", 50)
 LLM_QUEUE_TIMEOUT_SECONDS = _positive_int_env("VA_LSE_LLM_QUEUE_TIMEOUT_SECONDS", 30)
+
+# Optional *preventive* rate pacing between LLM call admissions (see
+# app/circuit_breaker.py's MinimumIntervalGate). Retries absorb the 429s that
+# happen; spacing stops them from happening. Both knobs express the same
+# constraint — pick whichever matches your provider's pricing page — and the
+# stricter wins when both are set. 0 (the default) disables pacing entirely.
+# Example: Perplexity's per-minute request cap translates directly to
+# VA_LSE_LLM_MAX_RPM; ~15 RPM ≈ one call every 4 s.
+LLM_RATE_MIN_INTERVAL_SECONDS = _float_env("VA_LSE_LLM_MIN_INTERVAL_SECONDS", 0.0) or 0.0
+LLM_RATE_MAX_RPM = _float_env("VA_LSE_LLM_MAX_RPM", 0.0) or 0.0
 
 # ---------------------------------------------------------------------------
 # Failover to a second LLM endpoint (optional — see app/llm.py).

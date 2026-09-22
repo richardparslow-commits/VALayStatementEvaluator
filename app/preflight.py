@@ -27,6 +27,7 @@ a rate limit, a 5xx) leaves the listing's verdict alone.
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field, replace
 from hashlib import sha256
@@ -315,15 +316,32 @@ def _quoted(names: tuple[str, ...]) -> str:
     return ", ".join(quoted[:-1]) + f" and {quoted[-1]}"
 
 
-def _model_present(model: str, available: set[str]) -> bool:
-    """True when the endpoint lists *model*, exactly or as a dated variant.
+# A listed-id tail that reads as a version or tag (`2025-04-16`, `v2`, `1.0.3`,
+# `latest`) rather than a name continuation (`mini`, `turbo`, `preview`).
+_VERSION_TAIL_RE = re.compile(r"^v?\d[\w.:-]*$|^latest$", re.IGNORECASE)
 
-    Providers routinely serve `qwen3.7-max` as `qwen3.7-max-2025-04-16`, and the
-    configured id is the one that works, so a listed id *extending* the configured
-    one counts as present. The reverse does not: a configured id longer than
-    anything listed is a different model, and blocking on it is the point.
+
+def _model_present(model: str, available: set[str]) -> bool:
+    """True when the endpoint lists *model*, exactly or as a versioned variant.
+
+    Providers routinely serve `qwen3.7-max` as `qwen3.7-max-2025-04-16` (or tag it
+    `...:latest`), and the configured id is the one that works, so a listed id may
+    *extend* the configured one — but only across a `-`/`:` boundary and only by
+    something that reads as a version or tag, never by more name: a configured
+    `gpt-4o` is not satisfied by a listed `gpt-4o-mini`, and `gpt-4` is not
+    satisfied by `gpt-40`. The reverse still does not count either: a configured id
+    longer than anything listed is a different model, and blocking on it is the
+    point.
     """
-    return any(candidate == model or candidate.startswith(model) for candidate in available)
+    if model in available:
+        return True
+    for candidate in available:
+        if not candidate.startswith(model):
+            continue
+        rest = candidate[len(model) :]
+        if rest[:1] in ("-", ":") and _VERSION_TAIL_RE.match(rest[1:]):
+            return True
+    return False
 
 
 def _router_note(settings: Settings) -> str:

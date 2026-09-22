@@ -13,6 +13,8 @@ import base64
 import hashlib
 import io
 import json
+import os
+import shlex
 import sys
 import tempfile
 import unittest
@@ -135,6 +137,11 @@ class ExtractorTestCase(unittest.TestCase):
         # which tests ran before it.
         error_report._ONCE_SEEN.clear()
         self.addCleanup(error_report._ONCE_SEEN.clear)
+        # The extraction status is process-wide too (it is what /health and the
+        # sidebar report), and the fallback tests below write it on purpose — so
+        # clean it on both sides and leave no evidence for another module to find.
+        extractors.reset_extraction_status()
+        self.addCleanup(extractors.reset_extraction_status)
 
     def sandbox(self, runner: Any, **kwargs: Any) -> extractors.SandboxExtractor:
         return extractors.SandboxExtractor(
@@ -344,6 +351,131 @@ class TestSandboxRefusals(ExtractorTestCase):
         )
 
 
+class TestRunnerInterpreter(unittest.TestCase):
+    """The documented runner command has to start on a host that only has ``python3``.
+
+    ``VA_LSE_EXTRACTOR_RUNNER="python scripts/vercel_sandbox_runner.py {work}"`` is
+    the line ``.env.example`` and both docs carry; before
+    :func:`app.extractors.resolve_python_interpreter` it failed on macOS, most Debian
+    images and this repo's own virtualenv with "the runner command does not exist
+    (python)", so the first real attempt at a box fell open for a reason that says
+    nothing about the box. A configured interpreter *path* that has moved is the same
+    failure one spelling over, so both are pinned here.
+    """
+
+    def test_a_python_the_host_lacks_becomes_the_running_interpreter(self) -> None:
+        runner = extractors.CommandBoxRunner("python scripts/vercel_sandbox_runner.py {work}")
+
+        with patch("app.extractors.shutil.which", return_value=None):
+            with self.assertLogs("app.extractors", level="INFO") as logged:
+                argv = runner.command_for(Path("/tmp/staged"))
+
+        self.assertEqual(
+            argv, [sys.executable, "scripts/vercel_sandbox_runner.py", "/tmp/staged"]
+        )
+        self.assertIn("'python'", "\n".join(logged.output))
+        self.assertIn("not on PATH", "\n".join(logged.output))
+        self.assertIn(sys.executable, "\n".join(logged.output))
+
+    def test_a_configured_interpreter_path_that_is_not_there_is_a_warning(self) -> None:
+        """The stale-``.venv`` case, which is a broken config rather than a spelling."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        missing = str(Path(tmp.name) / ".venv-sandbox" / "bin" / "python")
+        runner = extractors.CommandBoxRunner(f"{missing} scripts/vercel_sandbox_runner.py {{work}}")
+
+        with self.assertLogs("app.extractors", level="WARNING") as logged:
+            argv = runner.command_for(Path("/tmp/staged"))
+
+        self.assertEqual(
+            argv, [sys.executable, "scripts/vercel_sandbox_runner.py", "/tmp/staged"]
+        )
+        self.assertIn("not on this host", "\n".join(logged.output))
+        self.assertIn(sys.executable, "\n".join(logged.output))
+
+    def test_an_interpreter_path_that_exists_is_left_alone(self) -> None:
+        runner = extractors.CommandBoxRunner(f"{sys.executable} scripts/runner.py {{work}}")
+
+        self.assertEqual(
+            runner.command_for(Path("/w")), [sys.executable, "scripts/runner.py", "/w"]
+        )
+
+    def test_a_missing_file_that_is_not_an_interpreter_is_not_rewritten(self) -> None:
+        """The path branch matches the interpreter, not every ``…/bin/…`` that is gone."""
+        for program in ("~/bin/sandbox-run", "/opt/python-tools/runner"):
+            runner = extractors.CommandBoxRunner(f"{program} {{work}}")
+            self.assertEqual(runner.command_for(Path("/w")), [program, "/w"])
+
+    def test_a_windows_launcher_and_a_pinned_version_are_recognized(self) -> None:
+        for written in ("py", "python.exe", "python3.12.exe"):
+            runner = extractors.CommandBoxRunner(f"{written} -m box {{work}}")
+            with patch("app.extractors.shutil.which", return_value=None):
+                argv = runner.command_for(Path("/w"))
+            self.assertEqual(argv, [sys.executable, "-m", "box", "/w"])
+
+    def test_the_documented_command_really_runs_where_there_is_no_python(self) -> None:
+        """End to end: a real subprocess on a PATH with no ``python`` on it."""
+        script = self._box_script()  # writes the report JSON the adapter parses
+        runner = extractors.CommandBoxRunner(f"python {shlex.quote(str(script))} {{work}}")
+        empty_bin = script.parent / "no-python-here"
+        empty_bin.mkdir()
+
+        with patch.dict(os.environ, {"PATH": str(empty_bin)}):
+            with self.assertLogs("app.extractors", level="INFO"):
+                output = runner.run(
+                    extractors.StagedFile(
+                        label="records.pdf", path=script, sha256="", size=0
+                    ),
+                    script.parent,
+                    30,
+                )
+
+        # The argv the box saw is proof the interpreter was real: a missing one
+        # cannot even reach the script that prints this.
+        self.assertEqual(json.loads(output), {"documents": [], "argv": [str(script.parent)]})
+
+    def test_a_python_the_host_has_is_left_exactly_as_written(self) -> None:
+        runner = extractors.CommandBoxRunner("python3.12 -m box {work}")
+
+        with patch("app.extractors.shutil.which", return_value="/usr/bin/python3.12"):
+            self.assertEqual(runner.command_for(Path("/w")), ["python3.12", "-m", "box", "/w"])
+
+    def test_a_leading_assignment_does_not_hide_the_interpreter(self) -> None:
+        runner = extractors.CommandBoxRunner("PYTHONPATH=. python scripts/runner.py {work}")
+
+        with patch("app.extractors.shutil.which", return_value=None):
+            argv = runner.command_for(Path("/w"))
+
+        self.assertEqual(argv, ["PYTHONPATH=.", sys.executable, "scripts/runner.py", "/w"])
+
+    def test_an_empty_running_interpreter_never_rewrites_the_command(self) -> None:
+        """An embedded interpreter has no path to offer, so the error stays the truth."""
+        runner = extractors.CommandBoxRunner("python {work}")
+
+        with patch("app.extractors.shutil.which", return_value=None):
+            with patch.object(sys, "executable", ""):
+                self.assertEqual(runner.command_for(Path("/w")), ["python", "/w"])
+
+    def test_a_missing_program_that_is_not_python_is_still_a_missing_program(self) -> None:
+        """Resolution is narrow on purpose: a typo must keep failing, and says so."""
+        with patch("app.extractors.shutil.which", return_value=None):
+            runner = extractors.CommandBoxRunner("definitely-not-installed-anywhere {work}")
+            self.assertEqual(
+                runner.command_for(Path("/w")), ["definitely-not-installed-anywhere", "/w"]
+            )
+
+    def _box_script(self) -> Path:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        script = Path(tmp.name) / "box_runner.py"
+        script.write_text(
+            "import json, sys\n"
+            "print(json.dumps({'documents': [], 'argv': sys.argv[1:]}))\n",
+            encoding="utf-8",
+        )
+        return script
+
+
 class TestTimeouts(ExtractorTestCase):
     def test_a_spent_run_budget_does_not_start_the_box(self) -> None:
         runner = ScriptRunner()
@@ -450,6 +582,124 @@ class TestFailOpen(ExtractorTestCase):
         documents, _ = extractor.extract("records.pdf", data)
 
         self.assertEqual(len(documents), 1)
+
+
+class TestWhatIsReported(ExtractorTestCase):
+    """The status ``/health`` and the sidebar read: which reader, and how it went.
+
+    The failure this exists for is invisible from the outside — the sandbox falls back
+    per file, so a finished run is exactly what a broken box produces — which is why the
+    record has to be written where the decision and the fallback are made, not
+    reconstructed later from configuration.
+    """
+
+    def test_nothing_configured_means_in_process_and_nothing_failed(self) -> None:
+        status = extractors.extraction_status()
+
+        self.assertEqual(status.mode, "in-process")
+        self.assertFalse(status.on_the_box)
+        self.assertEqual(status.fallbacks, 0)
+        self.assertIsNone(status.last_fallback)
+        self.assertEqual(status.problem, "")
+
+    def test_a_sandbox_configuration_is_recorded_with_its_runner_and_timeout(self) -> None:
+        with (
+            patch.object(config, "EXTRACTOR_MODE", "sandbox"),
+            patch.object(config, "EXTRACTOR_RUNNER", "box-run {work}"),
+        ):
+            extractors.build_extractor()
+
+        status = extractors.extraction_status()
+        self.assertEqual(status.mode, "sandbox")
+        self.assertTrue(status.on_the_box)
+        self.assertEqual(status.runner, "box-run {work}")
+        self.assertEqual(status.timeout_seconds, config.EXTRACTOR_TIMEOUT_SECONDS)
+        self.assertEqual(status.problem, "")
+
+    def test_a_sandbox_without_a_runner_is_recorded_as_a_problem(self) -> None:
+        """Visible before a run, which is the entire point: this one costs every file."""
+        with (
+            patch.object(config, "EXTRACTOR_MODE", "sandbox"),
+            patch.object(config, "EXTRACTOR_RUNNER", ""),
+            patch("app.error_report.ensure_request_id", return_value="req-2"),
+        ):
+            extractors.build_extractor()
+
+        status = extractors.extraction_status()
+        self.assertEqual(status.mode, "sandbox", "the mode is still what was asked for")
+        self.assertIn("no runner is set", status.problem)
+        self.assertIn("VA_LSE_EXTRACTOR_RUNNER", status.problem)
+
+    def test_an_unknown_mode_is_recorded_as_a_problem_too(self) -> None:
+        with patch.object(config, "EXTRACTOR_MODE", "kubernetes"):
+            extractors.build_extractor()
+
+        status = extractors.extraction_status()
+        self.assertEqual(status.mode, "in-process")
+        self.assertIn("kubernetes", status.problem)
+
+    def test_a_fallback_is_counted_with_the_boxes_own_reason(self) -> None:
+        extractor = extractors.FailOpenExtractor(
+            self.sandbox(FakeRunner(extractors.SandboxUnavailable("the box is asleep")))
+        )
+
+        with self.assertLogs("app.error_report", level="WARNING"):
+            extractor.extract("one.pdf", _pdf_bytes([TYPED]))
+            extractor.extract("two.pdf", _pdf_bytes([TYPED]))
+
+        status = extractors.extraction_status()
+        self.assertEqual(status.fallbacks, 2)
+        self.assertIsNotNone(status.last_fallback)
+        assert status.last_fallback is not None  # for the type checker
+        self.assertEqual(status.last_fallback.label, "two.pdf", "the last one is the one kept")
+        self.assertIn("the box is asleep", status.last_fallback.reason)
+        self.assertTrue(status.last_fallback.at.endswith("Z"))
+
+    def test_a_later_success_does_not_erase_the_evidence(self) -> None:
+        """A box that recovered for one file still fell back for the one before it."""
+        data = _pdf_bytes([TYPED])
+        extractor = extractors.FailOpenExtractor(
+            self.sandbox(FakeRunner(extractors.SandboxUnavailable("the box is asleep")))
+        )
+        with self.assertLogs("app.error_report", level="WARNING"):
+            extractor.extract("one.pdf", data)
+
+        working = self.sandbox(FakeRunner(self.report_for("two.pdf", [extract_document("two.pdf", data)])))
+        working.extract("two.pdf", data)
+
+        status = extractors.extraction_status()
+        self.assertEqual(status.fallbacks, 1)
+        self.assertEqual(status.last_fallback.label if status.last_fallback else "", "one.pdf")
+
+    def test_the_health_shape_is_the_same_record(self) -> None:
+        extractors.record_configuration(mode="sandbox", runner="box-run {work}", timeout_seconds=30)
+        extractors.record_fallback("no runner command configured", "records.pdf")
+
+        payload = extractors.extraction_health()
+
+        self.assertEqual(payload["mode"], "sandbox")
+        self.assertEqual(payload["runner"], "box-run {work}")
+        self.assertEqual(payload["timeout_seconds"], 30)
+        self.assertEqual(payload["fallbacks"], 1)
+        self.assertEqual(payload["last_fallback"]["label"], "records.pdf")
+
+    def test_re_installing_the_configuration_keeps_the_evidence(self) -> None:
+        """A Streamlit reload re-imports the entry module: that must not erase a fallback."""
+        extractors.record_configuration(mode="sandbox", runner="box-run {work}")
+        extractors.record_fallback("the box is asleep", "one.pdf")
+
+        extractors.record_configuration(mode="sandbox", runner="box-run {work}")
+
+        status = extractors.extraction_status()
+        self.assertEqual(status.fallbacks, 1)
+        self.assertEqual(status.runner, "box-run {work}")
+
+    def test_the_record_can_be_cleared(self) -> None:
+        extractors.record_fallback("the box is asleep", "one.pdf")
+        extractors.reset_extraction_status()
+
+        self.assertEqual(extractors.extraction_health()["fallbacks"], 0)
+        self.assertIsNone(extractors.extraction_health()["last_fallback"])
 
 
 class TestConfiguration(ExtractorTestCase):

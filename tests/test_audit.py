@@ -340,6 +340,103 @@ class AuditErrorMessageRedactionTest(unittest.TestCase):
     can be dropped entirely for deployments that ship audit logs off-pod.
     """
 
+    def test_our_own_errors_are_described_in_our_own_words(self) -> None:
+        """Known classes never echo upstream text into the audit stream.
+
+        An extraction error interpolates the uploaded file name, and an upstream
+        HTTP error carries whatever the provider put in its response body — the two
+        shapes that actually carry a veteran's name. For those classes the audit
+        record keeps a curated reason (plus the numeric status, which is safe and
+        is what makes it actionable); the full text stays in app.log.
+        """
+        from app import audit as audit_mod
+        from app.documents import ExtractionError
+        from app.llm import LLMUpstreamError
+
+        captured, h = _capture_audit_payloads()
+        try:
+            audit_mod.audit_evaluate_error(
+                request_id="req_extract",
+                duration_ms=5,
+                error=ExtractionError(
+                    "John Doe VA Records 2024.pdf: no extractable text in 20 page(s)."
+                ),
+            )
+            audit_mod.audit_evaluate_error(
+                request_id="req_upstream",
+                duration_ms=5,
+                error=LLMUpstreamError(
+                    "Error code: 400 - {'error': {'message': 'input rejected: Jane Doe knee pain'}}",
+                    status_code=400,
+                ),
+            )
+            extraction, upstream = (json.dumps(p) for p in captured[:2])
+            self.assertEqual(captured[0].get("error_class"), "ExtractionError")
+            self.assertIn("extractable text", captured[0].get("error_message", ""))
+            self.assertNotIn("Doe", extraction)
+            self.assertNotIn("Records 2024", extraction)
+            self.assertNotIn("Doe", upstream)
+            self.assertIn("upstream status 400", captured[1].get("error_message", ""))
+        finally:
+            _cleanup_capture(h)
+
+    def test_a_traceback_never_reaches_the_payload(self) -> None:
+        """audit.log records a class and a description — never a stack trace.
+
+        Frames carry source lines and, with ``showlocals``, variable values; none of
+        that is passed here, so the SSN in the traceback's local scope cannot reach
+        the audit stream even though it is in the exception's own scope.
+        """
+        from app import audit as audit_mod
+
+        def boom() -> None:
+            local_ssn = "123-45-6789"
+            raise RuntimeError(f"review failed for {local_ssn}")
+
+        try:
+            boom()
+        except RuntimeError as exc:
+            error = exc
+
+        captured, h = _capture_audit_payloads()
+        try:
+            audit_mod.audit_evaluate_error(
+                request_id="req_tb", duration_ms=5, error=error
+            )
+            payload = json.dumps(captured[0])
+            for forbidden in ("Traceback", "test_audit.py", "boom", "local_ssn", "123-45-6789"):
+                self.assertNotIn(forbidden, payload)
+            self.assertEqual(captured[0].get("error_class"), "RuntimeError")
+        finally:
+            _cleanup_capture(h)
+
+    def test_caller_supplied_fields_are_scrubbed_too(self) -> None:
+        """``condition``, ``record_sources`` and ``outcome`` are caller text.
+
+        Truncation was the old control, which is not a privacy control: a condition
+        the user typed can hold a name or an SSN, a source label can be a path, and
+        an outcome value can be any string a future field carries.
+        """
+        from app import audit as audit_mod
+
+        captured, h = _capture_audit_payloads()
+        try:
+            audit_mod.audit_evaluate_ok(
+                request_id="req_fields",
+                duration_ms=10,
+                condition="John Doe 123-45-6789",
+                record_sources=["/Users/rich/Desktop/John Doe/records.pdf"],
+                outcome={"overall_rating": "Adequate", "note": "veteran John Doe"},
+            )
+            payload = json.dumps(captured[0])
+            self.assertNotIn("123-45-6789", payload)
+            self.assertNotIn("Doe", payload)
+            self.assertNotIn("/Users/rich", payload)
+            # Classifications still round-trip — the scrubber must not eat the signal.
+            self.assertEqual(captured[0]["outcome"]["overall_rating"], "Adequate")
+        finally:
+            _cleanup_capture(h)
+
     def test_pii_shaped_tokens_are_redacted_in_the_payload(self) -> None:
         from app import audit as audit_mod
 

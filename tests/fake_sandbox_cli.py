@@ -11,6 +11,11 @@ the remote paths rewritten to their local stand-ins). Everything on this side of
 the CLI boundary is then exercised for real — the manifest, the label-to-path
 mapping, the exec argv, the copy-back, the JSON on stdout.
 
+It also answers ``list``, the one authenticated read the box-free probe
+(``--check`` / ``scripts/check_sandbox.py``) makes. That is what lets a test assert
+the probe's central promise — that it creates nothing — by journalling every call
+and finding only ``list`` in it.
+
 Environment (all read by the fake, never by the runner):
 
     FAKE_SANDBOX_BOX       directory standing in for the boxes        (required)
@@ -143,6 +148,19 @@ def main(argv: list[str]) -> int:
             note({**entry, "exit": 130})
             return 130
         (BOX / name).mkdir(parents=True, exist_ok=True)
+        note({**entry, "exit": 0})
+        return 0
+
+    if command == "list":
+        # The authenticated read the box-free check makes. Journalled like every other
+        # call, so a test can assert a check reaches this and nothing else.
+        entry["step"] = "list"
+        failure = maybe_fail("list")
+        if failure is not None:
+            note({**entry, "exit": failure})
+            return failure
+        print("NAME                  STATUS    CREATED")
+        print("va-lse-ocr-example   running   2026-09-19T00:00:00Z")
         note({**entry, "exit": 0})
         return 0
 

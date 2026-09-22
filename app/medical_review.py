@@ -31,6 +31,7 @@ from .documents import (
     Chunk,
     ExtractedDocument,
     chunk_page_labelled_text,
+    iter_page_labelled_chunks,
     page_limit_message,
     paragraph_index,
 )
@@ -110,11 +111,23 @@ CHUNK TEXT:
 
 {guard_note}"""
 
-MERGE_SYSTEM = """You are consolidating extracted medical facts from multiple chunks of the \
+MERGE_SYSTEM = (
+    """You are consolidating extracted medical facts from multiple chunks of the \
 same record set into one authoritative digest. Deduplicate identical facts, keep every \
 distinct fact, resolve trivially different phrasings, and keep all source citations \
 (the file and page each fact came from — never replace them with a chunk number). \
-Do not add facts that were not provided. Output JSON only."""
+Do not add facts that were not provided. Output JSON only.
+
+"""
+    # These facts were extracted from untrusted record text, so their description
+    # and quote fields carry whatever the record contained — including text shaped
+    # like instructions. This is the second-order injection path: a PDF's payload
+    # launders through the digest model's JSON and lands here, where it used to
+    # arrive with no guard at all. The note goes in the *system* message (the
+    # stronger role), and the payload is escaped by ``sanitize_for_prompt`` at the
+    # call site, which is the mechanical half.
+    + GUARD_NOTE
+)
 
 # The elements a VA lay/witness statement has to establish, in the order a rating
 # decision reads them. A digest fact is only useful to the drafting pass if it can
@@ -568,7 +581,16 @@ def _restore_citations(
 
 
 def _norm_key(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip().lower()
+    """Whitespace-collapsed, case-folded comparison key.
+
+    ``" ".join(text.split())`` rather than ``re.sub(r"\s+", " ", text).strip()``:
+    identical output for every whitespace class (checked against NBSP, thin space,
+    vertical tab and tabs), 3-4x faster, and this runs twice per fact inside
+    ``_dedupe_facts`` — which is on the merge path of every run, once per merge
+    round over the whole fact list (measured 496 ms for 50,000 facts before, and
+    the regex was nearly all of it).
+    """
+    return " ".join(text.split()).lower()
 
 
 # Matches a source string that is a citation rather than an entity name. Used to
@@ -699,8 +721,17 @@ def review_medical_records(
 
     unreadable_pages = sum(doc.unreadable_count for doc in documents)
 
-    full_text = "\n\n".join(doc.page_labelled_text() for doc in unique_docs)
-    chunks = chunk_page_labelled_text(full_text)
+    # Streaming chunking: cut chunks directly off the page objects instead of
+    # materializing the joined corpus (measured 2026-09-21: the join plus its
+    # slicing churn peaked at 37.7 MB traced on a 5,000-page set — 2.5x what the
+    # pipeline retains — for text that exists only to be sliced). The iterator
+    # produces byte-identical chunks to chunk_page_labelled_text; see its
+    # docstring for the locality argument and the property test that pins it.
+    chunks = list(
+        iter_page_labelled_chunks(
+            page for doc in unique_docs for page in doc.pages
+        )
+    )
     total_units = len(chunks)
     # Deterministic per-page context for the digest prompt: the dates actually
     # printed on the page (an anchor for the fact's own date) and the VA.gov
@@ -1290,6 +1321,13 @@ def _chunk_sections(
 # of 8000 — every response truncated mid-JSON and 100% of merge calls failed
 # (observed live 2026-09-21: 13/13 batches unparseable, ~10k chars each). At 48
 # facts the echo is ~2.3k tokens: comfortably inside the budget.
+# Bound for prompts whose payload is *derived* from record text: the merge batch
+# (48 facts declared below), the sampled timeline in the summary, and the undated
+# date-inference rows. Generous on purpose — the batch sizes bound the payload, and
+# this is only here so a single field cannot flood the context window. Escaping is
+# what matters at this size, not truncation.
+DERIVED_TEXT_MAX_CHARS = 200_000
+
 MERGE_BATCH_SIZE = 48
 # Same arithmetic for the single-call path: 8,000 output tokens / ~48 tokens
 # per fact ≈ 165 facts maximum; 120 leaves margin for prompt preamble and
@@ -1404,12 +1442,21 @@ def _merge_facts(
 
 
 def _merge_once(llm: LLMService, facts: list[MedicalFact]) -> list[MedicalFact]:
-    """One merge call over a batch-sized fact list (fast model)."""
+    """One merge call over a batch-sized fact list (fast model).
+
+    The payload is escaped: these facts were extracted from untrusted record text,
+    so a record's own words — including text shaped like instructions — reach this
+    prompt through the digest model's JSON. The guard note rides in the system
+    message (see ``MERGE_SYSTEM``). The payload stays the last block of the user
+    message, right after the ``\\n\\n`` intro, because callers locate it there.
+    """
     data = llm.chat_json(
         MERGE_SYSTEM,
         "Deduplicate and consolidate these extracted medical facts. Keep every DISTINCT fact "
         "with its source. Return JSON: {\"facts\": [{\"date\",\"type\",\"description\",\"source\",\"quote\"}]}\n\n"
-        + json.dumps([vars(f) for f in facts]),
+        + sanitize_for_prompt(
+            json.dumps([vars(f) for f in facts]), max_chars=DERIVED_TEXT_MAX_CHARS
+        ),
         model=llm.fast_model,
         max_tokens=8000,
         phase="records:merge",
@@ -1424,12 +1471,21 @@ def _merge_once(llm: LLMService, facts: list[MedicalFact]) -> list[MedicalFact]:
 
 
 def _summarize(llm: LLMService, digest: MedicalDigest) -> str:
+    """Narrative summary over the timeline — record-derived text, so guarded.
+
+    Same second-order path as the merge: these descriptions came out of the digest
+    model's reading of untrusted pages, and a summary prompt that carried them
+    unguarded is a place an injected sentence could come back as an instruction.
+    """
     return llm.chat(
         "You are a medical-records analyst. Write a concise narrative summary (max 250 words) "
         "of the record set: key diagnoses, treatment history, notable events, and current "
-        "status. Plain text only.",
+        "status. Plain text only.\n\n" + GUARD_NOTE,
         "Extracted facts (sampled evenly across the full timeline):\n"
-        + digest.condensed_timeline(max_entries=400)[:16000],
+        + sanitize_for_prompt(
+            digest.condensed_timeline(max_entries=400)[:16000],
+            max_chars=DERIVED_TEXT_MAX_CHARS,
+        ),
         phase="records:summary",
     )
 
@@ -2024,7 +2080,7 @@ _UNDATED_LLM_SYSTEM = (
     "context clues (referenced ages, seasons, nearby events) to infer the most likely "
     "calendar year, and month if evident. Never invent a specific day — return only a year "
     "('YYYY') or year-month ('YYYY-MM'). If there is truly no inferable date, return null for "
-    "that fact. Output JSON only."
+    "that fact. Output JSON only.\n\n" + GUARD_NOTE
 )
 
 
@@ -2141,7 +2197,7 @@ def _infer_dates_once(
             _UNDATED_LLM_SYSTEM,
             "Infer dates for these facts. Return JSON exactly as: "
             '{"dates": [{"index": <int>, "date": "YYYY" | "YYYY-MM" | null}]}\n\n'
-            + json.dumps(items),
+            + sanitize_for_prompt(json.dumps(items), max_chars=DERIVED_TEXT_MAX_CHARS),
             model=llm.fast_model,
             # Budget per fact, not a flat cap: a fixed 2000-token ceiling over a
             # few hundred undated facts truncates the JSON mid-array and loses the

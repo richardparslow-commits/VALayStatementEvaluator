@@ -14,20 +14,37 @@ runs the runner's own ``SandboxCli`` — the same argv, the same stages — agai
 The knobs arrive under the ``VA_LSE_TEST_*`` prefix and are injected as the app's own
 names, because ``tests/hermetic.py`` strips ambient ``VA_LSE_*`` configuration (that
 prefix is the session's one sanctioned exception for a runner opting a test into real
-setup). It skips without the token, so CI is unaffected. Two tests, priced accordingly:
+setup). It skips without the token, so CI is unaffected. Five tests, priced accordingly —
+two need nothing but a credential, three need the pushed image and skip naming the build
+command while it is absent (a fresh clone: the image is built by hand, DEPLOYMENT.md §6):
 
-* the first only needs a credential. It creates a box on the CLI's **default runtime**
-  (``VA_LSE_SANDBOX_IMAGE=none``), makes a directory, copies a file in and back out,
-  and removes the box — the credential, the transport and the lifecycle, for a fraction
-  of a cent and no registry write.
-* the second runs the whole runner (``run_for_one_file``) so the entrypoint reads a real
-  staged record on a real box. It skips, naming the build command, while the custom
-  image is not in the registry — which is the state of a fresh clone, because the image
-  is built by hand (DEPLOYMENT.md §6).
+* **the credential, the transport and the lifecycle** — creates a box on the CLI's
+  **default runtime** (``VA_LSE_SANDBOX_IMAGE=none``), makes a directory, copies a file
+  in and back out, removes the box. A fraction of a cent, no registry write.
+* **the runner** (``run_for_one_file``) — the entrypoint reads a real staged record on a
+  real box, and the report is mapped back through ``documents_from_json``.
+* **the app's own extractor** — ``app/extractors.py`` stages the record, spawns the
+  runner over the documented command line, and validates the label that comes back. The
+  offline twin of this fakes the CLI, so this is the only place that contract meets a
+  microVM; it asserts *no* fallback was recorded, because ``SandboxExtractor`` fails
+  open and a silent fallback would pass while proving nothing.
+* **fail-open, against a real box** — the same adapter pointed at the CLI's default
+  runtime, where ``/app/scripts/ocr_and_extract.py`` does not exist: a box really is
+  created, the entrypoint really fails inside it, and the record still comes back from
+  the reader in this process, with one reported fallback naming the box. Needs no image.
+* **a scan** — a page that is a raster of text, which this process refuses outright
+  ("no extractable text") and the box reads. This is the whole reason the sandbox
+  exists, and the only test that shows the *built* image really carries an OCR engine
+  rather than merely being told to install one.
 
-Neither test asserts a *result* it cannot stand behind: the box's answer is compared
-against ``InProcessExtractor``, exactly as the offline parity test does, so a difference
-is a finding rather than a tolerance.
+No test asserts a *result* it cannot stand behind: the box's answer is compared against
+``InProcessExtractor``, exactly as the offline parity test does, so a difference is a
+finding rather than a tolerance.
+
+Measured against real boxes on 2026-09-21 (5 tests, 58 s, ``va-lse-sandbox:latest``):
+all five pass — so the image is in Vercel Container Registry, its OCR engine answers a
+raster page, and the app's extractor path is exercised end to end rather than only
+through fakes. Nothing was left running afterwards (``sandbox list`` empty).
 """
 from __future__ import annotations
 
@@ -40,6 +57,7 @@ import unittest
 import uuid
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path, PurePosixPath
+from typing import Any
 from unittest.mock import patch
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -70,6 +88,55 @@ def _pdf_bytes(page: str) -> bytes:
     pdf.drawString(72, 720, page)
     pdf.save()
     return buffer.getvalue()
+
+
+def _scan_font(size: int = 34) -> Any:
+    """A real font, so the raster has glyphs rather than a bitmap fallback."""
+    from PIL import ImageFont
+
+    for candidate in (
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/Library/Fonts/Arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    ):
+        if Path(candidate).is_file():
+            return ImageFont.truetype(candidate, size)
+    return ImageFont.load_default(size=size)
+
+
+def _scan_pdf_bytes(text: str, *, dpi: int = 200) -> bytes:
+    """A one-page PDF that is a *raster* of *text*: a scan, with no text layer.
+
+    Rendered at 200 dpi and wrapped to fit a letter page, because that is what an OCR
+    engine needs and what a records portal actually ships. This is the shape
+    ``InProcessExtractor`` counts as an unreadable page, and the shape the box exists to
+    read — so a live test that reads it proves the *built* image carries an OCR engine,
+    which is more than the Dockerfile contract test can say.
+    """
+    import textwrap
+
+    from PIL import Image, ImageDraw
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfgen import canvas
+
+    font = _scan_font()
+    image = Image.new("L", (int(8.5 * dpi), int(11 * dpi)), color=255)
+    draw = ImageDraw.Draw(image)
+    y = int(1.1 * dpi)
+    for line in textwrap.wrap(text, width=52):
+        draw.text((int(0.8 * dpi), y), line, fill=0, font=font)
+        y += int(font.size * 1.6)
+    page = io.BytesIO()
+    image.save(page, format="PNG")
+    page.seek(0)
+    out = io.BytesIO()
+    pdf = canvas.Canvas(out, pagesize=letter)
+    pdf.drawImage(ImageReader(page), 0, 0, width=letter[0], height=letter[1])
+    pdf.showPage()
+    pdf.save()
+    return out.getvalue()
 
 
 #: Live knobs are read under the hermetic session's opt-in prefix and mapped here;
@@ -235,6 +302,91 @@ class TestTheAppsExtractorAgainstARealBox(LiveSandboxTestCase):
         self.assertEqual([doc.filename for doc in documents], [doc.filename for doc in expected])
         self.assertEqual([doc.full_text for doc in documents], [doc.full_text for doc in expected])
         self.assertEqual(skipped, [])
+
+
+class TestTheAppsExtractorFailsOpenOnARealBox(LiveSandboxTestCase):
+    """A box that cannot read the record must cost a warning, not the run — live.
+
+    ``tests/test_extractors.py`` pins fail-open with a faked runner, which cannot show
+    the three things this does: the box was really created, the entrypoint really failed
+    *inside it*, and the file still came back from the reader in this process. Pointing
+    the box at the CLI's own default runtime forces exactly that without needing an image
+    in the registry — the exec of ``/app/scripts/ocr_and_extract.py`` cannot find the
+    entrypoint there — so this test runs with nothing but a credential.
+    """
+
+    def test_the_run_survives_a_box_that_cannot_run_the_entrypoint(self) -> None:
+        from app import error_report
+        from app.documents import InProcessExtractor
+        from app.extractors import CommandBoxRunner, FailOpenExtractor, SandboxExtractor
+
+        label, data = "progress_note.pdf", _pdf_bytes(TYPED)
+        error_report._ONCE_SEEN.clear()
+        self.addCleanup(error_report._ONCE_SEEN.clear)
+
+        with patch.dict(
+            os.environ, {**self.overrides, "VA_LSE_SANDBOX_IMAGE": "none"}, clear=False
+        ):
+            extractor = FailOpenExtractor(
+                SandboxExtractor(CommandBoxRunner(f"{sys.executable} {RUNNER} {{work}}"))
+            )
+            documents, skipped = extractor.extract(label, data)
+
+        failures = [
+            message for phase, message in error_report._ONCE_SEEN if phase == "extractor_sandbox"
+        ]
+        self.assertEqual(len(failures), 1, f"expected one reported fallback, got {failures}")
+        # The reason the user's log carries has to prove the trip: a generated box name
+        # means the box was created, and a non-zero exit from a command inside it means
+        # the failure came from the box rather than from this host.
+        self.assertIn("va-lse-ocr-", failures[0], "no box was ever named")
+        self.assertIn("failed (exit", failures[0], "the entrypoint never ran in the box")
+
+        expected, _expected_skipped = InProcessExtractor().extract(label, data)
+        self.assertEqual([doc.full_text for doc in documents], [doc.full_text for doc in expected])
+        self.assertEqual(skipped, [])
+
+
+class TestAScanOnARealBox(LiveSandboxTestCase):
+    """The claim only a box can prove: a scan has no text here and text there.
+
+    This app has no OCR by design, so an image-only page is counted and reported and
+    never read. The pushed image does have it. Both halves are asserted on a real
+    microVM — nothing in this process, the record text on the box — which is the whole
+    reason the sandbox exists, and the only test that can show the built image really
+    carries an OCR engine rather than merely being told to install one.
+    """
+
+    def test_a_scanned_page_is_empty_here_and_readable_on_the_box(self) -> None:
+        from app.documents import InProcessExtractor
+        from app.extractors import CommandBoxRunner, SandboxExtractor, SandboxUnavailable
+
+        label, data = "scan.pdf", _scan_pdf_bytes(TYPED)
+
+        here, here_skipped = InProcessExtractor().extract(label, data)
+        # Not "a page with no text": this process refuses the file outright, which is
+        # the behavior the box exists to change (measured: a 20-file all-scan bundle
+        # yields zero documents today).
+        self.assertEqual(here, [], "the fixture has to be a real scan, with no text layer")
+        self.assertIn("no extractable text", " ".join(here_skipped))
+
+        settings = self._settings(VA_LSE_SANDBOX_IMAGE=runner.DEFAULT_IMAGE)
+        with patch.dict(
+            os.environ, {**self.overrides, "VA_LSE_SANDBOX_IMAGE": settings.image}, clear=False
+        ):
+            box = SandboxExtractor(CommandBoxRunner(f"{sys.executable} {RUNNER} {{work}}"))
+            try:
+                documents, _skipped = box.extract(label, data)
+            except SandboxUnavailable as exc:
+                if any(marker in str(exc).lower() for marker in IMAGE_MISSING):
+                    self.skipTest(f"{settings.image} is not in the registry yet: {exc}")
+                raise
+
+        self.assertEqual([doc.filename for doc in documents], [label], "the box read the scan")
+        read = documents[0].full_text.lower()
+        for word in ("knee", "examination", "degrees"):
+            self.assertIn(word, read, f"the box's OCR did not read {word!r} from the scan")
+        self.assertEqual(documents[0].unreadable_pages, [], "the box left no page unread")
 
 
 if __name__ == "__main__":

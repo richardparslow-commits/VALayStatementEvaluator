@@ -58,7 +58,11 @@ logger = get_logger("app.knowledge_currency")
 # The committed framework this verdict is about. Only the two files the *topics* live in
 # are fingerprinted — the rubric and drafting guide are style/structure documents whose
 # currency is not a legal question, so including them would invalidate a good verdict
-# every time someone rewords a tip.
+# every time someone rewords a tip. The rubric does carry decision rules that cite
+# authority (a contradiction needs a cited record entry; a normal static exam does not
+# contradict a symptom), but those are rules about how to label evidence rather than
+# statements of current law, and the authorities behind them are stated — and therefore
+# fingerprinted — in the framework and checklist text above.
 FRAMEWORK_FILES: tuple[str, ...] = ("topic_checklist.md", "legal_framework.md")
 
 # Stable cache key: deliberately *not* keyed by fingerprint, because the interesting

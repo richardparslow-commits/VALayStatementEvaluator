@@ -8,6 +8,7 @@ cache. None of them raise, which is exactly why they need tests.
 from __future__ import annotations
 
 import io
+import os
 import sys
 import unittest
 import zipfile
@@ -18,8 +19,11 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 
+from app import config  # noqa: E402
 from app.documents import (  # noqa: E402
     BLOCK,
+    CHUNK_OVERLAP_CHARS,
+    MIN_CHUNK_CHARS,
     PAGE,
     DocumentPage,
     ExtractionError,
@@ -29,6 +33,7 @@ from app.documents import (  # noqa: E402
     clean_text,
     document_from_text,
     extract_uploaded_documents,
+    iter_page_labelled_chunks,
     normalize_tabular_rows,
     paragraph_index,
     records_from_local_path,
@@ -222,6 +227,90 @@ class TestChunkCitations(unittest.TestCase):
     def test_text_without_markers_falls_back_to_the_chunk_label(self) -> None:
         chunks = chunk_page_labelled_text("plain text with no page markers at all")
         self.assertEqual(chunks[0].source_hint, "chunk 1/1")
+
+
+class TestChunkBudgetIsBounded(unittest.TestCase):
+    """A chunk budget too small to cut with must not become a chunk explosion.
+
+    After a hard cut the next chunk starts at ``end - CHUNK_OVERLAP_CHARS``, so a
+    budget at or below the overlap advances the cursor by one character per chunk:
+    measured, ``max_chars=8`` produced exactly one chunk per character of input
+    (1,048,5xx chunks per MB of record text). On a 5,000-page bundle that is ~12
+    million chunks of up to ``max_chars`` characters each — gigabytes of ``Chunk``
+    objects in the Streamlit worker — reached from a plausible typo for the default
+    (``VA_LSE_DIGEST_CHUNK_CHARS=8`` for ``8000``). Both cutters floor the budget,
+    and ``config`` floors the env knob into the same band, so the typo costs a
+    slower run rather than a dead process.
+    """
+
+    @staticmethod
+    def _doc(pages: int = 8) -> ExtractedDocument:
+        return ExtractedDocument(
+            filename="bundle.pdf",
+            pages=[
+                DocumentPage("bundle.pdf", number, f"Page {number} body. " + ("pain noted " * 200))
+                for number in range(1, pages + 1)
+            ],
+            total_pages=pages,
+        )
+
+    def test_a_sub_overlap_budget_is_floored_not_honoured(self) -> None:
+        text = "A" * 100_000
+        for absurd in (-10, 0, 1, 8, CHUNK_OVERLAP_CHARS - 1, MIN_CHUNK_CHARS - 1):
+            chunks = chunk_page_labelled_text(text, max_chars=absurd)
+            self.assertLessEqual(
+                len(chunks),
+                len(text) // (MIN_CHUNK_CHARS - CHUNK_OVERLAP_CHARS) + 2,
+                msg=f"max_chars={absurd} produced {len(chunks)} chunks",
+            )
+            self.assertLessEqual(max(len(chunk.text) for chunk in chunks), MIN_CHUNK_CHARS + 1)
+
+    def test_the_floor_leaves_a_usable_budget_alone(self) -> None:
+        text = "A" * 60_000
+        self.assertEqual(
+            max(len(c.text) for c in chunk_page_labelled_text(text, max_chars=MIN_CHUNK_CHARS)),
+            MIN_CHUNK_CHARS + 1,
+        )
+        self.assertEqual(
+            max(len(c.text) for c in chunk_page_labelled_text(text, max_chars=4 * MIN_CHUNK_CHARS)),
+            4 * MIN_CHUNK_CHARS + 1,
+        )
+
+    def test_both_cutters_floor_identically(self) -> None:
+        """The floor belongs to both cutters, so a sub-overlap budget cannot make
+        them disagree — and neither can un-cleaned pages.
+
+        ``_doc``'s pages deliberately end in a space (what PDF extraction emits, and
+        exactly what the byte-equality property test in ``test_core`` sidesteps by
+        feeding the cutters pre-cleaned pages). ``page_labelled_text`` strips each
+        page so the parts' edges cannot interact with a seam; without that strip the
+        joined path kept ``"…body \n\n[marker]"`` where the streamer produced
+        ``"…body\n\n[marker]"``.
+        """
+        doc = self._doc()
+        reference = []
+        for budget in (8, MIN_CHUNK_CHARS, 4000):
+            reference = [
+                c.text for c in chunk_page_labelled_text(doc.page_labelled_text(), max_chars=budget)
+            ]
+            streamed = [c.text for c in iter_page_labelled_chunks(doc.pages, max_chars=budget)]
+            self.assertEqual(reference, streamed, msg=f"max_chars={budget}")
+        self.assertLess(len(reference), 60)
+
+    def test_the_env_knob_is_clamped_into_the_same_band(self) -> None:
+        self.assertEqual(config._MIN_DIGEST_CHUNK_CHARS, MIN_CHUNK_CHARS)
+        self.assertGreaterEqual(config.DIGEST_CHUNK_CHARS, MIN_CHUNK_CHARS)
+        self.assertLessEqual(config.DIGEST_CHUNK_CHARS, 100_000)
+        cases = {"8": MIN_CHUNK_CHARS, "0": MIN_CHUNK_CHARS, "999999999": 100_000, "4000": 4000}
+        for raw, expected in cases.items():
+            with patch.dict(os.environ, {"VA_LSE_CHUNK_BAND_PROBE": raw}):
+                self.assertEqual(
+                    config._bounded_int_env(
+                        "VA_LSE_CHUNK_BAND_PROBE", 8000, low=MIN_CHUNK_CHARS, high=100_000
+                    ),
+                    expected,
+                    msg=f"env value {raw}",
+                )
 
 
 class TestDuplicatePages(unittest.TestCase):

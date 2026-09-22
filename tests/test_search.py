@@ -20,7 +20,9 @@ from app.documents import (  # noqa: E402
     ExtractedDocument,
     Paragraph,
     _PARAGRAPH_CACHE,
+    _PARAGRAPH_CACHE_MAX_CHARS,
     _PARAGRAPH_CACHE_MAX_ENTRIES,
+    _cached_paragraph_chars,
     build_inverted_index,
     export_citation_index,
     paragraph_index,
@@ -153,6 +155,24 @@ class TestParagraphCacheIdentity(unittest.TestCase):
         for patient, result in enumerate(results):
             self.assertIn(f"Patient {patient:03d}:", result)
         self.assertLessEqual(len(_PARAGRAPH_CACHE), _PARAGRAPH_CACHE_MAX_ENTRIES)
+
+    def test_cache_is_bounded_by_paragraph_text_not_only_by_entries(self) -> None:
+        """One 5,000-page document indexes to ~12 MB of paragraph strings, so an
+        entry-count-only cap of 64 retains hundreds of MB in a long-lived server
+        process. The cache must evict once either bound is exceeded.
+
+        The byte bound is patched down here so the mechanism is what is tested
+        (the production bound needs megabytes of paragraph text to reach).
+        """
+        with patch("app.documents._PARAGRAPH_CACHE_MAX_CHARS", 900):
+            for patient in range(12):
+                paragraph_index(self._patient(f"{patient:03d}", "asthma " * 40))
+        self.assertGreater(_cached_paragraph_chars(), 0)
+        self.assertLessEqual(_cached_paragraph_chars(), 900)
+        self.assertLess(len(_PARAGRAPH_CACHE), 12)
+        # The newest entry survives eviction: a repeat of it is still a hit.
+        newest = paragraph_index(self._patient("011", "asthma " * 40))
+        self.assertIs(newest, paragraph_index(self._patient("011", "asthma " * 40)))
 
 
 class TestSearchRecords(unittest.TestCase):

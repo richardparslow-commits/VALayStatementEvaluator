@@ -25,6 +25,15 @@ logs/
 usage_history.json
 # VA.gov downloader failure evidence (signed-in page screenshots/HTML — PHI)
 va_gov_download_artifacts
+# Veteran medical records (PHI): users drop C-file PDFs in the project root to
+# run scripts/ocr_records.py locally, and the OCR output is written alongside
+# the input as <name>.ocr.pdf. None of it may ever be committable — `git add .`
+# must not be able to stage a record, wherever in the tree it sits. A pattern
+# without a slash matches by basename at any depth; the explicit `*.ocr.pdf`
+# line stays last so the OCR output remains excluded even if a narrower
+# `!…​.pdf` re-include is ever added below `*.pdf`.
+*.pdf
+*.ocr.pdf
 
 # macOS “Save As… “ duplicates (foo.py -> “foo 2.py”) and similar stray copies
 * 2.*

@@ -292,7 +292,7 @@ unencrypted; keep the whole checkout on encrypted disk and out of synced folders
 
 | Path | Content | Notes |
 |---|---|---|
-| `logs/runs.jsonl` (+ `logs/audit.log`) | Per-run audit trail: request ids, phase timings, counts, scrubbed error text | PII-shaped tokens are redacted at write time (`app/audit.py`); scrubbing happens only at write — a future field added without scrubbing is not protected by the old scrubber |
+| `logs/runs.jsonl` (+ `logs/audit.log`) | Per-run audit trail: request ids, phase timings, counts, scrubbed error text | No traceback is ever written. `app/audit.py` keeps the app's own error classes to a curated PHI-free reason and scrubs every remaining free-text field (SSN forms, digit runs, emails, URLs, paths, record-file names, phone numbers, cue-shaped names, control and invisible characters) — including the caller-supplied `condition`, `source` labels and `outcome` values. `VA_LSE_AUDIT_ERROR_MESSAGES=0` drops the free-text field entirely. Scrubbing happens only at write: a future field added without it is not protected by the old scrubber |
 | `outputs/batch-draft/state/batch_NN.json.gz` | **Resumable digest state: compressed per-batch extracted facts — derived PHI** | Written atomically (fsync + rename). Batch-fact shards hold the extracted medical evidence itself |
 | `outputs/batch-draft/staging/` | Extracted record text staged per batch group | Derived PHI; remove with the run output when done |
 | `outputs/batch-draft/…final` artifacts | The drafted statement, merge summaries, and full fact lists | Derived PHI |
@@ -303,6 +303,35 @@ unencrypted; keep the whole checkout on encrypted disk and out of synced folders
 Retention guidance: delete `outputs/batch-draft/` when a run's statement has been exported;
 treat `logs/runs.jsonl` as the long-lived record (scrubbed by design) and rotate or delete
 `logs/` on your own schedule; never commit, sync, or back up any of these paths.
+
+## 10. The prompt data boundary (injection from records)
+
+The record set, the statement, the observations and the witness fields are **untrusted input
+to a model**, and everything the model reads is ultimately read by a human as a legal work
+product. `app/prompt_sanitize.py` is the mechanical half of that boundary and `GUARD_NOTE` is
+the behavioral half — the module says so out loud, because a sanitizer that claims to *solve*
+injection is worse than none.
+
+**What is enforced mechanically.** Untrusted text is placed inside `<<<`/`>>>` blocks; every
+run of two or more angle brackets is escaped (runs, not triples, so two fields cannot re-form
+a delimiter when a template concatenates them), fenced-code runs are broken, angle-bracket
+lookalikes (fullwidth `＜`, CJK `⟨`) are translated to ASCII first, invisible characters
+(zero-widths, bidi overrides, Unicode tag characters) are dropped, and chat-template role
+tokens and line-leading role labels (`<|im_start|>`, `<system>`, `[INST]`, `System:`) are
+neutralized so record text cannot speak in the system role. Escaping is chosen to touch only
+characters that the citation check ignores — `verify_citations` compares quotes back against
+the page by alphanumeric token, so hardening the boundary cannot make a real citation
+unverifiable.
+
+**What is not, and cannot be.** No instruction is filtered: a record may legitimately discuss
+instructions, and blocking phrases would corrupt analyses rather than protect them. The
+answers are: the guard note lives in the **system** message of every prompt that carries
+untrusted or record-derived text (including the merge, summary and date-inference prompts,
+which are reached through the digest model's own JSON — the second-order path); every fact
+carries a page citation that is checked back against the record; and the output is reviewed
+by the person who uploaded the records. The realistic harm model for this app is therefore
+**integrity** (a crafted page steering an analysis), not exfiltration: a user's model output
+is shown to that user.
 
 ## 10. Reporting a vulnerability
 

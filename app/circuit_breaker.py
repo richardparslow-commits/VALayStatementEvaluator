@@ -19,6 +19,17 @@ Stdlib-only implementation that mirrors the behaviour the spec asks for
   rejected immediately with ``QueueFullError``. Waiting callers block up to
   ``VA_LSE_LLM_QUEUE_TIMEOUT_SECONDS`` (default 30 s) before timing out.
 
+* **Rate gate** — optional minimum-interval pacing between LLM call
+  admissions. ``VA_LSE_LLM_MIN_INTERVAL_SECONDS`` (default 0 = off) forces
+  at least that many seconds between the starts of successive calls in this
+  process; ``VA_LSE_LLM_MAX_RPM`` expresses the same thing as a
+  requests-per-minute cap (when both are set the stricter wins). A caller
+  whose reserved slot lies beyond its wait budget is rejected with
+  ``RateGateTimeoutError`` (a ``QueueFullError`` subclass, so chat()'s
+  fail-fast routing applies). Unlike the breaker and retries, spacing is
+  *preventive*: its goal is that the provider's 429s never happen, where
+  retries can only absorb the ones that do.
+
 The breaker is **per endpoint** (``get_llm_breaker``), because a breaker is a
 statement about one endpoint's health: a shared one would let a healthy fallback's
 successes close the primary's breaker and hide an ongoing outage, and let the
@@ -29,8 +40,9 @@ Each breaker also tracks how long its endpoint has been *continuously*
 unhealthy (``unhealthy_for_seconds``), which is the failover trigger. That is a
 different clock from the probe countdown: ``_opened_at`` is reset by every failed
 probe, so it never ages past one ``recovery_timeout`` while traffic keeps probing.
-Test helpers ``reset_llm_breaker`` / ``reset_llm_limiter`` allow tests to
-reconfigure them without restarting the process.
+Test helpers ``reset_llm_breaker`` / ``reset_llm_limiter`` /
+``reset_llm_rate_gate`` allow tests to reconfigure them without restarting
+the process.
 """
 
 from __future__ import annotations
@@ -65,6 +77,17 @@ class ConcurrencyLimitError(RuntimeError):
 
 class QueueFullError(ConcurrencyLimitError):
     """Raised when the concurrency queue is at capacity."""
+
+
+class RateGateTimeoutError(QueueFullError):
+    """Raised when a caller's pacing-wait budget is exhausted before its slot.
+
+    Deliberately a ``QueueFullError`` subclass: ``LLMClient.chat`` treats
+    queue rejections as fail-fast (never retried on the other endpoint), and
+    a pacing timeout is the same kind of rejection — the provider is fine,
+    this process is simply asking faster than its configured spacing allows,
+    and switching endpoints would not help because the gate is process-wide.
+    """
 
 
 class CircuitBreaker:
@@ -434,6 +457,124 @@ class ConcurrencyLimiter:
             self._cond.notify_all()
 
 
+# ---------------------------------------------------------------- rate gate
+
+
+class MinimumIntervalGate:
+    """Thread-safe minimum-spacing gate for LLM call admissions.
+
+    Guarantees at least ``min_interval_seconds`` between the *starts* of
+    successive admitted calls in this process, even under thread contention:
+    each caller reserves the next free slot under the lock (first-come
+    first-served), then sleeps until its slot outside the lock. Reservation —
+    not read-then-sleep — is what prevents bursts: five threads arriving
+    together are scheduled a full interval apart, not all woken at the same
+    instant to race the provider's rate limiter.
+
+    ``min_interval_seconds <= 0`` disables the gate entirely (``wait`` is a
+    no-op), which is the default: spacing is opt-in because the right value
+    depends on the provider tier.
+
+    Unlike the concurrency limiter this does not bound simultaneous calls —
+    it bounds their *rate*. The two compose: the gate spaces admissions, the
+    limiter caps how many of the admitted calls overlap.
+    """
+
+    def __init__(
+        self,
+        min_interval_seconds: float = 0.0,
+        queue_timeout: float = 30.0,
+        name: str = "llm-rate",
+    ) -> None:
+        self.min_interval_seconds = max(0.0, float(min_interval_seconds))
+        self.queue_timeout = max(0.0, float(queue_timeout))
+        self.name = name
+        self._next_free = 0.0  # monotonic timestamp of the next free slot
+        self._last_admitted = 0.0  # monotonic timestamp of the last admission
+        self._lock = threading.Lock()
+
+    # --------------------------------------------------------------- stats
+
+    @property
+    def enabled(self) -> bool:
+        return self.min_interval_seconds > 0.0
+
+    @property
+    def last_admitted(self) -> float:
+        """Monotonic timestamp of the most recent admission (0 before any)."""
+        with self._lock:
+            return self._last_admitted
+
+    # ---------------------------------------------------------------- wait
+
+    def wait(self, *, timeout: float | None = None) -> float:
+        """Reserve the next admission slot and block until it arrives.
+
+        Returns the seconds actually waited (0.0 when the gate is disabled or
+        the slot is already due). Raises ``RateGateTimeoutError`` when the
+        reservation lies further out than the caller's wait budget —
+        ``timeout`` if given, else ``queue_timeout``.
+        """
+        if not self.enabled:
+            return 0.0
+        effective_timeout = self.queue_timeout if timeout is None else max(0.0, float(timeout))
+        now = time.monotonic()
+        with self._lock:
+            scheduled = max(now, self._next_free)
+            self._next_free = scheduled + self.min_interval_seconds
+        delay = scheduled - now
+        if delay <= 0.0:
+            with self._lock:
+                self._last_admitted = time.monotonic()
+            return 0.0
+        if delay > effective_timeout:
+            logger.warning(
+                "rate gate '%s' timeout: slot %.1fs out exceeds %.1fs budget "
+                "(min_interval=%.2fs) — rejecting call",
+                self.name,
+                delay,
+                effective_timeout,
+                self.min_interval_seconds,
+                extra={
+                    "phase": "rate_gate",
+                    "status": "timeout",
+                    "gate": self.name,
+                    "delay_seconds": round(delay, 3),
+                    "min_interval": self.min_interval_seconds,
+                },
+            )
+            raise RateGateTimeoutError(
+                f"LLM rate gate '{self.name}' would wait {delay:.0f}s for a spaced "
+                f"slot, over the {effective_timeout:.0f}s budget. This process is "
+                f"asking faster than its spacing allows — raise the wait budget "
+                f"(VA_LSE_LLM_QUEUE_TIMEOUT_SECONDS), relax the spacing "
+                f"(VA_LSE_LLM_MIN_INTERVAL_SECONDS / VA_LSE_LLM_MAX_RPM), or slow "
+                f"the callers (VA_LSE_RECORDS_CONCURRENCY)."
+            )
+        if delay > 0.05:
+            logger.debug(
+                "rate gate '%s': pacing call by %.2fs (min_interval=%.2fs)",
+                self.name,
+                delay,
+                self.min_interval_seconds,
+            )
+        # Bounded sleep: delay <= effective_timeout, which the caller caps at
+        # the pipeline's remaining budget. check_pipeline_cancelled() runs in
+        # llm.py right after the wait returns, so a cancellation that lands
+        # mid-sleep is honored within at most one budget — and the wait itself
+        # stays short by construction (spacing is seconds, never minutes).
+        time.sleep(delay)
+        with self._lock:
+            self._last_admitted = time.monotonic()
+        return delay
+
+    def reset(self) -> None:
+        """Forget reserved slots and history (used in tests)."""
+        with self._lock:
+            self._next_free = 0.0
+            self._last_admitted = 0.0
+
+
 # ---------------------------------------------------------- singletons
 
 # Breaker names. The name is also the `breaker` label on the circuit-breaker
@@ -561,6 +702,81 @@ def reset_llm_limiter(
         return _llm_limiter
 
 
+_llm_rate_gate: MinimumIntervalGate | None = None
+_llm_rate_gate_lock = threading.RLock()
+
+
+def _rate_gate_interval_from_config() -> float:
+    """Effective spacing from config; stricter of the seconds-cap and RPM-cap.
+
+    Both knobs express the same constraint, so when both are set the *larger*
+    interval (the stricter cap) wins; a non-positive value means "unset".
+    """
+    try:
+        from . import config as _cfg  # pylint: disable=import-outside-toplevel
+
+        seconds = float(getattr(_cfg, "LLM_RATE_MIN_INTERVAL_SECONDS", 0.0) or 0.0)
+        rpm = float(getattr(_cfg, "LLM_RATE_MAX_RPM", 0.0) or 0.0)
+    except Exception:  # noqa: BLE001
+        return 0.0
+    return max(0.0, max(seconds, (60.0 / rpm) if rpm > 0 else 0.0))
+
+
+def get_llm_rate_gate() -> MinimumIntervalGate:
+    """Return the process-wide LLM rate gate (lazy, env-configured)."""
+    global _llm_rate_gate
+    if _llm_rate_gate is not None:
+        return _llm_rate_gate
+    with _llm_rate_gate_lock:
+        if _llm_rate_gate is not None:
+            return _llm_rate_gate
+        try:
+            from . import config as _cfg  # pylint: disable=import-outside-toplevel
+
+            timeout = float(getattr(_cfg, "LLM_QUEUE_TIMEOUT_SECONDS", 30))
+        except Exception:  # noqa: BLE001
+            timeout = 30.0
+        _llm_rate_gate = MinimumIntervalGate(
+            min_interval_seconds=_rate_gate_interval_from_config(),
+            queue_timeout=timeout,
+            name="llm-rate",
+        )
+        return _llm_rate_gate
+
+
+def reset_llm_rate_gate(
+    *,
+    min_interval_seconds: float | None = None,
+    max_rpm: float | None = None,
+    queue_timeout: float | None = None,
+) -> MinimumIntervalGate:
+    """Reset (or reconfigure) the global LLM rate gate — intended for tests.
+
+    ``max_rpm`` sets the interval from a requests-per-minute cap (0 disables);
+    ``min_interval_seconds``, when also given, overrides it.
+    """
+    global _llm_rate_gate
+    with _llm_rate_gate_lock:
+        if _llm_rate_gate is None:
+            _llm_rate_gate = get_llm_rate_gate()
+        assert _llm_rate_gate is not None
+        if min_interval_seconds is None and max_rpm is None:
+            # No explicit interval: re-derive from config, so a test (or an
+            # operator hot-reloading settings) gets the current env values
+            # rather than whatever the singleton was first built with.
+            _llm_rate_gate.min_interval_seconds = _rate_gate_interval_from_config()
+        else:
+            if max_rpm is not None:
+                rpm = max(0.0, float(max_rpm))
+                _llm_rate_gate.min_interval_seconds = (60.0 / rpm) if rpm > 0 else 0.0
+            if min_interval_seconds is not None:
+                _llm_rate_gate.min_interval_seconds = max(0.0, float(min_interval_seconds))
+        if queue_timeout is not None:
+            _llm_rate_gate.queue_timeout = max(0.0, float(queue_timeout))
+        _llm_rate_gate.reset()
+        return _llm_rate_gate
+
+
 def reset_all_for_tests(
     *,
     breaker_threshold: int = 3,
@@ -569,7 +785,11 @@ def reset_all_for_tests(
     limiter_queue_depth: int = 50,
     limiter_timeout: float = 30.0,
 ) -> tuple[CircuitBreaker, ConcurrencyLimiter]:
-    """Convenience: reset every breaker plus the limiter to known test defaults."""
+    """Convenience: reset every breaker, the limiter, and the rate gate.
+
+    The rate gate is reset to *disabled* (spacing is opt-in) so a test that
+    armed pacing cannot throttle an unrelated later test.
+    """
     # Every *existing* breaker, not just the primary: a test that armed failover
     # must not leak an OPEN fallback into the next test.
     with _llm_breaker_lock:
@@ -590,4 +810,5 @@ def reset_all_for_tests(
         max_queue_depth=limiter_queue_depth,
         queue_timeout=limiter_timeout,
     )
+    reset_llm_rate_gate(min_interval_seconds=0.0)
     return breaker, limiter

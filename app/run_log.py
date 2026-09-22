@@ -13,7 +13,10 @@ captured — which the launchd preview lost, leaving the reference untraceable.
 
 Design:
 - JSON lines, one event per line, containing only metadata — no statement,
-  observations, or record text (same PII discipline as app/audit.py).
+  observations, or record text (same PII discipline as app/audit.py, enforced by
+  the same scrubber: ``error`` and every string in ``extra`` go through
+  ``audit.scrub_free_text``, because an exception message can carry a file name,
+  an absolute path, or a provider's echo of the request it rejected).
 - stdlib only; append+flush per event; never raises (best-effort like audit).
 - The UI-facing error text and the run log are written through the same
   helper so a user-shown reference always has a matching log line.
@@ -33,6 +36,7 @@ from pathlib import Path
 from typing import Any
 
 from . import config
+from .audit import scrub_free_text
 from .logging_config import get_logger
 
 logger = get_logger("app.run_log")
@@ -106,16 +110,18 @@ def run_log_event(
         "request_id": request_id or "-",
     }
     if error:
-        payload["error"] = str(error)[:300]
+        payload["error"] = scrub_free_text(str(error))[:300]
     if error_class:
-        payload["error_class"] = str(error_class)[:80]
+        payload["error_class"] = scrub_free_text(str(error_class))[:80]
     for key, value in extra.items():
         if value is None:
             continue
         if isinstance(value, (str, int, float, bool)):
-            payload[str(key)[:40]] = value if isinstance(value, (int, float, bool)) else str(value)[:120]
+            payload[str(key)[:40]] = (
+                value if isinstance(value, (int, float, bool)) else scrub_free_text(str(value))[:120]
+            )
         else:
-            payload[str(key)[:40]] = repr(value)[:120]
+            payload[str(key)[:40]] = scrub_free_text(repr(value))[:120]
     try:
         line = json.dumps(payload, ensure_ascii=False)
         with _LOCK:

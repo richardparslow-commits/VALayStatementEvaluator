@@ -86,7 +86,7 @@ class TestParsingTheCommittedFramework(unittest.TestCase):
     def test_real_checklist_yields_every_lettered_topic(self) -> None:
         sections = currency.parse_topic_sections(config.load_knowledge("topic_checklist.md"))
         letters = [section.letter for section in sections]
-        self.assertEqual(letters, list("ABCDEFGHIJKL"))
+        self.assertEqual(letters, list("ABCDEFGHIJKLMNO"))
         for section in sections:
             self.assertTrue(section.title, msg=f"topic {section.letter} has no title")
             self.assertGreater(len(section.text), 40, msg=f"topic {section.letter} is empty")

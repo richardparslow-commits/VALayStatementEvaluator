@@ -207,6 +207,106 @@ class TestKnowledgeBase(unittest.TestCase):
                       "double-dosing", "stove", "before", "after"]:
             self.assertIn(topic, checklist, msg=f"checklist missing: {topic}")
 
+    def test_the_absence_rule_names_the_right_authority(self):
+        """Barr is a lay-competence case; the absence rule is Horn / M21-1 / Buchanan.
+
+        These two propositions sit next to each other in the framework, and swapping
+        them would put a citation in a claim file that does not say what it is cited
+        for.
+        """
+        framework = load_knowledge("legal_framework.md")
+        self.assertIn("Buczynski v. Shinseki", framework)
+        self.assertIn("Horn v. Shinseki", framework)
+        self.assertIn("M21-1", framework)
+        self.assertIn("Absence of evidence vs. negative evidence", framework)
+        lines = framework.splitlines()
+        start = next(i for i, line in enumerate(lines) if line.startswith("- **Barr v. Nicholson"))
+        bullet: list[str] = []
+        for line in lines[start:]:
+            if bullet and line.startswith("- "):
+                break
+            bullet.append(line)
+        barr = " ".join(bullet)
+        self.assertNotIn("negative evidence", barr.lower())
+        self.assertIn("readily observable", barr)
+        self.assertIn("medical in nature", barr)
+
+    def test_the_framework_does_not_end_mid_sentence(self):
+        """A truncated rule reads to the model as a weighing instruction.
+
+        The absence bullet was split across the file: the sentence stopped at "is not",
+        and its tail sat under "Weighing factors adjudicators apply". The rule the
+        rubric cites must exist in one piece.
+        """
+        framework = load_knowledge("legal_framework.md")
+        self.assertTrue(framework.rstrip().endswith("."))
+        self.assertNotIn("\n\n  affirmative evidence against the claim", framework)
+        # The combat-veteran sentence belongs to the absence rule, not to weighting.
+        self.assertLess(
+            framework.index("1154(b)"), framework.index("## Lay competence boundaries")
+        )
+
+    def test_the_rubric_requires_a_citation_for_a_contradiction(self):
+        rubric = load_knowledge("evaluation_rubric.md")
+        self.assertIn("CONTRADICTED requires affirmative contrary evidence", rubric)
+        self.assertIn("If you cannot point to\n     the specific record text that conflicts", rubric)
+        self.assertIn("Do not lower this dimension for unverifiable claims", rubric)
+        self.assertIn("Never describe a NOT FOUND claim as unverified", rubric)
+
+    def test_the_rubric_keeps_a_normal_static_exam_from_contradicting_a_symptom(self):
+        rubric = load_knowledge("evaluation_rubric.md")
+        self.assertIn("A normal finding does not contradict a symptom", rubric)
+        self.assertIn("would normally be noted or reported", rubric)
+        self.assertIn("Buczynski v. Shinseki", rubric)
+        self.assertIn("DeLuca v. Brown", rubric)
+        self.assertIn("4.59", rubric)
+
+    def test_the_checklist_carries_musculoskeletal_function(self):
+        """A physical claim needs the functional-loss facts, not a ROM number."""
+        checklist = load_knowledge("topic_checklist.md")
+        self.assertIn("Musculoskeletal function", checklist)
+        self.assertIn("dedicated topics of its own", checklist)
+        self.assertIn("never a measured range-of-motion number", checklist)
+        self.assertIn("38 C.F.R. § 4.40", checklist)
+
+    def test_an_inapplicable_physical_topic_is_not_a_deficiency(self):
+        checklist = load_knowledge("topic_checklist.md")
+        self.assertIn("an inapplicable topic is \"not applicable\", not \"absent\"", checklist)
+        self.assertIn("A **physical or musculoskeletal** claim is carried by", checklist)
+
+    def test_the_checklist_has_dedicated_musculoskeletal_topics(self):
+        """Painful motion, repeated-use loss, and flare-ups are their own topics.
+
+        DeLuca/Sharp made these the rating-deciding factors, so a woven-in sentence
+        inside F is too easy for an audit model to mark "partial"; each needs a
+        section the coverage audit must address by name.
+        """
+        checklist = load_knowledge("topic_checklist.md")
+        self.assertIn("## M. Painful Motion (38 C.F.R. § 4.59; DeLuca v. Brown)", checklist)
+        self.assertIn("## N. Functional Loss During Repeated Use", checklist)
+        self.assertIn("## O. Flare-Ups: Frequency, Duration, Severity, and Cost", checklist)
+        self.assertIn("Sharp v. Shulkin, 29 Vet. App. 26 (2017)", checklist)
+        self.assertIn("FUNCTIONALLY UNABLE TO DO", checklist)
+        self.assertIn("38 C.F.R. § 4.40", checklist)
+        # F stays the everyday-function topic; movement detail lives in M/N/O.
+        self.assertIn("dedicated topics of its own", checklist)
+        # The carrier map in the header points at the new letters, not the old ones.
+        self.assertIn("**M** (painful motion)", checklist)
+        self.assertIn("**N** (repeated-use functional loss)", checklist)
+        self.assertIn("**O** (flare-ups)", checklist)
+
+    def test_the_rubric_scores_aggravation_and_benefit_of_the_doubt(self):
+        rubric = load_knowledge("evaluation_rubric.md")
+        self.assertIn("Aggravation claims are a second, equally valid timeline shape", rubric)
+        self.assertIn("38 C.F.R. §§ 3.310", rubric)
+        self.assertIn("baseline before service", rubric)
+        self.assertIn("Never fault a statement\n   for the \"missing\" onset event", rubric)
+        self.assertIn("benefit-of-the-doubt rule", rubric)
+        self.assertIn("38 U.S.C. § 1154(b)", rubric)
+        self.assertIn("§ 3.102", rubric)
+        self.assertIn("immaterial discrepancies do not destroy credibility", rubric)
+        self.assertIn("not calendrical precision", rubric)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -55,7 +55,7 @@ when `VA_LSE_PROFILE_RUNS` is not set.
 | **claims** | Extract claims from the statement | 1 LLM call | 3–5% |
 | **verify** | Verify each claim against the record digest | N claims × (retrieval + 1 LLM call) | 10–15% |
 | **rubric** | Score against the VA lay-evidence rubric | 1 LLM call | 4–6% |
-| **topic** | Audit topic checklist (A–L) coverage | 1 LLM call | 3–5% |
+| **topic** | Audit topic checklist (A–O) coverage | 1 LLM call | 3–5% |
 | **revision** | Draft improvement suggestions + revised statement | 1 LLM call | 3–5% |
 | **report** | Build the Markdown report | Pure Python (no LLM) | <1% |
 

@@ -59,8 +59,10 @@ Before drafting:
 3. Where the witness's observations align with records, note the corroboration — this is the
    strongest form of lay evidence.
 4. Where the witness reports something not in the records, keep it (lay evidence need not be
-   corroborated — Buchanan/Barr) but flag it in the grounding notes so the witness can double
-   check their memory before signing.
+   corroborated, and the absence of a record is not negative evidence — Buchanan v. Nicholson;
+   Horn v. Shinseki) but flag it in the grounding notes so the witness can double check their
+   memory before signing. Never write in the draft that the records "show no" such fact, or
+   that it is "unverified" — the records simply may not address it.
 5. Where records conflict with the witness's account, DO NOT silently pick one side — surface
    the conflict to the user and draft only what the witness can truthfully support.
 6. Surface omissions: record facts that could strengthen the statement (e.g., documented pain

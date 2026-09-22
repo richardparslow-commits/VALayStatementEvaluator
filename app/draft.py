@@ -212,10 +212,10 @@ Return JSON:
     {{ "fact": "record fact worth including if witness confirms", "source": "..." }}
   ],
   "topic_coverage": [
-    {{ "topic": "checklist topic label (A-L)", "applicable": true | false, "covered": true | false, "prompt_for_witness": "specific question to elicit this topic if not covered, else empty string" }}
+    {{ "topic": "checklist topic label (A-O)", "applicable": true | false, "covered": true | false, "prompt_for_witness": "specific question to elicit this topic if not covered, else empty string" }}
   ]
 }}
-One topic_coverage entry per checklist topic (A through L), in checklist order. Never invent \
+One topic_coverage entry per checklist topic (A through O), in checklist order. Never invent \
 coverage: mark a topic covered only if the observations genuinely address it.
 
 CLAIMED CONDITION: {condition}

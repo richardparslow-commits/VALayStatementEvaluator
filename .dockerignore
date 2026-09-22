@@ -42,6 +42,20 @@
 **/outputs/
 **/usage_history.json
 **/*.log
+#
+# VA.gov scraper outputs — strict PHI/PII exclusion. The signed-in pages,
+# screenshots, PDFs and debug logs the tool saves are the veteran's medical
+# records, and the Chrome profiles hold the VA.gov session. The artifacts
+# directory defaults to a *relative* path (scripts/va_records_download.py
+# --artifacts-dir), so it lands wherever the user ran the tool — often this
+# checkout. The profile directories normally live in $HOME (outside any build
+# context), but both names are covered because a user can point the profile
+# into the repo with --user-data-dir: `.va_lse_debug_chrome` is the documented
+# example in the script's docstring, `.va_lse_va_gov_profile` the script's
+# DEFAULT_PROFILE_DIR. None of this may reach the daemon or a COPY.
+**/va_gov_download_artifacts/
+**/.va_lse_debug_chrome/
+**/.va_lse_va_gov_profile/
 
 # --- local scratch, caches, editor state -----------------------------------
 # `.git` without the slash on purpose: in a linked worktree `.git` is a *file*

@@ -1557,6 +1557,7 @@ class TestSidebarSettingsGuards(unittest.TestCase):
             patch.object(sidebar, "_job_queue_panel"),
             patch.object(sidebar, "_audit_backup_panel"),
             patch.object(sidebar, "_llm_failover_panel"),
+            patch.object(sidebar, "_record_reading_panel"),
         ):
             sidebar.render_sidebar_settings()
 
@@ -1635,6 +1636,7 @@ class TestSidebarSettingsGuards(unittest.TestCase):
             patch.object(sidebar, "_job_queue_panel"),
             patch.object(sidebar, "_audit_backup_panel"),
             patch.object(sidebar, "_llm_failover_panel"),
+            patch.object(sidebar, "_record_reading_panel"),
         ):
             sidebar.render_sidebar_settings()
         st_mock.warning.assert_called_once()
@@ -1707,6 +1709,7 @@ class TestSidebarSettingsGuards(unittest.TestCase):
             patch.object(sidebar, "_job_queue_panel"),
             patch.object(sidebar, "_audit_backup_panel"),
             patch.object(sidebar, "_llm_failover_panel"),
+            patch.object(sidebar, "_record_reading_panel"),
         ):
             sidebar.render_sidebar_settings()
         return st_mock, session
@@ -2967,6 +2970,171 @@ class TestRenderFailureDetail(unittest.TestCase):
         shown = st_mock.dataframe.call_args[0][0]
         self.assertEqual(len(shown), 1)
         self.assertIn("worker exploded", str(shown[0]))
+
+
+class TestRecordReadingPanel(unittest.TestCase):
+    """Sidebar: which reader a run will use, and whether the box has already failed.
+
+    The panel exists because sandbox mode fails *open*: a box that cannot be reached
+    still finishes the run, with its scanned pages simply empty. So the reader is stated
+    on every paint (before the next upload, not only after the last one), a
+    misconfiguration or a fallback is a warning above it, and the details — the runner,
+    the timeout, the box's own reason, and the command that checks a box without
+    creating one — are one click away.
+    """
+
+    @contextmanager
+    def _panel(
+        self,
+        st_mock: MagicMock,
+        *,
+        mode: str = "in-process",
+        runner: str = "",
+        timeout: float = 900.0,
+        problem: str = "",
+        fallbacks: int = 0,
+        last=None,  # noqa: ANN001 - app.extractors.Fallback
+        boom: bool = False,
+    ):
+        import app.views.sidebar as sidebar
+        from app.extractors import ExtractionStatus
+
+        status = ExtractionStatus(
+            mode=mode,
+            runner=runner,
+            timeout_seconds=timeout,
+            problem=problem,
+            fallbacks=fallbacks,
+            last_fallback=last,
+        )
+        effect = (
+            patch.object(sidebar, "extraction_status", side_effect=RuntimeError("no status"))
+            if boom
+            else patch.object(sidebar, "extraction_status", return_value=status)
+        )
+        with ExitStack() as stack:
+            stack.enter_context(_patch_st(sidebar, st_mock))
+            stack.enter_context(effect)
+            yield status
+
+    @staticmethod
+    def _captions(st_mock: MagicMock) -> str:
+        return " ".join(str(call.args[0]) for call in st_mock.caption.call_args_list)
+
+    @staticmethod
+    def _rows(st_mock: MagicMock) -> dict:
+        rows = st_mock.dataframe.call_args[0][0]
+        return {row["Setting"]: row["Value"] for row in rows}
+
+    def test_an_in_process_reader_is_stated_before_any_run(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        with self._panel(st_mock):
+            sidebar._record_reading_panel()
+
+        self.assertIn("read in-process", self._captions(st_mock))
+        self.assertEqual(self._rows(st_mock)["Reader"], "in-process (no OCR)")
+        st_mock.warning.assert_not_called()
+
+    def test_a_sandbox_reader_names_the_runner_it_will_use(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        with self._panel(st_mock, mode="sandbox", runner="box-run {work}"):
+            sidebar._record_reading_panel()
+
+        captions = self._captions(st_mock)
+        self.assertIn("read on the sandbox", captions)
+        self.assertIn("box-run {work}", captions)
+        self.assertEqual(self._rows(st_mock)["Runner"], "box-run {work}")
+        self.assertEqual(self._rows(st_mock)["Per-file timeout"], "900s")
+        st_mock.warning.assert_not_called()
+
+    def test_a_configuration_that_cannot_work_warns_and_still_tells_the_truth(self) -> None:
+        """`sandbox` asked for with no runner: the warning says so, the caption is honest."""
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        with self._panel(st_mock, mode="sandbox", problem="VA_LSE_EXTRACTOR=sandbox but no runner is set"):
+            sidebar._record_reading_panel()
+
+        st_mock.warning.assert_called_once()
+        self.assertIn("no runner is set", str(st_mock.warning.call_args[0][0]))
+        self.assertIn("read in-process", self._captions(st_mock))
+
+    def test_a_fallback_says_how_many_and_why(self) -> None:
+        import app.views.sidebar as sidebar
+        from app.extractors import Fallback
+
+        st_mock, _ = _fake_streamlit()
+        with self._panel(
+            st_mock,
+            mode="sandbox",
+            runner="box-run {work}",
+            fallbacks=3,
+            last=Fallback(
+                label="records/2024/visit.pdf",
+                reason="the box did not answer within 900s for records/2024/visit.pdf",
+                at="2026-09-21T21:00:00Z",
+            ),
+        ):
+            sidebar._record_reading_panel()
+
+        warning = str(st_mock.warning.call_args[0][0])
+        self.assertIn("3 file(s)", warning)
+        self.assertIn("records/2024/visit.pdf", warning)
+        self.assertIn("did not answer within 900s", warning)
+        self.assertIn("3 file(s) fell back", self._captions(st_mock))
+        self.assertEqual(self._rows(st_mock)["Files read in-process"], "3")
+
+    def test_the_details_name_the_command_that_checks_a_box(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        with self._panel(st_mock, mode="sandbox", runner="box-run {work}"):
+            sidebar._record_reading_panel()
+
+        self.assertIn("scripts/check_sandbox.py", self._captions(st_mock))
+
+    def test_the_in_process_details_offer_the_way_to_turn_the_box_on(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        with self._panel(st_mock):
+            sidebar._record_reading_panel()
+
+        self.assertIn("VA_LSE_EXTRACTOR=sandbox", self._captions(st_mock))
+
+    def test_a_long_reason_is_shortened_for_the_sidebar(self) -> None:
+        import app.views.sidebar as sidebar
+        from app.extractors import Fallback
+
+        long_reason = "the box refused " + "x" * 600
+        st_mock, _ = _fake_streamlit()
+        with self._panel(
+            st_mock,
+            mode="sandbox",
+            runner="box-run {work}",
+            fallbacks=1,
+            last=Fallback(label="records.pdf", reason=long_reason, at="2026-09-21T21:00:00Z"),
+        ):
+            sidebar._record_reading_panel()
+
+        self.assertLess(len(str(st_mock.warning.call_args[0][0])), 400)
+        self.assertEqual(len(sidebar._short(long_reason)), 240)
+        self.assertTrue(sidebar._short(long_reason).endswith("…"))
+
+    def test_a_status_it_cannot_read_is_an_error_rather_than_a_broken_app(self) -> None:
+        import app.views.sidebar as sidebar
+
+        st_mock, _ = _fake_streamlit()
+        with self._panel(st_mock, boom=True):
+            sidebar._record_reading_panel()
+
+        st_mock.error.assert_called_once()
+        self.assertIn("no status", str(st_mock.error.call_args[0][0]))
+        st_mock.caption.assert_not_called()
 
 
 if __name__ == "__main__":

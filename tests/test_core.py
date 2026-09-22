@@ -18,6 +18,7 @@ from app.documents import (  # noqa: E402
     ExtractionError,
     _read_docx_member_limited,
     chunk_page_labelled_text,
+    iter_page_labelled_chunks,
     extract_document,
     extract_uploaded_documents,
     paragraph_index,
@@ -33,6 +34,7 @@ from app.medical_review import (  # noqa: E402
     MedicalFact,
     _dedupe_facts,
     _merge_facts,
+    _norm_key,
     review_medical_records,
 )
 
@@ -422,6 +424,170 @@ class TestChunking(unittest.TestCase):
         union = "".join(c.text for c in chunks)
         for token in text.split()[:100]:
             self.assertIn(token, union)
+
+
+class TestStreamingChunking(unittest.TestCase):
+    """The streaming chunker must produce byte-identical chunks to the joined
+    implementation while never materializing the joined corpus."""
+
+    @staticmethod
+    def _docs(page_specs: list[tuple[str, int, str]]) -> list:
+        from app.documents import DocumentPage, ExtractedDocument
+
+        docs = {}
+        for filename, page, text in page_specs:
+            docs.setdefault(filename, []).append(DocumentPage(filename, page, text))
+        return [ExtractedDocument(name, pages) for name, pages in docs.items()]
+
+    def test_byte_identical_to_joined_implementation(self):
+        """Same chunks (text, pages, numbering) as the joined path — property
+        over randomized page sets with trap boundaries (long runs of blank
+        lines, trailing spaces before paragraph breaks, '. ' sentence cuts).
+
+        Page texts are passed through ``clean_text`` exactly as every real
+        extractor does before handing pages over (PDF, TXT, DOCX paths all
+        pre-clean), because the per-part-equals-joined equivalence the
+        streaming cutter relies on is stated for pre-cleaned parts: each part
+        then starts and ends with a non-whitespace character, so none of
+        ``clean_text``'s three operations can act across a seam.
+        """
+        import random
+
+        from app.documents import ExtractedDocument, clean_text
+
+        rng = random.Random(20260921)
+        for trial in range(40):
+            n_pages = rng.randint(0, 25)
+            specs = []
+            for i in range(n_pages):
+                if rng.random() < 0.1:
+                    text = ""  # image-only page: skipped by both paths
+                else:
+                    n_paras = rng.randint(1, 6)
+                    paras = []
+                    for _ in range(n_paras):
+                        n_sent = rng.randint(1, 8)
+                        body = ". ".join(
+                            f"Finding {rng.randint(0, 999)} noted by clinician {j}"
+                            for j in range(n_sent)
+                        )
+                        body += "."
+                        # Trap: trailing spaces before the paragraph break, and
+                        # occasional long blank-line runs inside a page.
+                        if rng.random() < 0.4:
+                            body += "   "
+                        if rng.random() < 0.15:
+                            body += "\n\n\n\n"
+                        paras.append(body)
+                    text = clean_text("\n\n".join(paras))
+                specs.append((f"rec{i // 8}.pdf", i % 8 + 1, text))
+            docs = self._docs(specs)
+            if not docs:
+                docs = [ExtractedDocument("empty.pdf", [])]
+
+            # The reference corpus is exactly what the pre-streaming caller
+            # built: the flat "\n\n" join of each page's "marker\ntext" part,
+            # composed here through the real page_labelled_text so the marker
+            # format can never drift between this test and the cutter.
+            joined = "\n\n".join(doc.page_labelled_text() for doc in docs)
+            reference = chunk_page_labelled_text(joined)
+            streamed = list(
+                iter_page_labelled_chunks(
+                    page for doc in docs for page in doc.pages
+                )
+            )
+            self.assertEqual(
+                len(reference),
+                len(streamed),
+                msg=f"trial {trial}: chunk count differs",
+            )
+            for k, (r, s) in enumerate(zip(reference, streamed)):
+                self.assertEqual(r.text, s.text, msg=f"trial {trial} chunk {k}: text differs")
+                self.assertEqual(
+                    r.pages, s.pages, msg=f"trial {trial} chunk {k}: pages differ"
+                )
+                self.assertEqual(r.index, s.index)
+                self.assertEqual(r.total, s.total)
+
+    def test_never_materializes_the_joined_corpus(self):
+        """Streaming peak stays at least one corpus copy below the joined
+        path's peak, measured under the same tracemalloc window.
+
+        Self-calibrating on purpose: an absolute bound would have to price in
+        per-chunk metadata and tracemalloc's per-allocation overhead, both of
+        which the joined path pays too. The joined path's traced delta over
+        the streamer's is exactly the copies streaming eliminates — the
+        ``clean_text`` copy of the corpus and the join itself — so the pinned
+        property is: joined_peak - streamed_peak >= one corpus. Any regression
+        that re-materializes the join adds a corpus copy to the streamer and
+        collapses the margin.
+        """
+        import tracemalloc
+
+        n_pages = 800
+        specs = [
+            (f"rec{i // 8}.pdf", i % 8 + 1, f"Finding {i} " + "x" * 180)
+            for i in range(n_pages)
+        ]
+        docs = self._docs(specs)
+        # The pre-built joined corpus is allocated before tracing starts, so
+        # it counts against neither pass — both paths receive the same string.
+        joined_corpus = "\n\n".join(doc.page_labelled_text() for doc in docs)
+        corpus_chars = len(joined_corpus)
+        page_iter = (page for doc in docs for page in doc.pages)
+
+        tracemalloc.start()
+        joined_chunks = chunk_page_labelled_text(joined_corpus)
+        _, joined_peak = tracemalloc.get_traced_memory()
+        del joined_chunks  # free pass 1 so it cannot inflate pass 2's peak
+        tracemalloc.reset_peak()
+        streamed = list(iter_page_labelled_chunks(page_iter))
+        _, streamed_peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+
+        self.assertGreater(len(streamed), 2)
+        self.assertLess(
+            streamed_peak,
+            joined_peak,
+            msg="streaming peak reached the joined path's peak",
+        )
+        self.assertGreaterEqual(
+            joined_peak - streamed_peak,
+            corpus_chars * 0.8,
+            msg="streaming no longer saves a full corpus copy — the join may "
+            "be materializing",
+        )
+
+    def test_empty_pages_yield_single_empty_chunk_like_joined_path(self):
+        """Edge parity: all-empty pages produce the same single empty chunk the
+        joined path produces from an empty string."""
+        docs = self._docs([("a.pdf", 1, ""), ("b.pdf", 1, "")])
+        streamed = list(iter_page_labelled_chunks(page for d in docs for page in d.pages))
+        reference = chunk_page_labelled_text("")
+        self.assertEqual(len(streamed), len(reference))
+        self.assertEqual(len(streamed), 1)
+        self.assertEqual(streamed[0].text, reference[0].text)
+        self.assertEqual(streamed[0].pages, ())
+
+    def test_hard_cut_landing_at_end_of_corpus_emits_no_extra_chunk(self):
+        """A cut that consumes the corpus exactly must not be followed by the
+        overlap-tail iteration — the joined path breaks on ``end >= len(text)``
+        and the streamer must too, or it emits a phantom 400-char final chunk.
+
+        Constructed so the virtual corpus (marker + newline + text) is exactly
+        ``max_chars + 1`` characters with no paragraph or sentence cut inside
+        the window: the only possible cut is the hard cut, and it lands one
+        past the corpus end.
+        """
+        from app.documents import DocumentPage
+
+        marker_probe = DocumentPage("x.pdf", 1, "")
+        text = "A" * (8001 - len(marker_probe.marker) - 1)
+        page = DocumentPage("x.pdf", 1, text)
+        chunks = list(iter_page_labelled_chunks([page]))
+        reference = chunk_page_labelled_text(page.marker + chr(10) + text)
+        self.assertEqual([c.text for c in chunks], [c.text for c in reference])
+        self.assertEqual(len(chunks), 1)
 
 
 class TestConfigParsing(unittest.TestCase):
@@ -1138,6 +1304,20 @@ class TestLargeRecordPipeline(unittest.TestCase):
         self.assertEqual(len(unique), 2)
         self.assertEqual(unique[0].source, "a")
         self.assertEqual(unique[1].date, "2021-02")
+
+    def test_norm_key_collapses_every_whitespace_class(self):
+        """``_norm_key`` is the dedupe/merge comparison key, so its normalization
+        must cover the whitespace real extraction emits: tabs and runs of spaces,
+        paragraph breaks, and the non-breaking/thin spaces that arrive from PDFs
+        and copied web pages.
+        """
+        self.assertEqual(
+            _norm_key("  Knee\t\tpAIN.\n\n rated   10\u00a0degrees "),
+            "knee pain. rated 10 degrees",
+        )
+        self.assertEqual(_norm_key("a\u2009b"), "a b")  # thin space
+        self.assertEqual(_norm_key("a\x0bb"), "a b")  # vertical tab
+        self.assertEqual(_norm_key(""), "")
 
     def test_relevant_facts_text_ranks_matches_first(self):
         digest = MedicalDigest(

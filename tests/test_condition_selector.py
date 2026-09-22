@@ -67,7 +67,7 @@ class TestGetPreselectedTopics(unittest.TestCase):
         preselected, forced = get_preselected_topics(
             [("Musculoskeletal", "Lumbar strain / degenerative disc disease")], False
         )
-        self.assertEqual(preselected, ["F", "G", "H", "K"])
+        self.assertEqual(preselected, ["F", "G", "H", "K", "M", "N", "O"])
         self.assertEqual(forced, [])
 
     def test_multiple_conditions_are_unioned(self):
@@ -78,7 +78,7 @@ class TestGetPreselectedTopics(unittest.TestCase):
             ],
             False,
         )
-        self.assertEqual(preselected, ["A", "F", "G", "H", "I", "K"])
+        self.assertEqual(preselected, ["A", "F", "G", "H", "I", "K", "M", "N", "O"])
 
     def test_unknown_condition_falls_back_to_default(self):
         preselected, _ = get_preselected_topics(
@@ -96,8 +96,8 @@ class TestGetPreselectedTopics(unittest.TestCase):
         preselected, forced = get_preselected_topics(
             [("Musculoskeletal", "Lumbar strain / degenerative disc disease")], True
         )
-        # Condition topics (F, G, H, K) plus forced A&A topics (B, C, E, J).
-        self.assertEqual(preselected, ["B", "C", "E", "F", "G", "H", "J", "K"])
+        # Condition topics (F, G, H, K, M, N, O) plus forced A&A topics (B, C, E, J).
+        self.assertEqual(preselected, ["B", "C", "E", "F", "G", "H", "J", "K", "M", "N", "O"])
         self.assertEqual(set(forced), {"B", "C", "E", "J"})
 
     def test_no_conditions_and_no_aa_toggle_returns_empty(self):

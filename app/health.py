@@ -322,6 +322,19 @@ def _health_payload(*, probe_cache: bool = False, probe_queue: bool = False) -> 
         payload["llm_failover"] = _fs()
     except Exception:  # noqa: BLE001
         payload["llm_failover"] = {"configured": False, "active": False}
+    # Which reader is in use, and whether it has already fallen back. Sandbox mode
+    # fails open *per file* by design, so a box that cannot be reached produces a
+    # finished run whose scans simply have no text — the one failure this app can have
+    # that looks exactly like success from the outside. Configuration and this
+    # process's own outcome, no probe: the image, credential and scope belong to the
+    # runner, and ``scripts/check_sandbox.py`` is what checks a box without creating
+    # one. It never makes /health unhealthy: records were read, just not there.
+    try:
+        from .extractors import extraction_health as _eh
+
+        payload["extractor"] = _eh()
+    except Exception:  # noqa: BLE001
+        payload["extractor"] = {"mode": "unavailable"}
     return payload
 
 

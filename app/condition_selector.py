@@ -3,7 +3,7 @@
 Renders body-system radio buttons followed by a searchable, multi-select
 condition dropdown immediately after record-source selection in both Evaluate
 and Draft modes (FR-1/FR-2/FR-3). Selecting condition(s) automatically
-pre-selects the union of relevant topics from the 12-topic checklist (FR-4,
+pre-selects the union of relevant topics from the lettered topic checklist (FR-4,
 FR-7), with a fallback default set for conditions without a predefined
 mapping (FR-8). A dedicated Aid & Attendance / SMC-L toggle forces topics
 B, C, E, and J as mandatory (FR-9/FR-10), while users may still manually
@@ -45,6 +45,9 @@ TOPIC_LABELS: dict[str, str] = {
     "J": "Physical side effects and secondary conditions from medications",
     "K": "Functional impairments from medication side effects",
     "L": "Formatting and certification",
+    "M": "Painful motion",
+    "N": "Functional loss during repeated use",
+    "O": "Flare-ups: frequency, duration, severity, and cost",
 }
 
 
@@ -149,8 +152,7 @@ def render_condition_selector(slot: str, feature_id: str) -> dict[str, Any]:
 
     st.markdown("##### Claimed condition")
     st.caption(
-        "Select the body system, then the specific condition(s), so the app can "
-        "pre-select the relevant topics from the 12-topic checklist."
+        "Select the body system, then the specific condition(s), so the app can "          "pre-select the relevant topics from the lettered topic checklist."
     )
 
     try:

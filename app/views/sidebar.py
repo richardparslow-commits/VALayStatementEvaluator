@@ -22,6 +22,7 @@ from ..config import (
     load_settings,
 )
 from ..error_report import report_failure
+from ..extractors import ExtractionStatus, extraction_status
 from ..llm import check_model_availability
 from ..preflight import (
     BLOCKED,
@@ -190,6 +191,7 @@ def render_sidebar_settings() -> None:
         st.divider()
         _audit_backup_panel()
         _llm_failover_panel()
+        _record_reading_panel()
         st.divider()
         st.caption(
             "⚠️ Uploaded documents are sent to the configured LLM endpoint for analysis. "
@@ -551,6 +553,97 @@ def _llm_failover_panel() -> None:
             "would silently not apply to queued runs. Live state is on `GET /health` "
             "→ `llm_failover` and as `va_lse_llm_failover_active` on `GET /metrics`."
         )
+
+
+def _record_reading_panel() -> None:
+    """Where record text comes from — stated before a run, not only after one.
+
+    ``VA_LSE_EXTRACTOR=sandbox`` changes what an upload is worth: a box can read a
+    scan, this process cannot. It also fails open *per file* by design, so a box that
+    cannot be reached finishes the run with those pages simply empty — the one failure
+    this app has that looks exactly like success. So the reader is a caption on every
+    paint (visible before the next upload, not just after the last one), a
+    configuration that cannot work or a file the box already refused is a warning
+    above it, and the details are one click away. No I/O and no probe: everything here
+    is what this process recorded when it chose a reader, plus what has happened since.
+    """
+    try:
+        status = extraction_status()
+    except Exception as exc:  # noqa: BLE001 - this panel must never break the app
+        st.error(
+            report_failure(
+                f"Extractor status unavailable: {type(exc).__name__}: {exc}",
+                phase="record_reading_panel",
+                exc=exc,
+                once=True,  # repainted on every rerun; log the first only
+            )
+        )
+        return
+
+    st.caption(f"📄 Records: {_reader_summary(status)}")
+    if status.problem:
+        st.warning(f"⚠️ {status.problem}")
+    elif status.fallbacks:
+        st.warning(f"⚠️ {_fallback_warning(status)}")
+
+    with st.expander("📄 Record reading — where text comes from", expanded=False):
+        st.dataframe(
+            [
+                {
+                    "Setting": "Reader",
+                    "Value": "sandbox (can OCR a scan)"
+                    if status.on_the_box
+                    else "in-process (no OCR)",
+                },
+                {"Setting": "Runner", "Value": status.runner or "—"},
+                {"Setting": "Per-file timeout", "Value": f"{status.timeout_seconds:g}s"},
+                {"Setting": "Files read in-process", "Value": str(status.fallbacks)},
+            ]
+        )
+        if status.last_fallback is not None:
+            st.caption(
+                f"Most recent fallback: **{status.last_fallback.label}** at "
+                f"{status.last_fallback.at} — {_short(status.last_fallback.reason)}"
+            )
+        if not (status.on_the_box and not status.problem):
+            st.caption(
+                "A scanned page has no text to give here: it comes back empty and is counted "
+                "as unreadable. Set `VA_LSE_EXTRACTOR=sandbox` plus `VA_LSE_EXTRACTOR_RUNNER` "
+                "to read those pages on a box that has OCR — see README → *Scanned pages and "
+                "OCR*."
+            )
+        st.caption(
+            "Before you rely on it: `.venv/bin/python scripts/check_sandbox.py` reports whether "
+            "a box would be reached from this host — the runner line, the CLI and the "
+            "credential — and creates nothing."
+        )
+
+
+def _reader_summary(status: ExtractionStatus) -> str:
+    """One line for the sidebar body: which reader a run will actually use."""
+    if status.on_the_box and not status.problem:
+        summary = f"read on the sandbox via `{status.runner}`"
+    else:
+        summary = "read in-process (no OCR — a scanned page has no text to give)"
+    if status.fallbacks:
+        summary += f" · {status.fallbacks} file(s) fell back"
+    return summary
+
+
+def _fallback_warning(status: ExtractionStatus) -> str:
+    """The warning for a box that has already refused a file in this session."""
+    last = status.last_fallback
+    named = f" The most recent: {last.label} — {_short(last.reason)}" if last else ""
+    return (
+        f"The sandbox could not read {status.fallbacks} file(s) in this session, so they were "
+        f"read in-process instead.{named}"
+    )
+
+
+def _short(text: str, limit: int = 240) -> str:
+    """A reason long enough to act on, short enough for a sidebar caption."""
+    collapsed = " ".join(text.split())
+    return collapsed if len(collapsed) <= limit else collapsed[: limit - 1] + "…"
 
 
 def _field_value(key: str, fallback: str = "") -> str:

@@ -10,12 +10,12 @@ import re
 import threading
 import zipfile
 import xml.etree.ElementTree as ET
-from collections import Counter
+from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 
-from typing import Any, Protocol, Sequence
+from typing import Any, Iterable, Iterator, Protocol, Sequence
 
 from pypdf import PdfReader
 
@@ -109,9 +109,20 @@ def chunk_source_hint(pages: Sequence[tuple[str, str, int]]) -> str:
 
 # Chunk size chosen so a digest prompt (system + knowledge + chunk) stays well under
 # typical context windows while small enough that dense pages are never truncated
-# mid-extraction. Overridable via VA_LSE_DIGEST_CHUNK_CHARS.
+# mid-extraction. Overridable via VA_LSE_DIGEST_CHUNK_CHARS (clamped there too).
 DEFAULT_CHUNK_CHARS = config.DIGEST_CHUNK_CHARS
 CHUNK_OVERLAP_CHARS = 400
+# Floor for any caller-supplied chunk budget. A budget at or below
+# ``CHUNK_OVERLAP_CHARS`` is not a smaller chunk — it is a chunk *explosion*, and
+# the mechanism is the overlap, not the cut: after a hard cut the next chunk starts
+# at ``end - CHUNK_OVERLAP_CHARS``, so with ``max_chars <= overlap`` every chunk
+# advances the cursor by a single character. Measured on a 0.38 MB corpus:
+# max_chars=8 produced 399,992 chunks and max_chars=64 produced 399,936 — exactly
+# 1,048,5xx chunks per MB, i.e. one chunk (up to max_chars long) per input
+# character, which on the 5,000-page bundle is ~12 million chunks. The floor keeps
+# the progress per chunk at ``max_chars - overlap + 1`` >= 601 characters, which
+# bounds a pathological budget to a slow run instead of an OOM.
+MIN_CHUNK_CHARS = 4 * CHUNK_OVERLAP_CHARS  # 1600: comfortably above the overlap
 MAX_STATEMENT_CHARS = 60_000
 # Max observations chars for the draft pathway (witness observations)
 MAX_OBSERVATIONS_CHARS = 60_000
@@ -180,8 +191,19 @@ class ExtractedDocument:
         return sum(len(p.text) for p in self.pages)
 
     def page_labelled_text(self) -> str:
-        """Full text with page markers so LLM citations can reference pages."""
-        parts = [f"{p.marker}\n{p.text}" for p in self.pages if p.text.strip()]
+        """Full text with page markers so LLM citations can reference pages.
+
+        Each page's text is stripped, so every part starts with ``[`` and ends with
+        a non-whitespace character. That is what makes ``clean_text`` part-local:
+        no part edge can interact with a ``\n\n`` seam, which is the property the
+        streaming cutter's per-page cleaning relies on to produce the same bytes as
+        cleaning this joined string (``iter_page_labelled_chunks``). Without the
+        strip, a page extracted with a trailing space (PDF extraction emits them)
+        gave the joined path ``"…body \n\n[marker]"`` and the streamer
+        ``"…body\n\n[marker]"`` — a silent byte difference between the two cutters,
+        so the equivalence held only for pages an extractor happened to pre-clean.
+        """
+        parts = [f"{p.marker}\n{p.text.strip()}" for p in self.pages if p.text.strip()]
         return "\n\n".join(parts)
 
     def page_records(self) -> list[tuple[str, str, int]]:
@@ -855,7 +877,15 @@ def _chunk_pages(text: str) -> tuple[tuple[str, str, int], ...]:
 
 
 def chunk_page_labelled_text(text: str, max_chars: int = DEFAULT_CHUNK_CHARS) -> list[Chunk]:
-    """Split page-labelled text into overlapping chunks at paragraph boundaries."""
+    """Split page-labelled text into overlapping chunks at paragraph boundaries.
+
+    ``max_chars`` is floored at :data:`MIN_CHUNK_CHARS` — at or below the overlap the
+    cutter advances one character per chunk. :func:`iter_page_labelled_chunks`
+    applies the same floor, so a budget too small to cut with behaves identically in
+    both (their byte-equality for pre-cleaned pages is pinned by the property test in
+    ``tests/test_core.py``).
+    """
+    max_chars = max(max_chars, MIN_CHUNK_CHARS)
     text = clean_text(text)
     if len(text) <= max_chars:
         return [Chunk(1, 1, text, _chunk_pages(text))]
@@ -882,6 +912,165 @@ def chunk_page_labelled_text(text: str, max_chars: int = DEFAULT_CHUNK_CHARS) ->
     return [
         Chunk(i, total, c, _chunk_pages(c)) for i, c in enumerate(chunks, start=1)
     ]
+
+
+# ------------------------------------------------------------ streaming chunks
+class _StreamingCutter:
+    """Cut the virtual page-labelled corpus into chunks without joining it.
+
+    The joined implementation (:func:`chunk_page_labelled_text`) materializes
+    the whole ``"\n\n".join(...)`` corpus and slices it; on a 5,000-page record
+    set that join plus its slicing churn peaked at 37.7 MB traced — text that
+    exists only to be cut. This cutter instead pulls one cleaned page part at a
+    time from the caller's page iterator, keeps only the parts overlapping the
+    current cutting window plus the overlap look-back, and accumulates just the
+    resulting chunk texts. Peak memory: the caller's pages, the chunk texts (the
+    caller retains those anyway), one ``max_chars`` window, and the largest
+    single page — never the joined corpus, never a second cleaned copy of it.
+
+    Reads see the same *virtual* text the joined implementation would clean:
+    every extractor hands over already-cleaned page text, ``clean_text`` is
+    idempotent, and its three operations are character-, line- and run-local —    so cleaning each ``marker\ntext`` part independently and joining the cleaned
+    parts with ``\n\n`` equals cleaning the one joined string, because each
+    part starts and ends with a non-whitespace character and each seam
+    (``\n\n``) therefore cannot interact with any ``clean_text`` operation.
+    The seams are part of this cutter's virtual text as their own deque
+    entries. The property test in ``tests/test_core.py`` pins byte equality
+    over randomized page sets.
+    """
+
+    def __init__(self, pages: Iterable[DocumentPage], max_chars: int) -> None:
+        self._pages = iter(pages)
+        self._max_chars = max_chars
+        self._parts: deque[str] = deque()
+        self._base = 0  # virtual index of self._parts[0][0]
+        self._filled = 0  # virtual index one past the last pulled character
+        self._exhausted = False
+
+    def _append_part(self, page: DocumentPage) -> None:
+        """Add one cleaned page part to the virtual text, with its seam.
+
+        The joined implementation builds a ``"\n\n".join(...)``; here the seam
+        is materialized as its own deque entry between parts, so reads and cut
+        positions see the exact bytes the joined path would.
+        """
+        if self._filled > 0:
+            self._parts.append("\n\n")
+            self._filled += 2
+        part = clean_text(f"{page.marker}\n{page.text}")
+        self._parts.append(part)
+        self._filled += len(part)
+
+    def _pull_one(self) -> bool:
+        """Pull the next non-blank page into the stream; ``False`` at the end.
+
+        Whitespace-only pages (blank or image-only) are skipped: the joined
+        path drops them in ``page_labelled_text`` before the join, so they
+        contribute neither text nor a seam.
+        """
+        while True:
+            page = next(self._pages, None)
+            if page is None:
+                self._exhausted = True
+                return False
+            if not page.text.strip():
+                continue
+            self._append_part(page)
+            return True
+
+    def _fill_to(self, length: int) -> None:
+        """Pull cleaned parts until the virtual text reaches *length* or ends.
+
+        When the text lands exactly on *length*, one more content part is
+        pulled (or exhaustion confirmed), so the caller can always tell "the
+        corpus ends exactly here" from "more remains" — the distinction the
+        joined path gets for free by branching on ``end < len(text)`` of the
+        full string. Without the lookahead, a cut landing exactly at
+        end-of-corpus would be followed by an overlap-tail iteration and emit
+        a chunk the joined implementation never produces.
+        """
+        while not self._exhausted and self._filled < length:
+            self._pull_one()
+        if not self._exhausted and self._filled == length:
+            self._pull_one()
+
+    def _read(self, start: int, end: int) -> str:
+        """The virtual text from *start* (inclusive) to *end* (exclusive)."""
+        if start < self._base:
+            raise ValueError("read before the retained window")
+        pieces: list[str] = []
+        pos = self._base
+        for part in self._parts:
+            part_end = pos + len(part)
+            if part_end > start:
+                lo = max(start - pos, 0)
+                hi = min(end - pos, len(part))
+                if hi > lo:
+                    pieces.append(part[lo:hi])
+            if part_end >= end:
+                break
+            pos = part_end
+        return "".join(pieces)
+
+    def _drop_before(self, pos: int) -> None:
+        """Release parts that end at or before *pos* (the cursor passed them)."""
+        while self._parts and self._base + len(self._parts[0]) <= pos:
+            self._base += len(self._parts.popleft())
+
+
+def iter_page_labelled_chunks(
+    pages: Iterable[DocumentPage], max_chars: int = DEFAULT_CHUNK_CHARS
+) -> Iterator[Chunk]:
+    """Yield the same chunks as :func:`chunk_page_labelled_text` over page
+    objects, without ever materializing the joined corpus.
+
+    Cut positions, overlap handling, and the original's ``max_chars + 1``
+    hard-cut slice are reproduced exactly, so the chunks are byte-identical to
+    the joined implementation (pinned by the property test in
+    ``tests/test_core.py``). Chunk texts accumulate before the first yield
+    because ``Chunk.total`` must be known up front; the memory this saves is
+    the joined corpus itself plus the second cleaned copy of it — the texts the
+    caller keeps anyway (the chunks, the pages) are untouched.
+
+    ``max_chars`` is floored at :data:`MIN_CHUNK_CHARS`, matching
+    :func:`chunk_page_labelled_text` exactly.
+    """
+    max_chars = max(max_chars, MIN_CHUNK_CHARS)
+    cutter = _StreamingCutter(pages, max_chars)
+    pieces: list[str] = []
+    start = 0
+    while True:
+        # Fill one past the window: the original branches on ``end < len(text)``
+        # of the joined string, so "exactly max_chars remain" must be
+        # distinguishable from "more remains".
+        cutter._fill_to(start + max_chars + 1)
+        window = cutter._read(start, start + max_chars)
+        if cutter._filled <= start + max_chars:
+            # Stream ended inside this window: the whole rest is the final
+            # chunk. An all-empty corpus is special-cased for parity with the
+            # joined implementation, whose clean_text("") yields one empty
+            # chunk (and therefore one — degenerate — digest call).
+            if start == 0 and cutter._filled == 0:
+                pieces.append("")
+            else:
+                pieces.append(window)
+            break
+        # Prefer cutting at a paragraph, then sentence, then hard cut.
+        cut = window.rfind("\n\n")
+        if cut < max_chars // 2:
+            cut = window.rfind(". ")
+        if cut < max_chars // 2:
+            cut = max_chars
+        end = start + cut + 1
+        pieces.append(cutter._read(start, end))
+        if cutter._exhausted and end >= cutter._filled:
+            break  # the cut consumed the corpus: no overlap-tail iteration
+        next_start = max(end - CHUNK_OVERLAP_CHARS, start + 1)
+        cutter._drop_before(next_start)
+        start = next_start
+    total = len(pieces)
+    for i, chunk_text in enumerate(pieces, start=1):
+        yield Chunk(i, total, chunk_text, _chunk_pages(chunk_text))
 
 
 # ------------------------------------------------------- paragraph retrieval
@@ -924,9 +1113,58 @@ def _split_oversized(block: str, limit: int = PARAGRAPH_MAX_CHARS) -> list[str]:
     return pieces
 
 
-_PARAGRAPH_CACHE: dict[tuple[str, int, int], list[Paragraph]] = {}
+# Paragraph indexes are memoized per document: a large record set is searched once
+# per claim batch, so the split work must not repeat per query.
+#
+# Bounded by *text*, not only by entry count. One 5,000-page document indexes to
+# ~12 MB of paragraph strings (measured), so an entry-count-only cap of 64 retains
+# hundreds of MB in a long-lived server process — the difference between a session
+# that survives a week and one the OOM killer takes. Oldest entries are evicted
+# once either bound is exceeded; the newest is always kept, so a single oversized
+# document is still cached rather than recomputed on every query.
+_PARAGRAPH_CACHE: OrderedDict[tuple[str, int, int], list[Paragraph]] = OrderedDict()
 _PARAGRAPH_CACHE_LOCK = threading.Lock()
 _PARAGRAPH_CACHE_MAX_ENTRIES = 64
+_PARAGRAPH_CACHE_MAX_CHARS = 4_000_000
+
+
+def _cache_get(key: tuple[str, int, int]) -> list[Paragraph] | None:
+    """Cached index for *key*, refreshed as most-recently-used, or ``None``."""
+    with _PARAGRAPH_CACHE_LOCK:
+        cached = _PARAGRAPH_CACHE.get(key)
+        if cached is not None:
+            _PARAGRAPH_CACHE.move_to_end(key)
+        return cached
+
+
+def _cache_put(key: tuple[str, int, int], paragraphs: list[Paragraph]) -> None:
+    """Store *key* and evict oldest entries until both bounds hold.
+
+    The total is measured once and then decremented per eviction rather than
+    recomputed inside the loop: a document large enough to matter is exactly the one
+    whose paragraph count would make the recompute expensive, and eviction is the
+    path it triggers.
+    """
+    with _PARAGRAPH_CACHE_LOCK:
+        if key in _PARAGRAPH_CACHE:
+            _PARAGRAPH_CACHE.move_to_end(key)
+            return
+        _PARAGRAPH_CACHE[key] = paragraphs
+        total = _cached_paragraph_chars()
+        while len(_PARAGRAPH_CACHE) > 1 and (
+            len(_PARAGRAPH_CACHE) > _PARAGRAPH_CACHE_MAX_ENTRIES
+            or total > _PARAGRAPH_CACHE_MAX_CHARS
+        ):
+            _, evicted = _PARAGRAPH_CACHE.popitem(last=False)
+            total -= sum(len(paragraph.text) for paragraph in evicted)
+
+
+def _cached_paragraph_chars() -> int:
+    """Characters of paragraph text the cache holds (caller holds the lock)."""
+    return sum(
+        sum(len(paragraph.text) for paragraph in paragraphs)
+        for paragraphs in _PARAGRAPH_CACHE.values()
+    )
 
 
 def paragraph_index(doc: ExtractedDocument, min_chars: int = 40) -> list[Paragraph]:
@@ -943,8 +1181,7 @@ def paragraph_index(doc: ExtractedDocument, min_chars: int = 40) -> list[Paragra
         fingerprint.update(json.dumps(page_input, ensure_ascii=True).encode("ascii"))
     split_limit = PARAGRAPH_MAX_CHARS
     key = (fingerprint.hexdigest(), min_chars, split_limit)
-    with _PARAGRAPH_CACHE_LOCK:
-        cached = _PARAGRAPH_CACHE.get(key)
+    cached = _cache_get(key)
     if cached is not None:
         return cached
     paragraphs: list[Paragraph] = []
@@ -955,10 +1192,7 @@ def paragraph_index(doc: ExtractedDocument, min_chars: int = 40) -> list[Paragra
                 continue
             for piece in _split_oversized(block, limit=split_limit):
                 paragraphs.append(Paragraph(label, piece))
-    with _PARAGRAPH_CACHE_LOCK:
-        if len(_PARAGRAPH_CACHE) >= _PARAGRAPH_CACHE_MAX_ENTRIES:
-            _PARAGRAPH_CACHE.clear()
-        _PARAGRAPH_CACHE[key] = paragraphs
+    _cache_put(key, paragraphs)
     return paragraphs
 
 

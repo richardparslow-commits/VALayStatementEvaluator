@@ -6,10 +6,21 @@ these utilities before it is interpolated into an LLM prompt or stored as a
 setting.  The goal is not to "solve" prompt injection perfectly — no escaping
 scheme does — but to:
 
-* Break common delimiter-escape / context-switching tricks (triple backticks,
-  the <<< / >>> delimiters used throughout our prompt templates, and obvious
-  ``ignore previous instructions``-style directives).
-* Enforce a hard length bound so a single field cannot flood the context window.
+* Break delimiter-escape / context-switching tricks: runs of angle brackets and
+  code fences (including runs formed by concatenating two fields), angle-bracket
+  lookalikes (fullwidth ``＜``), invisible-character smuggling (zero-widths, bidi
+  overrides, Unicode tag characters), and chat-template role tokens or
+  line-leading role labels that would let record text speak in the system role.
+* Be explicit about what it does *not* do: no injection phrase is stripped (a
+  record may legitimately discuss one), so instructional attacks are answered by
+  ``GUARD_NOTE`` in the system message, by citations that ``verify_citations``
+  checks back against the page, and by keeping the human in the loop — not by
+  filtering words.
+* Enforce a length bound so a single field cannot flood the context window.
+  Truncation is applied last and the ``… [truncated N chars]`` suffix is always
+  kept, so for ``max_chars`` below the suffix's own length the result is the
+  suffix rather than a silent empty string (bounded at 300 characters either way;
+  every call site in this repo passes ≥ 200).
 * Give prompts an explicit instruction to treat user-supplied text as DATA that
   must not be obeyed.
 * Validate sidebar settings so absurd values are rejected at the UI boundary.
@@ -23,9 +34,56 @@ import re
 
 # ---------------------------------------------------------------- constants
 
-# Sentinel used to replace delimiter sequences that could close a "<<<" ... ">>>"
-# block or a fenced code block in the prompt templates.
-_DELIM_REPLACEMENT = " "
+# Characters that render as nothing (or as a direction change) yet still tokenize:
+# zero-width space/joiner/non-joiner, bidi overrides, soft hyphen, word joiner,
+# BOM, and the Unicode "tag" block. Left in place, ``<\u200b<\u200b<`` renders as
+# ``<<<`` to a reader (and to anything that normalizes before comparing) while
+# dodging a literal ``<<<`` check. They carry no meaning in record text, so they
+# are dropped rather than escaped.
+_INVISIBLE_RE = re.compile(
+    "[\u00ad\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff"
+    "\U000e0000-\U000e007f]"
+)
+
+# Angle brackets that *look* like ``<``/``>`` once rendered: fullwidth (CJK input
+# methods produce these), CJK double angle brackets, and the mathematical angle
+# brackets. Translated to ASCII before the escaping pass so a lookalike cannot
+# carry a delimiter past a byte-level replace.
+#
+# Deliberately a translation table rather than ``unicodedata.normalize("NFKC")``:
+# NFKC would also rewrite letters, digits and ligatures inside record text, and
+# every quote this app extracts is checked back against the page by token
+# (``verify_citations``). Normalizing the prompt but not the record could make an
+# echoed quote unverifiable. Only the characters that can smuggle a delimiter are
+# touched here, and those are precisely the ones the citation check ignores.
+_ANGLE_LOOKALIKES = str.maketrans(
+    {"＜": "<", "＞": ">", "❮": "<", "❯": ">", "⟨": "<", "⟩": ">"}
+)
+
+# Every run of two or more angle brackets, escaped to a same-width lookalike.
+# Escaping *runs* rather than the literal triple closes the gap where two fields that
+# each hold one ``<`` are joined inside a template as ``<<``; the field-edge escape
+# in the function closes the harder version of the same gap (three fields that each
+# contribute one bracket meeting as ``<<<``), which no per-field run check can see.
+_BRACKET_RUN_RE = re.compile(r"<{2,}|>{2,}")
+# Fenced code blocks (backticks or the ``~~~`` alternative) — 3+ of either.
+_FENCE_RUN_RE = re.compile(r"`{3,}|~{3,}")
+# Chat-template control tokens. Not delimiters in this app's templates, but they
+# are role boundaries in the models' own templates, so text from a record must not
+# be able to speak in the system role: ``<|im_start|>system``, ``<|endoftext|>``…
+_CHAT_TOKEN_RE = re.compile(r"<\|([A-Za-z_]{1,24})\|>")
+_ROLE_TAG_RE = re.compile(
+    r"</?(system|assistant|user|instruction|instructions|developer|tool|data|document|"
+    r"context|records|prompt|rules?)\s*>",
+    re.IGNORECASE,
+)
+_INST_TOKEN_RE = re.compile(r"\[(/?)(INST|SYS)\]", re.IGNORECASE)
+# Line-leading role labels (``System:``, ``### Assistant:``) — the model-agnostic
+# version of the same trick, and the one that needs no special tokens at all.
+_ROLE_LABEL_RE = re.compile(
+    r"(?m)^([ \t]*(?:#{1,6}[ \t]*)?)(system|assistant|human|user|developer|instruction)\s*:",
+    re.IGNORECASE,
+)
 
 # Instruction appended to prompts that carry untrusted content.
 GUARD_NOTE = (
@@ -72,16 +130,29 @@ def sanitize_for_prompt(text: str, *, max_chars: int) -> str:
     Operations (in order):
     1. Coerce non-strings to str.
     2. Normalize lone ``\\r`` to ``\\n``.
-    3. Escape delimiter sequences that would otherwise close the ``<<<``/``>>>``
-       blocks or fenced code blocks: ``>>>``, ``<<<``, and ````` ``.
-       They are replaced with a benign visual placeholder (a single space) so
-       the user's meaning is preserved without breaking the template.
-    4. Truncate to *max_chars* with an explicit ``… [truncated N chars]`` suffix
+    3. Translate angle-bracket lookalikes (fullwidth ``＜``, CJK ``⟨``) to ASCII.
+    4. Drop invisible characters — zero-widths, bidi overrides, Unicode tag
+       characters — which otherwise let a ``<<<`` be rendered but not matched.
+    5. Neutralize chat/role control tokens and line-leading role labels
+       (``<|im_start|>``, ``<system>``, ``[INST]``, ``System:``) — these are role
+       boundaries in the model's own template even when our ``<<<`` block holds.
+    6. Escape every run of 2+ ``<``/``>`` (``>>>`` → ``»»»``, ``<<`` → ``««``), any
+       bracket at the very start/end of the field, and every fenced-code run
+       (`` ``` `` → `` ` ` ` ``, ``~~~`` → ``~ ~ ~``). Runs *and* edges, not triples:
+       that is what makes a delimiter unforgeable by concatenating fields in a
+       template, since a forged ``<<<`` needs brackets at field edges.
+    7. Truncate to *max_chars* with an explicit ``… [truncated N chars]`` suffix
        so the model knows input was bounded (and so callers can distinguish
        prompt-sanitize truncation from the separate documents.py pipeline limits).
-    5. No blocking on injection phrases — see module docstring — but the
-       escaping + GUARD_NOTE together reduce the success rate of naive attacks
-       and are exercise-test-visible via the preserved-phrase property.
+
+    No injection phrase is blocked — see the module docstring — so the boundary
+    above is the mechanical half of the defense and ``GUARD_NOTE`` is the
+    behavioral half. What the escaping can guarantee is that untrusted text cannot
+    *close* the block it was placed in, cannot act as a role, and cannot hide a
+    delimiter behind a lookalike; what it cannot do is stop a model from obeying a
+    sentence it was told to treat as data. That is why the guard note is placed in
+    the *system* message wherever a prompt is assembled here, and why facts carry
+    page citations that ``verify_citations`` checks back against the record.
 
     The function never raises; empty string out for empty in.
     """
@@ -90,15 +161,35 @@ def sanitize_for_prompt(text: str, *, max_chars: int) -> str:
     # Normalize carriage returns so delimiter matching is predictable.
     text = text.replace("\r\n", "\n").replace("\r", "\n")
 
-    # Escape prompt-template delimiters. Order: >>> before <<< is irrelevant,
-    # but handle triple-backticks first so e.g. ``>>` `` is not double-counted.
-    # Use simple string replacement (no regex) to avoid missing overlapping cases.
-    if "```" in text:
-        text = text.replace("```", "` ` `")
-    if ">>>" in text:
-        text = text.replace(">>>", "»»»")
-    if "<<<" in text:
-        text = text.replace("<<<", "«««")
+    # 1. Lookalikes → ASCII, then invisibles away, so everything below sees the
+    #    same bytes a reader (or a normalizing tokenizer) would.
+    text = text.translate(_ANGLE_LOOKALIKES)
+    text = _INVISIBLE_RE.sub("", text)
+
+    # 2. Break role boundaries the model's own template would honor. This runs
+    #    *before* the bracket escaping below, because those patterns are the more
+    #    specific shapes: escaping a leading ``<`` first would leave ``«|im_start|>``,
+    #    which is no longer a token this pass can recognize.
+    text = _CHAT_TOKEN_RE.sub(r"‹|\1|›", text)
+    text = _ROLE_TAG_RE.sub(lambda m: "‹" + m.group(0)[1:-1] + "›", text)
+    text = _INST_TOKEN_RE.sub(lambda m: "⟦" + m.group(1) + m.group(2) + "⟧", text)
+    text = _ROLE_LABEL_RE.sub(r"\1\2 -", text)
+
+    # 3. Escape delimiter runs, preserving their width so the text still reads the
+    #    way it was written.
+    text = _BRACKET_RUN_RE.sub(
+        lambda m: ("«" if m.group(0)[0] == "<" else "»") * len(m.group(0)), text
+    )
+    text = _FENCE_RUN_RE.sub(lambda m: " ".join(m.group(0)), text)
+    # 3b. A delimiter can also be assembled by *concatenation*: three fields that
+    #     each begin or end with one bracket meet inside a template as "<<<", which
+    #     no per-field run check can see. Only a field-edge bracket can do that, so
+    #     the edge bracket — and only it — is escaped too. Interior brackets are left
+    #     alone deliberately: "<1.0 mg/dL" is clinical text, not a delimiter.
+    if text[:1] in ("<", ">"):
+        text = ("«" if text[0] == "<" else "»") + text[1:]
+    if text[-1:] in ("<", ">"):
+        text = text[:-1] + ("«" if text[-1] == "<" else "»")
 
     # Enforce length bound
     if max_chars <= 0:

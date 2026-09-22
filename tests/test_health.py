@@ -18,7 +18,7 @@ from unittest.mock import MagicMock, Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 
-from app import health  # noqa: E402
+from app import extractors, health  # noqa: E402
 from app.config import Settings  # noqa: E402
 
 
@@ -305,6 +305,68 @@ class TestHealthPure(unittest.TestCase):
 
 
 # ------------------------------------------------------------------ server integration (loopback, no external network)
+class TestHealthExtractorBlock(unittest.TestCase):
+    """`/health` says which reader is in use, and whether it has already fallen back.
+
+    The fallback is the failure that mimics success: sandbox mode fails open per file,
+    so a box that cannot be reached finishes the run with its scanned pages simply
+    empty. "Is it reading files on a box, or pretending to?" therefore has to be
+    answerable from the endpoint operators already poll.
+    """
+
+    def setUp(self):
+        extractors.reset_extraction_status()
+        self.addCleanup(extractors.reset_extraction_status)
+
+    def test_the_payload_says_which_reader_is_configured(self):
+        payload = health._health_payload()
+
+        self.assertEqual(payload["extractor"]["mode"], "in-process")
+        self.assertEqual(payload["extractor"]["fallbacks"], 0)
+        self.assertIsNone(payload["extractor"]["last_fallback"])
+
+    def test_a_configured_sandbox_is_reported_with_its_runner(self):
+        extractors.record_configuration(
+            mode="sandbox", runner="python scripts/vercel_sandbox_runner.py {work}", timeout_seconds=900
+        )
+
+        block = health._health_payload()["extractor"]
+
+        self.assertEqual(block["mode"], "sandbox")
+        self.assertIn("vercel_sandbox_runner.py", block["runner"])
+        self.assertEqual(block["timeout_seconds"], 900)
+
+    def test_a_fallback_is_visible_with_its_reason(self):
+        extractors.record_fallback("the box did not answer within 900s for records.pdf", "records.pdf")
+
+        block = health._health_payload()["extractor"]
+
+        self.assertEqual(block["fallbacks"], 1)
+        self.assertEqual(block["last_fallback"]["label"], "records.pdf")
+        self.assertIn("did not answer within", block["last_fallback"]["reason"])
+        self.assertTrue(block["last_fallback"]["at"].endswith("Z"))
+
+    def test_a_fallback_never_makes_the_app_look_unhealthy(self):
+        """Records were still read — just not on the box. The pod is fine."""
+        extractors.record_configuration(mode="sandbox", problem="no runner is set")
+        extractors.record_fallback("no runner command configured", "records.pdf")
+
+        payload = health._health_payload()
+
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["extractor"]["problem"], "no runner is set")
+        self.assertTrue(health._ready_payload(True, "ready")["status"], "ready")
+
+    def test_reading_the_block_does_not_probe_anything(self):
+        """/health is polled by the kubelet: configuration only, no network, no process."""
+        extractors.record_configuration(mode="sandbox", runner="box-run {work}")
+
+        with patch("subprocess.run", side_effect=AssertionError("probed on the liveness path")):
+            payload = health._health_payload()
+
+        self.assertEqual(payload["extractor"]["mode"], "sandbox")
+
+
 class TestHealthServer(unittest.TestCase):
     def test_liveness_get_returns_200_json(self):
         server, port, patcher = _free_port_server(probe_return=(True, "ready"))

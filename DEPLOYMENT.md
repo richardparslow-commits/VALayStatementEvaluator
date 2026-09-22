@@ -688,6 +688,15 @@ Four things about it are deliberate and easy to get wrong by hand:
   unparseable JSON — is logged once through `app.error_report` and the file is read
   in-process, so a misconfigured box costs a warning rather than a run.
 
+  That fail-open behavior is the reason this is *reported* in two places rather than
+  only logged. `GET /health → extractor` and the sidebar both state which reader this
+  process runs, the runner and timeout it was given, any configuration that cannot
+  work (`sandbox` with no runner, an unknown mode), and how many files the box has
+  already refused with the last reason — because a run that finishes with its scans
+  empty is indistinguishable from success everywhere else. Neither reports it as
+  unhealthy: the records *were* read, just not on a box. For "would a box be reached
+  at all, before anything is uploaded", that is `scripts/check_sandbox.py` above.
+
   Measured on a generated 20-file / 400-page all-scan bundle (`--no-ocr` vs. the
   box, engine cost excluded): **0 → 20 documents read, ≈124,000 characters of record
   text (≈31,000 tokens) reaching the digest**, at ≈4 ms per page of non-engine work.
@@ -704,12 +713,56 @@ Four things about it are deliberate and easy to get wrong by hand:
   VA_LSE_EXTRACTOR_RUNNER="python scripts/vercel_sandbox_runner.py {work}"
   ```
 
-  Use an interpreter that actually exists. The runner is spawned as a subprocess, so
-  the command is only as good as its first word: macOS ships `python3` and no `python`,
-  and Streamlit started from a virtualenv does not put `python` on `PATH` either — the
-  file then fails open with "the runner command does not exist (python)" and every
-  record is read in-process, which is a warning per run rather than an error. Point it
-  at an absolute interpreter path (`…/venv/bin/python`) or at `python3`.
+  That line works on a host that has no `python` on `PATH`. The runner is spawned as a
+  subprocess, so the command is only as good as its first word — and macOS ships
+  `python3` with no `python`, while Streamlit started from a virtualenv puts neither on
+  `PATH`. A first word that names a Python interpreter this host does not have is
+  therefore resolved to the interpreter running this app, which is the interpreter the
+  operator meant and the one whose packages are installed:
+
+  * a bare spelling that is **not on `PATH`** (`python`, `python3`, `python3.x`,
+    Windows' `py`) is logged once at **INFO** — normal on macOS, and only the spelling
+    has changed;
+  * an interpreter **path** that is not on disk (`…/.venv-sandbox/bin/python`, a venv
+    that was moved or deleted) is logged once at **WARNING** — that one is a broken
+    configuration, not a spelling, so it should not pass quietly.
+
+  Either way the line is actionable: it names the word as written and the interpreter
+  that took over. A spelling that *is* on `PATH`, or a path that *is* on disk, is left
+  exactly as written — version pin included — and a first word that names no
+  interpreter at all (`my-box-run.sh`, `npx -y sandbox`, a typo) is still a runner that
+  does not exist: the file then fails open with "the runner command does not exist (…)"
+  and every record is read in-process, a warning per run rather than an error.
+
+* **Ask before you trust it, and pay nothing to ask.** `scripts/check_sandbox.py`
+  answers "would a box be reached from *this* host?" in one verdict, before an upload
+  rather than after one:
+
+  ```bash
+  .venv/bin/python scripts/check_sandbox.py            # exit 1 = a run would fall back
+  .venv/bin/python scripts/check_sandbox.py --json     # the same, for a script
+  ```
+
+  It resolves `VA_LSE_EXTRACTOR_RUNNER` exactly the way a run resolves it (so a bare
+  `python` on a host that only has `python3` is reported as the substitution a run would
+  make, not as a missing interpreter), executes that command with `--check`, and folds in
+  the box-side answer from the runner: is `VA_LSE_SANDBOX_CLI` on `PATH`, and does one
+  authenticated `sandbox list` come back for `VA_LSE_SANDBOX_SCOPE` and
+  `VA_LSE_SANDBOX_PROJECT`. **It creates no box and reads no record** — an assertion in
+  `tests/test_check_sandbox.py` runs it against a CLI that journals every call and
+  insists the only subcommand reached is `list`.
+
+  One question it will not answer, because nothing local can: whether the image is in
+  the registry. The Sandbox CLI has no command that lists images, so the verdict reports
+  it as `unproven` and names both ways to settle it — `vercel vcr image ls
+  va-lse-sandbox` (the **Vercel** CLI, whose `vcr` commands read the registry) or the
+  opt-in live test, which boots a real box. A guessed answer here would be worse than
+  none: "pushed" sends you to a run that falls back, "missing" sends you to rebuild an
+  image that was already there.
+
+  Because the verdict is only as good as the configuration it read, run it **on the host
+  that will read records** (or from the same `.env`): `app/config.py` loads `.env` with
+  `override=True`, so the file decides, not the shell.
 
   Per file it runs `sandbox create --name va-lse-ocr-<id> --image va-lse-sandbox:latest
   --timeout 20m --non-persistent --silent`, then `exec … mkdir -p
@@ -779,11 +832,32 @@ Four things about it are deliberate and easy to get wrong by hand:
   ```
 
   The knobs arrive under the `VA_LSE_TEST_*` prefix because `tests/hermetic.py` strips
-  ambient `VA_LSE_*` configuration; the first test creates a box on the default
-  runtime, copies a file in and back out and removes the box (the credential, the
-  transport and the lifecycle, for a fraction of a cent and no registry write), and the
-  second runs the whole runner so the entrypoint reads a real staged record — skipping,
-  with the build command, while the image is not in the registry. Four assumptions in
+  ambient `VA_LSE_*` configuration. Five tests, and the ones that need the image skip
+  naming the build command while it is not in the registry (a fresh clone):
+
+  * a file round-trips through a real box on the CLI's **default runtime** — the
+    credential, the transport and the lifecycle, for a fraction of a cent and no
+    registry write;
+  * the whole runner (`run_for_one_file`) reads a real staged record, so the entrypoint
+    runs on a box;
+  * the app's own extractor — `app/extractors.py` stages the record, spawns the runner
+    over the documented command line and validates the label it answers under — which
+    the offline tests can only fake, and which asserts *no* fallback was recorded
+    (a silent one would pass while proving nothing);
+  * **fail-open on a real box**: the same adapter pointed at the default runtime, where
+    `/app/scripts/ocr_and_extract.py` does not exist, so a box really is created, the
+    entrypoint really fails inside it, and the record still comes back in-process with
+    one reported fallback naming the box. Needs no image;
+  * **a scan**: a page that is a raster of text, which this process refuses outright and
+    the box reads — the only test that shows the *built* image carries an OCR engine
+    rather than merely being told to install one.
+
+  Measured on 2026-09-21 against `va-lse-sandbox:latest`: all five pass in 58 s, and
+  `sandbox list` was empty afterwards (each test removes its box, and the runner removes
+  its own). That settles the one question `scripts/check_sandbox.py` cannot answer
+  locally — the image *is* in the registry and answers a real page.
+
+  Four assumptions in
   this section were corrected by running it against a real account: `remove` does take
   the auth flags, the CLI's credential variable is `VERCEL_AUTH_TOKEN`, a failed `create`
   reports a bare status rather than "Image not found" (the message stays in its response
@@ -2228,6 +2302,9 @@ python scripts/rehearse_failover.py --expect-idle
 - [ ] TLS termination is handled by a reverse proxy (not Streamlit)
 - [ ] Security headers (CSP, HSTS, X-Frame-Options) are set by the proxy
 - [ ] `.streamlit/config.toml` is present in the container (XSRF, toolbar, maxUploadSize)
+- [ ] If `VA_LSE_EXTRACTOR=sandbox`: `python scripts/check_sandbox.py` exits 0 **on the host that
+      reads records** — and the one thing it cannot prove, the image, was settled another way
+      (`vercel vcr image ls <repo>`, or the dispatch-only job that builds and pushes it)
 - [ ] LLM endpoint can handle `N_pods × VA_LSE_MAX_CONCURRENT_LLM_CALLS` concurrent requests
 - [ ] Audit logs (`logs/audit.log`) are retained per your compliance policy
 - [ ] Circuit breaker + concurrency limiter env vars are tuned for your user count
