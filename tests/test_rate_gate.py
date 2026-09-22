@@ -81,14 +81,20 @@ class TestMinimumIntervalGate(unittest.TestCase):
     def test_contending_threads_burst_apart_not_together(self):
         # The whole point of slot reservation: N threads arriving at once must
         # come out a full interval apart, not all admitted at the first tick.
+        # Assert on scheduled slots (start + returned delay), not wake
+        # timestamps — a late wakeup on an earlier thread legitimately shrinks
+        # the wake-to-wake gap while slot spacing still holds.
         gate = _small_gate(0.04)
         start = threading.Barrier(5)
-        admitted: list[float] = []
+        slots: list[float] = []
+        lock = threading.Lock()
 
         def worker() -> None:
             start.wait()
-            gate.wait()
-            admitted.append(time.monotonic())
+            began = time.monotonic()
+            delay = gate.wait()
+            with lock:
+                slots.append(began + delay)
 
         threads = [threading.Thread(target=worker) for _ in range(5)]
         for t in threads:
@@ -96,13 +102,13 @@ class TestMinimumIntervalGate(unittest.TestCase):
         for t in threads:
             t.join()
 
-        self.assertEqual(len(admitted), 5)
-        admitted.sort()
-        for earlier, later in zip(admitted, admitted[1:]):
+        self.assertEqual(len(slots), 5)
+        slots.sort()
+        for earlier, later in zip(slots, slots[1:]):
             self.assertGreaterEqual(
                 later - earlier,
-                0.035,
-                "burst not prevented: two threads admitted within one interval",
+                0.0399,
+                "burst not prevented: two threads scheduled within one interval",
             )
 
     def test_reservation_survives_sleep_outside_lock(self):

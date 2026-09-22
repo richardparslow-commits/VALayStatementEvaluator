@@ -23,6 +23,11 @@ outputs/
 logs/
 *.log
 usage_history.json
+# Witness input: intentionally starts as a placeholder template, but its whole
+# purpose is to be filled with a real witness's name, relationship, and
+# observations about a real veteran — PII/PHI the moment it is real. It ships
+# once as a template, then leaves version control for good.
+witness.json
 # VA.gov downloader failure evidence (signed-in page screenshots/HTML — PHI)
 va_gov_download_artifacts
 # Veteran medical records (PHI): users drop C-file PDFs in the project root to
