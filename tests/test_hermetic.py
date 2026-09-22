@@ -1263,5 +1263,133 @@ class TestTheLiveSmokeJobAcceptsAKey(unittest.TestCase):
             )
 
 
+class TestThePerplexityLiveJobIsWired(unittest.TestCase):
+    """The live Agent API test is only as good as the job that hands it a key.
+
+    ``tests/test_perplexity_live.py`` skips itself without ``VA_LSE_TEST_PERPLEXITY_KEY``,
+    which is the right shape for a credit-consuming test and also the exact way it can
+    stop running without anyone noticing: delete the job, rename the secret, or install
+    from something other than the lock, and the module goes on reporting green while
+    skipping every assertion. Nothing else in the suite reads the workflow file, so
+    without this guard the Agent API half of the app could fall back to being verified
+    only by the httpx mock — the gap this job exists to close.
+    """
+
+    WORKFLOW = PROJECT_ROOT / ".github" / "workflows" / "test.yml"
+    JOB = "perplexity-live"
+    GATE_JOB = "perplexity-credentials"
+    RUNNER = "python -m unittest tests.test_perplexity_live"
+    #: The module's own opt-in variable, and the secret it must be fed from. One
+    #: Perplexity key serves both the pipeline and the Agent API, and
+    #: ``PERPLEXITY_API`` is the name a key created in the console gets.
+    KEY_VAR = "VA_LSE_TEST_PERPLEXITY_KEY"
+    KEY_SECRET = "PERPLEXITY_API"
+
+    def _workflow(self) -> dict:
+        try:
+            import yaml
+        except ImportError:  # pragma: no cover - a declared test prerequisite
+            raise unittest.SkipTest("PyYAML is not installed")
+        return yaml.safe_load(self.WORKFLOW.read_text(encoding="utf-8"))
+
+    def _job(self, name: str) -> dict:
+        job = self._workflow()["jobs"].get(name)
+        self.assertIsNotNone(
+            job,
+            f"there is no '{name}' job, so the live Agent API test never runs and "
+            "skips look identical to passing",
+        )
+        return job
+
+    def _commands(self, job: dict) -> str:
+        return "\n".join(str(step.get("run", "")) for step in job["steps"])
+
+    def test_the_live_job_runs_the_agent_api_module(self) -> None:
+        commands = self._commands(self._job(self.JOB))
+        self.assertIn(
+            self.RUNNER,
+            commands,
+            "the job no longer runs the live Agent API module, so it is green while "
+            "asserting nothing",
+        )
+
+    def test_the_live_job_feeds_the_module_its_opt_in_variable(self) -> None:
+        """The module's variable name and the secret must agree, or it skips."""
+        job = self._job(self.JOB)
+        reads = {
+            key: str(value)
+            for step in job["steps"]
+            for key, value in (step.get("env") or {}).items()
+        }
+        self.assertIn(
+            self.KEY_VAR,
+            reads,
+            f"the job never sets {self.KEY_VAR}, so the module skips itself and the "
+            "job passes without testing the Agent API",
+        )
+        self.assertIn(
+            f"secrets.{self.KEY_SECRET}",
+            reads[self.KEY_VAR],
+            f"{self.KEY_VAR} is not read from the {self.KEY_SECRET} secret, so a key "
+            "stored under that name is indistinguishable from no key",
+        )
+
+    def test_the_gate_reads_the_same_secret(self) -> None:
+        gate = self._job(self.GATE_JOB)
+        reads = "\n".join(
+            str(value)
+            for step in gate["steps"]
+            for value in (step.get("env") or {}).values()
+        )
+        self.assertIn(
+            f"secrets.{self.KEY_SECRET}",
+            reads,
+            f"the gate never reads {self.KEY_SECRET}, so a key stored under that "
+            "name never enables the live job",
+        )
+
+    def test_the_live_job_installs_the_sdk_the_module_skips_without(self) -> None:
+        """A skip because a dependency is missing is unverified code, not a pass.
+
+        The module skips when the ``perplexityai`` package is absent, so the job has
+        to install something that carries it. It is in the core set,
+        ``requirements.txt`` and the hash-pinned ``requirements.lock``; installing the
+        lock is what CI does everywhere else.
+        """
+        commands = self._commands(self._job(self.JOB))
+        self.assertIn(
+            "requirements.lock",
+            commands,
+            "the job no longer installs the lock, so the Perplexity SDK it needs may "
+            "be absent and every assertion would skip",
+        )
+
+    def test_the_live_job_cannot_spend_credits_on_a_push(self) -> None:
+        """Dispatch-only, through its gate, and never allowed to fail quietly.
+
+        The Agent API is billed per model token and per tool invocation, so this job
+        must not run on a push — the gate is what enforces that, because a job-level
+        ``if`` cannot read the secrets context and an ungated job would run (and bill)
+        on every event. ``continue-on-error`` is refused for the same reason it is
+        refused on the smoke job: a failed assertion behind a swallow still reports
+        green.
+        """
+        gate = self._job(self.GATE_JOB)
+        self.assertIn(
+            "workflow_dispatch",
+            str(gate.get("if", "")),
+            "the gate is not limited to manual dispatch, so the live job would run "
+            "(and bill) on every push",
+        )
+        job = self._job(self.JOB)
+        self.assertIn(
+            self.GATE_JOB,
+            str(job.get("if", "")),
+            "the live job does not depend on its credentials gate, so it would run "
+            "even without a key",
+        )
+        self.assertNotIn("continue-on-error", job)
+
+
 if __name__ == "__main__":
     unittest.main()

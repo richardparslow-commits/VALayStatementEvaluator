@@ -793,7 +793,11 @@ All public helpers in `app/main.py`, `app/fetch_client.py`, `app/evaluate.py` ca
 > `OPENAI_API_KEY` or `PERPLEXITY_API` (a key created in the Perplexity console
 > under that name works as-is; the job maps it onto the app's primary-key
 > variable); the optional `OPENAI_BASE_URL`, `LLM_MODEL_MAIN`, and `LLM_MODEL_FAST` secrets override the endpoint and
-> models in that job if set (see `.env.example`). The sandbox image is built on every event
+> models in that job if set (see `.env.example`). A second dispatch-only job runs the live
+> **Agent API** test (`tests/test_perplexity_live.py`) under that same `PERPLEXITY_API` secret:
+> the smoke run above exercises Evaluate and Draft, so the Research tab and the
+> framework-currency check — which go through `app/perplexity_agent.py` — are only ever reached
+> there. The sandbox image is built on every event
 > (nothing pushed), and a manual dispatch builds and pushes it to Vercel Container Registry and
 > then reads a record on a real box — that job needs a `VERCEL_TOKEN` secret and skips itself
 > without one, exactly like the smoke test (`DEPLOYMENT.md` §6).
@@ -1011,10 +1015,15 @@ itself can come from CI: on manual dispatch a job builds, pushes and then reads 
 on a real box, so nothing has to be built locally. Failure is fail-open by design: records are
 still read and the run still finishes.
 
-Two opt-in live tests cover the halves a fake cannot: `tests/test_ai_gateway_live.py` for the
-LLM endpoint (`VA_LSE_TEST_AI_GATEWAY_KEY`) and `tests/test_vercel_sandbox_live.py` for the box
-(`VA_LSE_TEST_VERCEL_SANDBOX_TOKEN`, plus the team/project and `VA_LSE_TEST_VERCEL_SANDBOX_CLI`
-if the CLI is not on `PATH`). Both skip without their variable, so CI is unaffected.
+Three opt-in live tests cover the halves a fake cannot: `tests/test_ai_gateway_live.py` for a
+generic LLM endpoint (`VA_LSE_TEST_AI_GATEWAY_KEY`), `tests/test_perplexity_live.py` for the
+**Agent API** — the Research tab and the framework-currency check, which the Evaluate/Draft
+smoke run never reaches (`VA_LSE_TEST_PERPLEXITY_KEY`) — and `tests/test_vercel_sandbox_live.py`
+for the box (`VA_LSE_TEST_VERCEL_SANDBOX_TOKEN`, plus the team/project and
+`VA_LSE_TEST_VERCEL_SANDBOX_CLI` if the CLI is not on `PATH`). All three skip without their
+variable, so ordinary CI is unaffected; the Agent API and the box each have a dispatch-only job
+that supplies it (`.github/workflows/test.yml` → `perplexity-live`, `sandbox-image-push`), and
+the gateway one is run locally against an account that has a key for it.
 
 `scripts/va_records_download.py` also inspects what it just downloaded — page count,
 text-vs-image balance, sha256 — prints a warning when the export is implausibly small or mostly
