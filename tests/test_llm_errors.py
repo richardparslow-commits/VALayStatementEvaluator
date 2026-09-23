@@ -13,6 +13,7 @@ Uses the merged error taxonomy (``LLMUpstreamError`` with ``retriable`` /
 from __future__ import annotations
 
 import sys
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -34,6 +35,8 @@ from app.llm import (  # noqa: E402
     _retry_after_hint,
     _retry_backoff_seconds,
     _retry_wait_seconds,
+    _shutdown_pool_sockets,
+    _stall_watchdog_seconds,
     _is_moderation_filtered,
     _is_transient_provider_error,
     _is_transient_status,
@@ -621,6 +624,131 @@ class TestRetryAfterHonoring(unittest.TestCase):
         self.assertGreaterEqual(
             len(set(waits)), 6, "concurrent wakes must be staggered, not synchronized"
         )
+
+
+class TestStallWatchdog(unittest.TestCase):
+    """The wall-clock rescue for a call whose connection died silently.
+
+    With a warm keep-alive socket, "no bytes for N seconds" never accumulates,
+    so no read timeout ever fires (2026-09-22: two digest workers parked in an
+    SSL read for five hours while the sockets stayed ESTABLISHED). At
+    multiplier × call-timeout the watchdog force-closes the pool's raw
+    sockets, which turns the frozen read into the SDK's APIConnectionError —
+    already classified retriable — and the ordinary ladder absorbs it.
+    """
+
+    def setUp(self) -> None:
+        reset_all_for_tests()
+        self.addCleanup(reset_all_for_tests)
+        # The ladder's backoff sleeps through pipeline_guard's time.sleep —
+        # patch THERE or the rescue test takes the real 1-second wait.
+        self.sleep_patcher = patch("app.pipeline_guard.time.sleep", return_value=None)
+        self.sleep_patcher.start()
+        self.addCleanup(self.sleep_patcher.stop)
+
+    @staticmethod
+    def _ok() -> MagicMock:
+        ok = MagicMock()
+        ok.choices = [MagicMock(message=MagicMock(content="ok response"))]
+        ok.usage = None
+        return ok
+
+    # ------------------------------------------------------------- the budget
+
+    def test_budget_is_multiplier_times_call_timeout(self) -> None:
+        with patch.object(config, "LLM_CALL_TIMEOUT_SECONDS", 300):
+            with patch.object(config, "LLM_STALL_WATCHDOG_MULTIPLIER", 2.0):
+                self.assertEqual(_stall_watchdog_seconds(), 600.0)
+        with patch.object(config, "LLM_CALL_TIMEOUT_SECONDS", 100):
+            with patch.object(config, "LLM_STALL_WATCHDOG_MULTIPLIER", 3.5):
+                self.assertEqual(_stall_watchdog_seconds(), 350.0)
+
+    def test_nonpositive_multiplier_disables_the_watchdog(self) -> None:
+        with patch.object(config, "LLM_STALL_WATCHDOG_MULTIPLIER", 0):
+            self.assertEqual(_stall_watchdog_seconds(), 0.0)
+
+    def test_no_timer_is_armed_when_disabled(self) -> None:
+        client = LLMClient(_FakeSettings())  # type: ignore[arg-type]
+        armed = []
+
+        class _FakeTimer:
+            def __init__(self, *_args, **_kwargs) -> None:
+                armed.append(self)
+
+            def start(self) -> None: ...
+
+            def cancel(self) -> None: ...
+
+        with patch.object(config, "LLM_STALL_WATCHDOG_MULTIPLIER", 0):
+            with patch("app.llm.threading.Timer", _FakeTimer):
+                client._client.chat.completions.create = MagicMock(  # type: ignore[attr-defined]
+                    return_value=self._ok()
+                )
+                out = client.chat("system", "user", phase="test")
+        self.assertEqual(out, "ok response")
+        self.assertEqual(armed, [], "a disabled watchdog must arm nothing")
+
+    # ------------------------------------------------------------ the rescue
+
+    def test_a_call_parked_past_the_budget_is_rescued_and_retried(self) -> None:
+        # The parked read "dies" exactly when the watchdog closes the pool —
+        # the physical sequence, replayed in miniature: timer fires → pool
+        # closed → ConnectionError → ladder retries → success on the fresh
+        # client.
+        client = LLMClient(_FakeSettings())  # type: ignore[arg-type]
+        rescued = threading.Event()
+        calls = {"n": 0}
+
+        def scripted(*_args, **_kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                rescued.wait(timeout=5.0)  # parked until the pool is shut down
+                raise ConnectionError("connection reset by pool shutdown")
+            return self._ok()
+
+        rebuild = MagicMock(name="rebuild_client")
+        client._rebuild_client = rebuild  # type: ignore[method-assign]
+        close_mock = MagicMock(side_effect=lambda: rescued.set())
+        client._client.close = close_mock  # type: ignore[attr-defined]
+        create_mock = MagicMock(side_effect=scripted)
+        client._client.chat.completions.create = create_mock  # type: ignore[attr-defined]
+
+        with patch.object(config, "LLM_CALL_TIMEOUT_SECONDS", 1):
+            with patch.object(config, "LLM_STALL_WATCHDOG_MULTIPLIER", 0.2):
+                out = client.chat("system", "user", phase="test")
+
+        self.assertEqual(out, "ok response", "the ladder must absorb the rescue")
+        # One arg, the endpoint: the retry must land on a fresh client.
+        rebuild.assert_called_once_with("primary")
+        close_mock.assert_called_once()
+        self.assertEqual(create_mock.call_count, 2)
+
+    def test_shutdown_pool_sockets_closes_the_raw_socket(self) -> None:
+        # The real rescue mechanism: walking the pool object graph must reach
+        # a socket.socket and shut it down (verified live 2026-09-23: this is
+        # what unblocks a parked read; client.close() alone does not).
+        import socket as _socket
+
+        pair = _socket.socketpair()
+        conn = MagicMock()
+        conn._sock = pair[0]
+        pool = MagicMock()
+        pool.connections = [conn]
+        transport = MagicMock()
+        transport._pool = pool
+        httpx_like = MagicMock()
+        httpx_like._transport = transport
+        holder = MagicMock()
+        holder._client = httpx_like
+        count = _shutdown_pool_sockets(holder)
+        self.assertEqual(count, 1)
+        self.assertEqual(pair[0].fileno(), -1, "the socket must be closed")
+        pair[1].close()
+
+    def test_unwalkable_pool_shapes_are_safely_ignored(self) -> None:
+        weird = MagicMock(spec=["unrelated"])
+        self.assertEqual(_shutdown_pool_sockets(weird), 0)
+        self.assertEqual(_shutdown_pool_sockets(None), 0)  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":

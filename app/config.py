@@ -714,6 +714,21 @@ _retry_after_raw = _float_env("VA_LSE_LLM_RETRY_AFTER_MAX_SECONDS", 60.0)
 LLM_RETRY_AFTER_MAX_SECONDS = 60.0 if _retry_after_raw is None or _retry_after_raw < 0 else _retry_after_raw
 del _retry_after_raw
 
+# Wall-clock watchdog for silent socket stalls. A provider call whose upstream
+# connection dies silently can sit inside an SSL read indefinitely: with a
+# warm keep-alive connection the per-call HTTP timeout's "no bytes for N
+# seconds" never accumulates (observed 2026-09-22: two digest workers parked
+# in _ssl__SSLSocket_read for over five hours while the sockets stayed
+# ESTABLISHED). When a call exceeds this multiplier of the configured per-call
+# timeout (VA_LSE_LLM_CALL_TIMEOUT_SECONDS), the endpoint's connection pool is
+# force-closed — the frozen read fails immediately and the retry ladder takes
+# over. Any call still alive at that point has already outlived its own
+# deadline, so closing the pool cannot hurt a healthy call. 0 disables the
+# watchdog entirely.
+_stall_raw = _float_env("VA_LSE_LLM_STALL_WATCHDOG_MULTIPLIER", 2.0)
+LLM_STALL_WATCHDOG_MULTIPLIER = 2.0 if _stall_raw is None or _stall_raw < 0 else _stall_raw
+del _stall_raw
+
 # ---------------------------------------------------------------------------
 # Failover to a second LLM endpoint (optional — see app/llm.py).
 #

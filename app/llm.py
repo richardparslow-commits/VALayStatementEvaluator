@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import random
+import socket
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -943,6 +945,74 @@ def _configured_timeout_seconds() -> float:
     return max(1.0, timeout_seconds)
 
 
+def _stall_watchdog_seconds() -> float:
+    """Wall-clock budget for one provider call, or ``0.0`` to disable the watchdog.
+
+    ``multiplier ×`` the configured per-call timeout (via
+    ``VA_LSE_LLM_STALL_WATCHDOG_MULTIPLIER``), so the watchdog is always the
+    *second* line of defense: the HTTP timeout should fire first for a slow
+    provider; the watchdog only saves a call whose connection died silently —
+    with a warm keep-alive socket, "no bytes for N seconds" never accumulates
+    and no read timeout ever fires (the 2026-09-22 five-hour hang).
+    """
+    try:
+        from . import config as _cfg
+
+        multiplier = float(getattr(_cfg, "LLM_STALL_WATCHDOG_MULTIPLIER", 2.0))
+    except (TypeError, ValueError):
+        multiplier = 2.0
+    if multiplier <= 0:
+        return 0.0  # disabled
+    return multiplier * _configured_timeout_seconds()
+
+
+def _shutdown_pool_sockets(client: OpenAI) -> int:
+    """Force-close the raw sockets beneath *client*'s connection pool.
+
+    The SDK's ``close()`` releases *idle* connections but does not unblock a
+    request already parked in a socket read (measured 2026-09-23 against the
+    vendored openai 3.13/httpx2 stack: a hung call stayed parked through
+    ``close()``). The stall watchdog therefore walks the pool's connection
+    objects to the underlying sockets and ``shutdown()``s them — the parked
+    read fails immediately with a connection error the retry ladder already
+    classifies as retriable. Best-effort by design: returns the number of
+    sockets touched, and any object shape this walk cannot parse simply means
+    no rescue fires for that call shape.
+    """
+    try:
+        pool = client._client._transport._pool  # type: ignore[attr-defined]
+        frontier: list[Any] = list(getattr(pool, "connections", []) or [])
+    except AttributeError:
+        return 0
+    seen: set[int] = set()
+    count = 0
+    depth = 0
+    while frontier and depth < 8:
+        nxt: list[Any] = []
+        for obj in frontier:
+            if id(obj) in seen:
+                continue
+            seen.add(id(obj))
+            for value in list(vars(obj).values()) if hasattr(obj, "__dict__") else []:
+                if isinstance(value, socket.socket):
+                    try:
+                        value.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass  # already gone — that is the rescue working
+                    try:
+                        value.close()
+                    except OSError:
+                        pass
+                    count += 1
+                elif hasattr(value, "__dict__"):
+                    nxt.append(value)
+                elif isinstance(value, (list, tuple)):
+                    nxt.extend(v for v in value if hasattr(v, "__dict__"))
+        frontier = nxt
+        depth += 1
+    return count
+
+
 def _validate_settings(settings: Settings) -> None:
     if not settings.configured:
         raise LLMConfigurationError(
@@ -1315,6 +1385,94 @@ class LLMClient:
             return self._fallback_client
         return self._client
 
+    def _rebuild_client(self, endpoint: str) -> None:
+        """Replace *endpoint*'s client with one on a fresh connection pool.
+
+        Called by the stall watchdog right after force-closing the old pool: the
+        retry attempt must not land on the dead sockets, and the SDK exposes no
+        way to swap the pool inside a live client. Mirrors ``__init__``'s
+        construction exactly (same timeout, retries disabled) so a rebuilt
+        client is indistinguishable from a fresh start.
+        """
+        OpenAI_cls = cast("type[OpenAI]", _sdk_name("OpenAI"))
+        timeout = max(1.0, _configured_timeout_seconds())
+        if endpoint == FALLBACK_ENDPOINT:
+            target = _fallback_target(self._settings)
+            self._fallback_client = OpenAI_cls(
+                api_key=target.api_key,
+                base_url=target.base_url,
+                timeout=timeout,
+                max_retries=0,  # Application retries must observe pipeline cancellation.
+            )
+            return
+        self._client = OpenAI_cls(
+            api_key=self._settings.api_key,
+            base_url=self._settings.base_url,
+            timeout=timeout,
+            max_retries=0,  # Application retries must observe pipeline cancellation.
+        )
+
+    def _stall_watchdog_fired(
+        self,
+        endpoint: str,
+        rid: str,
+        phase: str,
+        model: str,
+        attempt: int,
+        budget: float,
+    ) -> None:
+        """Watchdog callback (runs on its timer thread): rescue a stalled call.
+
+        A call that outlived this budget is past its HTTP deadline twice over
+        and its socket read is parked with no end in sight. The rescue is
+        physical, not cooperative: the raw sockets beneath the pool are
+        ``shutdown()`` so the parked read fails immediately, the client is
+        closed, and a fresh client (new pool) is built so the retry does not
+        land on the dead sockets. Races are harmless — a call that completed
+        microseconds earlier had its timer cancelled already, and closing a
+        pool whose only request just finished only costs the next call one
+        new TCP handshake. Any call still alive at this point has already
+        outlived its own deadline, so pool-wide collateral is bounded to calls
+        that are themselves anomalous.
+        """
+        client = self._endpoint_client(endpoint)
+        touched = _shutdown_pool_sockets(client)
+        try:
+            client.close()
+        except Exception:  # noqa: BLE001 - the timer thread must never die loudly
+            logger.debug(
+                "llm stall watchdog could not close the %s client", endpoint, exc_info=True
+            )
+        try:
+            self._rebuild_client(endpoint)
+        except Exception:  # noqa: BLE001 - retry may still land on the closed pool once
+            logger.warning(
+                "llm stall watchdog could not rebuild the %s client — the next "
+                "attempt may fail once more before recovering",
+                endpoint,
+                exc_info=True,
+                extra={"request_id": rid, "phase": phase, "endpoint": endpoint},
+            )
+        logger.warning(
+            "llm stall watchdog force-closed the %s connection pool after %.0fs "
+            "with no response (attempt %d, %d socket(s) shut down) — the stalled "
+            "call fails fast and retries on a fresh pool",
+            endpoint,
+            budget,
+            attempt,
+            touched,
+            extra={
+                "request_id": rid,
+                "phase": phase,
+                "status": "stall_watchdog",
+                "model": model,
+                "endpoint": endpoint,
+                "attempt": attempt,
+                "stall_budget_seconds": budget,
+                "sockets_shutdown": touched,
+            },
+        )
+
     def _call_openai(
         self,
         endpoint: str,
@@ -1583,9 +1741,14 @@ class LLMClient:
             last_error: Exception | None = None
             nudged = False
             t0 = time.perf_counter()
+            # Watchdog budget for one wire call (see _stall_watchdog_fired);
+            # 0 disables the watchdog. Computed once — it does not vary per
+            # attempt.
+            stall_budget = _stall_watchdog_seconds()
             for attempt in range(MAX_RETRIES):
                 check_pipeline_cancelled()
                 attempt_t0 = time.perf_counter()
+                stall_timer: threading.Timer | None = None
                 try:
                     # Opt-in span around the provider call itself
                     # (VA_LSE_TRACE_LLM_CALLS) — this is where endpoint latency
@@ -1600,10 +1763,35 @@ class LLMClient:
                             )
                             if remaining is not None else NOT_GIVEN
                         )
-                        response, responses = self._call_openai(
-                            endpoint, model, system, user, temperature, max_tokens,
-                            request_timeout,
-                        )
+                        if stall_budget > 0:
+                            # Armed only around the wire call: once _call_openai
+                            # returns, the response is fully buffered and there is
+                            # nothing left to stall. The timer fires on its own
+                            # daemon thread and force-closes the pool (see
+                            # _stall_watchdog_fired); cancelling here is cheap
+                            # and races are harmless.
+                            stall_timer = threading.Timer(
+                                stall_budget,
+                                self._stall_watchdog_fired,
+                                args=(
+                                    endpoint,
+                                    rid,
+                                    phase,
+                                    model,
+                                    attempt + 1,
+                                    stall_budget,
+                                ),
+                            )
+                            stall_timer.daemon = True
+                            stall_timer.start()
+                        try:
+                            response, responses = self._call_openai(
+                                endpoint, model, system, user, temperature, max_tokens,
+                                request_timeout,
+                            )
+                        finally:
+                            if stall_timer is not None:
+                                stall_timer.cancel()
                     check_pipeline_cancelled()
                     content = (
                         _responses_output_text(response) if responses
@@ -1670,6 +1858,11 @@ class LLMClient:
                     raise
                 except Exception as exc:  # noqa: BLE001 - retry on any provider error
                     check_pipeline_cancelled()
+                    # A stall-watchdog rescue surfaces here as the SDK's
+                    # APIConnectionError (the shutdown socket made the parked
+                    # read fail); _normalize_provider_error already classifies
+                    # connection errors as retriable, so the ordinary ladder
+                    # absorbs it — no special case needed.
                     # Normalize onto the error taxonomy. Deterministic failures
                     # (moderation filter 400s, bad key/model, malformed request)
                     # come back with retriable=False — identical input would

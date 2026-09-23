@@ -1060,6 +1060,7 @@ All deployment-relevant variables (see `README.md` for the full list):
 | `VA_LSE_HEALTH_HOST` | Interface the sidecar binds to | `0.0.0.0` | Keep the default in a cluster (probes arrive from outside the pod). Set `127.0.0.1` wherever that port is published to the internet |
 | `VA_LSE_SHUTDOWN_GRACE_SECONDS` | Drain timeout | `30` | 30–60 for large record sets |
 | `VA_LSE_LLM_CALL_TIMEOUT_SECONDS` | Per-call timeout | `300` | 300–600 depending on endpoint speed |
+| `VA_LSE_LLM_STALL_WATCHDOG_MULTIPLIER` | Stall-watchdog budget as a multiple of the per-call timeout; force-closes a pool whose call sat silent past it | `2` | Keep at 2; lower only if stalls are frequent and expensive |
 | `VA_LSE_LOG_DIR` | Diagnostic log directory | (stdout only) | Set to `/app/logs` for persistent logs |
 | `VA_LSE_AUDIT_LOG_DIR` | Audit log directory | `logs` | Set to `/app/logs` **on a PVC**, not an emptyDir |
 | `VA_LSE_AUDIT_LOG_MAX_BYTES` | Audit file size before rotation | `10485760` | Sets the ceiling; see §16 for the retention interaction |

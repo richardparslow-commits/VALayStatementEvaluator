@@ -70,6 +70,12 @@ scripts/
   batch_draft.py          Batched, resumable drafting over a local record folder
                           too large for one run (see *Batched drafting over a
                           full C-file* below)
+  watch_statement_review.py  Detached poller for a batch_draft run: when the final
+                          statement lands it runs the mechanical review checks
+                          (certification, jargon, observation coverage) against it
+  sonar_probe.py          Live probe: are Perplexity's Sonar models accepted on the
+                          Agent API yet? Exit 0 = the one-line .env model switch is
+                          possible now; 1 = not yet; 2 = inconclusive (see TROUBLESHOOTING.md)
   split_records.py        Split an oversized record file into uploadable chunks
                           (see TROUBLESHOOTING.md → *Split Large Record Sets*)
   ocr_records.py          Add a text layer to a scanned record PDF so the app can
@@ -225,6 +231,7 @@ installs on macOS and Linux CI.
 | `VA_LSE_RECORDS_CONCURRENCY` | Parallel chunk-digest workers | `2` (Lite plan fits 1–2 concurrent agents) |
 | `VA_LSE_LLM_ENDPOINT_SCHEMA` | Force the wire schema: `responses` or `chat`. Empty (default) asks the endpoint which routes it serves (one cached HEAD probe) and falls back to the host's documented shape | (empty) |
 | `VA_LSE_LLM_RETRY_AFTER_MAX_SECONDS` | Longest single honored `Retry-After` wait from a 429 (header is obeyed exactly, plus 0.1–0.5 s jitter; `0` disables honoring and keeps the exponential ladder only) | `60` |
+| `VA_LSE_LLM_STALL_WATCHDOG_MULTIPLIER` | Wall-clock stall watchdog: when one LLM call exceeds this multiple of the call timeout, its connection pool's sockets are force-closed so the frozen read fails and retries on a fresh pool (catches silent socket stalls no read timeout can see; `0` disables) | `2` |
 | `VA_LSE_MAX_DIGEST_FACTS` | Default JSON prompt-view limit and maximum relevance-selected facts per prompt; does not cap stored evidence | `1500` |
 | `VA_LSE_DIGEST_CHUNK_CHARS` | Characters per record chunk | `8000` |
 | `VA_LSE_DOCX_MAX_INTERNAL_FILE_BYTES` | Max uncompressed bytes allowed for a single DOCX internal file | `52428800` |
@@ -1217,7 +1224,12 @@ in-flight runs cleanly:
    and Draft tabs once shutdown begins (`app/main.py` checks `enter_run()`).
 4. **Per-LLM-call timeout** (`VA_LSE_LLM_CALL_TIMEOUT_SECONDS`, default 300 s
    / 5 min) prevents a single hung call from blocking the drain forever.  A
-   timeout surfaces as `LLMError` with a clear, actionable message.
+   timeout surfaces as `LLMError` with a clear, actionable message.  Behind
+   that sits a **stall watchdog** (`VA_LSE_LLM_STALL_WATCHDOG_MULTIPLIER`,
+   default 2×): a call whose connection died silently parks in a socket read
+   that no timeout can interrupt, so at the watchdog budget the pool's raw
+   sockets are force-closed — the frozen read fails as a retriable connection
+   error and the retry ladder lands on a freshly built client.
 5. If the grace window expires with runs still in flight, a WARNING is logged
    and the orchestrator's SIGKILL forces exit.
 
