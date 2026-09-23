@@ -29,6 +29,8 @@ from unittest import mock
 
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 
+from app import config  # noqa: E402
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -465,6 +467,162 @@ class TestResumableState(unittest.TestCase):
         self.assertTrue((shards / "batch_02.json.gz").is_file())
         reloaded = batch_draft.load_state(cfg)
         self.assertEqual(set(reloaded["batches"]), {"batch_01", "batch_02"})
+
+
+def _gate_settings() -> "config.Settings":
+    """A real Settings for main()-level tests: once the credential gate passes,
+    main() constructs LLMClient from it, and the SDK validates its arguments —
+    a MagicMock here would die inside OpenAI(**settings)."""
+    return config.Settings(
+        api_key="k", base_url="https://api.perplexity.ai/v1",
+        model_main="perplexity/kimi-k3", model_fast="perplexity/glm-5.3-flash",
+        fetch_api_key="", fetch_base_url="", fetch_records_path="",
+    )
+
+
+def _main_argv(tmp: Path) -> list[str]:
+    """A minimal main() argument vector over one staged part, shared by the
+    credential-gate and fatal-auth tests; --no-final keeps main() out of the
+    final phase, which these tests do not own."""
+    records = tmp / "records"
+    records.mkdir(parents=True, exist_ok=True)
+    (records / "Part1.pdf").write_text("EVT", encoding="utf-8")
+    obs = tmp / "observations.txt"
+    obs.write_text("I have watched the veteran decline since 2022.", encoding="utf-8")
+    return ["--records", str(records), "--glob", "Part*.pdf",
+            "--out", str(tmp / "out"),
+            "--condition", "PTSD", "--claim-type", "Initial claim",
+            "--observations", str(obs), "--no-final"]
+
+
+class TestStartupCredentialGate(unittest.TestCase):
+    """A refused credential check must stop the run before any work begins.
+
+    The 2026-09-22 dead-key incident spent 17 minutes discovering a 401 one
+    chunk at a time; the gate makes that failure cost one probe (~600 ms when
+    refused — a 401 spends nothing) and one readable line.
+    """
+
+    def test_a_refused_credential_check_stops_the_run_before_any_batch(self) -> None:
+        from app.llm import ChatProbe
+
+        cfg_calls: list[list[str]] = []
+
+        def refused_probe(base_url: str, api_key: str, model: str) -> ChatProbe:
+            cfg_calls.append([base_url, model])
+            return ChatProbe(401, "Invalid API key provided.")
+
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            with (
+                mock.patch("app.config.load_settings", return_value=_gate_settings()),
+                mock.patch("app.llm.probe_chat", side_effect=refused_probe),
+                mock.patch("batch_draft.digest_group") as digest,
+            ):
+                code = batch_draft.main(_main_argv(tmp))
+
+        self.assertEqual(code, 1)
+        self.assertEqual(len(cfg_calls), 1, "exactly one credential probe")
+        digest.assert_not_called()
+
+    def test_an_ambiguous_probe_lets_the_run_proceed_to_batch_planning(self) -> None:
+        # The gate blocks only on deterministic refusals; a probe that could not
+        # get a response (status None) must not refuse a working run.
+        from app.llm import ChatProbe
+
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            digest_calls: list[str] = []
+
+            def fake_digest(llm, cfg, label, files, depth=0):  # noqa: ANN001
+                digest_calls.append(label)
+                # Real signature: (state, excluded-files) — main unpacks it.
+                return dict(batch_draft.EMPTY_DIGEST_STATE), []
+
+            with (
+                mock.patch("app.config.load_settings", return_value=_gate_settings()),
+                mock.patch("app.llm.probe_chat",
+                           return_value=ChatProbe(None, "URLError: name or service not known")),
+                mock.patch("batch_draft.digest_group", side_effect=fake_digest),
+            ):
+                code = batch_draft.main(_main_argv(tmp))
+
+        self.assertEqual(code, 0, "digest-only run completes")
+        self.assertEqual(digest_calls, ["batch_01"])
+
+
+class TestFatalAuthHaltsTheRun(unittest.TestCase):
+    """A credential refusal mid-run stops the pipeline; it never bisects.
+
+    The dead-key incident bisected five levels deep and quarantined nine
+    healthy files because the bisect policy had no way to know an auth refusal
+    is not a property of any file. LLMAuthError now escapes the bisect entirely.
+    """
+
+    def test_digest_group_stops_the_run_on_an_auth_error(self) -> None:
+        """Through the REAL digest_group: the review layer refuses credentials,
+        digest_group converts that into SystemExit(2) — never a bisect, never a
+        quarantine. Exactly one review call proves the point: a bisect would
+        invoke it again on each half."""
+        from app.llm import LLMAuthError
+
+        cfg = _make_cfg(Path(tempfile.mkdtemp()))
+        for name in ("good_a.pdf", "good_b.pdf", "good_c.pdf"):
+            (cfg.records_dir / name).write_text("EVT note.", encoding="utf-8")
+
+        review_calls = 0
+
+        def refused(llm, docs, progress=None):  # noqa: ANN001
+            nonlocal review_calls
+            review_calls += 1
+            raise LLMAuthError("Credentials refused by the LLM endpoint (HTTP 401)",
+                               retriable=False, status_code=401)
+
+        with (
+            mock.patch("app.documents.records_from_local_path",
+                       side_effect=lambda p: ([], [])),
+            mock.patch("app.medical_review.review_medical_records", side_effect=refused),
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                batch_draft.digest_group(
+                    object(), cfg, "batch_01",
+                    sorted(cfg.records_dir.glob("*.pdf")),
+                )
+
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertEqual(review_calls, 1, "one refusal, zero bisects")
+
+    def test_main_exits_2_when_a_batch_hits_the_auth_wall(self) -> None:
+        # Through the REAL digest_group (a mock would bypass the very
+        # except-LLMAuthError branch under test): the review layer refuses
+        # credentials, digest_group converts that into SystemExit(2), and
+        # main() — whose per-batch handler catches only Exception — lets it
+        # escape. In production `raise SystemExit(main())` turns that into
+        # exit code 2; here we assert on the exception itself.
+        from app.llm import ChatProbe, LLMAuthError
+
+        def refused_review(llm, docs, progress=None):  # noqa: ANN001
+            raise LLMAuthError("Credentials refused by the LLM endpoint (HTTP 401)",
+                               retriable=False, status_code=401)
+
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            records = tmp / "records"
+            records.mkdir(parents=True, exist_ok=True)
+            (records / "Part1.pdf").write_text("EVT", encoding="utf-8")
+            with (
+                mock.patch("app.config.load_settings", return_value=_gate_settings()),
+                mock.patch("app.llm.probe_chat", return_value=ChatProbe(200, "", "OK")),
+                mock.patch("app.documents.records_from_local_path",
+                           side_effect=lambda p: ([], [])),
+                mock.patch("app.medical_review.review_medical_records",
+                           side_effect=refused_review),
+            ):
+                with self.assertRaises(SystemExit) as ctx:
+                    batch_draft.main(_main_argv(tmp))
+
+        self.assertEqual(ctx.exception.code, 2,
+                         "SystemExit(2) — a stop-the-run signal, not a batch failure")
 
 
 if __name__ == "__main__":

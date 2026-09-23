@@ -191,10 +191,112 @@ class TestResponsesUsage(unittest.TestCase):
         self.assertEqual(llm._responses_usage_tokens(_responses_body(
             input_tokens=None, output_tokens=None)), (None, None))
 
-    def test_serialized_input_joins_system_and_user(self) -> None:
-        self.assertEqual(llm._responses_input("sys", "usr"), "sys\n\nusr")
-        self.assertEqual(llm._responses_input("   ", "usr"), "usr")
+    def test_serialized_input_is_the_user_turn_with_system_in_instructions(self) -> None:
+        # The system prompt travels in `instructions` only. It used to be joined
+        # into `input` as well — the endpoint accepted the duplication but billed
+        # the system block twice on every call, and the digest prompt re-sends
+        # its rubric preamble hundreds of times per run.
+        self.assertEqual(llm._responses_input("sys", "usr"), "usr")
         self.assertEqual(llm._responses_input("", "usr"), "usr")
+
+
+# ----------------------------------------------------- wire-schema resolution
+
+
+class TestEndpointSchemaResolution(unittest.TestCase):
+    """The wire schema is resolved from the endpoint's capability, not just its host.
+
+    Resolution is cached per base URL and hermetic.py neutralizes the route
+    probe for the whole suite, so every test here sees the documented host
+    guess (the probe returning "cannot tell") and no network. The override
+    knob is the deterministic way to test the probe's decision itself.
+    """
+
+    def setUp(self) -> None:
+        self._override = patch.object(config, "LLM_ENDPOINT_SCHEMA", "")
+        self._override.start()
+        self.addCleanup(self._override.stop)
+        llm._SCHEMA_CACHE.clear()
+        self.addCleanup(llm._SCHEMA_CACHE.clear)
+
+    def test_the_perplexity_host_guess_is_responses(self) -> None:
+        self.assertTrue(llm._uses_responses_schema("https://api.perplexity.ai/v1"))
+
+    def test_any_other_host_guesses_chat(self) -> None:
+        self.assertFalse(llm._uses_responses_schema("https://openai-compatible.invalid/v1"))
+
+    def test_the_env_override_wins_over_the_host_guess(self) -> None:
+        with patch.object(config, "LLM_ENDPOINT_SCHEMA", "chat"):
+            self.assertFalse(llm._uses_responses_schema("https://api.perplexity.ai/v1"))
+        with patch.object(config, "LLM_ENDPOINT_SCHEMA", "responses"):
+            self.assertTrue(llm._uses_responses_schema("https://gateway.invalid/v1"))
+
+    def test_an_unrecognized_override_is_ignored(self) -> None:
+        with patch.object(config, "LLM_ENDPOINT_SCHEMA", "completions-ish"):
+            self.assertTrue(llm._uses_responses_schema("https://api.perplexity.ai/v1"))
+
+
+class TestHeadRouteProbe(unittest.TestCase):
+    """The probe's own status vocabulary, with urllib stubbed out.
+
+    Calibrated live 2026-09-22 against the Agent API: HEAD /responses -> 405
+    (route exists, HEAD not an allowed method), HEAD /chat/completions -> 404,
+    HEAD /nope -> 404. Auth and rate statuses say nothing about the route;
+    neither does a dead network — "cannot tell" (None) is the only honest
+    answer for those, and resolution falls back to the host guess.
+    """
+
+    @staticmethod
+    def _urlopen_error(status: int) -> Exception:
+        return urllib.error.HTTPError(
+            url="https://x.invalid/responses", code=status, msg="x", hdrs={}, fp=io.BytesIO(b"")
+        )
+
+    def _resolved(self, code: int | None) -> bool | None:
+        boom = (
+            urllib.error.URLError("connection refused")
+            if code is None
+            else self._urlopen_error(code)
+        )
+        with patch.object(llm.urllib.request, "urlopen", side_effect=boom):
+            # *_original: hermetic.py replaces the module attribute with a
+            # never-network stub for the session; the vocabulary under test
+            # here is the real implementation, with urllib stubbed instead.
+            return llm._head_route_exists_original("https://x.invalid/responses")
+
+    def test_405_means_the_route_exists(self) -> None:
+        self.assertIs(self._resolved(405), True)
+
+    def test_404_and_410_mean_it_does_not(self) -> None:
+        self.assertIs(self._resolved(404), False)
+        self.assertIs(self._resolved(410), False)
+
+    def test_auth_rate_and_server_statuses_cannot_tell(self) -> None:
+        for code in (401, 403, 429, 500):
+            self.assertIsNone(self._resolved(code))
+
+    def test_a_network_failure_cannot_tell(self) -> None:
+        self.assertIsNone(self._resolved(None))
+
+    def test_affirmative_probe_evidence_outranks_the_host_guess(self) -> None:
+        # 405 on /responses and 404 on /chat/completions is affirmative evidence
+        # — it must resolve "responses" even on a NON-Perplexity host, which is
+        # the whole point of capability routing. "Cannot tell" (None) falls back
+        # to the host guess instead.
+        def fake_head(url: str) -> bool | None:
+            if url.endswith("/responses"):
+                return True
+            if url.endswith("/chat/completions"):
+                return False
+            return None
+
+        with patch.object(config, "LLM_ENDPOINT_SCHEMA", ""):
+            with patch.object(llm, "_head_route_exists", side_effect=fake_head):
+                self.assertTrue(
+                    llm._uses_responses_schema("https://responses-only-provider.invalid/v1")
+                )
+            with patch.object(llm, "_head_route_exists", side_effect=lambda url: None):
+                self.assertFalse(llm._uses_responses_schema("https://mystery-proxy.invalid/v1"))
 
 
 # --------------------------------------------------------- run-time wire calls
@@ -225,7 +327,7 @@ class TestResponsesWireCall(unittest.TestCase):
         self.assertEqual(out, "agent answer")
         kwargs = responses.create.call_args.kwargs
         self.assertEqual(kwargs["model"], "main-model")
-        self.assertEqual(kwargs["input"], "be brief\n\nhello")
+        self.assertEqual(kwargs["input"], "hello")
         self.assertEqual(kwargs["instructions"], "be brief")
         self.assertEqual(kwargs["max_output_tokens"], 8000)
         self.assertNotIn("messages", kwargs)

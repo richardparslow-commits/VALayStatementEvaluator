@@ -390,3 +390,42 @@ STREAMLIT_SECRETS_NEUTRALIZED = neutralize_streamlit_secrets()
 STREAMLIT_CONFIG_NEUTRALIZED = neutralize_streamlit_config_files()
 STREAMLIT_DEVELOPMENT_MODE_NEUTRALIZED = neutralize_streamlit_development_mode()
 REMOVED_AMBIENT_NAMES = strip_ambient_config()
+
+
+def neutralize_endpoint_probes() -> bool:
+    """Stub app.llm's route-existence HEAD probe; tests resolve by host guess.
+
+    Why this exists: schema resolution in ``app.llm`` asks the *endpoint* which
+    wire routes it serves (a cached HEAD probe) before trusting the host-based
+    guess. That is the right behaviour in production and exactly wrong in a
+    hermetic suite — tests that construct a client against the real host string
+    (``https://api.perplexity.ai/v1`` with the SDK response stubbed) would fire
+    live HEAD requests from unit tests, and a test that passes only because the
+    machine has network egress is not a test. With the probe stubbed to
+    "cannot tell", resolution falls back to the documented host guess, which is
+    what these tests asserted before the probe existed.
+
+    Placement: this imports ``app.llm`` *after* the scrub above, so the
+    invariant "app modules import under a clean environment" holds — the same
+    invariant every test module's ``from tests import hermetic`` line buys, just
+    satisfied here once for all of them. The OpenAI SDK import stays lazy
+    (``app.llm``'s own module ``__getattr__``), so this adds no SDK floor.
+    """
+    try:
+        from app import llm as _llm
+    except Exception:  # noqa: BLE001 - never make the session unstartable
+        return False
+
+    def _no_probe(url: str) -> bool | None:  # noqa: ARG001 - signature parity
+        return None
+
+    # The real function stays reachable as *_original so the probe's own status
+    # vocabulary (405 means exists, 404 means absent, otherwise cannot tell)
+    # stays testable without network — its tests stub urllib, not this module.
+    _llm._head_route_exists_original = _llm._head_route_exists
+    _llm._head_route_exists = _no_probe
+    _llm._SCHEMA_CACHE.clear()
+    return True
+
+
+ENDPOINT_PROBES_NEUTRALIZED = neutralize_endpoint_probes()

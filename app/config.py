@@ -693,6 +693,27 @@ LLM_QUEUE_TIMEOUT_SECONDS = _positive_int_env("VA_LSE_LLM_QUEUE_TIMEOUT_SECONDS"
 LLM_RATE_MIN_INTERVAL_SECONDS = _float_env("VA_LSE_LLM_MIN_INTERVAL_SECONDS", 0.0) or 0.0
 LLM_RATE_MAX_RPM = _float_env("VA_LSE_LLM_MAX_RPM", 0.0) or 0.0
 
+# Wire schema for the LLM endpoint: "responses" (the OpenAI Responses API) or
+# "chat" (Chat Completions). Empty (the default) lets app/llm.py resolve the
+# schema itself — it asks the endpoint which routes it serves (a cached HEAD
+# probe) and falls back to the host's documented shape when the probe cannot
+# tell. Set this only to override that resolution: a proxy that mishandles the
+# probe, or an endpoint whose route table is deliberately obscured. An
+# unrecognized value is ignored (resolution proceeds as if unset).
+LLM_ENDPOINT_SCHEMA = _setting("VA_LSE_LLM_ENDPOINT_SCHEMA")
+
+# Retry-After honoring (app/llm.py). When the provider's 429 carries a
+# Retry-After header — integer seconds or an HTTP-date — the retry waits
+# exactly that long (plus 0.1–0.5 s of jitter to de-synchronize workers)
+# instead of the fixed exponential ladder. This cap bounds a single honored
+# wait, so a misbehaving header (or a provider asking for minutes) cannot
+# stall a worker past the point where the next attempt is still useful; the
+# pipeline's own remaining-time budget caps it a second time. 0 turns
+# honoring off entirely (ladder only).
+_retry_after_raw = _float_env("VA_LSE_LLM_RETRY_AFTER_MAX_SECONDS", 60.0)
+LLM_RETRY_AFTER_MAX_SECONDS = 60.0 if _retry_after_raw is None or _retry_after_raw < 0 else _retry_after_raw
+del _retry_after_raw
+
 # ---------------------------------------------------------------------------
 # Failover to a second LLM endpoint (optional — see app/llm.py).
 #

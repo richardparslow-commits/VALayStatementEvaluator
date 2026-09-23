@@ -38,7 +38,7 @@ from app.circuit_breaker import (  # noqa: E402
     QueueFullError,
 )
 from app.job_payload import usage_from_json, usage_to_json  # noqa: E402
-from app.llm import LLMClient  # noqa: E402
+from app.llm import LLMAuthError, LLMClient  # noqa: E402
 from app.usage import UsageTracker  # noqa: E402
 
 
@@ -1014,3 +1014,72 @@ class TestAuditStamping(unittest.TestCase):
             request_id="req_blank", duration_ms=10, llm_endpoints=["", "  "]
         )
         self.assertNotIn("llm_endpoints", self._lines()[0])
+
+
+class _ProviderAuthShape(Exception):
+    """Shape-compatible stand-in for the SDK's AuthenticationError.
+
+    The retry-loop normalizer only needs ``status_code`` (and whatever
+    ``response`` shape _provider_status_code reads) to classify it fatal.
+    """
+
+    def __init__(self, status_code: int) -> None:
+        super().__init__(f"Error code: {status_code}")
+        self.status_code = status_code
+        self.response = MagicMock(status_code=status_code)
+
+
+class TestAuthRefusalNeverFailsOver(unittest.TestCase):
+    """A credential verdict must not burn the fallback endpoint on a second 401.
+
+    The fallback usually shares the primary's credential (its key defaults to
+    the primary's), so failing over on a 401 is a guaranteed second refusal —
+    plus a metrics record that says failover happened when none usefully did.
+    Both tests run in the one routing shape where chat() can fall through at
+    all: the primary is OPEN past its grace period and its recovery window has
+    elapsed, so the primary is tried as a probe with the fallback behind it.
+    """
+
+    def setUp(self) -> None:
+        self.addCleanup(circuit_breaker.reset_all_for_tests)
+        self.addCleanup(metrics.reset_for_tests)
+        breaker = circuit_breaker.get_llm_breaker(LLM_BREAKER_NAME)
+        for _ in range(breaker.failure_threshold):
+            breaker.record_failure()
+        self.failover_patch = patch.object(config, "LLM_FAILOVER_AFTER_SECONDS", 0)
+        self.failover_patch.start()
+        self.addCleanup(self.failover_patch.stop)
+        breaker.recovery_timeout = 0
+        self.sleep_patch = patch("app.llm.wait_with_cancellation", lambda seconds: None)
+        self.sleep_patch.start()
+        self.addCleanup(self.sleep_patch.stop)
+
+    @staticmethod
+    def _wire(client: LLMClient, primary_effect: Exception) -> tuple[MagicMock, MagicMock]:
+        primary = MagicMock(side_effect=primary_effect)
+        fallback = MagicMock(return_value=_response("from fallback"))
+        client._client.chat.completions.create = primary  # type: ignore[attr-defined]
+        assert client._fallback_client is not None
+        client._fallback_client.chat.completions.create = fallback  # type: ignore[attr-defined]
+        return primary, fallback
+
+    def test_401_from_the_primary_raises_without_touching_the_fallback(self) -> None:
+        client = LLMClient(_armed())
+        primary, fallback = self._wire(client, _ProviderAuthShape(401))
+
+        with self.assertRaises(LLMAuthError):
+            client.chat("system", "user", phase="test")
+
+        self.assertEqual(primary.call_count, 1, "auth is not retried")
+        self.assertEqual(fallback.call_count, 0, "the fallback would be refused identically")
+
+    def test_a_transient_primary_failure_still_fails_over(self) -> None:
+        # The guard must be narrow: this is the behavior it exists beside. A
+        # transient failure runs the primary's full retry ladder first, then
+        # the probe call falls through to the fallback.
+        client = LLMClient(_armed())
+        primary, fallback = self._wire(client, Exception("primary boom"))
+
+        self.assertEqual(client.chat("system", "user", phase="test"), "from fallback")
+        self.assertEqual(primary.call_count, 3, "the ladder runs on the primary first")
+        self.assertEqual(fallback.call_count, 1)

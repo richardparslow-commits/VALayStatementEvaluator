@@ -223,6 +223,8 @@ installs on macOS and Linux CI.
 | `VA_LSE_RUN_LOG_BACKUPS` | Rotated run logs kept | `5` |
 | `VA_LSE_DISK_MIN_FREE_BYTES` | Log-volume floor reported by `/health → disk` | `268435456` |
 | `VA_LSE_RECORDS_CONCURRENCY` | Parallel chunk-digest workers | `2` (Lite plan fits 1–2 concurrent agents) |
+| `VA_LSE_LLM_ENDPOINT_SCHEMA` | Force the wire schema: `responses` or `chat`. Empty (default) asks the endpoint which routes it serves (one cached HEAD probe) and falls back to the host's documented shape | (empty) |
+| `VA_LSE_LLM_RETRY_AFTER_MAX_SECONDS` | Longest single honored `Retry-After` wait from a 429 (header is obeyed exactly, plus 0.1–0.5 s jitter; `0` disables honoring and keeps the exponential ladder only) | `60` |
 | `VA_LSE_MAX_DIGEST_FACTS` | Default JSON prompt-view limit and maximum relevance-selected facts per prompt; does not cap stored evidence | `1500` |
 | `VA_LSE_DIGEST_CHUNK_CHARS` | Characters per record chunk | `8000` |
 | `VA_LSE_DOCX_MAX_INTERNAL_FILE_BYTES` | Max uncompressed bytes allowed for a single DOCX internal file | `52428800` |

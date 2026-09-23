@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import time
+import urllib.error
+import urllib.request
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast, runtime_checkable
 from urllib.parse import urlparse
 
@@ -399,25 +402,109 @@ def _is_perplexity_base_url(base_url: str) -> bool:
     return host == PERPLEXITY_HOST or host.endswith(f".{PERPLEXITY_HOST}")
 
 
-def _uses_responses_schema(base_url: str) -> bool:
-    """Endpoints on a Perplexity host speak Responses; everything else, Chat Completions.
+def _head_route_exists(url: str) -> bool | None:
+    """Whether a route exists at *url*, or ``None`` when the probe cannot tell.
 
-    A custom deployment that wants Chat Completions on a Perplexity host (the retired
-    Router) can still be addressed by IP or a proxy URL, which falls through to the
-    Chat path — the split exists to make the *documented* shape the effortless one.
+    A ``HEAD`` is the cheapest existence question. The statuses that answer it
+    were calibrated live against the working Agent API (2026-09-22):
+    ``HEAD /responses`` → ``405`` (the route exists; HEAD is just not an allowed
+    method on it), ``HEAD /chat/completions`` → ``404``, ``HEAD /nope`` → ``404``.
+    So ``404/410`` is a definitive no and ``405`` a definitive yes; auth and rate
+    statuses say nothing about the route's shape, and network errors say nothing
+    at all — all of those return ``None`` rather than guessing.
     """
-    return _is_perplexity_base_url(base_url)
+    try:
+        req = urllib.request.Request(
+            url, method="HEAD", headers={"Authorization": "Bearer probe"}
+        )
+        with urllib.request.urlopen(req, timeout=3) as resp:  # noqa: S310 - operator-configured endpoint
+            return resp.status not in (404, 410)
+    except urllib.error.HTTPError as exc:
+        exc.close()
+        if exc.code in (404, 410):
+            return False
+        if exc.code == 405:
+            return True
+        return None
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+
+
+#: Resolved schema per base URL. Populated once per process per endpoint: the
+#: probe is a startup-time cost and the answer does not change mid-run.
+_SCHEMA_CACHE: dict[str, str] = {}
+
+
+def _endpoint_schema(base_url: str) -> str:
+    """``"responses"`` or ``"chat"`` — the wire schema *base_url* actually serves.
+
+    The host classification stays as the fast, offline-safe guess, but it no
+    longer has the final say: one cached HEAD probe asks the endpoint which
+    routes it serves, and affirmative evidence from that probe outranks the
+    host sniff. This is deliberate capability routing, not model-string
+    sniffing — a provider may legally serve models under prefixed ids on its
+    own host (Perplexity's ``perplexity/kimi-k3`` does), so the model name
+    carries no routing signal, while the route table does.
+
+    ``VA_LSE_LLM_ENDPOINT_SCHEMA`` (``responses`` | ``chat``) overrides the
+    resolution entirely — the escape hatch for a proxy that mishandles HEAD
+    probes, and the deterministic knob tests use.
+    """
+    override = (getattr(_config_module(), "LLM_ENDPOINT_SCHEMA", "") or "").strip().lower()
+    if override in ("responses", "chat"):
+        return override
+    cached = _SCHEMA_CACHE.get(base_url)
+    if cached:
+        return cached
+    guess = "responses" if _is_perplexity_base_url(base_url) else "chat"
+    root = base_url.rstrip("/")
+    responses_route = _head_route_exists(f"{root}/responses")
+    chat_route = _head_route_exists(f"{root}/chat/completions")
+    schema: str | None = None
+    if responses_route and chat_route is False:
+        schema = "responses"
+    elif chat_route and responses_route is False:
+        schema = "chat"
+    elif responses_route and chat_route:
+        # Both routes exist: the host's documented shape wins.
+        schema = guess
+    resolved = schema or guess
+    _SCHEMA_CACHE[base_url] = resolved
+    return resolved
+
+
+def _config_module() -> Any:
+    """The config module, imported lazily to keep the import ladder light."""
+    from . import config as _cfg
+
+    return _cfg
+
+
+def _uses_responses_schema(base_url: str) -> bool:
+    """Whether this endpoint takes the Responses wire schema.
+
+    Resolution is capability-based (:func:`_endpoint_schema`); the host split
+    only supplies the default guess when the endpoint's route table cannot be
+    observed. A custom deployment that wants Chat Completions on a Perplexity
+    host no longer needs the old IP/proxy workaround — the probe sees which
+    routes exist — but the env override is there for anything the probe cannot
+    see through.
+    """
+    return _endpoint_schema(base_url) == "responses"
 
 
 def _responses_input(system: str, user: str) -> str:
-    """Serialize the system+user pair into the stateless ``input`` string.
+    """Serialize the user turn into the stateless ``input`` string.
 
-    The Responses endpoint is stateless — there is no server-side thread — so the
-    whole prompt travels in ``input`` on every call, exactly as the Chat path sends
-    ``messages`` every call. The system text rides in ``instructions`` and is joined
-    here with the same separation the Chat payload's two roles give it.
+    The system prompt does NOT travel here: it rides in ``instructions``, the
+    Responses schema's dedicated field, sent by ``_call_openai``. It used to be
+    joined into ``input`` as well — the endpoint accepted the duplication, but
+    it billed the system block twice on every call (this app's digest prompt
+    re-sends the same rubric preamble hundreds of times per run, so the waste
+    was real money at scale). Verified 2026-09-22 against the live endpoint:
+    ``instructions``-only payloads serve correctly, with and without the field.
     """
-    return f"{system}\n\n{user}" if system.strip() else user
+    return user
 
 
 def _responses_field(obj: Any, name: str) -> Any:
@@ -799,6 +886,21 @@ class LLMUpstreamError(LLMError):
         self.upstream_request_id = upstream_request_id
 
 
+class LLMAuthError(LLMUpstreamError):
+    """Fatal credential/authorization refusal (HTTP 401/403).
+
+    A subclass on purpose, so every ``except LLMUpstreamError`` keeps working,
+    but a distinct one because the retry/bisect machinery must not treat it
+    like a payload problem: the credential verdict applies to every future
+    call identically, so it takes exactly one attempt (never retried — see
+    :func:`_normalize_provider_error`), never failover (the fallback would be
+    refused the same way — it cannot share this credential's fate differently),
+    and the batch runner treats it as a stop-the-run signal rather than a file
+    to quarantine. Raised for a rejected key, an account without entitlement,
+    or a revoked/deactivated credential — never for a rate limit or an outage.
+    """
+
+
 class LLMTimeoutError(LLMUpstreamError):
     """Raised when the upstream LLM call times out."""
 
@@ -907,6 +1009,13 @@ def _is_transient_status(status_code: int | None) -> bool:
 
 def _is_transient_provider_error(exc: BaseException) -> bool:
     """True when retrying the same request could plausibly succeed."""
+    status_code = _provider_status_code(exc)
+    # Defensive, not dead code: _normalize_provider_error routes 401/403 to
+    # LLMAuthError before consulting this predicate, but anything that builds
+    # an upstream error directly (probes, tests, future call sites) must not
+    # have an auth refusal reinterpreted as "retry may succeed".
+    if status_code in (401, 403):
+        return False
     if _is_timeout_error(exc):
         return True
     if isinstance(exc, (ConnectionError, OSError)):
@@ -948,6 +1057,22 @@ def _normalize_provider_error(exc: Exception) -> LLMError:
     status_code = _provider_status_code(exc)
     upstream_request_id = _provider_request_id(exc)
     details = _provider_details(exc)
+    # A 401/403 is a verdict on the credential, not the payload: retrying the
+    # identical request reproduces it exactly (the 2026-09-22 incident — a key
+    # deactivated provider-side between 14:47 and 16:13 — burned 3 attempts and
+    # opened the breaker before the bisect cascade quarantined healthy files).
+    # One attempt, one actionable message, own class so the batch runner can
+    # halt instead of bisect.
+    if status_code in (401, 403):
+        return LLMAuthError(
+            f"Credentials refused by the LLM endpoint (HTTP {status_code}) — the API key "
+            f"is invalid, revoked, or not entitled to this model/endpoint. Regenerate the "
+            f"key, check the account's credit balance, and confirm base URL and key belong "
+            f"to the same provider account. ({details})",
+            retriable=False,
+            status_code=status_code,
+            upstream_request_id=upstream_request_id,
+        )
     if _is_moderation_filtered(exc):
         return _ModerationFilteredError(
             "The LLM provider's content filter rejected this run "
@@ -986,6 +1111,84 @@ def _normalize_provider_error(exc: Exception) -> LLMError:
 
 def _retry_backoff_seconds(attempt: int) -> float:
     return min(MAX_RETRY_BACKOFF_SECONDS, RETRY_BACKOFF_SECONDS * (2.0 ** attempt))
+
+
+#: Jitter added to an honored Retry-After wait. A provider that throttles N
+#: concurrent workers answers them with the *same* Retry-After value — without
+#: jitter they would all wake at the same instant and re-form the herd the
+#: header exists to disperse. Uniform 0.1–0.5 s is small next to any real
+#: Retry-After and large enough to stagger thread wakes.
+RETRY_AFTER_JITTER_SECONDS = (0.1, 0.5)
+
+
+def _retry_after_hint(exc: BaseException | None) -> float | None:
+    """The Retry-After demand carried by a raw provider error, or ``None``.
+
+    The OpenAI SDK raises ``openai.RateLimitError`` (an ``APIStatusError``) for
+    HTTP 429 and keeps the underlying ``httpx.Response`` on ``.response`` —
+    whose ``.headers`` is a case-insensitive mapping, so ``get("retry-after")``
+    matches ``Retry-After``, ``RETRY-AFTER``, and any casing the provider uses.
+    Both header forms RFC 7231 allows are parsed: integer seconds (what
+    Perplexity sends) and HTTP-date (resolved against the local clock; the
+    second or so of parsing drift is bounded by the cap and jitter). Missing,
+    empty, unparseable, or negative values all return ``None`` — the caller
+    falls back to the ladder, never guesses.
+    """
+    if exc is None:
+        return None
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    raw = headers.get("retry-after")
+    # isinstance guard, not truthiness: stubbed responses in tests carry a
+    # MagicMock whose .get() returns a MagicMock, and float(MagicMock())
+    # silently returns 1.0 — a header that was never sent must not be honored.
+    if not isinstance(raw, str):
+        return None
+    value = raw.strip()
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        seconds = None
+    if seconds is not None:
+        return seconds if seconds >= 0 else None
+    # Not an integer: attempt the HTTP-date form. Imported lazily — the common
+    # path (integer header, or no header at all) must not pay for email.utils.
+    try:
+        from datetime import datetime, timezone
+        from email.utils import parsedate_to_datetime
+
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    delta = (when - datetime.now(timezone.utc)).total_seconds()
+    return delta if delta > 0 else 0.0
+
+
+def _retry_wait_seconds(attempt: int, exc: BaseException | None) -> tuple[float, bool]:
+    """``(seconds, honored)`` to wait before the next attempt after *exc*.
+
+    Honors the provider's Retry-After when one is present and the cap allows,
+    clamped to ``VA_LSE_LLM_RETRY_AFTER_MAX_SECONDS`` and jittered; missing,
+    unparseable, or disabled (cap 0) falls back to the exponential ladder,
+    exactly as before. Thread safety is inherited from the sleep, not added
+    here: the wait runs through ``wait_with_cancellation`` inside the one
+    worker thread that caught the 429 — the main thread and the other workers
+    never block on it — and the jitter staggers wakes so the herd does not
+    re-form at the header's expiry instant.
+    """  # noqa: E501 - docstring width is not load-bearing
+    hint = _retry_after_hint(exc)
+    cap = getattr(_config_module(), "LLM_RETRY_AFTER_MAX_SECONDS", 60.0)
+    if hint is not None and cap > 0:
+        return min(max(hint, 0.0), cap) + random.uniform(*RETRY_AFTER_JITTER_SECONDS), True
+    return _retry_backoff_seconds(attempt), False
 
 
 def _failure_reason(error: BaseException | None) -> str:
@@ -1272,6 +1475,13 @@ class LLMClient:
                 if not note:
                     raise
                 raise type(exc)(f"{exc} {note}") from exc
+            except LLMAuthError:
+                # A credential verdict, not an endpoint outage: the fallback
+                # would be refused the same way (its key defaults to this one,
+                # and a second provider's key authenticates nothing at this
+                # endpoint). One clean raise beats a guaranteed second 401 and
+                # a metrics record that says "failover happened".
+                raise
             except LLMError as exc:
                 last_error = exc
                 if index + 1 >= len(candidates):
@@ -1553,7 +1763,31 @@ class LLMClient:
                         # A nudge retry does not sleep: the rejection was
                         # instantaneous, not a load/rate-limit signal.
                         if not nudge_next:
-                            wait_with_cancellation(_retry_backoff_seconds(attempt))
+                            wait, honored = _retry_wait_seconds(attempt, exc)
+                            if honored:
+                                # Visible at INFO so an operator can tell a
+                                # header-driven wait from the ladder in the log
+                                # — this is the line that proves throttling is
+                                # being *obeyed*, not just absorbed.
+                                logger.info(
+                                    "llm retry-after honored phase=%s model=%s "
+                                    "attempt=%d/%d wait=%.2fs",
+                                    phase,
+                                    model,
+                                    attempt + 1,
+                                    MAX_RETRIES,
+                                    wait,
+                                    extra={
+                                        "request_id": rid,
+                                        "phase": phase,
+                                        "status": "retry",
+                                        "model": model,
+                                        "endpoint": endpoint,
+                                        "attempt": attempt + 1,
+                                        "retry_after": True,
+                                    },
+                                )
+                            wait_with_cancellation(wait)
             # Exhausted retries — counts as one logical failure for the breaker.
             breaker.record_failure(
                 reason=_failure_reason(last_error),

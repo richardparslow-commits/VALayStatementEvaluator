@@ -37,6 +37,7 @@ from .documents import (
 )
 from .llm import (
     CircuitBreakerOpenError,
+    LLMAuthError,
     LLMClient,
     LLMError,
     LLMService,
@@ -909,6 +910,20 @@ def review_medical_records(
                         # made. Counted separately so the summary can say how much
                         # of the failure is cascade, and never reported as the cause.
                         fail_fast_chunks += 1
+                    elif isinstance(exc, LLMAuthError):
+                        # A credential verdict is not a property of any chunk: the
+                        # same refusal awaits every other file, so bisecting and
+                        # quarantining can only manufacture failures (measured
+                        # 2026-09-22: one 401 bisected five levels deep and
+                        # quarantined nine healthy files). Bail out immediately —
+                        # the raise propagates out of run_round past the retry
+                        # round into review_medical_records' own raise.
+                        raise LLMAuthError(
+                            f"The endpoint refused the credentials — this is fatal for the "
+                            f"whole run, not for chunk {chunk.index}: no file can succeed "
+                            "until the API key is fixed. Fix the key or credit balance and "
+                            "re-run; completed work resumes from state."
+                        ) from exc
                     else:
                         refused = _refused_as_configured(exc)
                         if refused and not _refused_as_configured(cause):
@@ -1029,6 +1044,12 @@ def review_medical_records(
         # whole point: this string is what the user reads in the red box, and a
         # 2,000-page bundle fails as 300+ chunks, so leading with the labels pushed
         # the actual error and its fix past the end of a ~2,300-character wall.
+        if isinstance(reason_exc, LLMAuthError):
+            # Deliberately not wrapped into the "Record review failed: …" frame:
+            # the batch runner's stop-the-pipeline branch keys on this class, and
+            # the credential advice is the whole message a user needs here — a
+            # chunk census would imply files were at fault when none are.
+            raise reason_exc
         raise LLMError(
             f"Record review failed: {first_error}. "
             f"{_digest_failure_advice(reason_exc, fail_fast_chunks=fail_fast_chunks)} "
@@ -1235,6 +1256,13 @@ def _digest_failure_advice(exc: BaseException, *, fail_fast_chunks: int = 0) -> 
     or an unusable model id fails identically on a one-page record. Worse, following
     it costs the user real work (chopping a bundle) and changes nothing.
     """
+    if isinstance(exc, LLMAuthError):
+        return (
+            "The endpoint refused the credentials (HTTP 401/403) — every call in the run "
+            "would be refused identically, so this is fatal for the run rather than a "
+            "problem with any file. Regenerate the API key, check the account's credit "
+            "balance, then re-run: completed work resumes from state."
+        )
     if isinstance(exc, CircuitBreakerOpenError):
         return (
             "The endpoint was already marked unhealthy when these chunks ran, so they were "

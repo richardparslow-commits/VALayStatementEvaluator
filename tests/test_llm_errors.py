@@ -13,6 +13,7 @@ Uses the merged error taxonomy (``LLMUpstreamError`` with ``retriable`` /
 from __future__ import annotations
 
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -20,14 +21,19 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 
+from app import config  # noqa: E402
 from app.circuit_breaker import reset_all_for_tests  # noqa: E402
 from app.llm import (  # noqa: E402
     MODERATION_NUDGE_MAX_USER_CHARS,
+    LLMAuthError,
     LLMClient,
     LLMError,
     LLMParseError,
     LLMTimeoutError,
     LLMUpstreamError,
+    _retry_after_hint,
+    _retry_backoff_seconds,
+    _retry_wait_seconds,
     _is_moderation_filtered,
     _is_transient_provider_error,
     _is_transient_status,
@@ -413,6 +419,208 @@ class TestChatRetryPolicy(unittest.TestCase):
                 client.chat("system", "user", phase="draft")
             self.assertIn("empty response", str(ctx.exception))
             self.assertEqual(create_mock.call_count, 1)
+
+
+class TestAuthenticationClassification(unittest.TestCase):
+    """A credential refusal is fatal and typed: exactly one attempt, own class.
+
+    The 2026-09-22 incident: a key deactivated provider-side between two runs
+    came back as 401 on every call. The retry loop burned all three attempts,
+    the breaker opened on the third, and the batch runner's bisect — which had
+    no way to know an auth refusal is not a file problem — quarantined nine
+    healthy files. The fix is the type: LLMAuthError.
+    """
+
+    def test_401_normalizes_to_the_auth_type_not_generic_upstream(self) -> None:
+        normalized = _normalize_provider_error(
+            _ProviderError("Error code: 401 - invalid api key", 401)
+        )
+        self.assertIsInstance(normalized, LLMAuthError)
+        # The subclass contract is load-bearing: every existing
+        # `except LLMUpstreamError` (digest bookkeeping, advice selection) keeps
+        # firing; only the fatal-policy branches key on the narrower type.
+        self.assertIsInstance(normalized, LLMUpstreamError)
+        self.assertFalse(normalized.retriable)
+        self.assertEqual(normalized.status_code, 401)
+        self.assertIn("401", str(normalized))
+        self.assertIn("invalid api key", str(normalized))  # provider's own words survive
+
+    def test_403_entitlement_refusal_is_the_same_fatal_type(self) -> None:
+        normalized = _normalize_provider_error(_ProviderError("Error code: 403 - forbidden", 403))
+        self.assertIsInstance(normalized, LLMAuthError)
+        self.assertFalse(normalized.retriable)
+
+    def test_auth_statuses_are_never_transient_even_outside_normalization(self) -> None:
+        # _is_transient_provider_error is a seam other code paths build errors
+        # through directly; it must not label 401/403 "retry may succeed".
+        for status in (401, 403):
+            self.assertFalse(_is_transient_provider_error(_ProviderError("x", status)))
+
+    def test_rate_limit_and_outage_still_normalize_transient(self) -> None:
+        for status in (429, 503):
+            normalized = _normalize_provider_error(_ProviderError("x", status))
+            self.assertNotIsInstance(normalized, LLMAuthError)
+            self.assertTrue(normalized.retriable)
+
+
+class TestAuthRefusalRetryPolicy(unittest.TestCase):
+    """chat() spends exactly one attempt on a credential refusal — no ladder."""
+
+    def setUp(self) -> None:
+        self.sleep_patcher = patch("app.pipeline_guard.time.sleep", return_value=None)
+        self.sleep_mock = self.sleep_patcher.start()
+        self.addCleanup(self.sleep_patcher.stop)
+        self.addCleanup(reset_all_for_tests)
+
+    def test_401_takes_exactly_one_attempt_and_raises_the_auth_type(self) -> None:
+        exc = _ProviderError("Error code: 401 - invalid api key", status_code=401)
+        client, create_mock = _client_with_create_raises(exc)
+        with self.assertRaises(LLMAuthError):
+            client.chat("system", "user", phase="test")
+        self.assertEqual(create_mock.call_count, 1)
+
+    def test_a_429_still_takes_the_full_ladder(self) -> None:
+        exc = _ProviderError("Error code: 429 - rate limited", status_code=429)
+        client, create_mock = _client_with_create_raises(exc)
+        with self.assertRaises(LLMUpstreamError) as ctx:
+            client.chat("system", "user", phase="test")
+        self.assertNotIsInstance(ctx.exception, LLMAuthError)
+        self.assertEqual(create_mock.call_count, 3)
+
+
+class TestRetryAfterHonoring(unittest.TestCase):
+    """A 429's Retry-After demand is obeyed, not approximated by the ladder.
+
+    The ladder (1s/2s/4s) under sustained throttling asks again before the
+    provider said it would listen — burning attempts and tripping the breaker
+    — so when the provider names a time, that time wins (capped, jittered).
+    """
+
+    def setUp(self) -> None:
+        # wait_with_cancellation sleeps through pipeline_guard's time.sleep —
+        # patch THERE or the header test takes the real 7-second wait.
+        self.sleep_patcher = patch("app.pipeline_guard.time.sleep", return_value=None)
+        self.sleep_mock = self.sleep_patcher.start()
+        self.addCleanup(self.sleep_patcher.stop)
+        self.addCleanup(reset_all_for_tests)
+
+    @staticmethod
+    def _ratelimit(value: str | None) -> Exception:
+        """A shaped 429, with (or without) a Retry-After header."""
+        exc = _ProviderError("Error code: 429 - rate limited", 429)
+        exc.response = MagicMock(
+            status_code=429, headers={} if value is None else {"retry-after": value}
+        )
+        return exc
+
+    # ------------------------------------------------- header extraction/parsing
+
+    def test_integer_seconds_is_parsed(self) -> None:
+        self.assertEqual(_retry_after_hint(self._ratelimit("2")), 2.0)
+        self.assertEqual(_retry_after_hint(self._ratelimit(" 12 ")), 12.0)
+        self.assertEqual(_retry_after_hint(self._ratelimit("0")), 0.0)
+
+    def test_http_date_form_is_parsed_against_the_local_clock(self) -> None:
+        from email.utils import formatdate
+
+        soon = formatdate(time.time() + 30, usegmt=True)
+        hint = _retry_after_hint(self._ratelimit(soon))
+        self.assertIsNotNone(hint)
+        assert hint is not None
+        self.assertGreater(hint, 20.0, "an HTTP-date 30s out must read as roughly 30s")
+        self.assertLess(hint, 40.0)
+
+    def test_a_stale_http_date_reads_as_zero_not_negative(self) -> None:
+        from email.utils import formatdate
+
+        stale = formatdate(time.time() - 60, usegmt=True)
+        self.assertEqual(_retry_after_hint(self._ratelimit(stale)), 0.0)
+
+    def test_unparseable_values_fall_through_to_none(self) -> None:
+        self.assertIsNone(_retry_after_hint(self._ratelimit("soon")))
+        self.assertIsNone(_retry_after_hint(self._ratelimit("")))
+        self.assertIsNone(_retry_after_hint(self._ratelimit("-5")))
+
+    def test_a_missing_header_or_missing_response_is_none(self) -> None:
+        self.assertIsNone(_retry_after_hint(self._ratelimit(None)))
+        self.assertIsNone(_retry_after_hint(Exception("no shape at all")))
+        self.assertIsNone(_retry_after_hint(None))
+
+    def test_a_mock_header_is_never_honored(self) -> None:
+        # The MagicMock trap: a stub response's headers.get() returns a MagicMock,
+        # and float(MagicMock()) would silently yield 1.0. Only a real string is
+        # a header the provider actually sent.
+        self.assertIsNone(_retry_after_hint(_ProviderError("x", 429)))
+
+    # ----------------------------------------------------- the wait computation
+
+    def test_honored_wait_is_capped_and_jittered(self) -> None:
+        with patch.object(config, "LLM_RETRY_AFTER_MAX_SECONDS", 5.0):
+            wait, honored = _retry_wait_seconds(0, self._ratelimit("30"))
+        self.assertTrue(honored)
+        self.assertGreaterEqual(wait, 5.1, "cap, plus at least the jitter floor")
+        self.assertLessEqual(wait, 5.5, "cap, plus at most the jitter ceiling")
+
+    def test_cap_zero_disables_honoring_entirely(self) -> None:
+        with patch.object(config, "LLM_RETRY_AFTER_MAX_SECONDS", 0):
+            wait, honored = _retry_wait_seconds(0, self._ratelimit("30"))
+        self.assertFalse(honored)
+        self.assertEqual(wait, _retry_backoff_seconds(0))
+
+    def test_missing_header_falls_back_to_the_exponential_ladder(self) -> None:
+        for attempt in (0, 1, 2):
+            wait, honored = _retry_wait_seconds(attempt, self._ratelimit(None))
+            self.assertFalse(honored)
+            self.assertEqual(wait, _retry_backoff_seconds(attempt))
+
+    # ------------------------------------------------------------ the live loop
+
+    def test_the_retry_loop_sleeps_for_the_header_duration(self) -> None:
+        exc = self._ratelimit("7")
+        client = LLMClient(_FakeSettings())  # type: ignore[arg-type]
+        ok = MagicMock()
+        ok.choices = [MagicMock(message=MagicMock(content="ok response"))]
+        ok.usage = None
+        create_mock = MagicMock(side_effect=[exc, ok])
+        client._client.chat.completions.create = create_mock  # type: ignore[attr-defined]
+
+        with patch.object(config, "LLM_RETRY_AFTER_MAX_SECONDS", 60.0):
+            out = client.chat("system", "user", phase="test")
+
+        self.assertEqual(out, "ok response")
+        self.assertEqual(create_mock.call_count, 2)
+        self.sleep_mock.assert_called_once()
+        waited = self.sleep_mock.call_args.args[0]
+        self.assertGreaterEqual(waited, 7.1)
+        self.assertLessEqual(waited, 7.5, "exactly the header (7s) plus jitter")
+
+    def test_the_jitter_staggers_concurrent_wakes(self) -> None:
+        # The thundering-herd case: N throttled workers receive the SAME header
+        # and must not wake on the same instant. Jitter is per-call, so N
+        # concurrently computed waits come out distinct.
+        import threading
+
+        barrier = threading.Barrier(12)
+        waits: list[float] = []
+        lock = threading.Lock()
+
+        def worker() -> None:
+            barrier.wait()
+            wait, honored = _retry_wait_seconds(0, self._ratelimit("5"))
+            with lock:
+                waits.append(wait)
+
+        with patch.object(config, "LLM_RETRY_AFTER_MAX_SECONDS", 60.0):
+            threads = [threading.Thread(target=worker) for _ in range(12)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        self.assertEqual(len(waits), 12)
+        self.assertGreaterEqual(
+            len(set(waits)), 6, "concurrent wakes must be staggered, not synchronized"
+        )
 
 
 if __name__ == "__main__":

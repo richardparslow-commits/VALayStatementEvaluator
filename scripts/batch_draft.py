@@ -353,6 +353,7 @@ def digest_group(llm: Any, cfg: BatchConfig, group_label: str,
     nothing granularity of ``review_medical_records``.
     """
     from app.documents import records_from_local_path
+    from app.llm import LLMAuthError
     from app.medical_review import review_medical_records
     from app.pipeline_guard import run_with_timeout
 
@@ -370,6 +371,20 @@ def digest_group(llm: Any, cfg: BatchConfig, group_label: str,
             review_medical_records, llm, docs,
             timeout_seconds=cfg.batch_timeout_s, progress=progress_cb(group_label),
         )
+    except LLMAuthError as exc:
+        # A credential refusal is not a property of any file: every member of
+        # the group — and every other batch — would be refused identically.
+        # Bisecting cannot help (the 2026-09-22 dead-key incident bisected five
+        # levels deep and quarantined nine healthy files), so the only correct
+        # move is to stop the run, keep every completed shard (save_state is
+        # the caller's job; nothing here has dirtied state), and tell the
+        # operator the one thing that fixes it. SystemExit(2): distinct from
+        # the argument/validation code, and BaseException so the per-batch
+        # "one bad batch must not kill the run" handler lets it through.
+        log(f"FATAL: {exc}")
+        log("Run stopped before further spend. Fix the credential, then re-run "
+            "the same command — completed batches resume from state.")
+        raise SystemExit(2) from exc
     except Exception as exc:  # noqa: BLE001 — bisect or quarantine, per policy above
         msg = f"{type(exc).__name__}: {str(exc)[:200]}"
         if len(files) == 1 or depth >= 6:
@@ -681,10 +696,27 @@ def main(argv: list[str] | None = None) -> int:
     log(f"{len(part_files)} parts -> {len(batches)} batches of ≤{cfg.parts_per_batch}")
 
     from app.config import load_settings
-    from app.llm import LLMClient
+    from app.llm import LLMClient, probe_chat
+    from app.preflight import REFUSAL_STATUSES
 
     settings = load_settings()
     log(f"endpoint={settings.base_url} main={settings.model_main} fast={settings.model_fast}")
+
+    # Startup credential gate (one real call, ~600 ms when refused — a 401
+    # spends nothing): the 2026-09-22 incident spent 17 minutes discovering a
+    # dead key one chunk at a time. REFUSAL_STATUSES (401/403/404) here are
+    # the same deterministic refusals the UI preflight blocks on; anything
+    # ambiguous (no response, 429, 5xx) lets the run proceed and leaves the
+    # verdict to the run's own retry machinery — a gate that refuses a working
+    # run is worse than the failure it prevents. Deliberately before the
+    # client is constructed: there is no reason to build one on a dead key.
+    probe = probe_chat(settings.base_url, settings.api_key, settings.model_fast)
+    if probe.status in REFUSAL_STATUSES:
+        log(f"FATAL: the endpoint refused the credential check (HTTP {probe.status})"
+            f"{': ' + probe.error if probe.error else ''}")
+        log("Nothing was run and nothing was spent. Regenerate the API key / check the "
+            "credit balance, then re-run this command.")
+        return 1
     llm = LLMClient(settings)
 
     t_all = time.time()
