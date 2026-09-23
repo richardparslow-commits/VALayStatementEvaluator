@@ -1957,6 +1957,17 @@ class LLMClient:
                         # instantaneous, not a load/rate-limit signal.
                         if not nudge_next:
                             wait, honored = _retry_wait_seconds(attempt, exc)
+                            # A 429's method of waiting is a rate-limit signal the
+                            # operator can act on: 'retry_after' means the provider
+                            # named a time (header present and honored); 'backoff'
+                            # means no usable header arrived and the ladder chose.
+                            # This is what answers "does Perplexity ever send the
+                            # header?" — without it, an all-'backoff' split is
+                            # indistinguishable from an untested honored path.
+                            if _provider_status_code(exc) == 429:
+                                metrics.observe_llm_rate_limit_retry(
+                                    "retry_after" if honored else "backoff"
+                                )
                             if honored:
                                 # Visible at INFO so an operator can tell a
                                 # header-driven wait from the ladder in the log

@@ -2001,6 +2001,7 @@ If you use the Prometheus operator, annotate the web and worker pods instead:
 
 | Metric | Meaning |
 |---|---|
+| `va_lse_llm_rate_limit_retries_total` | 429 retries by wait method: `method="retry_after"` honored the provider's Retry-After header, `method="backoff"` means no usable header arrived and the ladder chose — the split that answers whether the provider ever sends the header |
 | `va_lse_audit_backup_state` | Enum: `0`=ok, `1`=disabled, `2`=never_ran, `3`=stale, `4`=error, `5`=unavailable |
 | `va_lse_audit_backup_last_success_timestamp_seconds` | When the last pass succeeded |
 | `va_lse_audit_backup_pending_bytes` | Audit bytes on this volume not yet shipped — what a pod death would lose |

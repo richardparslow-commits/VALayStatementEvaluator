@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 
 from app import config  # noqa: E402
+from app import metrics  # noqa: E402
 from app.circuit_breaker import reset_all_for_tests  # noqa: E402
 from app.llm import (  # noqa: E402
     MODERATION_NUDGE_MAX_USER_CHARS,
@@ -506,6 +507,7 @@ class TestRetryAfterHonoring(unittest.TestCase):
         self.sleep_mock = self.sleep_patcher.start()
         self.addCleanup(self.sleep_patcher.stop)
         self.addCleanup(reset_all_for_tests)
+        metrics.reset_for_tests()
 
     @staticmethod
     def _ratelimit(value: str | None) -> Exception:
@@ -539,6 +541,61 @@ class TestRetryAfterHonoring(unittest.TestCase):
         stale = formatdate(time.time() - 60, usegmt=True)
         self.assertEqual(_retry_after_hint(self._ratelimit(stale)), 0.0)
 
+    def test_all_three_rfc_7231_date_forms_are_parsed(self) -> None:
+        """IMF-fixdate, RFC 850, and asctime all resolve against the local clock.
+
+        RFC 7231 requires recipients to accept all three forms; a provider that
+        sends any of them must get the same honored wait, not a silent ladder
+        fallback that ignores an explicit instruction.
+        """
+        from email.utils import formatdate
+
+        imf = formatdate(time.time() + 30, usegmt=True)  # "Sat, 26 Sep 2026 20:40:04 GMT"
+        day, rest = imf.split(", ", 1)
+        d, mon, yr, hms, _zone = rest.split()
+        fullday = {
+            "Mon": "Monday", "Tue": "Tuesday", "Wed": "Wednesday",
+            "Thu": "Thursday", "Fri": "Friday", "Sat": "Saturday", "Sun": "Sunday",
+        }[day]
+        rfc850 = f"{fullday}, {d}-{mon}-{yr[2:]} {hms} GMT"
+        asctime = f"{day} {mon} {d} {hms} {yr}"
+        for value in (imf, rfc850, asctime):
+            hint = _retry_after_hint(self._ratelimit(value))
+            self.assertIsNotNone(hint, value)
+            assert hint is not None
+            self.assertGreater(hint, 20.0, value)
+            self.assertLess(hint, 40.0, value)
+
+    def test_a_naive_http_date_without_zone_is_read_as_utc(self) -> None:
+        """A date with no zone is repaired as UTC, not dropped to the ladder.
+
+        RFC 7231 requires a zone, but a GMT wall-clock sent bare must still mean
+        roughly what it says: reading it as local time would make the hint
+        timezone-dependent, and returning None would ignore the instruction.
+        """
+        from email.utils import formatdate
+
+        soon = formatdate(time.time() + 30, usegmt=True)
+        hint = _retry_after_hint(self._ratelimit(soon.replace(" GMT", "")))
+        self.assertIsNotNone(hint)
+        assert hint is not None
+        self.assertGreater(hint, 20.0)
+        self.assertLess(hint, 40.0)
+
+    def test_a_stale_date_honors_a_near_zero_wait(self) -> None:
+        """A past date reads as 0.0 and is honored with jitter, not re-laddered.
+
+        The provider has said "you may retry now"; sleeping the ladder's full
+        first step would be slower than instructed for no safety gain.
+        """
+        from email.utils import formatdate
+
+        stale = formatdate(time.time() - 60, usegmt=True)
+        wait, honored = _retry_wait_seconds(0, self._ratelimit(stale))
+        self.assertTrue(honored)
+        self.assertGreaterEqual(wait, 0.1, "exactly the jitter floor")
+        self.assertLessEqual(wait, 0.5, "exactly the jitter ceiling")
+
     def test_unparseable_values_fall_through_to_none(self) -> None:
         self.assertIsNone(_retry_after_hint(self._ratelimit("soon")))
         self.assertIsNone(_retry_after_hint(self._ratelimit("")))
@@ -570,6 +627,47 @@ class TestRetryAfterHonoring(unittest.TestCase):
         self.assertFalse(honored)
         self.assertEqual(wait, _retry_backoff_seconds(0))
 
+    def test_cap_clamping_is_inclusive_at_the_boundary(self) -> None:
+        """A hint at the cap passes untouched; one over it is clamped to the cap.
+
+        The 59s case is the important half: a clamping bug that replaced a
+        below-cap hint with the cap would *inflate* waits the provider chose,
+        and nothing else in this suite would notice.
+        """
+        with patch.object(config, "LLM_RETRY_AFTER_MAX_SECONDS", 60.0):
+            at_cap, _ = _retry_wait_seconds(0, self._ratelimit("60"))
+            over_cap, honored_over = _retry_wait_seconds(0, self._ratelimit("61"))
+            under_cap, _ = _retry_wait_seconds(0, self._ratelimit("59"))
+        for label, wait in (("at cap", at_cap), ("over cap", over_cap)):
+            self.assertGreaterEqual(wait, 60.1, f"{label}: cap plus the jitter floor")
+            self.assertLessEqual(wait, 60.5, f"{label}: cap plus the jitter ceiling")
+        self.assertTrue(honored_over)
+        self.assertGreaterEqual(under_cap, 59.1, "below-cap hints must pass through")
+        self.assertLessEqual(under_cap, 59.5, "below-cap hints must not be inflated")
+
+    def test_a_date_far_in_the_future_is_capped(self) -> None:
+        """A date-derived hint beyond the cap is clamped like an integer one."""
+        from email.utils import formatdate
+
+        later = formatdate(time.time() + 3600, usegmt=True)
+        with patch.object(config, "LLM_RETRY_AFTER_MAX_SECONDS", 60.0):
+            wait, honored = _retry_wait_seconds(0, self._ratelimit(later))
+        self.assertTrue(honored)
+        self.assertGreaterEqual(wait, 60.1)
+        self.assertLessEqual(wait, 60.5)
+
+    def test_a_negative_cap_disables_honoring(self) -> None:
+        """A misconfigured negative cap must fall back to the ladder, not honor.
+
+        config.py normalizes negative values at import; this pins the loop-side
+        ``cap > 0`` guard so a patched or stubbed config cannot turn the clamp
+        into ``min(-1, hint)`` — a negative sleep.
+        """
+        with patch.object(config, "LLM_RETRY_AFTER_MAX_SECONDS", -1):
+            wait, honored = _retry_wait_seconds(0, self._ratelimit("30"))
+        self.assertFalse(honored)
+        self.assertEqual(wait, _retry_backoff_seconds(0))
+
     def test_missing_header_falls_back_to_the_exponential_ladder(self) -> None:
         for attempt in (0, 1, 2):
             wait, honored = _retry_wait_seconds(attempt, self._ratelimit(None))
@@ -597,6 +695,42 @@ class TestRetryAfterHonoring(unittest.TestCase):
         self.assertGreaterEqual(waited, 7.1)
         self.assertLessEqual(waited, 7.5, "exactly the header (7s) plus jitter")
 
+    def test_the_retry_loop_sleeps_for_an_http_date_header(self) -> None:
+        """The end-to-end date path: a date-derived hint reaches the loop's sleep.
+
+        The hint unit tests prove parsing; this proves the loop *uses* it — a
+        regression that honored dates at the hint level but laddered inside the
+        retry loop would pass every hint test and still misbehave in production.
+        """
+        from email.utils import formatdate
+
+        client = LLMClient(_FakeSettings())  # type: ignore[arg-type]
+        # Built AFTER the client: the constructor pays the SDK's lazy-import
+        # floor, and a date built before it would be stale by that much when
+        # the loop parses it. An integer header does not decay; a date does.
+        soon = formatdate(time.time() + 60, usegmt=True)
+        ok = MagicMock()
+        ok.choices = [MagicMock(message=MagicMock(content="ok response"))]
+        ok.usage = None
+        create_mock = MagicMock(side_effect=[self._ratelimit(soon), ok])
+        client._client.chat.completions.create = create_mock  # type: ignore[attr-defined]
+
+        with patch.object(config, "LLM_RETRY_AFTER_MAX_SECONDS", 60.0):
+            out = client.chat("system", "user", phase="test")
+
+        self.assertEqual(out, "ok response")
+        self.assertEqual(create_mock.call_count, 2)
+        self.sleep_mock.assert_called_once()
+        waited = self.sleep_mock.call_args.args[0]
+        # The hint decays between header construction and parsing — measured
+        # anywhere from ~0.4s (suite process) to ~1.5s (fresh interpreter —
+        # imports, GC, scheduler noise on a loaded box), so the window is wide
+        # enough to tolerate that while staying unambiguous: the ladder's first
+        # step is 1.0s and the cap clamps at 60.0, so only a honored date lands
+        # anywhere near 60.
+        self.assertGreaterEqual(waited, 55.0)
+        self.assertLessEqual(waited, 61.0, "cap + jitter is the hard ceiling")
+
     def test_the_jitter_staggers_concurrent_wakes(self) -> None:
         # The thundering-herd case: N throttled workers receive the SAME header
         # and must not wake on the same instant. Jitter is per-call, so N
@@ -623,6 +757,61 @@ class TestRetryAfterHonoring(unittest.TestCase):
         self.assertEqual(len(waits), 12)
         self.assertGreaterEqual(
             len(set(waits)), 6, "concurrent wakes must be staggered, not synchronized"
+        )
+
+    # ------------------------------------------------------- the metrics signal
+
+    def test_a_429_retry_counts_its_method_retry_after_or_backoff(self) -> None:
+        """A honored header is visible as 'retry_after', a headerless 429 as 'backoff'.
+
+        This split is the whole point of the counter: an all-'backoff' total is
+        the evidence that the provider never sends the header, and the moment a
+        'retry_after' series appears, the honored path is live in production.
+        """
+        ok = MagicMock()
+        ok.choices = [MagicMock(message=MagicMock(content="ok response"))]
+        ok.usage = None
+        client, _ = _client_with_create_raises([self._ratelimit("1"), ok])
+        client.chat("system", "user", phase="test")
+        self.assertEqual(
+            metrics.llm_rate_limit_retries_total.samples(),
+            [({"method": "retry_after"}, 1.0)],
+        )
+
+    def test_a_429_without_a_header_counts_as_a_ladder_backoff(self) -> None:
+        ok = MagicMock()
+        ok.choices = [MagicMock(message=MagicMock(content="ok response"))]
+        ok.usage = None
+        client, _ = _client_with_create_raises([self._ratelimit(None), ok])
+        client.chat("system", "user", phase="test")
+        self.assertEqual(
+            metrics.llm_rate_limit_retries_total.samples(),
+            [({"method": "backoff"}, 1.0)],
+        )
+
+    def test_non_429_retries_never_reach_the_rate_limit_counter(self) -> None:
+        # 503s and timeouts are transient too, but they are not rate limits:
+        # counting them would dilute exactly the split this counter exists to
+        # report. _is_transient_status marks 503 retriable, so this takes the
+        # ladder and must stay absent from the family.
+        exc = _ProviderError("Error code: 503 - unavailable", status_code=503)
+        client, _ = _client_with_create_raises(exc)
+        with self.assertRaises(LLMUpstreamError):
+            client.chat("system", "user", phase="test")
+        self.assertEqual(metrics.llm_rate_limit_retries_total.samples(), [])
+
+    def test_only_retry_waits_are_counted_not_the_final_failure(self) -> None:
+        # Three 429 attempts = two waits between them. Counting the final
+        # failed attempt would inflate the total into "429s seen", not "waits
+        # the ladder took because of 429s" — the wait is the thing whose method
+        # (header vs ladder) this counter distinguishes.
+        client, create_mock = _client_with_create_raises(self._ratelimit("1"))
+        with self.assertRaises(LLMUpstreamError):
+            client.chat("system", "user", phase="test")
+        self.assertEqual(create_mock.call_count, 3)
+        self.assertEqual(
+            metrics.llm_rate_limit_retries_total.samples(),
+            [({"method": "retry_after"}, 2.0)],
         )
 
 

@@ -319,6 +319,16 @@ llm_errors_total = Counter(
     help_text="Failed LLM calls by error category (client|retry|moderation|moderation_nudge).",
 )
 
+llm_rate_limit_retries_total = Counter(
+    name="va_lse_llm_rate_limit_retries_total",
+    help_text=(
+        "Retries after a 429 rate limit, by method: 'retry_after' honored the "
+        "provider's Retry-After header; 'backoff' means no usable header arrived "
+        "and the exponential ladder chose the wait. The split answers whether the "
+        "provider ever sends the header."
+    ),
+)
+
 llm_endpoint_duration_ms = Histogram(
     name="va_lse_llm_endpoint_duration_ms",
     help_text=(
@@ -479,6 +489,17 @@ def observe_llm_error(category: str) -> None:
     llm_errors_total.inc(category=category or "unknown")
 
 
+def observe_llm_rate_limit_retry(method: str) -> None:
+    """Record one retry following a 429, by how its wait was chosen.
+
+    Only genuine rate-limit retries are counted (the caller checks), so the
+    family's total is the provider's 429 pressure as the retry ladder saw it,
+    and the method label says whether the provider instructed the wait or the
+    ladder guessed.
+    """
+    llm_rate_limit_retries_total.inc(method=method or "unknown")
+
+
 def observe_phase(phase: str, outcome: str, duration_ms: float) -> None:
     """Record one pipeline phase. Called by ``PhaseTimer``."""
     phase_duration_ms.observe(duration_ms, phase=phase or "unknown", outcome=outcome)
@@ -500,6 +521,7 @@ def reset_for_tests() -> None:
         llm_calls_total,
         llm_attempts_total,
         llm_errors_total,
+        llm_rate_limit_retries_total,
         llm_endpoint_duration_ms,
         llm_endpoint_calls_total,
         llm_failover_total,
@@ -893,6 +915,7 @@ def _emit_llm(writer: _Writer) -> None:
     writer.counter(llm_calls_total, zero_when_empty=True)
     writer.counter(llm_attempts_total, zero_when_empty=True)
     writer.counter(llm_errors_total, zero_when_empty=True)
+    writer.counter(llm_rate_limit_retries_total, zero_when_empty=True)
     writer.histogram(llm_endpoint_duration_ms, zero_when_empty=True)
     writer.counter(llm_endpoint_calls_total, zero_when_empty=True)
     writer.counter(llm_failover_total, zero_when_empty=True)
@@ -1143,6 +1166,7 @@ def metric_names() -> Sequence[str]:
         "va_lse_llm_calls_total",
         "va_lse_llm_attempts_total",
         "va_lse_llm_errors_total",
+        "va_lse_llm_rate_limit_retries_total",
         "va_lse_circuit_breaker_rejections_total",
         "va_lse_circuit_breaker_transitions_total",
         "va_lse_metrics_series_dropped_total",

@@ -65,6 +65,51 @@ class TestVerdictClassification(unittest.TestCase):
     def test_404_is_unreachable(self) -> None:
         self.assertEqual(sonar_probe._classify(404, "")[0], "unreachable")
 
+    # ------------------------------------------------- body-truncation hardening
+
+    def test_a_marker_past_display_truncation_still_classifies(self) -> None:
+        """Classification reads the whole body, not the first 200 characters.
+
+        A rejection whose 'not supported' marker sits past the display
+        truncation must still read as ``rejected`` — truncating before
+        classification would misreport a real catalog verdict as
+        inconclusive, and an operator could re-probe forever against a model
+        that will never arrive.
+        """
+        pad = "x" * 500
+        verdict, _ = sonar_probe._classify(400, pad + 'model "sonar" is not supported')
+        self.assertEqual(verdict, "rejected")
+
+        rate_pad = "y" * 500
+        verdict, _ = sonar_probe._classify(429, rate_pad + "Request rate limit exceeded")
+        self.assertEqual(verdict, "rate_limited")
+
+    def test_a_structured_404_error_body_reads_as_rejected(self) -> None:
+        """A 404 carrying the API's structured error object means the model is unserved.
+
+        Several providers reject unknown models with 404-shaped structured
+        bodies rather than 400s. Reading every 404 as 'route missing' would
+        bury a catalog verdict under an unreachable-route story; the JSON
+        ``error`` key separates the endpoint's own answer from a bare missing
+        route. The failure direction stays conservative: rejected ("not yet"),
+        never accepted.
+        """
+        body = '{"error": {"message": "model not found: sonar"}}'
+        verdict, note = sonar_probe._classify(404, body)
+        self.assertEqual(verdict, "rejected")
+        self.assertIn("404", note)
+
+    def test_a_bare_404_stays_unreachable(self) -> None:
+        # No JSON error object: a missing route or proxy page, not a model verdict.
+        self.assertEqual(sonar_probe._classify(404, "")[0], "unreachable")
+        self.assertEqual(sonar_probe._classify(404, "<html>proxy page</html>")[0], "unreachable")
+
+    def test_an_array_json_body_is_not_a_structured_error(self) -> None:
+        # A JSON *array* has no 'error' key; json.loads succeeds but the
+        # membership test must not raise — pin the non-dict shapes.
+        self.assertEqual(sonar_probe._classify(404, '[1, 2, 3]')[0], "unreachable")
+        self.assertEqual(sonar_probe._classify(404, '"just a string"')[0], "unreachable")
+
 
 class _FakeSettings:
     configured = True

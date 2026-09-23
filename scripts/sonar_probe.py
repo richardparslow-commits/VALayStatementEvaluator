@@ -58,6 +58,18 @@ def _classify(status: int | None, body: str) -> tuple[str, str]:
     catalog yet), ``forbidden`` (valid key, no entitlement), ``auth`` (key
     refused — regenerate/credits first; probe result is meaningless),
     ``rate_limited`` (try again later), ``unreachable`` (no HTTP answer).
+
+    Classification always sees the FULL body — a marker phrase sitting past
+    the display truncation must still classify correctly (a probe that read
+    only the first 200 characters would report a real catalog rejection as
+    ``inconclusive``). Truncation is for the note text only.
+
+    A 404 splits on the body: a JSON object with an ``error`` key is the
+    endpoint's structured API error (several providers reject unknown models
+    with 404-shaped bodies), so it reads as ``rejected`` — the conservative
+    direction ("not yet", never "switch now"). A bare or non-JSON 404 is a
+    missing route or a proxy page, which says nothing about the model, and
+    stays ``unreachable``.
     """
     if status == 200:
         return "accepted", "model served by the endpoint"
@@ -66,19 +78,29 @@ def _classify(status: int | None, body: str) -> tuple[str, str]:
     lowered = body.lower()
     if status == 400 and "not supported" in lowered:
         return "rejected", "model not in the endpoint's catalog yet"
+    if status == 404:
+        try:
+            structured_error = "error" in json.loads(body)
+        except ValueError:
+            structured_error = False
+        if structured_error:
+            return "rejected", "endpoint answered 404 with a structured error — model not served"
+        return "unreachable", f"route missing at this base URL ({status})"
     if status == 403:
         return "forbidden", "valid key without entitlement to this model"
     if status in (401,):
         return "auth", "key refused — check the key and credit balance first"
     if status == 429 or "rate limit" in lowered:
         return "rate_limited", "throttled (the batch run may own the budget) — retry later"
-    if status == 404:
-        return "unreachable", f"route missing at this base URL ({status})"
     return "inconclusive", f"HTTP {status}: {body[:120]}"
 
 
 def _post(base_url: str, api_key: str, model: str, timeout: float) -> tuple[int | None, str]:
-    """One tiny ``/responses`` call; returns ``(status or None, body excerpt)``."""
+    """One tiny ``/responses`` call; returns ``(status or None, full body)``.
+
+    The body is returned whole because classification reads it (see
+    :func:`_classify`); nothing renders it unbounded — the note truncates.
+    """
     req = urllib.request.Request(
         f"{base_url.rstrip('/')}/responses",
         data=json.dumps(
@@ -97,13 +119,13 @@ def _post(base_url: str, api_key: str, model: str, timeout: float) -> tuple[int 
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - operator-configured endpoint
-            return resp.status, resp.read().decode("utf-8", errors="replace")[:200]
+            return resp.status, resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")[:200]
+        body = exc.read().decode("utf-8", errors="replace")
         exc.close()
         return exc.code, body
     except (urllib.error.URLError, OSError, ValueError) as exc:
-        return None, repr(exc)[:160]
+        return None, repr(exc)
 
 
 def _request_timeout(requested: int | None) -> float:
