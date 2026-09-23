@@ -57,6 +57,24 @@ def log(msg: str) -> None:
         fh.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
 
 
+def notify(title: str, message: str) -> None:
+    """Best-effort macOS desktop notification; never raises.
+
+    The report file is the source of truth — this only saves the user from
+    re-polling. Silent no-op on non-macOS hosts or when osascript is absent.
+    Fixed message strings only (no statement text), so nothing user-supplied
+    reaches a shell parser.
+    """
+    try:
+        subprocess.run(
+            ["osascript", "-e",
+             f'display notification "{message}" with title "{title}" sound name "Glass"'],
+            check=False, capture_output=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def run_checks() -> str:
     text = STATEMENT.read_text(encoding="utf-8")
     lines: list[str] = ["# Mechanical review — statement.md", "",
@@ -107,9 +125,14 @@ def main() -> int:
             report = run_checks()
             REPORT.write_text(report, encoding="utf-8")
             log(f"statement detected; mechanical report written to {REPORT.name}")
+            notify(
+                "VA statement ready",
+                f"statement.md landed — mechanical review written to {REPORT.name}",
+            )
             return 0
         time.sleep(20)
     log("timed out without statement.md — run may have died; check rerun2.log")
+    notify("VA statement watcher timed out", "No statement.md after 8 hours — check rerun2.log")
     return 1
 
 
