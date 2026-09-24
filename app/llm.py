@@ -575,16 +575,30 @@ def _responses_empty_error(body: Any) -> LLMError:
     """The error for a Responses answer with no visible text, with its real cause.
 
     A 200 body can carry ``status: failed`` with the provider's own reason in
-    ``error.message`` — reporting that beats a generic "empty response" for the
-    same wire event. A completed run with no text is the reasoning-model case
-    the probe already treats as a served call; at run time, empty text cannot
-    feed a pipeline, so it stays an error, but a status-aware one.
+    ``error.message`` — reporting that beats a generic "empty response" for
+    the same wire event. A completed run with no text is the reasoning-model
+    case the probe already treats as a served call; at run time, empty text
+    cannot feed a pipeline, so it stays an error, but a status-aware one.
+
+    ``status: incomplete`` is classified retriable, not deterministic: live
+    evidence 2026-09-23 (provider degradation, ~470 absorbed merge failures in
+    one run) shows the same call succeeding minutes later with nothing changed
+    but time. As a plain ``LLMError`` it fell out of the retry ladder in one
+    attempt and each failure told the breaker to record a *deterministic*
+    failure — whose advice ("fix the request rather than waiting") is exactly
+    wrong for a condition waiting actually fixes.
     """
     status = _responses_status(body)
     if status and status != "completed":
         detail = _responses_error_message(body) or "no details given"
-        return LLMError(f"The Responses run did not complete (status: {status}): {detail}")
-    return LLMError("Model returned an empty response.")
+        message = f"The Responses run did not complete (status: {status}): {detail}"
+        if status == "incomplete":
+            return LLMUpstreamError(message, retriable=True)
+        return LLMError(message)
+    # A completed run with no text rides the same burst signature (empties
+    # interleaved with incompletes in the same degradation window), so it gets
+    # the ladder too — the moderation nudge and parse re-ask live there.
+    return LLMUpstreamError("Model returned an empty response.", retriable=True)
 
 
 def _responses_usage_tokens(body: Any) -> tuple[int | None, int | None]:

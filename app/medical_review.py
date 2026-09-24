@@ -1362,6 +1362,13 @@ MERGE_BATCH_SIZE = 48
 # model verbosity.
 MERGE_SINGLE_LIMIT = 120
 
+# Fast-fail rejections (breaker OPEN, concurrency queue full) ride the same
+# keep-raw-facts fallback as ordinary merge failures: they say "pause the
+# calls for a while", not "the merge is wrong", and one worker tripping the
+# breaker (the tail of a 429 storm) must not abort the whole final phase —
+# the 2026-09-23 run died there twice with 5,972 raw facts in hand.
+_MERGE_TOLERATED_ERRORS = (LLMError, CircuitBreakerOpenError, QueueFullError)
+
 
 def _merge_facts(
     llm: LLMService,
@@ -1380,7 +1387,7 @@ def _merge_facts(
     if len(facts) <= MERGE_SINGLE_LIMIT:
         try:
             consolidated = _restore_citations(_merge_once(llm, facts), facts) or facts
-        except LLMError:
+        except _MERGE_TOLERATED_ERRORS:
             consolidated = facts
         return consolidated
 
@@ -1439,7 +1446,7 @@ def _merge_facts(
                 batch_index = future_map[future]
                 try:
                     merged_by_batch[batch_index] = future.result() or batches[batch_index]
-                except LLMError as exc:
+                except _MERGE_TOLERATED_ERRORS as exc:
                     logger.warning(
                         "merge batch failed round=%d batch=%d error=%s",
                         round_no,

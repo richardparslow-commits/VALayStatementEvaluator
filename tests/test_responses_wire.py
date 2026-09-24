@@ -157,6 +157,33 @@ class TestResponsesOutputText(unittest.TestCase):
         self.assertIn("quota exhausted", str(err))
         self.assertNotIn("empty response", str(err))
 
+    def test_an_incomplete_run_is_retriable(self) -> None:
+        # Live evidence 2026-09-23: during a provider degradation, "status:
+        # incomplete" hit in bursts while identical calls succeeded minutes
+        # later — transient, so it must ride the retry ladder instead of
+        # dying in one attempt and telling the breaker it was deterministic.
+        body = _responses_body(text="", status="incomplete", with_output_text_key=False)
+        err = llm._responses_empty_error(body)
+        self.assertIn("incomplete", str(err))
+        self.assertIsInstance(err, llm.LLMUpstreamError)
+        self.assertTrue(err.retriable)
+
+    def test_a_completed_but_empty_run_is_retriable(self) -> None:
+        # Empty completions interleaved with incompletes in the same
+        # degradation window share the burst signature.
+        err = llm._responses_empty_error(_responses_body(text="  "))
+        self.assertIn("empty response", str(err))
+        self.assertIsInstance(err, llm.LLMUpstreamError)
+        self.assertTrue(err.retriable)
+
+    def test_a_failed_run_stays_deterministic(self) -> None:
+        # A failed run WITH a provider reason (bad model id, quota) is a
+        # request problem, not a burst — the ladder must not burn attempts on it.
+        body = _responses_body(text="", status="failed", with_output_text_key=False)
+        body["error"] = {"message": "quota exhausted"}
+        err = llm._responses_empty_error(body)
+        self.assertFalse(getattr(err, "retriable", False))
+
     def test_a_completed_run_with_no_text_still_says_empty(self) -> None:
         err = llm._responses_empty_error(_responses_body(text="  "))
         self.assertIn("empty response", str(err))

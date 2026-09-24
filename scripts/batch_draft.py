@@ -411,6 +411,63 @@ def digest_group(llm: Any, cfg: BatchConfig, group_label: str,
     return state, []
 
 
+def _retry_phase(fn: Callable[[], Any], label: str, *, attempts: int = 8,
+                 base_wait_s: float = 30.0) -> Any:
+    """Run one final-phase LLM call across provider degradation bursts.
+
+    The per-call retry ladder spans seconds; the 2026-09-23 degradation came in
+    minutes-long bursts (status: incomplete / empty responses, then 429s) that
+    outlast it, and the single calls after the merge have no keep-raw-facts
+    fallback — one exhausted ladder discarded the whole final phase's work.
+    This wraps them with a patient outer loop: wait out each burst, retry the
+    whole call. The breaker-wait gate runs first so an OPEN breaker (fed by the
+    burst) is waited out before the attempt, not burned as one.
+    """
+    from app.llm import LLMAuthError
+
+    for attempt in range(1, attempts + 1):
+        _wait_for_breaker(f"the {label} call")
+        try:
+            return fn()
+        except LLMAuthError:
+            raise  # a credential verdict never heals
+        except Exception as exc:  # noqa: BLE001 — degraded bursts are the case this exists for
+            if attempt == attempts:
+                raise
+            wait = min(base_wait_s * attempt, 180.0)
+            log(f"{label} call failed (attempt {attempt}/{attempts}) — "
+                f"{type(exc).__name__}: {exc}; waiting {wait:.0f}s before retrying")
+            time.sleep(wait)
+    raise AssertionError("unreachable")
+
+
+def _wait_for_breaker(source: str) -> None:
+    """Block until the LLM circuit breaker will admit a call.
+
+    The merge's keep-raw-facts fallback absorbs a breaker OPEN during a
+    provider degradation (that is what saved the 2026-09-23 run), but the
+    single calls that follow it — summarize, grounding, draft — have no
+    fallback, and starting one with the breaker still OPEN killed the whole
+    final phase instantly, twice. The breaker's own recovery clock is the
+    right wait: it re-probes the provider at the configured cadence, so this
+    returns as soon as a call would be admitted.
+    """
+    from app.circuit_breaker import get_llm_breaker
+
+    breaker = get_llm_breaker()
+    poll_s = 5.0
+    polls = 0
+    while breaker.state == "OPEN" and not breaker.allow_request():
+        if polls == 0:
+            log(f"breaker OPEN after {source} — waiting out its recovery window")
+        time.sleep(poll_s)
+        polls += 1
+        if polls % 12 == 0:
+            log(f"still waiting on breaker recovery ({polls * poll_s:.0f}s so far)")
+    if polls:
+        log(f"breaker recovered after {polls * poll_s:.0f}s — resuming {source}")
+
+
 def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> dict:
     """Merge cross-batch, summarize, then grounding -> draft -> review.
 
@@ -467,7 +524,7 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
         merged = _merge_facts(llm, combined, progress=progress_cb("merge"))
         combined.facts = merged
         log(f"combined: {len(merged)} facts after merge -> summarize")
-        combined.summary = _summarize(llm, combined)
+        combined.summary = _retry_phase(lambda: _summarize(llm, combined), "summarize")
         log("combined: summary done")
 
         obs_for_prompt, removed = _truncate_for_prompt(cfg.observations, DRAFT_INTERNAL_MAX_CHARS)
@@ -478,26 +535,29 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
 
         log("grounding call…")
         care_block = _care_block(cfg.witness)
-        raw_grounding = llm.chat_json(
-            GROUNDING_SYSTEM,
-            _format_with(
-                GROUNDING_USER,
-                condition=sanitize_for_prompt(cfg.condition, max_chars=500),
-                claim_type=sanitize_for_prompt(cfg.claim_type, max_chars=500),
-                relationship=sanitize_for_prompt(
-                    cfg.witness.get("relationship", "not specified"), max_chars=500),
-                credentials_block=witness_credentials_block(cfg.witness),
-                care_block=care_block,
-                observations=sanitize_for_prompt(obs_for_prompt, max_chars=DRAFT_INTERNAL_MAX_CHARS),
-                digest=sanitize_digest_text(
-                    combined.relevant_facts_text(
-                        grounding_query, **_facts_text_kwargs(combined)),
-                    max_chars=120_000,
+        raw_grounding = _retry_phase(
+            lambda: llm.chat_json(
+                GROUNDING_SYSTEM,
+                _format_with(
+                    GROUNDING_USER,
+                    condition=sanitize_for_prompt(cfg.condition, max_chars=500),
+                    claim_type=sanitize_for_prompt(cfg.claim_type, max_chars=500),
+                    relationship=sanitize_for_prompt(
+                        cfg.witness.get("relationship", "not specified"), max_chars=500),
+                    credentials_block=witness_credentials_block(cfg.witness),
+                    care_block=care_block,
+                    observations=sanitize_for_prompt(obs_for_prompt, max_chars=DRAFT_INTERNAL_MAX_CHARS),
+                    digest=sanitize_digest_text(
+                        combined.relevant_facts_text(
+                            grounding_query, **_facts_text_kwargs(combined)),
+                        max_chars=120_000,
+                    ),
+                    checklist=load_knowledge("topic_checklist.md"),
+                    guard_note=GUARD_NOTE,
                 ),
-                checklist=load_knowledge("topic_checklist.md"),
-                guard_note=GUARD_NOTE,
+                phase="grounding",
             ),
-            phase="grounding",
+            "grounding",
         )
         grounding = _normalize_grounding(raw_grounding)
         log(f"grounding done: {len(grounding)} keys")
@@ -509,7 +569,7 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
             scope_block = f"CREDENTIAL SCOPE:\n{scope_block}"
 
         log("draft call…")
-        draft = llm.chat(
+        draft = _retry_phase(lambda: llm.chat(
             _format_with(
                 DRAFT_SYSTEM_TEMPLATE,
                 guide=load_knowledge("drafting_guide.md"),
@@ -541,7 +601,7 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
             ),
             max_tokens=6000,
             phase="draft",
-        )
+        ), "draft")
         log(f"draft done: {len(draft):,} chars")
 
         issues: list[str] = []
@@ -559,7 +619,11 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
         else:
             log("review call…")
             try:
-                review = llm.chat_json(
+                # The review is polish, not substance: fewer attempts than the
+                # mandatory calls, because its designed degradation (ship the
+                # unreviewed draft with a note) beats burning 20 minutes of
+                # waits for a second opinion.
+                review = _retry_phase(lambda: llm.chat_json(
                     REVIEW_SYSTEM,
                     _format_with(
                         REVIEW_USER,
@@ -571,7 +635,7 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
                         guard_note=GUARD_NOTE,
                     ),
                     phase="review",
-                )
+                ), "review", attempts=2, base_wait_s=10.0)
             except Exception as exc:  # noqa: BLE001 — keep the finished draft
                 review = None
                 issues.append(
@@ -752,6 +816,16 @@ def main(argv: list[str] | None = None) -> int:
         log("digest-only run (--no-final): statement not drafted.")
         return 0
 
+    final = state.get("final")
+    if final is not None and "error" in final:
+        # A stored error from a previous attempt is a resume point, not a
+        # verdict: the digest shards behind it represent hours of paid API
+        # work, and the failure that leaves one here (breaker opened mid-merge
+        # during a provider degradation) is transient. Re-run the final phase
+        # on every resume instead of dying with the run unrecoverable.
+        log(f"final phase previously failed — retrying: {final['error']}")
+        state["final"] = None
+
     if state.get("final") is None:
         try:
             state["final"] = final_phase(llm, cfg, ok)
@@ -765,7 +839,7 @@ def main(argv: list[str] | None = None) -> int:
 
     final = state["final"]
     if "error" in final:
-        log(f"final phase previously failed: {final['error']}")
+        log(f"final phase reported an error: {final['error']}")
         return 1
 
     (cfg.out_dir / "statement.md").write_text(

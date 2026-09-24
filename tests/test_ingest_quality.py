@@ -41,8 +41,10 @@ from app.documents import (  # noqa: E402
 )
 from app.evaluate import coverage_lines  # noqa: E402
 from app.medical_review import (  # noqa: E402
+    CircuitBreakerOpenError,
     MedicalDigest,
     MedicalFact,
+    QueueFullError,
     _cross_source_corroborations,
     _dates_in_text,
     _dedupe_pages,
@@ -915,6 +917,35 @@ class TestCoverageReportAdditions(unittest.TestCase):
         text = " ".join(coverage_lines(digest))
         self.assertNotIn("corroborated", text)
         self.assertNotIn("Digest capped", text)
+
+
+class TestMergeToleratesFastFailRejections(unittest.TestCase):
+    """A merge worker rejected fast (breaker OPEN / queue full) is a "pause",
+    not a verdict on the merge: the raw facts ride through, like an ordinary
+    merge failure. 2026-09-23: during a provider degradation the tail of a 429
+    storm opened the breaker and one worker's CircuitBreakerOpenError — not an
+    LLMError — escaped this pool and killed the whole final phase with 5,972
+    raw facts in hand.
+    """
+
+    def _facts(self, count: int) -> list[MedicalFact]:
+        return [
+            MedicalFact(
+                "2020-01-01", "symptom", f"fast-fail fact {index}", "a.pdf p.1",
+                document="a.pdf", page=1,
+            )
+            for index in range(count)
+        ]
+
+    def test_a_breaker_open_rejection_keeps_the_raw_facts_instead_of_aborting(self) -> None:
+        facts = self._facts(4)
+        llm = _StubLLM([CircuitBreakerOpenError("circuit breaker 'llm' is OPEN")])
+        self.assertEqual(_merge_facts(llm, MedicalDigest(facts=facts)), facts)
+
+    def test_a_queue_full_rejection_keeps_the_raw_facts_instead_of_aborting(self) -> None:
+        facts = self._facts(4)
+        llm = _StubLLM([QueueFullError("concurrency queue at capacity")])
+        self.assertEqual(_merge_facts(llm, MedicalDigest(facts=facts)), facts)
 
 
 class TestDigestCapAccounting(unittest.TestCase):

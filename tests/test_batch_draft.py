@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -30,6 +31,7 @@ from unittest import mock
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 
 from app import config  # noqa: E402
+from app.llm import ChatProbe  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -301,18 +303,26 @@ class TestFinalPhaseSemantics(unittest.TestCase):
                 return {"supported_observations": []}
 
         llm = FakeLLM()
+        # The final phase's own resilience (_retry_phase sleeps between outer
+        # attempts and polls the breaker inside _wait_for_breaker) is covered
+        # by its own tests; this helper drives prompt plumbing, so both are
+        # stubbed to keep a failing review call from stalling the suite.
         with mock.patch("app.pipeline_guard.run_with_timeout",
                         side_effect=lambda fn, *a, **k: fn()), \
              mock.patch("app.medical_review._summarize", return_value="Summary."), \
              mock.patch("app.medical_review._merge_facts",
-                        side_effect=lambda llm2, d, progress=None: d.facts):
+                        side_effect=lambda llm2, d, progress=None: d.facts), \
+             mock.patch.object(batch_draft.time, "sleep"), \
+             mock.patch.object(batch_draft, "_wait_for_breaker"):
             result = batch_draft.final_phase(llm, cfg, {"batch_01": batch_state})
         result["_calls"] = (llm.chat_calls, llm.chat_json_calls)  # grounding + review
         return result
 
     def test_review_failure_keeps_the_draft(self) -> None:
         result = self._run_final("raise")
-        self.assertEqual(result["_calls"], (1, 2))  # grounding chat_json + failed review
+        # grounding chat_json once, then the review's two outer attempts (the
+        # polish call retries once before its graceful keep-the-draft fallback)
+        self.assertEqual(result["_calls"], (1, 3))
         self.assertEqual(result["statement"], self.DRAFT)
         self.assertTrue(
             any("Self-review pass was skipped" in i for i in result["review_issues"]))
@@ -469,6 +479,177 @@ class TestResumableState(unittest.TestCase):
         self.assertEqual(set(reloaded["batches"]), {"batch_01", "batch_02"})
 
 
+class TestFinalPhaseFailureRetry(unittest.TestCase):
+    """A stored final-phase error is a resume point, not a verdict.
+
+    2026-09-23: the final phase failed twice mid-merge during a provider
+    degradation and each failure was persisted as an error shard — the resume
+    then refused to re-draft ("final phase previously failed", exit 1) with
+    six batches of paid digest work frozen behind it. An operator had to move
+    the shard aside by hand. Re-running the final phase on every resume costs
+    nothing when it succeeds and rediscovers the failure when it persists.
+    """
+
+    def test_a_stored_final_error_is_retried_not_fatal(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            final_result = {
+                "statement": "I certify the foregoing is true.",
+                "grounding_markdown": "# Grounding\n",
+                "facts_total": 1, "facts_pre_merge": 2, "review_issues": [],
+            }
+            with (
+                mock.patch("app.config.load_settings", return_value=_gate_settings()),
+                mock.patch("app.llm.probe_chat",
+                           return_value=ChatProbe(200, "ok")),
+                mock.patch("batch_draft.final_phase", return_value=final_result),
+            ):
+                code = batch_draft.main(_retry_argv(tmp, final_error="CircuitBreakerOpenError: breaker OPEN"))
+
+            self.assertEqual(code, 0)
+            statement = (tmp / "out" / "statement.md").read_text(encoding="utf-8")
+            self.assertIn("I certify the foregoing is true.", statement)
+            self.assertTrue((tmp / "out" / "grounding.md").is_file())
+            # The stored error must not survive as state: a resume after this
+            # run sees a clean success, not another retry.
+            reloaded = batch_draft.load_state(_make_cfg(tmp, out_dir=tmp / "out"))
+            self.assertNotIn("error", reloaded["final"])
+
+    def test_a_clean_final_shard_is_not_redone(self) -> None:
+        # The retry path must not throw away a finished draft: a state with a
+        # real final result skips straight to writing the outputs.
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            final_result = {
+                "statement": "already drafted", "grounding_markdown": "g",
+                "facts_total": 1, "facts_pre_merge": 2, "review_issues": [],
+            }
+            with (
+                mock.patch("app.config.load_settings", return_value=_gate_settings()),
+                mock.patch("app.llm.probe_chat",
+                           return_value=ChatProbe(200, "ok")),
+                mock.patch("batch_draft.final_phase") as final_phase,
+            ):
+                code = batch_draft.main(_retry_argv(tmp, final_result=final_result))
+
+            self.assertEqual(code, 0)
+            final_phase.assert_not_called()
+            self.assertIn("already drafted", (tmp / "out" / "statement.md").read_text(encoding="utf-8"))
+
+
+class TestWaitForBreaker(unittest.TestCase):
+    """The single calls after the merge must wait out an OPEN breaker.
+
+    2026-09-23, attempt 3: the merge's keep-raw-facts fallback absorbed the
+    degradation (that part worked), but _summarize then started with the
+    breaker still OPEN from the absorbed failures and died instantly on the
+    entry check — the merge had no checkpoint, so the whole final phase's work
+    was thrown away. Waiting out the breaker's own recovery clock turns that
+    into a pause.
+    """
+
+    def _watched_breaker(self, **kwargs) -> object:
+        from app.circuit_breaker import CircuitBreaker
+
+        # A short-recovery breaker distinct from the process-wide "llm" one,
+        # handed to _wait_for_breaker via the get_llm_breaker patch below.
+        defaults = dict(failure_threshold=2, recovery_timeout=0.2, name="test-wait")
+        defaults.update(kwargs)
+        return CircuitBreaker(**defaults)
+
+    def test_returns_immediately_when_the_breaker_is_closed(self) -> None:
+        breaker = self._watched_breaker()
+        with mock.patch("app.circuit_breaker.get_llm_breaker", return_value=breaker):
+            started = time.monotonic()
+            batch_draft._wait_for_breaker("unit test")
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_waits_out_an_open_breaker_until_a_call_is_admitted(self) -> None:
+        breaker = self._watched_breaker()
+        # Force the breaker OPEN; allow_request flips it HALF_OPEN once the
+        # (short) recovery timeout elapses, which is what unblocks the wait.
+        for _ in range(breaker.failure_threshold):
+            breaker.record_failure(reason="unit test", retriable=True)
+        self.assertEqual(breaker.state, "OPEN")
+        original_sleep = time.sleep
+        sleeps: list[float] = []
+
+        def fast_sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            original_sleep(min(seconds, 0.01))
+
+        started = time.monotonic()
+        with (
+            mock.patch("app.circuit_breaker.get_llm_breaker", return_value=breaker),
+            mock.patch("time.sleep", side_effect=fast_sleep),
+        ):
+            batch_draft._wait_for_breaker("unit test")
+        self.assertTrue(sleeps, "wait must sleep between polls")
+        self.assertLess(time.monotonic() - started, 10.0)
+        self.assertIn(breaker.state, {"HALF_OPEN", "CLOSED"})
+
+
+class TestRetryPhase(unittest.TestCase):
+    """The post-merge single calls must survive minutes-long provider bursts.
+
+    2026-09-23, attempt 4: summarize succeeded, then the grounding call died
+    to one burst — its 3-attempt ladder spans seconds, the burst spanned
+    minutes, and there is no fallback, so the whole final phase's work was
+    discarded again.
+    """
+
+    def _run_without_breaker_wait(self) -> object:
+        # _wait_for_breaker polls the process-wide breaker with real sleeps;
+        # these tests own the retry loop, not the wait, and another test
+        # module's failures can leave that breaker OPEN.
+        return mock.patch.object(batch_draft, "_wait_for_breaker")
+
+    def test_retries_through_transient_failures_and_returns_the_result(self) -> None:
+        attempts: list[str] = []
+
+        def flaky() -> str:
+            attempts.append("hit")
+            if len(attempts) < 3:
+                raise RuntimeError("The Responses run did not complete (status: incomplete)")
+            return "draft text"
+
+        with (
+            self._run_without_breaker_wait(),
+            mock.patch.object(batch_draft.time, "sleep"),
+        ):
+            result = batch_draft._retry_phase(flaky, "unit test")
+        self.assertEqual(result, "draft text")
+        self.assertEqual(len(attempts), 3)
+
+    def test_raises_after_the_last_attempt(self) -> None:
+        def always_fails() -> None:
+            raise RuntimeError("burst")
+
+        with (
+            self._run_without_breaker_wait(),
+            mock.patch.object(batch_draft.time, "sleep"),
+        ):
+            with self.assertRaises(RuntimeError):
+                batch_draft._retry_phase(always_fails, "unit test", attempts=3)
+
+    def test_an_auth_error_is_never_retried(self) -> None:
+        from app.llm import LLMAuthError
+
+        calls: list[int] = []
+
+        def refused() -> None:
+            calls.append(1)
+            raise LLMAuthError("401: invalid key")
+
+        with (
+            self._run_without_breaker_wait(),
+            mock.patch.object(batch_draft.time, "sleep"),
+        ):
+            with self.assertRaises(LLMAuthError):
+                batch_draft._retry_phase(refused, "unit test")
+        self.assertEqual(len(calls), 1, "a credential verdict never heals")
+
+
 def _gate_settings() -> "config.Settings":
     """A real Settings for main()-level tests: once the credential gate passes,
     main() constructs LLMClient from it, and the SDK validates its arguments —
@@ -493,6 +674,34 @@ def _main_argv(tmp: Path) -> list[str]:
             "--out", str(tmp / "out"),
             "--condition", "PTSD", "--claim-type", "Initial claim",
             "--observations", str(obs), "--no-final"]
+
+
+def _retry_argv(tmp: Path, final_error: str = "",
+                final_result: dict | None = None) -> list[str]:
+    """A resume-argv whose out-dir already holds digest shards plus a final
+    shard — the shape the 2026-09-23 run was left in when the final phase
+    died mid-merge: hours of digest work saved, draft absent. Unlike
+    ``_main_argv`` there is no --no-final: these tests drive the final phase.
+    """
+    records = tmp / "records"
+    records.mkdir(parents=True, exist_ok=True)
+    (records / "Part1.pdf").write_text("EVT", encoding="utf-8")
+    obs = tmp / "observations.txt"
+    obs.write_text("I have watched the veteran decline since 2022.", encoding="utf-8")
+    out = tmp / "out"
+    cfg = _make_cfg(tmp, out_dir=out)
+    state: dict = {"batches": {"batch_01": dict(batch_draft.EMPTY_DIGEST_STATE,
+                                                facts=[{"description": "night terrors"}])},
+                   "final": None}
+    if final_error:
+        state["final"] = {"error": final_error}
+    elif final_result is not None:
+        state["final"] = final_result
+    batch_draft.save_state(cfg, state)
+    return ["--records", str(records), "--glob", "Part*.pdf",
+            "--out", str(out),
+            "--condition", "PTSD", "--claim-type", "Initial claim",
+            "--observations", str(obs)]
 
 
 class TestStartupCredentialGate(unittest.TestCase):
