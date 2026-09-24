@@ -568,7 +568,7 @@ def _responses_error_message(body: Any) -> str:
     """
     err = _responses_field(body, "error")
     message = _responses_field(err, "message")
-    return message.strip() if isinstance(message, str) and message.strip() else ""
+   return message.strip() if isinstance(message, str) and message.strip() else ""
 
 
 def _responses_empty_error(body: Any) -> LLMError:
