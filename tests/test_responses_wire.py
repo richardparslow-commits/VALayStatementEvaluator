@@ -18,6 +18,8 @@ from __future__ import annotations
 import io
 import json
 import sys
+import threading
+import time
 import unittest
 import urllib.error
 from pathlib import Path
@@ -261,6 +263,45 @@ class TestEndpointSchemaResolution(unittest.TestCase):
     def test_an_unrecognized_override_is_ignored(self) -> None:
         with patch.object(config, "LLM_ENDPOINT_SCHEMA", "completions-ish"):
             self.assertTrue(llm._uses_responses_schema("https://api.perplexity.ai/v1"))
+
+    def test_a_slow_probe_on_one_endpoint_does_not_block_another(self) -> None:
+        """Probes must run OUTSIDE the global cache lock.
+
+        Regression: the lock used to be held across both blocking HEAD probes,
+        so one degraded endpoint serialised every worker thread — including
+        threads resolving a *different* base URL — behind it for up to ~6 s,
+        exactly the convoy stall that bites during failover. Dropping the lock
+        around the probe costs only duplicate probes (bounded by the thread
+        count, once per process per endpoint), not correctness: ``setdefault``
+        still converges everyone on one cached answer.
+        """
+        release = threading.Event()
+        probed: list[str] = []
+
+        def fake_head(url: str) -> bool | None:
+            probed.append(url)
+            if "slow.invalid" in url:
+                release.wait(5)  # a hung endpoint, in test time
+            return None  # "cannot tell" -> host guess
+
+        with patch.object(llm, "_head_route_exists", side_effect=fake_head):
+            slow = threading.Thread(
+                target=llm._endpoint_schema,
+                args=("https://slow.invalid/v1",),
+                daemon=True,
+            )
+            slow.start()
+            # Wait until the slow thread is inside its probe, then prove a
+            # different base URL resolves immediately, without the lock.
+            deadline = time.monotonic() + 5
+            while not probed and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(probed, "slow thread never reached the probe")
+            started = time.monotonic()
+            self.assertEqual(llm._endpoint_schema("https://healthy.invalid/v1"), "chat")
+            self.assertLess(time.monotonic() - started, 1.0)
+            release.set()
+            slow.join(5)
 
 
 class TestHeadRouteProbe(unittest.TestCase):

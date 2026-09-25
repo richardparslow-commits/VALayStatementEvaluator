@@ -460,27 +460,29 @@ def _endpoint_schema(base_url: str) -> str:
     cached = _SCHEMA_CACHE.get(base_url)
     if cached:
         return cached
-    # Slow path: acquire lock and re-check before probing
+    # Probe WITHOUT holding the lock. Each probe is blocking HTTP (2 × up to 3 s);
+    # serialising every caller behind one global lock across network I/O — including
+    # callers resolving a *different* base URL — turns a degraded endpoint into a
+    # convoy stall at exactly the moment failover needs the fallback resolved.
+    # The cost of dropping single-flight is duplicate HEAD probes, bounded by the
+    # thread count, once per process per endpoint: cheap against a 6 s stall.
+    guess = "responses" if _is_perplexity_base_url(base_url) else "chat"
+    root = base_url.rstrip("/")
+    responses_route = _head_route_exists(f"{root}/responses")
+    chat_route = _head_route_exists(f"{root}/chat/completions")
+    schema: str | None = None
+    if responses_route and chat_route is False:
+        schema = "responses"
+    elif chat_route and responses_route is False:
+        schema = "chat"
+    elif responses_route and chat_route:
+        # Both routes exist: the host's documented shape wins.
+        schema = guess
+    resolved = schema or guess
+    # Lock held for the dict write only; setdefault makes the first writer win so
+    # every thread converges on one cached answer per base URL.
     with _SCHEMA_CACHE_LOCK:
-        # Another thread may have populated the cache while we waited
-        cached = _SCHEMA_CACHE.get(base_url)
-        if cached:
-            return cached
-        guess = "responses" if _is_perplexity_base_url(base_url) else "chat"
-        root = base_url.rstrip("/")
-        responses_route = _head_route_exists(f"{root}/responses")
-        chat_route = _head_route_exists(f"{root}/chat/completions")
-        schema: str | None = None
-        if responses_route and chat_route is False:
-            schema = "responses"
-        elif chat_route and responses_route is False:
-            schema = "chat"
-        elif responses_route and chat_route:
-            # Both routes exist: the host's documented shape wins.
-            schema = guess
-        resolved = schema or guess
-        _SCHEMA_CACHE[base_url] = resolved
-        return resolved
+        return _SCHEMA_CACHE.setdefault(base_url, resolved)
 
 
 def _config_module() -> Any:
