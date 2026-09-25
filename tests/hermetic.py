@@ -4,11 +4,12 @@ A test that passes on one laptop and fails in CI (or the reverse) is usually not
 a flaky test: it is a test that read ambient configuration. Five ambient sources
 reach this suite, and each reaches the whole *process* rather than one test:
 
-* ``app/config.py`` calls ``load_dotenv(PROJECT_ROOT / ".env", override=True)``
-  at import, so a developer's uncommitted ``.env`` is copied into ``os.environ``
-  and stays there for every test that follows. A local ``.env`` naming
-  ``OPENAI_API_KEY``/``LLM_MODEL_MAIN``/…  therefore changes what the suite sees,
-  and CI — which has no ``.env`` — sees the opposite.
+* ``app/config.py`` calls ``load_dotenv(PROJECT_ROOT / ".env", override=False)``
+  at import, so a developer's uncommitted ``.env`` fills in any names not already
+  present in ``os.environ``. A local ``.env`` naming ``OPENAI_API_KEY``/
+  ``LLM_MODEL_MAIN``/… therefore changes what the suite sees for any name the
+  test harness did not pre-set, and CI — which has no ``.env`` — sees the
+  opposite.
 * ``app/config.py`` reads ~110 names into **module-level constants** at import
   time. An exported ``VA_LSE_*`` variable is frozen into the app under test, and
   no ``patch.dict(os.environ, ...)`` written inside a test can undo it.

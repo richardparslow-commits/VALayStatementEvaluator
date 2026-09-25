@@ -17,9 +17,12 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 KNOWLEDGE_DIR = Path(__file__).resolve().parent / "knowledge"
 
-# Load .env from the project root if present (never committed). override=True so
-# the project's .env wins over any pre-existing environment values.
-load_dotenv(PROJECT_ROOT / ".env", override=True)
+# Load .env from the project root if present (never committed). override=False
+# so that environment variables explicitly set in the terminal (e.g.
+# LLM_MODEL_MAIN="sonar-pro" python script.py) take absolute priority over the
+# .env file — standard 12-Factor App precedence. The .env fills in only for
+# names the operator did not already export.
+load_dotenv(PROJECT_ROOT / ".env", override=False)
 
 # ---------------------------------------------------------------------------
 # Secret resolution order.  A secret can arrive three ways, checked in order:

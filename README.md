@@ -76,6 +76,10 @@ scripts/
   sonar_probe.py          Live probe: are Perplexity's Sonar models accepted on the
                           Agent API yet? Exit 0 = the one-line .env model switch is
                           possible now; 1 = not yet; 2 = inconclusive (see TROUBLESHOOTING.md)
+  sonar_watch.py          Detached hourly re-check of that probe (both routes): the
+                          hour the Sonar models pass it rewrites .env — backed up,
+                          and never under a live batch run — and notifies (see
+                          TROUBLESHOOTING.md → Sonar models)
   split_records.py        Split an oversized record file into uploadable chunks
                           (see TROUBLESHOOTING.md → *Split Large Record Sets*)
   ocr_records.py          Add a text layer to a scanned record PDF so the app can

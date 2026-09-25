@@ -268,7 +268,8 @@ class TestFinalPhaseSemantics(unittest.TestCase):
         "Since 2022 his nightmares occur most nights and he sleeps in the spare room. "
     ) + DRAFT
 
-    def _run_final(self, review_behavior: str) -> dict:
+    def _run_final(self, review_behavior: str, *,
+                   bad_grounding_once: bool = False) -> dict:
         from app.medical_review import MedicalDigest, MedicalFact
 
         cfg = _make_cfg(Path(tempfile.mkdtemp()))
@@ -285,6 +286,7 @@ class TestFinalPhaseSemantics(unittest.TestCase):
             def __init__(self):
                 self.chat_calls = 0
                 self.chat_json_calls = 0
+                self.grounding_tried = False
 
             def chat(self, system, user, **kw):
                 self.chat_calls += 1
@@ -300,6 +302,12 @@ class TestFinalPhaseSemantics(unittest.TestCase):
                                 "improved_statement": improved_text}
                     return {}
                 # grounding (and any other JSON phase) returns a plain payload
+                if bad_grounding_once and not self.grounding_tried:
+                    self.grounding_tried = True
+                    # Parseable JSON of the wrong shape: chat_json succeeds,
+                    # _normalize_grounding then rejects it — the 2026-09-23
+                    # 23:21 failure mode (a bare array).
+                    return ["not", "an", "object"]
                 return {"supported_observations": []}
 
         llm = FakeLLM()
@@ -311,7 +319,7 @@ class TestFinalPhaseSemantics(unittest.TestCase):
                         side_effect=lambda fn, *a, **k: fn()), \
              mock.patch("app.medical_review._summarize", return_value="Summary."), \
              mock.patch("app.medical_review._merge_facts",
-                        side_effect=lambda llm2, d, progress=None: d.facts), \
+                        side_effect=lambda llm2, d, progress=None, **kw: d.facts), \
              mock.patch.object(batch_draft.time, "sleep"), \
              mock.patch.object(batch_draft, "_wait_for_breaker"):
             result = batch_draft.final_phase(llm, cfg, {"batch_01": batch_state})
@@ -333,6 +341,15 @@ class TestFinalPhaseSemantics(unittest.TestCase):
         result = self._run_final("ok")
         self.assertEqual(result["statement"], self.IMPROVED)
         self.assertEqual(result["review_issues"], ["add dates"])
+
+    def test_a_shape_invalid_grounding_is_retried_not_fatal(self) -> None:
+        # The normalizer must run INSIDE _retry_phase: a parseable-but-wrong-
+        # shape grounding answer has to re-roll like any other grounding
+        # failure, not kill the final phase after the merge is banked.
+        result = self._run_final("ok", bad_grounding_once=True)
+        # grounding chat_json x2 (1 bad shape + 1 good) + review x1, draft x1
+        self.assertEqual(result["_calls"], (1, 3))
+        self.assertEqual(result["statement"], self.IMPROVED)
 
     def test_non_dict_review_preserves_the_draft(self) -> None:
         result = self._run_final("empty")
@@ -832,6 +849,158 @@ class TestFatalAuthHaltsTheRun(unittest.TestCase):
 
         self.assertEqual(ctx.exception.code, 2,
                          "SystemExit(2) — a stop-the-run signal, not a batch failure")
+
+
+class TestMergeRoundCheckpointing(unittest.TestCase):
+    """Merge-round checkpointing: a relaunch resumes the consolidation.
+
+    The final phase's merge is the most expensive single stage (an hour of
+    rounds at production scale), and every relaunch before checkpointing
+    redid all of it. These tests pin the contract from both sides: the shard
+    round-trips under its input fingerprint, a mismatched or corrupt shard
+    reads as absent, a resume actually short-circuits round 1, and --fresh
+    clears the checkpoint along with the rest of the state.
+    """
+
+    def _final_with_real_merge(self, cfg):
+        """Drive final_phase with the real _merge_facts (shrinking fake LLM).
+
+        Returns (result, llm, cfg, fingerprint) so tests can assert on the
+        checkpoint the merge itself wrote. 200 distinct facts in, and every
+        merge call keeps 3/4 of its batch: round 1 ends at 150 facts (> the
+        120 single-call limit, < 200 — the merge continues, so the round IS
+        checkpointed), round 2 ends at 112 (<= 120 — terminal, so it is not:
+        a terminal list must never be resumed from, see the resume guard).
+        """
+        from app.medical_review import MedicalDigest, MedicalFact, _dedupe_facts
+
+        batch_state = batch_draft.digest_to_state(MedicalDigest(
+            facts=[MedicalFact(date="2023-01-01", type="symptom",
+                               description=f"fact number {i}", source="p. 1")
+                    for i in range(200)],
+            pages_in_files=10, pages_reviewed=10,
+        ))
+
+        class FactPassingLLM:
+            """Merge calls pass facts through unchanged, like test_core's fake."""
+
+            fast_model = "fake-fast"
+
+            def __init__(self):
+                self.merge_calls = 0
+                self.chat_calls = 0
+
+            def chat(self, system, user, **kw):
+                self.chat_calls += 1
+                return ""
+
+            def chat_json(self, system, user, **kw):
+                if kw.get("phase") == "records:merge":
+                    self.merge_calls += 1
+                    facts = json.loads(user.split("\n\n", 1)[1])
+                    return {"facts": facts[: max(1, (len(facts) * 3) // 4)]}
+                return {"supported_observations": []}  # grounding / review
+
+        # The exact fingerprint final_phase will derive: dedupe of all batch facts.
+        all_facts = [MedicalFact(**f) for f in batch_state["facts"]]
+        fingerprint = batch_draft._merge_fingerprint(_dedupe_facts(all_facts))
+        llm = FactPassingLLM()
+        with mock.patch("app.pipeline_guard.run_with_timeout",
+                        side_effect=lambda fn, *a, **k: fn()), \
+             mock.patch("app.medical_review._summarize", return_value="Summary."), \
+             mock.patch.object(batch_draft.time, "sleep"), \
+             mock.patch.object(batch_draft, "_wait_for_breaker"):
+            result = batch_draft.final_phase(llm, cfg, {"batch_01": batch_state})
+        return result, llm, cfg, fingerprint
+
+    def test_round_checkpoint_round_trips_and_fingerprint_gates(self) -> None:
+        from app.medical_review import MedicalFact
+
+        facts = [
+            MedicalFact(date="2023-01-01", type="symptom",
+                        description="Nightmares most nights", source="p. 1"),
+            MedicalFact(date="2023-02-01", type="medication",
+                        description="Sertraline increased", source="p. 2",
+                        document="part03.pdf", page=12),
+            MedicalFact(date="2023-03-01", type="visit",
+                        description="Missed appointment", source="p. 3"),
+        ]
+        cfg = _make_cfg(Path(tempfile.mkdtemp()))
+        fingerprint = batch_draft._merge_fingerprint(facts)
+        batch_draft.save_merge_checkpoint(cfg, fingerprint, 1, facts)
+
+        loaded = batch_draft.load_merge_checkpoint(cfg, fingerprint)
+        self.assertEqual(loaded, facts)  # dataclass equality: every field survives
+
+        # A different input's fingerprint must not open this checkpoint: the
+        # resume must never continue a consolidation whose input was different.
+        other = [MedicalFact(date="2023-01-01", type="symptom",
+                             description="different fact entirely", source="p. 1")]
+        self.assertIsNone(
+            batch_draft.load_merge_checkpoint(cfg, batch_draft._merge_fingerprint(other)))
+
+    def test_load_missing_or_corrupt_checkpoint_is_none(self) -> None:
+        cfg = _make_cfg(Path(tempfile.mkdtemp()))
+        self.assertIsNone(batch_draft.load_merge_checkpoint(cfg, "whatever"))
+        path = batch_draft._merge_ckpt_path(cfg)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"not gzip at all")
+        self.assertIsNone(batch_draft.load_merge_checkpoint(cfg, "whatever"))
+
+    def test_final_phase_resumes_from_checkpoint_and_reuses_it(self) -> None:
+        """A stored round-1 list short-circuits round 1 — including on a
+        relaunch where nothing but the shard on disk carries the state."""
+        from app.medical_review import MedicalFact
+
+        result, llm, cfg, fingerprint = self._final_with_real_merge(
+            _make_cfg(Path(tempfile.mkdtemp())))
+        # Round 1: 5 batches of 48 -> 36 each = 150 (checkpointed, the merge
+        # continues). Round 2: 4 batches -> 112 <= 120 -> terminal, no rewrite.
+        self.assertEqual(llm.merge_calls, 9)
+        self.assertEqual(result["facts_total"], 112)
+        stored = batch_draft.load_merge_checkpoint(cfg, fingerprint)
+        self.assertIsNotNone(stored)
+        self.assertEqual(len(stored), 150)
+
+        # Now the resume: pre-store a smaller round-1 output for the SAME
+        # input fingerprint and re-run the final phase from scratch (new LLM,
+        # nothing in memory — exactly a relaunch reading the same out-dir).
+        resumed = [MedicalFact(date="2023-01-01", type="symptom",
+                               description=f"resumed fact {i}", source="p. 1")
+                   for i in range(150)]
+        batch_draft.save_merge_checkpoint(cfg, fingerprint, 1, resumed)
+        result2, llm2, cfg2, fp2 = self._final_with_real_merge(cfg)
+        self.assertEqual(fp2, fingerprint)
+        # 150 stored facts -> 4 batches; round 1 skipped entirely...
+        self.assertEqual(llm2.merge_calls, 4)
+        # ...and this run's round 1 is terminal (112 <= 120), so the stored
+        # checkpoint was consumed, not rewritten.
+        self.assertEqual(result2["facts_total"], 112)
+        self.assertEqual(batch_draft.load_merge_checkpoint(cfg2, fp2), resumed)
+
+    def test_fresh_clears_merge_checkpoint(self) -> None:
+        from app.medical_review import MedicalDigest, MedicalFact
+
+        cfg = _make_cfg(Path(tempfile.mkdtemp()))
+        path = batch_draft._merge_ckpt_path(cfg)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"stale checkpoint bytes")
+        argv = _main_argv(cfg.records_dir.parent)
+        argv[argv.index("--out") + 1] = str(cfg.out_dir)
+        records = cfg.records_dir
+        (records / "Part1.pdf").write_text("EVT", encoding="utf-8")
+        with mock.patch("app.config.load_settings", return_value=_gate_settings()), \
+             mock.patch("app.llm.probe_chat", return_value=ChatProbe(200, "", "OK")), \
+             mock.patch("app.documents.records_from_local_path",
+                        side_effect=lambda p: ([], [])), \
+             mock.patch("app.medical_review.review_medical_records",
+                        return_value=MedicalDigest(facts=[
+                            MedicalFact(date="2023-01-01", type="symptom",
+                                        description="Nightmares most nights",
+                                        source="p. 1")],
+                                pages_in_files=10, pages_reviewed=10)):
+            batch_draft.main(argv + ["--fresh"])
+        self.assertFalse(path.exists(), "--fresh must clear the merge checkpoint")
 
 
 if __name__ == "__main__":

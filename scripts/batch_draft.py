@@ -31,7 +31,11 @@ shard under ``<out>/state/`` (plus a human-readable ``index.json`` summary),
 each written atomically — a crash costs at most the shard being written,
 never the whole run. Re-runs read the shards back and skip completed
 batches; a legacy monolithic ``state.json`` from an older run still loads.
-Delete the ``state/`` directory (or pass ``--fresh``) to start over.
+The final phase's hierarchical merge persists its own checkpoint
+(``state/merge_ckpt.json.gz``, written after every completed merge round and
+keyed to a fingerprint of the merge's input facts): a relaunch resumes the
+consolidation from the last completed round instead of redoing an hour of
+rounds. Delete the ``state/`` directory (or pass ``--fresh``) to start over.
 
 Run:
     .venv/bin/python scripts/batch_draft.py --records "path/to/records" \\
@@ -47,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import hashlib
 import inspect
 import json
 import os
@@ -267,6 +272,80 @@ def load_state(cfg: BatchConfig, fresh: bool = False) -> dict:
             # hides the message that would have said so.
             return {"batches": {}, "final": None}
     return {"batches": {}, "final": None}
+
+
+MERGE_CKPT_NAME = "merge_ckpt.json.gz"
+_MERGE_CKPT_SCHEMA = 1
+
+
+def _merge_ckpt_path(cfg: BatchConfig) -> Path:
+    return cfg.out_dir / SHARD_DIR_NAME / MERGE_CKPT_NAME
+
+
+def _merge_fingerprint(facts: list[Any]) -> str:
+    """A stable digest of the merge's *input* facts.
+
+    The merge-round checkpoint is only valid for the exact fact list that
+    produced it: the resume must not continue a consolidation whose input was
+    different (digests re-run, flags change), so the checkpoint stores this
+    fingerprint and a loader refuses any mismatch. Content-derived, not
+    count-derived — a same-length list with different facts must not match.
+    """
+    h = hashlib.sha256()
+    for f in facts:
+        h.update(f"{getattr(f, 'date', '')}\x1f{getattr(f, 'type', '')}"
+                 f"\x1f{getattr(f, 'description', '')}\x1e".encode("utf-8", "replace"))
+    return h.hexdigest()[:16]
+
+
+def load_merge_checkpoint(cfg: BatchConfig, fingerprint: str) -> list[Any] | None:
+    """The stored post-round fact list for *fingerprint*, or None.
+
+    A missing, corrupt, stale-schema, or fingerprint-mismatched checkpoint all
+    read as None — the merge then simply starts from round 1, the same start a
+    run without this feature would take. Facts are rebuilt field-wise exactly
+    like ``digest_from_state`` so a schema-grown MedicalFact stays loadable.
+    """
+    try:
+        data = json.loads(gzip.decompress(_merge_ckpt_path(cfg).read_bytes()))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("schema") != _MERGE_CKPT_SCHEMA:
+        return None
+    if data.get("fingerprint") != fingerprint:
+        return None
+    raw = data.get("facts")
+    if not isinstance(raw, list):
+        return None
+    from app.medical_review import MedicalFact
+
+    fields = MedicalFact.__dataclass_fields__
+    return [MedicalFact(**{k: f[k] for k in fields if k in f})
+            for f in raw if isinstance(f, dict)]
+
+
+def save_merge_checkpoint(
+    cfg: BatchConfig, fingerprint: str, round_no: int, facts: list[Any]
+) -> None:
+    """Atomically persist one completed merge round's output.
+
+    Same durability contract as the batch shards (temp file, fsync, atomic
+    rename): a crash mid-write leaves the previous round's checkpoint intact,
+    so a resume loses at most the interrupted round — never a half-written
+    fact list.
+    """
+    body = json.dumps(
+        {
+            "schema": _MERGE_CKPT_SCHEMA,
+            "fingerprint": fingerprint,
+            "round": round_no,
+            "facts": [vars(f) for f in facts],
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    shards = cfg.out_dir / SHARD_DIR_NAME
+    shards.mkdir(parents=True, exist_ok=True)
+    _atomic_write_bytes(shards / MERGE_CKPT_NAME, gzip.compress(body, mtime=0))
 
 
 def digest_to_state(digest: Any) -> dict:
@@ -510,6 +589,7 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
         log(f"combined: {len(all_facts)} facts from {len(parts)} batches -> dedupe")
         deduped = _dedupe_facts(all_facts)
         log(f"combined: {len(deduped)} facts after mechanical dedupe -> hierarchical merge")
+        fingerprint = _merge_fingerprint(deduped)
         combined = MedicalDigest(
             facts=deduped,
             conditions=sorted({c for d in parts for c in d.conditions}),
@@ -521,7 +601,19 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
             pages_in_files=sum(d.pages_in_files for d in parts),
             chunks_without_facts=sum(d.chunks_without_facts for d in parts),
         )
-        merged = _merge_facts(llm, combined, progress=progress_cb("merge"))
+        merged = _merge_facts(
+            llm,
+            combined,
+            progress=progress_cb("merge"),
+            # Merge-round checkpointing: every completed round is persisted
+            # (keyed to this exact input's fingerprint), and a relaunch resumes
+            # the consolidation instead of redoing an hour of rounds. The
+            # hooks never raise into the merge (both sides guard); a broken
+            # or stale checkpoint degrades to a from-scratch merge.
+            on_round=lambda round_no, facts: save_merge_checkpoint(
+                cfg, fingerprint, round_no, facts),
+            resume=lambda: load_merge_checkpoint(cfg, fingerprint),
+        )
         combined.facts = merged
         log(f"combined: {len(merged)} facts after merge -> summarize")
         combined.summary = _retry_phase(lambda: _summarize(llm, combined), "summarize")
@@ -535,8 +627,12 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
 
         log("grounding call…")
         care_block = _care_block(cfg.witness)
-        raw_grounding = _retry_phase(
-            lambda: llm.chat_json(
+        # Normalization runs INSIDE the retry: chat_json guarantees parseable
+        # JSON, not the object-of-lists shape grounding needs, and a
+        # shape-invalid answer (2026-09-23 23:21: a bare array) died outside
+        # the wrapper one second after a 4-minute call, discarding the merge.
+        grounding = _retry_phase(
+            lambda: _normalize_grounding(llm.chat_json(
                 GROUNDING_SYSTEM,
                 _format_with(
                     GROUNDING_USER,
@@ -556,10 +652,9 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
                     guard_note=GUARD_NOTE,
                 ),
                 phase="grounding",
-            ),
+            )),
             "grounding",
         )
-        grounding = _normalize_grounding(raw_grounding)
         log(f"grounding done: {len(grounding)} keys")
 
         # Self-contained scope block, exactly as run_draft builds it: heading
@@ -751,6 +846,15 @@ def main(argv: list[str] | None = None) -> int:
 
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
     state = load_state(cfg, fresh=args.fresh)
+    if args.fresh:
+        # --fresh means start over: a merge checkpoint from the discarded run
+        # must not survive to short-circuit the new run's consolidation (its
+        # fingerprint would not match anyway, but deleting it keeps the state
+        # directory honest about what it holds).
+        try:
+            _merge_ckpt_path(cfg).unlink()
+        except OSError:
+            pass
 
     part_files = sorted(cfg.records_dir.glob(cfg.part_glob))
     if not part_files:

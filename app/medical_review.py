@@ -1374,6 +1374,9 @@ def _merge_facts(
     llm: LLMService,
     digest: MedicalDigest,
     progress: ProgressCallback | None = None,
+    *,
+    on_round: Callable[[int, list[MedicalFact]], None] | None = None,
+    resume: Callable[[], list[MedicalFact] | None] | None = None,
 ) -> list[MedicalFact]:
     """Consolidate facts, hierarchically when the list is too large for one call.
 
@@ -1381,6 +1384,14 @@ def _merge_facts(
     merged in batches (in parallel), and the merged results are re-merged until
     the list fits one call or stops shrinking. Mechanical dedup runs between
     rounds so facts resolving to the same date+description collapse.
+
+    ``on_round`` / ``resume`` are optional checkpoint hooks for long-running
+    batch drivers (default off, so interactive callers are unchanged). The
+    driver passes ``on_round`` to persist the list after every completed
+    round, and ``resume`` returning a non-None list to continue from its
+    stored round — a relaunch then redoes at most the interrupted round
+    instead of hours of consolidation. The callback errors are the driver's
+    to handle; none are raised here.
     """
     check_pipeline_cancelled()
     facts = _dedupe_facts(digest.facts)
@@ -1392,6 +1403,20 @@ def _merge_facts(
         return consolidated
 
     current = facts
+    if resume is not None:
+        try:
+            stored = resume()
+        except Exception:  # noqa: BLE001 — a broken checkpoint must not kill the run
+            stored = None
+        # Accept the checkpoint only while a further round is possible: at
+        # MERGE_SINGLE_LIMIT or below the loop would break immediately, and a
+        # list that cannot shrink (a no-progress stop) would loop forever from
+        # it. Either way the caller's fresh ``facts`` are the safer start.
+        if stored and len(stored) > MERGE_SINGLE_LIMIT and len(stored) < len(current):
+            current = stored
+            logger.info("merge resumed from checkpoint facts=%d", len(current))
+            if progress:
+                progress(0.66, f"Resuming merge from checkpoint — {len(current):,} facts…")
     _merge_rid = get_request_id() or "-"
     for round_no in range(1, 4):
         check_pipeline_cancelled()
@@ -1472,6 +1497,11 @@ def _merge_facts(
             current = merged
             break
         current = merged
+        if on_round is not None:
+            try:
+                on_round(round_no, current)
+            except Exception as exc:  # noqa: BLE001 — checkpointing must not kill the run
+                logger.warning("merge checkpoint write failed round=%d error=%s", round_no, type(exc).__name__)
 
     return current
 

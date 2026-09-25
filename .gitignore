@@ -3,6 +3,9 @@
 .env.local
 .env.*.local
 *.env.local
+# .env backups written by scripts/sonar_watch.py before its rewrite — same
+# secret content as .env, so the same rule: never committable.
+.env.bak-*
 
 # Python
 .venv/
