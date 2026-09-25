@@ -436,6 +436,13 @@ def digest_group(llm: Any, cfg: BatchConfig, group_label: str,
     from app.medical_review import review_medical_records
     from app.pipeline_guard import run_with_timeout
 
+    # Guard against empty file list to prevent infinite recursion in bisection.
+    # This should never happen in practice (batch_files() never produces empty
+    # batches), but defensive programming prevents theoretical edge cases.
+    if not files:
+        log(f"{group_label}: EMPTY — no files to process")
+        return dict(EMPTY_DIGEST_STATE), []
+
     sdir = cfg.out_dir / "staging" / group_label
     sdir.mkdir(parents=True, exist_ok=True)
     for src in files:
@@ -587,6 +594,14 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
         parts = [digest_from_state(s) for s in batch_states.values()]
         all_facts = [f for d in parts for f in d.facts]
         log(f"combined: {len(all_facts)} facts from {len(parts)} batches -> dedupe")
+        # Memory pressure warning: for very large runs (6,000+ facts from 5,000-page
+        # bundles), the dedupe and merge phases create additional copies of the fact
+        # list. Peak memory during final_phase can spike to 20-30 MB for 10,000+ facts.
+        # This is manageable on modern systems but worth monitoring.
+        if len(all_facts) > 10_000:
+            log(f"WARNING: High fact count ({len(all_facts):,}) — final phase memory "
+                f"usage may spike. Consider reducing batch size or increasing worker "
+                f"memory limits if the system is under pressure.")
         deduped = _dedupe_facts(all_facts)
         log(f"combined: {len(deduped)} facts after mechanical dedupe -> hierarchical merge")
         fingerprint = _merge_fingerprint(deduped)
