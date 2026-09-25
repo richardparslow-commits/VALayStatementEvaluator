@@ -2050,12 +2050,22 @@ class LLMClient:
     # ------------------------------------------------------------------ json
 
     #: Upper bound on the first response that may be re-asked for *stochastic*
-    #: parse failures (malformed JSON, markdown fences, etc.). A ~16k-character
-    #: response that fails to parse is more often the model writing an essay than
+    #: parse failures (malformed JSON, markdown fences, etc.). A response this
+    #: large that fails to parse is more often the model writing an essay than
     #: sampling noise, and re-asking doubles the spend on a call likely to miss
-    #: again. Truncated responses (hit max_tokens mid-structure) bypass this cap
-    #: — they are deterministic failures worth recovering, not stochastic ones.
+    #: again. TRUNCATED responses — JSON that opened and was cut off before its
+    #: closing bracket — bypass this cap: they are deterministic failures worth
+    #: recovering at any size, and are re-asked with a doubled output budget
+    #: (capped at JSON_REASK_MAX_TOKENS), because the identical budget is what
+    #: truncated them in the first place.
     JSON_REASK_MAX_CHARS = 32_768
+
+    #: Output-budget ceiling for a truncation re-ask. A reasoning model can
+    #: spend the whole original budget before the JSON document finishes; the
+    #: re-ask doubles the budget, capped here. If the provider hard-caps output
+    #: tokens below this, lower it to match — an oversized request would
+    #: otherwise fail deterministically.
+    JSON_REASK_MAX_TOKENS = 16_000
 
     #: One bounded re-ask: stochastically malformed output is worth a second
     #: chance; identical input is not worth a third (the moderation-nudge precedent:
@@ -2081,8 +2091,10 @@ class LLMClient:
         run's evidence. Every :meth:`chat` call inside goes through the usual
         retry/breaker/cancellation machinery, and the re-ask is bounded: after
         one retry the original :class:`LLMParseError` is raised unchanged, and
-        responses above ``JSON_REASK_MAX_CHARS`` are not re-asked at all (a
-        16k-character essay is more likely a wrong output mode than noise).
+        responses above ``JSON_REASK_MAX_CHARS`` are not re-asked (an oversized
+        essay is a wrong output mode, not noise). Truncated JSON is the
+        exception: it bypasses the cap and is re-asked with a doubled output
+        budget, because the identical budget is what truncated it.
         """
         json_system = system + "\n\nRespond with ONLY valid JSON — no markdown fences, no commentary."
         text = self.chat(
@@ -2099,38 +2111,63 @@ class LLMClient:
             failure = LLMParseError(
                 f"Could not parse JSON for phase '{phase}' (response chars={len(text)})."
             )
-            # Detect truncation: response ends mid-structure or hit max_tokens.
-            # Truncated responses are deterministic failures worth recovering,
-            # not stochastic noise — always re-ask them regardless of size.
-            stripped = text.rstrip()
-            is_truncated = (
-                not stripped.endswith(("}", "]"))
-                or stripped.endswith((",", ":", "{", "["))
-                or len(text) >= max_tokens * 3  # Heuristic: ~4 chars/token
+            # Truncation means: the model *started a JSON document* and the
+            # output budget ran out before it closed. Both signals require the
+            # structural opener — a cut can land just after an inner closer
+            # ("...{\"a\":1}"), hence the budget clause (~4 chars/token; *3 is
+            # deliberately conservative). Pure prose/essays lack the opener:
+            # they are a wrong output mode, not a budget problem, and a bigger
+            # re-ask cannot fix them — classifying them as truncated would let
+            # any oversized garbage bypass the fail-fast cap.
+            candidate = _strip_code_fences(text)
+            starts_like_json = candidate[:1] in ("{", "[")
+            is_truncated = starts_like_json and (
+                not candidate.endswith(("}", "]"))
+                or len(text) >= max_tokens * 3
             )
             if self.JSON_REASK_ATTEMPTS <= 0:
                 raise failure from exc
-            # For responses above the cap, fail fast (likely an essay, not noise)
-            if len(text) > self.JSON_REASK_MAX_CHARS:
+            # Over-cap AND not truncated: fail fast (likely an essay, not noise).
+            # Over-cap AND truncated: the documented bypass — deterministic
+            # failures are worth recovering at any size.
+            if len(text) > self.JSON_REASK_MAX_CHARS and not is_truncated:
                 raise failure from exc
-            logger.warning(
-                "json parse failed — one re-ask before giving up phase=%s chars=%d truncated=%s",
-                phase,
-                len(text),
-                is_truncated,
-                extra={"phase": phase, "status": "retry", "truncated": is_truncated},
-            )
+            reask_max_tokens = max_tokens
             reask_system = json_system + (
                 "\n\nYour previous response was not valid JSON. Return ONLY the JSON "
                 "document — no prose, no markdown fences, no trailing commentary — "
                 "matching the structure asked for."
+            )
+            if is_truncated:
+                # The identical budget is what truncated the first response:
+                # give the second draw room to finish, and say why, so the model
+                # compresses string values instead of re-expanding them.
+                reask_max_tokens = min(max_tokens * 2, self.JSON_REASK_MAX_TOKENS)
+                reask_system += (
+                    " Your previous response was CUT OFF before the JSON document was"
+                    " complete. Emit the complete document; keep individual string"
+                    " values concise so it fits the output budget."
+                )
+            logger.warning(
+                "json parse failed — one re-ask before giving up phase=%s chars=%d "
+                "truncated=%s reask_max_tokens=%d",
+                phase,
+                len(text),
+                is_truncated,
+                reask_max_tokens,
+                extra={
+                    "phase": phase,
+                    "status": "retry",
+                    "truncated": is_truncated,
+                    "reask_max_tokens": reask_max_tokens,
+                },
             )
             retry_text = self.chat(
                 reask_system,
                 user,
                 model=model,
                 temperature=temperature,
-                max_tokens=max_tokens,
+                max_tokens=reask_max_tokens,
                 phase=phase,
             )
             try:
@@ -2139,14 +2176,26 @@ class LLMClient:
                 raise failure from retry_exc
 
 
-def _parse_json(text: str) -> Any:
-    """Parse JSON from a model response, tolerating fences/prose around it."""
+def _strip_code_fences(text: str) -> str:
+    """Remove one layer of markdown code fencing, if present.
+
+    Shared by :func:`_parse_json` (parse the fenced document) and ``chat_json``'s
+    truncation classifier (classify the document, not its wrapper): the two must
+    agree on what the model's JSON candidate actually is, or a fence-wrapped
+    truncation would be misread as an essay.
+    """
     candidate = text.strip()
     if candidate.startswith("```"):
         candidate = candidate.strip("`")
         if candidate.lower().startswith("json"):
             candidate = candidate[4:]
         candidate = candidate.strip()
+    return candidate
+
+
+def _parse_json(text: str) -> Any:
+    """Parse JSON from a model response, tolerating fences/prose around it."""
+    candidate = _strip_code_fences(text)
     try:
         return json.loads(candidate)
     except json.JSONDecodeError:
