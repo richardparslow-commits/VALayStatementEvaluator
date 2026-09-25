@@ -435,6 +435,7 @@ def _head_route_exists(url: str) -> bool | None:
 #: Resolved schema per base URL. Populated once per process per endpoint: the
 #: probe is a startup-time cost and the answer does not change mid-run.
 _SCHEMA_CACHE: dict[str, str] = {}
+_SCHEMA_CACHE_LOCK = threading.Lock()
 
 
 def _endpoint_schema(base_url: str) -> str:
@@ -455,24 +456,31 @@ def _endpoint_schema(base_url: str) -> str:
     override = (getattr(_config_module(), "LLM_ENDPOINT_SCHEMA", "") or "").strip().lower()
     if override in ("responses", "chat"):
         return override
+    # Fast path: check cache without lock (read is atomic for dict.get)
     cached = _SCHEMA_CACHE.get(base_url)
     if cached:
         return cached
-    guess = "responses" if _is_perplexity_base_url(base_url) else "chat"
-    root = base_url.rstrip("/")
-    responses_route = _head_route_exists(f"{root}/responses")
-    chat_route = _head_route_exists(f"{root}/chat/completions")
-    schema: str | None = None
-    if responses_route and chat_route is False:
-        schema = "responses"
-    elif chat_route and responses_route is False:
-        schema = "chat"
-    elif responses_route and chat_route:
-        # Both routes exist: the host's documented shape wins.
-        schema = guess
-    resolved = schema or guess
-    _SCHEMA_CACHE[base_url] = resolved
-    return resolved
+    # Slow path: acquire lock and re-check before probing
+    with _SCHEMA_CACHE_LOCK:
+        # Another thread may have populated the cache while we waited
+        cached = _SCHEMA_CACHE.get(base_url)
+        if cached:
+            return cached
+        guess = "responses" if _is_perplexity_base_url(base_url) else "chat"
+        root = base_url.rstrip("/")
+        responses_route = _head_route_exists(f"{root}/responses")
+        chat_route = _head_route_exists(f"{root}/chat/completions")
+        schema: str | None = None
+        if responses_route and chat_route is False:
+            schema = "responses"
+        elif chat_route and responses_route is False:
+            schema = "chat"
+        elif responses_route and chat_route:
+            # Both routes exist: the host's documented shape wins.
+            schema = guess
+        resolved = schema or guess
+        _SCHEMA_CACHE[base_url] = resolved
+        return resolved
 
 
 def _config_module() -> Any:
@@ -2041,13 +2049,13 @@ class LLMClient:
 
     # ------------------------------------------------------------------ json
 
-    #: Upper bound on the first response that may be re-asked. A small response
-    #: that fails to parse is sampling noise; a ~16k-character one is more often
-    #: the model writing an essay — and re-asking with the full user payload
-    #: doubles the spend on a call that is likely to miss again. Above the cap the
-    #: original fail-fast behavior stands (a digest chunk is dropped, the run
-    #: proceeds — that policy is unchanged).
-    JSON_REASK_MAX_CHARS = 8_000
+    #: Upper bound on the first response that may be re-asked for *stochastic*
+    #: parse failures (malformed JSON, markdown fences, etc.). A ~16k-character
+    #: response that fails to parse is more often the model writing an essay than
+    #: sampling noise, and re-asking doubles the spend on a call likely to miss
+    #: again. Truncated responses (hit max_tokens mid-structure) bypass this cap
+    #: — they are deterministic failures worth recovering, not stochastic ones.
+    JSON_REASK_MAX_CHARS = 32_768
 
     #: One bounded re-ask: stochastically malformed output is worth a second
     #: chance; identical input is not worth a third (the moderation-nudge precedent:
@@ -2091,16 +2099,26 @@ class LLMClient:
             failure = LLMParseError(
                 f"Could not parse JSON for phase '{phase}' (response chars={len(text)})."
             )
-            if (
-                self.JSON_REASK_ATTEMPTS <= 0
-                or len(text) > self.JSON_REASK_MAX_CHARS
-            ):
+            # Detect truncation: response ends mid-structure or hit max_tokens.
+            # Truncated responses are deterministic failures worth recovering,
+            # not stochastic noise — always re-ask them regardless of size.
+            stripped = text.rstrip()
+            is_truncated = (
+                not stripped.endswith(("}", "]"))
+                or stripped.endswith((",", ":", "{", "["))
+                or len(text) >= max_tokens * 3  # Heuristic: ~4 chars/token
+            )
+            if self.JSON_REASK_ATTEMPTS <= 0:
+                raise failure from exc
+            # For non-truncated responses above the cap, fail fast (likely an essay)
+            if len(text) > self.JSON_REASK_MAX_CHARS and not is_truncated:
                 raise failure from exc
             logger.warning(
-                "json parse failed — one re-ask before giving up phase=%s chars=%d",
+                "json parse failed — one re-ask before giving up phase=%s chars=%d truncated=%s",
                 phase,
                 len(text),
-                extra={"phase": phase, "status": "retry"},
+                is_truncated,
+                extra={"phase": phase, "status": "retry", "truncated": is_truncated},
             )
             reask_system = json_system + (
                 "\n\nYour previous response was not valid JSON. Return ONLY the JSON "
