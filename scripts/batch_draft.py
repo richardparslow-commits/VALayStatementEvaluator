@@ -422,6 +422,19 @@ EMPTY_DIGEST_STATE = {
 }
 
 
+def _fresh_empty_state() -> dict:
+    """A per-call copy of EMPTY_DIGEST_STATE with fresh list values.
+
+    ``dict(EMPTY_DIGEST_STATE)`` shallow-copies: every empty/quarantined batch
+    would alias the constant's ``facts``/``conditions``/``providers`` lists, and
+    one in-place ``.append`` would cross-contaminate all of them *and the module
+    constant* the tests pin. Keep the constant (tests reference
+    ``batch_draft.EMPTY_DIGEST_STATE``); copy through this helper.
+    """
+    return {k: (list(v) if isinstance(v, list) else v)
+            for k, v in EMPTY_DIGEST_STATE.items()}
+
+
 def digest_group(llm: Any, cfg: BatchConfig, group_label: str,
                  files: list[Path], depth: int = 0) -> tuple[dict, list[str]]:
     """Digest a group of staged part files, bisecting on an isolated failure.
@@ -441,7 +454,7 @@ def digest_group(llm: Any, cfg: BatchConfig, group_label: str,
     # batches), but defensive programming prevents theoretical edge cases.
     if not files:
         log(f"{group_label}: EMPTY — no files to process")
-        return dict(EMPTY_DIGEST_STATE), []
+        return _fresh_empty_state(), []
 
     sdir = cfg.out_dir / "staging" / group_label
     sdir.mkdir(parents=True, exist_ok=True)
@@ -476,7 +489,7 @@ def digest_group(llm: Any, cfg: BatchConfig, group_label: str,
         if len(files) == 1 or depth >= 6:
             log(f"{group_label}: QUARANTINED {len(files)} file(s) "
                 f"[{', '.join(f.name for f in files)}] — {msg}")
-            state = dict(EMPTY_DIGEST_STATE)
+            state = _fresh_empty_state()
             state.update({"quarantined": [f.name for f in files], "error": msg,
                           "files": len(files), "pages": pages, "duration_s": 0.0})
             return state, [f.name for f in files]
@@ -594,11 +607,13 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
         parts = [digest_from_state(s) for s in batch_states.values()]
         all_facts = [f for d in parts for f in d.facts]
         log(f"combined: {len(all_facts)} facts from {len(parts)} batches -> dedupe")
-        # Memory pressure warning: for very large runs (6,000+ facts from 5,000-page
-        # bundles), the dedupe and merge phases create additional copies of the fact
-        # list. Peak memory during final_phase can spike to 20-30 MB for 10,000+ facts.
-        # This is manageable on modern systems but worth monitoring.
-        if len(all_facts) > 10_000:
+        # Memory pressure warning: at the 6,000+ fact design scale (5,000-page
+        # bundles) the dedupe and merge phases create additional copies of the
+        # fact list, and peak memory during final_phase climbs toward 20-30 MB
+        # by ~10,000 facts. The threshold matches the design scale so the
+        # warning actually fires on production-sized runs — at the old 10,000
+        # mark it never could. Log-only: counts, no PHI.
+        if len(all_facts) > 6_000:
             log(f"WARNING: High fact count ({len(all_facts):,}) — final phase memory "
                 f"usage may spike. Consider reducing batch size or increasing worker "
                 f"memory limits if the system is under pressure.")

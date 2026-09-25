@@ -174,6 +174,34 @@ class TestMergeStates(unittest.TestCase):
         self.assertEqual(m["coverage_ratio"], 1.0)
 
 
+class TestEmptyStateFreshness(unittest.TestCase):
+    """Empty/quarantined batches must never alias EMPTY_DIGEST_STATE's lists."""
+
+    def test_fresh_states_do_not_alias_each_other_or_the_constant(self) -> None:
+        a = batch_draft._fresh_empty_state()
+        b = batch_draft._fresh_empty_state()
+        a["facts"].append({"description": "x"})
+        a["conditions"].append("PTSD")
+        a["providers"].append("VA")
+        self.assertEqual(b["facts"], [])
+        self.assertEqual(b["conditions"], [])
+        self.assertEqual(b["providers"], [])
+        self.assertEqual(batch_draft.EMPTY_DIGEST_STATE["facts"], [])
+        self.assertEqual(batch_draft.EMPTY_DIGEST_STATE["conditions"], [])
+        self.assertEqual(batch_draft.EMPTY_DIGEST_STATE["providers"], [])
+
+    def test_fresh_state_keeps_the_pinned_shape(self) -> None:
+        self.assertEqual(batch_draft._fresh_empty_state(),
+                         batch_draft.EMPTY_DIGEST_STATE)
+
+    def test_empty_group_guard_returns_unshared_state(self) -> None:
+        cfg = _make_cfg(Path(tempfile.mkdtemp()))
+        state, excluded = batch_draft.digest_group(object(), cfg, "batch_01", [])
+        self.assertEqual(excluded, [])
+        state["facts"].append({"description": "x"})
+        self.assertEqual(batch_draft.EMPTY_DIGEST_STATE["facts"], [])
+
+
 class TestBisectPolicy(unittest.TestCase):
     """One failing file must not quarantine its group."""
 
@@ -243,6 +271,19 @@ class TestBisectPolicy(unittest.TestCase):
         state, excluded = self._run_group(cfg, {"a.pdf", "b.pdf"})
         self.assertEqual(excluded, ["a.pdf", "b.pdf"])
         self.assertEqual(state["facts"], [])
+
+    def test_quarantine_state_does_not_alias_the_constant(self) -> None:
+        cfg = _make_cfg(Path(tempfile.mkdtemp()))
+        (cfg.records_dir / "poison.pdf").write_text("EVT note.", encoding="utf-8")
+
+        state, excluded = self._run_group(cfg, {"poison.pdf"})
+        self.assertEqual(excluded, ["poison.pdf"])
+        # Mutating a quarantined batch's state must not touch the constant or
+        # any other batch's lists.
+        state["conditions"].append("PTSD")
+        state["facts"].append({"description": "x"})
+        self.assertEqual(batch_draft.EMPTY_DIGEST_STATE["conditions"], [])
+        self.assertEqual(batch_draft.EMPTY_DIGEST_STATE["facts"], [])
 
     def test_no_failure_returns_full_group(self) -> None:
         cfg = _make_cfg(Path(tempfile.mkdtemp()))
