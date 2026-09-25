@@ -60,12 +60,26 @@ class TestLsofParsing(unittest.TestCase):
 
     def test_named_port_resolved_numerically(self) -> None:
         """The live sidecar shows as ``*:vcom-tunnel`` — service-name form
-        for port 8001 (``/etc/services``; the run doc's sidecar port)."""
-        snap = self._parse("f21", "n*:vcom-tunnel")
+        for port 8001 (``/etc/services``; the run doc's sidecar port).
+
+        ``vcom-tunnel`` exists in macOS's services database but not Linux's,
+        so mock ``socket.getservbyname`` for cross-platform determinism.
+        """
+        import socket
+
+        with mock.patch.object(
+            socket, "getservbyname", return_value=8001
+        ):
+            snap = self._parse("f21", "n*:vcom-tunnel")
         self.assertEqual(snap, {21: ("0.0.0.0", 8001)})
 
     def test_multiple_listens_kept_apart_by_fd(self) -> None:
-        snap = self._parse("f6", "nlocalhost:8501", "f21", "n*:vcom-tunnel")
+        import socket
+
+        with mock.patch.object(
+            socket, "getservbyname", return_value=8001
+        ):
+            snap = self._parse("f6", "nlocalhost:8501", "f21", "n*:vcom-tunnel")
         self.assertEqual(
             snap, {6: ("localhost", 8501), 21: ("0.0.0.0", 8001)}
         )
