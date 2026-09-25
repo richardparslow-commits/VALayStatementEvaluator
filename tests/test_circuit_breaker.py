@@ -117,6 +117,35 @@ class TestCircuitBreakerUnit(unittest.TestCase):
             breaker.record_failure()
         self.assertEqual(breaker.state, "OPEN")
 
+    def test_half_open_admits_every_call_until_a_verdict_is_reported(self) -> None:
+        """HALF_OPEN is a permissive trial, not one metered probe slot.
+
+        A slot whose holder never reports back (a cancelled or crashed call)
+        would wedge the breaker shut for the life of the process, so the trial
+        instead admits every caller — bounded in practice by the concurrency
+        limiter and rate gate — and the first reported verdict ends it. The
+        module docstring once promised "lets one probe through"; this pins the
+        real contract so the docs and the gate cannot drift apart again.
+        """
+        breaker = CircuitBreaker(failure_threshold=2, recovery_timeout=0.05, name="t")
+        with self.assertLogs("app.circuit_breaker", level="WARNING"):
+            breaker.record_failure()
+            breaker.record_failure()
+        time.sleep(0.08)
+        with self.assertLogs("app.circuit_breaker", level="WARNING"):
+            self.assertTrue(breaker.allow_request())  # transitions to HALF_OPEN
+        self.assertEqual(breaker.state, "HALF_OPEN")
+        # Every concurrent caller is admitted while the trial is undecided —
+        # a metered probe slot would refuse the second one.
+        self.assertTrue(breaker.allow_request())
+        self.assertTrue(breaker.allow_request())
+        self.assertEqual(breaker.state, "HALF_OPEN")
+        # The first reported verdict ends the trial, for every waiter at once.
+        with self.assertLogs("app.circuit_breaker", level="WARNING"):
+            breaker.record_failure()
+        self.assertEqual(breaker.state, "OPEN")
+        self.assertFalse(breaker.allow_request(), "re-opened for a full window")
+
     def test_state_changes_log_at_warning(self) -> None:
         breaker = CircuitBreaker(failure_threshold=1, recovery_timeout=60, name="t")
         with self.assertLogs("app.circuit_breaker", level="WARNING") as cm:

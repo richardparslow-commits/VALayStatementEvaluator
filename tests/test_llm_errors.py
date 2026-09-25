@@ -123,6 +123,62 @@ class TestChatJsonReask(unittest.TestCase):
         client = self._client([at_cap, '{"ok": 1}'])
         self.assertEqual(client.chat_json("sys", "user"), {"ok": 1})
 
+    # ------------------------------------------------- truncation recovery --
+    # A truncation is a deterministic budget failure: the identical max_tokens
+    # would truncate the re-ask again, so it must bypass the spend cap and be
+    # retried with a doubled output budget.
+
+    #: Mirrors the ``chat_json(max_tokens=8000)`` literal default.
+    _DEFAULT_MAX_TOKENS = 8000
+
+    def test_a_truncated_response_above_the_cap_is_reasked_with_a_bigger_budget(self) -> None:
+        # 33k chars (over the 32,768 cap), opens with "{", cut mid-string.
+        truncated = '{"summary": "' + "x" * 33_000
+        client = self._client([truncated, '{"ok": true}'])
+        self.assertEqual(client.chat_json("sys", "user"), {"ok": True})
+        self.assertEqual(client.chat.call_count, 2)
+        second = client.chat.call_args_list[1]
+        self.assertEqual(
+            second.kwargs["max_tokens"],
+            min(self._DEFAULT_MAX_TOKENS * 2, LLMClient.JSON_REASK_MAX_TOKENS),
+        )
+        self.assertIn("CUT OFF", second[0][0])
+
+    def test_a_truncated_response_ending_on_an_inner_closer_is_detected_via_the_budget(self) -> None:
+        # Worst case for the ends-with-closer check: the budget cut landed
+        # immediately after a nested closer. len 43k >= max_tokens * 3 (24k)
+        # proves the budget was consumed and the document cannot be complete.
+        truncated = '{"summary": "' + "x" * 43_000 + '{"a": 1}'
+        client = self._client([truncated, '{"ok": true}'])
+        self.assertEqual(client.chat_json("sys", "user"), {"ok": True})
+        self.assertEqual(client.chat.call_count, 2)
+        second = client.chat.call_args_list[1]
+        self.assertEqual(
+            second.kwargs["max_tokens"],
+            min(self._DEFAULT_MAX_TOKENS * 2, LLMClient.JSON_REASK_MAX_TOKENS),
+        )
+
+    def test_a_fence_wrapped_truncation_is_classified_on_the_document(self) -> None:
+        # The classifier must strip markdown fences like _parse_json does: the
+        # raw text ends with backticks, but the *document* was cut mid-value.
+        truncated = "```json\n" + '{"summary": "' + "x" * 33_000 + "\n```"
+        client = self._client([truncated, '{"ok": true}'])
+        self.assertEqual(client.chat_json("sys", "user"), {"ok": True})
+        second = client.chat.call_args_list[1]
+        self.assertEqual(
+            second.kwargs["max_tokens"],
+            min(self._DEFAULT_MAX_TOKENS * 2, LLMClient.JSON_REASK_MAX_TOKENS),
+        )
+
+    def test_a_stochastic_reask_keeps_the_original_token_budget(self) -> None:
+        # Under the cap, no truncation signal: plain re-ask, budget unchanged.
+        client = self._client(["Here you go: not JSON", '{"ok": true}'])
+        self.assertEqual(client.chat_json("sys", "user"), {"ok": True})
+        self.assertEqual(client.chat.call_count, 2)
+        second = client.chat.call_args_list[1]
+        self.assertEqual(second.kwargs["max_tokens"], self._DEFAULT_MAX_TOKENS)
+        self.assertNotIn("CUT OFF", second[0][0])
+
     def test_valid_json_on_the_first_try_is_not_reasked(self) -> None:
         client = self._client(['{"ok": true}'])
         self.assertEqual(client.chat_json("sys", "user"), {"ok": True})

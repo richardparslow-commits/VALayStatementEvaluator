@@ -317,18 +317,21 @@ def usage_to_json(usage: UsageTracker) -> dict[str, Any]:
 
 def usage_from_json(raw: Any) -> UsageTracker:
     tracker = UsageTracker()
-    for item in _dict_items(_as_dict(raw).get("entries")):
-        tracker.entries.append(
-            UsageEntry(
-                model=_as_str(item.get("model")),
-                phase=_as_str(item.get("phase")),
-                prompt_tokens=_as_int(item.get("prompt_tokens")),
-                completion_tokens=_as_int(item.get("completion_tokens")),
-                # Missing (an older web pod's payload) reads as the primary, which
-                # is what a payload without the field actually meant.
-                endpoint=_as_str(item.get("endpoint")) or PRIMARY_ENDPOINT,
-            )
+    entries = [
+        UsageEntry(
+            model=_as_str(item.get("model")),
+            phase=_as_str(item.get("phase")),
+            prompt_tokens=_as_int(item.get("prompt_tokens")),
+            completion_tokens=_as_int(item.get("completion_tokens")),
+            # Missing (an older web pod's payload) reads as the primary, which
+            # is what a payload without the field actually meant.
+            endpoint=_as_str(item.get("endpoint")) or PRIMARY_ENDPOINT,
         )
+        for item in _dict_items(_as_dict(raw).get("entries"))
+    ]
+    # Bulk-load through the tracker's locked write path rather than touching
+    # ``entries`` directly: see UsageTracker.add_entries.
+    tracker.add_entries(entries)
     return tracker
 
 

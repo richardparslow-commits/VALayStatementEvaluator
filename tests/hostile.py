@@ -111,8 +111,15 @@ HOSTILE_ENVIRONMENT: dict[str, str] = {
     "VA_LSE_AUDIT_LOG_BACKUPS": "1",
     "VA_LSE_AUDIT_RETENTION_DAYS": "1",
     "VA_LSE_AUDIT_ERROR_MESSAGES": "0",
+    # Backup destinations. Every endpoint a cloud SDK could dial is pinned to
+    # an RFC 2606 ``.invalid`` host, so if a canary ever regresses and the app
+    # honours one of these values the call fails closed on a guaranteed NXDOMAIN
+    # instead of reaching real, third-party (squattable) infrastructure. The
+    # bucket and container names are inert for the same reason: no client can
+    # carry them to a real service through these endpoints.
     "VA_LSE_AUDIT_BACKUP_DESTINATION": "s3",
     "VA_LSE_AUDIT_BACKUP_S3_BUCKET": "hostile-bucket",
+    "VA_LSE_AUDIT_BACKUP_S3_ENDPOINT_URL": "https://hostile.s3.invalid",
     "VA_LSE_AUDIT_BACKUP_DIR": "/tmp/va-lse-hostile-audit-backup",
     "VA_LSE_AUDIT_BACKUP_STATE_FILE": "/tmp/va-lse-hostile-audit-backup/state.json",
     "VA_LSE_AUDIT_BACKUP_INTERVAL_HOURS": "1",
@@ -120,7 +127,10 @@ HOSTILE_ENVIRONMENT: dict[str, str] = {
     "VA_LSE_AUDIT_BACKUP_CLOUD_RETENTION_DAYS": "1",
     "VA_LSE_AUDIT_BACKUP_GCS_BUCKET": "hostile-gcs-bucket",
     "VA_LSE_AUDIT_BACKUP_GCS_PREFIX": "hostile/",
-    "VA_LSE_AUDIT_BACKUP_AZURE_ACCOUNT_URL": "https://hostile.blob.core.windows.net",
+    # google-cloud-storage has no VA_LSE endpoint knob; its SDK reads this
+    # variable itself, which redirects (and de-credentials) every API call.
+    "STORAGE_EMULATOR_HOST": "https://hostile-gcs.invalid",
+    "VA_LSE_AUDIT_BACKUP_AZURE_ACCOUNT_URL": "https://hostile.blob.core.windows.invalid",
     "VA_LSE_AUDIT_BACKUP_AZURE_CONTAINER": "hostile-container",
     "VA_LSE_AUDIT_BACKUP_AZURE_PREFIX": "hostile/",
     "VA_LSE_AUDIT_BACKUP_REQUIRED": "0",

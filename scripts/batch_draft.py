@@ -22,7 +22,12 @@ that is the wrong granularity — one dense chunk whose digest response overflow
 the output cap (measured: 21,339 chars, JSON truncated mid-string) must not
 quarantine its 12 siblings. So on failure the group bisects in half and each
 half retries; a file that fails ALONE is quarantined (excluded, recorded in
-state) and the rest of its group survives. The review pass is treated the way
+state) and the rest of its group survives. A breaker-open cascade is the one
+failure that is not a file verdict: every chunk was refused before it was sent,
+so the group waits out the breaker's recovery and retries WHOLE (bounded by
+BREAKER_CASCADE_WAITS_MAX), and a sustained outage fails the batch retryably —
+state records an error, resume re-runs it, and quarantine stays reserved for
+files that were actually reviewed and failed. The review pass is treated the way
 ``run_draft`` treats it: a failure there keeps the finished draft and records
 the miss instead of discarding hours of work.
 
@@ -422,14 +427,69 @@ EMPTY_DIGEST_STATE = {
 }
 
 
+def _fresh_empty_state() -> dict:
+    """A per-call copy of EMPTY_DIGEST_STATE with fresh list values.
+
+    ``dict(EMPTY_DIGEST_STATE)`` shallow-copies: every empty/quarantined batch
+    would alias the constant's ``facts``/``conditions``/``providers`` lists, and
+    one in-place ``.append`` would cross-contaminate all of them *and the module
+    constant* the tests pin. Keep the constant (tests reference
+    ``batch_draft.EMPTY_DIGEST_STATE``); copy through this helper.
+    """
+    return {k: (list(v) if isinstance(v, list) else v)
+            for k, v in EMPTY_DIGEST_STATE.items()}
+
+
+#: How many breaker-recovery waits one group lineage spends on cascade
+#: failures before giving up and failing the batch retryably. Each wait is
+#: the breaker's own recovery clock (it re-probes the provider), so this
+#: bounds the retries, not the wall time — a provider outage that outlasts it
+#: ends in an "error" shard that resume re-runs, never in a quarantine.
+BREAKER_CASCADE_WAITS_MAX = 3
+
+#: review_medical_records quotes the failed chunks' exception class in the
+#: LLMError it raises (via _failure_summary); this token identifies a
+#: breaker cascade from the message alone.
+_BREAKER_CASCADE_MARK = "CircuitBreakerOpenError"
+
+
+def _breaker_is_open() -> bool:
+    """Whether the process-wide LLM breaker is OPEN right now (read-only)."""
+    from app.circuit_breaker import get_llm_breaker
+
+    return get_llm_breaker().state == "OPEN"
+
+
+def _is_breaker_cascade(exc: BaseException) -> bool:
+    """Whether a digest failure is a breaker-open cascade, not a file fault.
+
+    Two signals, either sufficient. The breaker being OPEN right now: every
+    chunk of the group was refused before it was sent (<2 s, no network), so
+    the files were never reviewed and bisecting can only manufacture
+    quarantines. Or the raised message naming the breaker error class —
+    review_medical_records quotes the failed chunk exception when it embeds
+    one in the LLMError it raises, which covers the race where the breaker
+    recovered between the last refused chunk and this check. A genuinely
+    faulty file that fails while the breaker happens to be open resurfaces
+    on the whole-group retry after recovery — with the breaker closed, the
+    ordinary bisect-or-quarantine path then handles it.
+    """
+    return _breaker_is_open() or _BREAKER_CASCADE_MARK in str(exc)
+
+
 def digest_group(llm: Any, cfg: BatchConfig, group_label: str,
-                 files: list[Path], depth: int = 0) -> tuple[dict, list[str]]:
+                 files: list[Path], depth: int = 0,
+                 breaker_waits: int = 0) -> tuple[dict, list[str]]:
     """Digest a group of staged part files, bisecting on an isolated failure.
 
     Returns the merged digest-state dict and the list of file names that were
     quarantined. A file that fails alone is excluded and recorded; its group
     survives. See the module docstring for why this overrides the all-or-
-    nothing granularity of ``review_medical_records``.
+    nothing granularity of ``review_medical_records``. A breaker-open cascade
+    is not a file verdict: the group waits out the breaker and retries whole
+    (at most ``BREAKER_CASCADE_WAITS_MAX`` times per lineage), after which the
+    batch fails retryably — quarantine stays reserved for files that were
+    actually reviewed and failed.
     """
     from app.documents import records_from_local_path
     from app.llm import LLMAuthError
@@ -441,7 +501,7 @@ def digest_group(llm: Any, cfg: BatchConfig, group_label: str,
     # batches), but defensive programming prevents theoretical edge cases.
     if not files:
         log(f"{group_label}: EMPTY — no files to process")
-        return dict(EMPTY_DIGEST_STATE), []
+        return _fresh_empty_state(), []
 
     sdir = cfg.out_dir / "staging" / group_label
     sdir.mkdir(parents=True, exist_ok=True)
@@ -472,19 +532,43 @@ def digest_group(llm: Any, cfg: BatchConfig, group_label: str,
             "the same command — completed batches resume from state.")
         raise SystemExit(2) from exc
     except Exception as exc:  # noqa: BLE001 — bisect or quarantine, per policy above
+        if _is_breaker_cascade(exc):
+            # An outage, not a file fault: the breaker refused every chunk
+            # before it was sent. Bisecting would walk the group down to
+            # single files and quarantine all of them permanently — the
+            # dead-key incident pattern (2026-09-22: one 401 quarantined nine
+            # healthy files) replayed with a cause that heals. Wait out the
+            # breaker's own recovery clock, then retry the group WHOLE.
+            if breaker_waits < BREAKER_CASCADE_WAITS_MAX:
+                log(f"{group_label}: breaker OPEN cascade ({type(exc).__name__}) — "
+                    f"no file verdict possible; waiting out recovery, then retrying "
+                    f"the group whole (wait {breaker_waits + 1}/"
+                    f"{BREAKER_CASCADE_WAITS_MAX})")
+                _wait_for_breaker(f"{group_label}'s digest")
+                return digest_group(llm, cfg, group_label, files, depth=depth,
+                                    breaker_waits=breaker_waits + 1)
+            # Sustained outage: fail the batch retryably. main() records
+            # {"error": ...} without "facts", so resume re-runs the batch —
+            # unlike a quarantine, which resume skips as done.
+            log(f"{group_label}: still cascading after {BREAKER_CASCADE_WAITS_MAX} "
+                f"breaker-recovery waits — failing the batch for resume instead "
+                f"of quarantining {len(files)} healthy file(s)")
+            raise
         msg = f"{type(exc).__name__}: {str(exc)[:200]}"
         if len(files) == 1 or depth >= 6:
             log(f"{group_label}: QUARANTINED {len(files)} file(s) "
                 f"[{', '.join(f.name for f in files)}] — {msg}")
-            state = dict(EMPTY_DIGEST_STATE)
+            state = _fresh_empty_state()
             state.update({"quarantined": [f.name for f in files], "error": msg,
                           "files": len(files), "pages": pages, "duration_s": 0.0})
             return state, [f.name for f in files]
         mid = len(files) // 2
         log(f"{group_label}: FAILED ({type(exc).__name__}) — bisecting {len(files)} files "
             f"into {mid}+{len(files) - mid}")
-        a, ea = digest_group(llm, cfg, f"{group_label}a", files[:mid], depth + 1)
-        b, eb = digest_group(llm, cfg, f"{group_label}b", files[mid:], depth + 1)
+        a, ea = digest_group(llm, cfg, f"{group_label}a", files[:mid], depth + 1,
+                             breaker_waits=breaker_waits)
+        b, eb = digest_group(llm, cfg, f"{group_label}b", files[mid:], depth + 1,
+                             breaker_waits=breaker_waits)
         merged = merge_states(a, b)
         merged["quarantined"] = sorted(set(merged.get("quarantined", [])) | set(ea) | set(eb))
         return merged, ea + eb
@@ -508,8 +592,17 @@ def _retry_phase(fn: Callable[[], Any], label: str, *, attempts: int = 8,
     This wraps them with a patient outer loop: wait out each burst, retry the
     whole call. The breaker-wait gate runs first so an OPEN breaker (fed by the
     burst) is waited out before the attempt, not burned as one.
+
+    The patience is for transients only. A credential refusal, a missing or
+    malformed setting, and anything the provider taxonomy marks
+    ``retriable=False`` (a content-filter 400, a deterministic 4xx rejection)
+    are re-raised on the first attempt: waiting out a burst cannot change a
+    verdict that does not depend on the burst, and sleeping the full ladder
+    (~10 minutes at defaults) only arrives later at the same answer. main()
+    records the final-phase error and resume retries it — nothing is lost by
+    failing now.
     """
-    from app.llm import LLMAuthError
+    from app.llm import LLMAuthError, LLMConfigurationError
 
     for attempt in range(1, attempts + 1):
         _wait_for_breaker(f"the {label} call")
@@ -517,7 +610,17 @@ def _retry_phase(fn: Callable[[], Any], label: str, *, attempts: int = 8,
             return fn()
         except LLMAuthError:
             raise  # a credential verdict never heals
+        except LLMConfigurationError:
+            raise  # a missing/malformed setting does not fix itself mid-run
         except Exception as exc:  # noqa: BLE001 — degraded bursts are the case this exists for
+            if not getattr(exc, "retriable", True):
+                # The provider taxonomy already ruled this rejection
+                # deterministic; the ladder would only sleep toward the same
+                # verdict. Fail fast and let the caller's error handling (and
+                # resume) own the outcome.
+                log(f"{label} call failed deterministically — "
+                    f"{type(exc).__name__}: {exc}")
+                raise
             if attempt == attempts:
                 raise
             wait = min(base_wait_s * attempt, 180.0)
@@ -594,11 +697,13 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
         parts = [digest_from_state(s) for s in batch_states.values()]
         all_facts = [f for d in parts for f in d.facts]
         log(f"combined: {len(all_facts)} facts from {len(parts)} batches -> dedupe")
-        # Memory pressure warning: for very large runs (6,000+ facts from 5,000-page
-        # bundles), the dedupe and merge phases create additional copies of the fact
-        # list. Peak memory during final_phase can spike to 20-30 MB for 10,000+ facts.
-        # This is manageable on modern systems but worth monitoring.
-        if len(all_facts) > 10_000:
+        # Memory pressure warning: at the 6,000+ fact design scale (5,000-page
+        # bundles) the dedupe and merge phases create additional copies of the
+        # fact list, and peak memory during final_phase climbs toward 20-30 MB
+        # by ~10,000 facts. The threshold matches the design scale so the
+        # warning actually fires on production-sized runs — at the old 10,000
+        # mark it never could. Log-only: counts, no PHI.
+        if len(all_facts) > 6_000:
             log(f"WARNING: High fact count ({len(all_facts):,}) — final phase memory "
                 f"usage may spike. Consider reducing batch size or increasing worker "
                 f"memory limits if the system is under pressure.")

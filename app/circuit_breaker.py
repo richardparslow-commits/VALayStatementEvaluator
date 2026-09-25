@@ -9,8 +9,13 @@ Stdlib-only implementation that mirrors the behaviour the spec asks for
   OPEN every call fails fast (``CircuitBreakerOpenError``) in <2 s without
   touching the network — this stops 100 concurrent users from hammering a
   degraded endpoint. After ``VA_LSE_CB_RECOVERY_SECONDS`` (default 60 s) the
-  breaker moves to HALF_OPEN and lets one probe through; a success closes it,
-  a failure re-opens it. All state changes log at WARNING.
+  breaker moves to HALF_OPEN and admits calls again; the first reported
+  verdict ends the trial — a success closes it, a failure re-opens it for
+  another full window. HALF_OPEN deliberately admits *every* caller instead
+  of metering a single probe slot: a slot whose holder never reports back (a
+  cancelled or crashed call) would wedge the breaker shut for the life of the
+  process, and the recovery burst is already bounded by the concurrency
+  limiter and rate gate below. All state changes log at WARNING.
 
 * **Concurrency limiter** — global semaphore with an in-memory queue.
   ``VA_LSE_MAX_CONCURRENT_LLM_CALLS`` (default 20) caps the number of LLM
@@ -196,7 +201,10 @@ class CircuitBreaker:
     def allow_request(self) -> bool:
         """Return True if a call may proceed, False if it must fail fast.
 
-        Handles the OPEN -> HALF_OPEN time-based transition.
+        Handles the OPEN -> HALF_OPEN time-based transition. HALF_OPEN admits
+        every caller — there is no single-probe slot to leak (see the module
+        docstring); the first ``record_success``/``record_failure`` ends the
+        trial.
         """
         with self._lock:
             if self._state == "CLOSED":

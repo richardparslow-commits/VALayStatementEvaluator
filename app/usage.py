@@ -114,6 +114,19 @@ class UsageTracker:
         with self._lock:
             self.entries.append(entry)
 
+    def add_entries(self, entries: list[UsageEntry]) -> None:
+        """Bulk-load pre-built entries under the lock (deserialisation path).
+
+        ``job_payload.usage_from_json`` rebuilds a tracker from a queued job's
+        payload; the tracker is thread-confined until returned, so this is
+        contention-free today — but routing the write through the same lock as
+        ``record()`` keeps a single guarded write path, so a future invariant
+        added to ``record()`` cannot be silently bypassed by the deserialiser.
+        """
+        new = list(entries)
+        with self._lock:
+            self.entries.extend(new)
+
     # ------------------------------------------------------------ aggregation
     def per_phase(self) -> OrderedDict[str, PhaseStats]:
         stats: OrderedDict[str, PhaseStats] = OrderedDict()
@@ -197,15 +210,34 @@ class UsageTracker:
         )
 
     def summary(self) -> dict[str, Any]:
-        """Structured totals for post-run display, including the endpoints used."""
-        total = self.totals()
+        """Structured totals for post-run display, including the endpoints used.
+
+        Aggregates from ONE snapshot: taking separate snapshots per field would
+        let a concurrent ``record()`` land between them and make
+        ``fallback_calls`` / ``endpoints`` disagree with ``calls`` inside the
+        same report. The class docstring promises readers a consistent
+        point-in-time view, so the whole report comes from a single one.
+        """
+        entries = self._snapshot()
+        total = PhaseStats()
+        seen: set[str] = set()
+        fallback_calls = 0
+        for entry in entries:
+            total.calls += 1
+            total.prompt_tokens += entry.prompt_tokens
+            total.completion_tokens += entry.completion_tokens
+            total.models[entry.model] += 1
+            if entry.endpoint:
+                seen.add(entry.endpoint)
+            if entry.endpoint == FALLBACK_ENDPOINT:
+                fallback_calls += 1
         return {
             "calls": total.calls,
             "prompt_tokens": total.prompt_tokens,
             "completion_tokens": total.completion_tokens,
             "total_tokens": total.total_tokens,
-            "endpoints": self.endpoints_used(),
-            "fallback_calls": sum(
-                1 for entry in self._snapshot() if entry.endpoint == FALLBACK_ENDPOINT
-            ),
+            "endpoints": [
+                name for name in (PRIMARY_ENDPOINT, FALLBACK_ENDPOINT) if name in seen
+            ],
+            "fallback_calls": fallback_calls,
         }
