@@ -9,6 +9,7 @@ we never guess one by default.
 """
 from __future__ import annotations
 
+import threading
 from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
@@ -52,10 +53,35 @@ class PhaseStats:
 
 
 class UsageTracker:
-    """Collect per-call usage across a single pipeline run."""
+    """Collect per-call usage across a single pipeline run.
+
+    Thread-safe: multiple LLM worker threads may call ``record()`` concurrently
+    (one per pipeline chunk), and the UI / job serialiser may read totals at the
+    same time.  A single ``threading.Lock`` guards both writes and the snapshot
+    taken by every aggregation method, so a reader always sees a consistent
+    point-in-time view of the entries list.
+    """
 
     def __init__(self) -> None:
         self.entries: list[UsageEntry] = []
+        self._lock = threading.Lock()
+
+    def _snapshot(self) -> list[UsageEntry]:
+        """Return a consistent copy of entries taken under the lock.
+
+        Holding the lock only for the list copy (not the aggregation loop)
+        keeps contention minimal — writers block for microseconds while the
+        reference is swapped, and readers do their arithmetic on a private list.
+        """
+        with self._lock:
+            return list(self.entries)
+
+    def entries_snapshot(self) -> list[UsageEntry]:
+        """Public read-only snapshot for external consumers (serialisers, views).
+
+        Returns a new list so callers cannot mutate the tracker's internal state.
+        """
+        return self._snapshot()
 
     def record(
         self,
@@ -70,28 +96,28 @@ class UsageTracker:
         endpoint: str = PRIMARY_ENDPOINT,
     ) -> None:
         """Record one completed call. Prefer real metadata when available."""
-        self.entries.append(
-            UsageEntry(
-                model=model,
-                endpoint=endpoint or PRIMARY_ENDPOINT,
-                phase=phase,
-                prompt_tokens=(
-                    prompt_tokens
-                    if prompt_tokens is not None
-                    else estimate_tokens(system) + estimate_tokens(user)
-                ),
-                completion_tokens=(
-                    completion_tokens
-                    if completion_tokens is not None
-                    else estimate_tokens(content)
-                ),
-            )
+        entry = UsageEntry(
+            model=model,
+            endpoint=endpoint or PRIMARY_ENDPOINT,
+            phase=phase,
+            prompt_tokens=(
+                prompt_tokens
+                if prompt_tokens is not None
+                else estimate_tokens(system) + estimate_tokens(user)
+            ),
+            completion_tokens=(
+                completion_tokens
+                if completion_tokens is not None
+                else estimate_tokens(content)
+            ),
         )
+        with self._lock:
+            self.entries.append(entry)
 
     # ------------------------------------------------------------ aggregation
     def per_phase(self) -> OrderedDict[str, PhaseStats]:
         stats: OrderedDict[str, PhaseStats] = OrderedDict()
-        for entry in self.entries:
+        for entry in self._snapshot():
             s = stats.setdefault(entry.phase, PhaseStats())
             s.calls += 1
             s.prompt_tokens += entry.prompt_tokens
@@ -107,7 +133,7 @@ class UsageTracker:
         the sidebar while the phase role is fixed by the pipeline.
         """
         roles: dict[str, int] = {"main": 0, "fast": 0}
-        for entry in self.entries:
+        for entry in self._snapshot():
             role = "fast" if entry.phase in FAST_MODEL_PHASES else "main"
             roles[role] += entry.prompt_tokens + entry.completion_tokens
         return roles
@@ -120,17 +146,17 @@ class UsageTracker:
         list, so a stored run record always answers "which endpoint produced this?"
         rather than leaving it silent.
         """
-        seen = {entry.endpoint for entry in self.entries if entry.endpoint}
+        seen = {entry.endpoint for entry in self._snapshot() if entry.endpoint}
         return [name for name in (PRIMARY_ENDPOINT, FALLBACK_ENDPOINT) if name in seen]
 
     @property
     def used_fallback(self) -> bool:
         """Whether any call in this run was served by the backup endpoint."""
-        return any(entry.endpoint == FALLBACK_ENDPOINT for entry in self.entries)
+        return any(entry.endpoint == FALLBACK_ENDPOINT for entry in self._snapshot())
 
     def totals(self) -> PhaseStats:
         total = PhaseStats()
-        for entry in self.entries:
+        for entry in self._snapshot():
             total.calls += 1
             total.prompt_tokens += entry.prompt_tokens
             total.completion_tokens += entry.completion_tokens
@@ -149,7 +175,7 @@ class UsageTracker:
         if not known:
             return None
         tokens_by_model: Counter[str] = Counter()
-        for entry in self.entries:
+        for entry in self._snapshot():
             tokens_by_model[entry.model] += entry.prompt_tokens + entry.completion_tokens
         credits = 0.0
         for model, tokens in tokens_by_model.items():
@@ -180,6 +206,6 @@ class UsageTracker:
             "total_tokens": total.total_tokens,
             "endpoints": self.endpoints_used(),
             "fallback_calls": sum(
-                1 for entry in self.entries if entry.endpoint == FALLBACK_ENDPOINT
+                1 for entry in self._snapshot() if entry.endpoint == FALLBACK_ENDPOINT
             ),
         }

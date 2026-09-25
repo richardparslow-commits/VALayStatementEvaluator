@@ -310,7 +310,7 @@ def usage_to_json(usage: UsageTracker) -> dict[str, Any]:
                 # the user reads, and a silently switched model must not vanish.
                 "endpoint": e.endpoint,
             }
-            for e in usage.entries
+            for e in usage.entries_snapshot()
         ]
     }
 
