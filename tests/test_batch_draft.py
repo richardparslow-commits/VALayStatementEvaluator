@@ -12,7 +12,9 @@ be right *before* anyone points it at 1,800 real pages:
 * the bisect-or-quarantine policy, driven through the real ``digest_group``
   code with the pipeline stubbed — a file that fails alone must not quarantine
   its siblings (the measured failure: one dense chunk's 21k-char truncated
-  JSON response);
+  JSON response), and a breaker-open cascade must not quarantine ANY of them
+  (an outage is not a file verdict: the group waits out the breaker and
+  retries whole, then fails retryably);
 * merge arithmetic and the final phase's failure semantics — a failed review
   call keeps the finished draft, exactly like ``run_draft``.
 
@@ -245,7 +247,12 @@ class TestBisectPolicy(unittest.TestCase):
 
     def _run_group(self, cfg, fail_names):
         p1, p2 = self._stub_review(fail_names)
-        with p1, p2:
+        # The stubs raise a plain RuntimeError; digest_group's breaker-cascade
+        # guard must not mistake it for an outage because another module's
+        # failures left the process-wide breaker OPEN (the same reason
+        # TestRetryPhase patches _wait_for_breaker).
+        with p1, p2, mock.patch.object(batch_draft, "_breaker_is_open",
+                                       return_value=False):
             return batch_draft.digest_group(
                 object(),  # the llm is passed straight to the stubbed review
                 cfg, "batch_01", sorted(cfg.records_dir.glob("*.pdf")),
@@ -294,6 +301,176 @@ class TestBisectPolicy(unittest.TestCase):
         self.assertEqual(excluded, [])
         self.assertEqual(len(state["facts"]), 2)
         self.assertEqual(state["files"], 2)
+
+
+class TestBreakerCascadePolicy(unittest.TestCase):
+    """A breaker-open cascade must never quarantine healthy files.
+
+    The breaker refuses every chunk before it is sent (<2 s, no network),
+    review_medical_records raises, and the generic handler used to bisect the
+    group down to single files — permanently quarantining all of them for a
+    transient outage, because resume skips a quarantined batch as done. The
+    dead-key incident pattern (2026-09-22) replayed with a cause that heals.
+    """
+
+    _CASCADE_MSG = ("Record review failed: CircuitBreakerOpenError: the endpoint "
+                    "was marked unhealthy; no request was sent")
+
+    def _stub_group(self, fail_times: int, msg: str):
+        """Stub the pipeline so whole-group review fails the first
+        ``fail_times`` calls with ``msg``, then returns a minimal digest.
+        Returns the call log (file names as presented) and the patches."""
+        from app.medical_review import MedicalDigest, MedicalFact
+
+        calls: list[list[str]] = []
+
+        def fake_docs(path_str):
+            from app.documents import DocumentPage, ExtractedDocument
+
+            path = Path(path_str)
+            docs = [
+                ExtractedDocument(
+                    filename=f.name,
+                    pages=[DocumentPage(f.name, 1, f"{f.name} EVT note.")],
+                )
+                for f in sorted(path.glob("*.pdf"))
+            ]
+            return docs, []
+
+        def fake_review(llm, docs, progress=None):  # noqa: ANN001
+            from app.llm import LLMError
+
+            calls.append(sorted(d.filename for d in docs))
+            if len(calls) <= fail_times:
+                raise LLMError(msg)
+            return MedicalDigest(
+                facts=[
+                    MedicalFact(date="2023-01-01", type="symptom",
+                                description=f"note from {d.filename}", source="p. 1")
+                    for d in docs
+                ],
+                pages_reviewed=len(docs), pages_in_files=len(docs),
+                chunks_reviewed=1,
+            )
+
+        return calls, (
+            mock.patch("app.documents.records_from_local_path", side_effect=fake_docs),
+            mock.patch("app.medical_review.review_medical_records",
+                       side_effect=fake_review),
+        )
+
+    def _cfg_with_files(self, names: tuple[str, ...]):
+        cfg = _make_cfg(Path(tempfile.mkdtemp()))
+        for name in names:
+            (cfg.records_dir / name).write_text("EVT note.", encoding="utf-8")
+        return cfg
+
+    def test_a_cascade_waits_out_the_breaker_and_retries_the_group_whole(self) -> None:
+        cfg = self._cfg_with_files(("a.pdf", "b.pdf"))
+        calls, (p1, p2) = self._stub_group(1, self._CASCADE_MSG)
+        with (
+            p1, p2,
+            mock.patch.object(batch_draft, "_breaker_is_open", return_value=False),
+            mock.patch.object(batch_draft, "_wait_for_breaker") as waited,
+        ):
+            state, excluded = batch_draft.digest_group(
+                object(), cfg, "batch_01", sorted(cfg.records_dir.glob("*.pdf")))
+        self.assertEqual(excluded, [])
+        self.assertEqual(state["quarantined"], [])
+        self.assertEqual(len(state["facts"]), 2)
+        # The retry presents the WHOLE group: no bisect during an outage.
+        self.assertEqual(calls, [["a.pdf", "b.pdf"], ["a.pdf", "b.pdf"]])
+        self.assertEqual(waited.call_count, 1)
+
+    def test_an_open_breaker_alone_marks_the_failure_as_cascade(self) -> None:
+        # The raised message quotes whichever exception set the cause, which a
+        # pure cascade can miss by name; the breaker's own OPEN state is the
+        # other arm of the detection and must work on its own.
+        cfg = self._cfg_with_files(("a.pdf", "b.pdf"))
+        calls, (p1, p2) = self._stub_group(
+            1, "Record review failed: LLMTimeoutError: LLM call timed out")
+        with (
+            p1, p2,
+            mock.patch.object(batch_draft, "_breaker_is_open", return_value=True),
+            mock.patch.object(batch_draft, "_wait_for_breaker") as waited,
+        ):
+            state, excluded = batch_draft.digest_group(
+                object(), cfg, "batch_01", sorted(cfg.records_dir.glob("*.pdf")))
+        self.assertEqual(excluded, [])
+        self.assertEqual(state["quarantined"], [])
+        self.assertEqual(len(state["facts"]), 2)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(waited.call_count, 1)
+
+    def test_a_sustained_cascade_fails_the_batch_retryably_not_quarantined(self) -> None:
+        from app.llm import LLMError
+
+        cfg = self._cfg_with_files(("a.pdf", "b.pdf"))
+        calls, (p1, p2) = self._stub_group(
+            batch_draft.BREAKER_CASCADE_WAITS_MAX + 5, self._CASCADE_MSG)
+        with (
+            p1, p2,
+            mock.patch.object(batch_draft, "_breaker_is_open", return_value=False),
+            mock.patch.object(batch_draft, "_wait_for_breaker") as waited,
+        ):
+            with self.assertRaises(LLMError):
+                batch_draft.digest_group(
+                    object(), cfg, "batch_01", sorted(cfg.records_dir.glob("*.pdf")))
+        # One attempt per wait in the budget, then the raise main() turns into
+        # an "error" shard (no "facts" key) — which resume RE-RUNS, unlike a
+        # quarantine it would skip as done. No bisect at any point.
+        self.assertEqual(len(calls), batch_draft.BREAKER_CASCADE_WAITS_MAX + 1)
+        self.assertEqual(waited.call_count, batch_draft.BREAKER_CASCADE_WAITS_MAX)
+        self.assertTrue(all(c == ["a.pdf", "b.pdf"] for c in calls),
+                        f"every attempt must present the whole group: {calls}")
+
+    def test_a_file_fault_with_a_closed_breaker_still_bisects(self) -> None:
+        # The cascade guard must not swallow the ordinary bisect policy: with
+        # the breaker closed and no breaker class in the message, a poison file
+        # is still quarantined alone (TestBisectPolicy's contract, re-pinned
+        # here against the new guard).
+        from app.medical_review import MedicalDigest, MedicalFact
+
+        cfg = self._cfg_with_files(("good.pdf", "poison.pdf"))
+
+        def fake_docs(path_str):
+            from app.documents import DocumentPage, ExtractedDocument
+
+            path = Path(path_str)
+            return ([ExtractedDocument(
+                         filename=f.name,
+                         pages=[DocumentPage(f.name, 1, f"{f.name} EVT note.")])
+                     for f in sorted(path.glob("*.pdf"))], [])
+
+        def fake_review(llm, docs, progress=None):  # noqa: ANN001
+            from app.llm import LLMError
+
+            names = {d.filename for d in docs}
+            if "poison.pdf" in names:
+                raise LLMError("Record review failed: LLMParseError: digest overflow")
+            return MedicalDigest(
+                facts=[
+                    MedicalFact(date="2023-01-01", type="symptom",
+                                description=f"note from {d.filename}", source="p. 1")
+                    for d in docs
+                ],
+                pages_reviewed=len(docs), pages_in_files=len(docs),
+                chunks_reviewed=1,
+            )
+
+        with (
+            mock.patch("app.documents.records_from_local_path", side_effect=fake_docs),
+            mock.patch("app.medical_review.review_medical_records",
+                       side_effect=fake_review),
+            mock.patch.object(batch_draft, "_breaker_is_open", return_value=False),
+            mock.patch.object(batch_draft, "_wait_for_breaker") as waited,
+        ):
+            state, excluded = batch_draft.digest_group(
+                object(), cfg, "batch_01", sorted(cfg.records_dir.glob("*.pdf")))
+        self.assertEqual(excluded, ["poison.pdf"])
+        self.assertEqual(state["quarantined"], ["poison.pdf"])
+        self.assertEqual(len(state["facts"]), 1)
+        waited.assert_not_called()
 
 
 class TestFinalPhaseSemantics(unittest.TestCase):
@@ -706,6 +883,65 @@ class TestRetryPhase(unittest.TestCase):
             with self.assertRaises(LLMAuthError):
                 batch_draft._retry_phase(refused, "unit test")
         self.assertEqual(len(calls), 1, "a credential verdict never heals")
+
+    def test_a_configuration_error_is_never_retried(self) -> None:
+        from app.llm import LLMConfigurationError
+
+        calls: list[int] = []
+
+        def misconfigured() -> None:
+            calls.append(1)
+            raise LLMConfigurationError("model_main is missing or malformed")
+
+        with (
+            self._run_without_breaker_wait(),
+            mock.patch.object(batch_draft.time, "sleep") as slept,
+        ):
+            with self.assertRaises(LLMConfigurationError):
+                batch_draft._retry_phase(misconfigured, "unit test")
+        self.assertEqual(len(calls), 1, "a setting does not fix itself mid-run")
+        slept.assert_not_called()
+
+    def test_a_non_retriable_provider_rejection_is_never_retried(self) -> None:
+        from app.llm import LLMUpstreamError
+
+        calls: list[int] = []
+
+        def rejected() -> None:
+            calls.append(1)
+            raise LLMUpstreamError("LLM provider rejected the request",
+                                   retriable=False, status_code=400)
+
+        with (
+            self._run_without_breaker_wait(),
+            mock.patch.object(batch_draft.time, "sleep") as slept,
+        ):
+            with self.assertRaises(LLMUpstreamError):
+                batch_draft._retry_phase(rejected, "unit test")
+        self.assertEqual(len(calls), 1, "the provider taxonomy already ruled out a retry")
+        slept.assert_not_called()
+
+    def test_a_retriable_upstream_error_still_rides_the_ladder(self) -> None:
+        from app.llm import LLMUpstreamError
+
+        calls: list[int] = []
+
+        def throttled() -> str:
+            calls.append(1)
+            if len(calls) < 3:
+                raise LLMUpstreamError("Transient LLM provider error",
+                                       retriable=True, status_code=429)
+            return "summary text"
+
+        with (
+            self._run_without_breaker_wait(),
+            mock.patch.object(batch_draft.time, "sleep") as slept,
+        ):
+            result = batch_draft._retry_phase(throttled, "unit test")
+        self.assertEqual(result, "summary text")
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(slept.call_count, 2,
+                         "a degradation burst is exactly what the ladder exists for")
 
 
 def _gate_settings() -> "config.Settings":
