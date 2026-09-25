@@ -1000,6 +1000,52 @@ class TestAHostileEnvironmentCannotReachTheSuite(unittest.TestCase):
             )
 
 
+class TestTheHostileFixturesCannotReachRealInfrastructure(unittest.TestCase):
+    """Every endpoint in the hostile fixtures must fail closed.
+
+    The fixtures exist to prove the suite ignores ambient configuration. If that
+    proof ever regresses, the app would *use* these values — so none of them may
+    name a reachable host: RFC 2606 reserves ``.invalid`` for exactly this, and
+    a lookup under it is a guaranteed NXDOMAIN. The alternative — real DNS zones
+    like ``*.blob.core.windows.net``, or bucket names in the globally unique
+    S3/GCS namespaces with a default endpoint — turns a harness regression into
+    test-time egress toward third-party, squattable infrastructure.
+    """
+
+    def test_every_url_in_the_hostile_environment_is_unreachable(self) -> None:
+        for name, value in hostile.HOSTILE_ENVIRONMENT.items():
+            if "://" not in value:
+                continue
+            host = value.split("://", 1)[1].split("/", 1)[0]
+            self.assertTrue(
+                host.endswith(".invalid"),
+                f"{name} points at a reachable host: {host!r}",
+            )
+
+    def test_every_url_in_the_hostile_secrets_is_unreachable(self) -> None:
+        for name, value in hostile.HOSTILE_SECRETS.items():
+            if "://" not in value:
+                continue
+            host = value.split("://", 1)[1].split("/", 1)[0]
+            self.assertTrue(
+                host.endswith(".invalid"),
+                f"{name} points at a reachable host: {host!r}",
+            )
+
+    def test_the_cloud_backup_endpoints_are_pinned_invalid(self) -> None:
+        env = hostile.HOSTILE_ENVIRONMENT
+        # The fixtures select the S3 destination; the endpoint override is what
+        # keeps boto3 off real AWS.
+        self.assertEqual(env["VA_LSE_AUDIT_BACKUP_S3_ENDPOINT_URL"],
+                         "https://hostile.s3.invalid")
+        # google-cloud-storage has no VA_LSE knob; its SDK reads this itself.
+        self.assertEqual(env["STORAGE_EMULATOR_HOST"],
+                         "https://hostile-gcs.invalid")
+        self.assertTrue(
+            env["VA_LSE_AUDIT_BACKUP_AZURE_ACCOUNT_URL"].endswith(".invalid")
+        )
+
+
 class TestTheCIGateIsStillWired(unittest.TestCase):
     """A gate that can be deleted without a test noticing is not a gate.
 
