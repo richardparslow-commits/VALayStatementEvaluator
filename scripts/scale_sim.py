@@ -15,6 +15,15 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
+# Hermetic session: strip .env, secrets, and ambient configuration before any
+# app module imports. The scale sim is "offline" — no network, no API calls —
+# so it must not see the operator's real credentials or model settings. In CI
+# there is no .env, but locally the dotenv loader in app/config.py would fill
+# os.environ with real keys, and a script that accidentally constructed a real
+# LLM client instead of FakeLLM would spend real money. The same harness the
+# test modules use (tests/hermetic.py) prevents that here.
+import hermetic  # noqa: E402,F401  (hermetic session; see tests/hermetic.py)
+
 from app.documents import DocumentPage, ExtractedDocument  # noqa: E402
 from app.medical_review import review_medical_records  # noqa: E402
 from test_core import FakeLLM  # noqa: E402

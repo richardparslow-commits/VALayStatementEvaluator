@@ -2110,8 +2110,8 @@ class LLMClient:
             )
             if self.JSON_REASK_ATTEMPTS <= 0:
                 raise failure from exc
-            # For non-truncated responses above the cap, fail fast (likely an essay)
-            if len(text) > self.JSON_REASK_MAX_CHARS and not is_truncated:
+            # For responses above the cap, fail fast (likely an essay, not noise)
+            if len(text) > self.JSON_REASK_MAX_CHARS:
                 raise failure from exc
             logger.warning(
                 "json parse failed — one re-ask before giving up phase=%s chars=%d truncated=%s",
