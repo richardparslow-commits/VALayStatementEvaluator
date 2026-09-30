@@ -498,8 +498,9 @@ def _citation_quote_present(quote: str, text: str) -> bool:
             char.isalnum() or char == "_" or unicodedata.category(char).startswith("M")
         )
 
-    separators = ".,:/-"
-    lexical_joiners = "-‐‑–—'’/"
+    separators = ".,:/‐‑–—−-"
+    # Hyphens join lexical terms; en/em dashes separate sentence clauses.
+    lexical_joiners = "-‐‑'’/"
     numeric_suffixes = "%％‰‱+−-°℃℉±"
     # Suffixes belong to the value: 95%, 3+, and 37°C cannot be shortened to
     # 95, 3, or 37, nor can 37° be accepted as the complete 37°C token.
@@ -512,6 +513,9 @@ def _citation_quote_present(quote: str, text: str) -> bool:
         end = start + len(quote)
         before = text[start - 1] if start else ""
         after = text[end] if end < len(text) else ""
+        before_number = start - 1
+        while before_number >= 0 and text[before_number] in numeric_suffixes:
+            before_number -= 1
         splits_word = (
             word_char(quote[0]) and word_char(before)
             or word_char(quote[-1]) and word_char(after)
@@ -526,7 +530,7 @@ def _citation_quote_present(quote: str, text: str) -> bool:
         # likewise do not certify a prefix of a decimal, date or signed value.
         splits_number = (
             quote[0].isdigit() and bool(before) and (
-                before in "+-−<>≤≥≈~="
+                before in "+-−±<>≤≥≈~="
                 or (before in separators and start >= 2 and text[start - 2].isdigit())
             )
             or quote[0] in separators and len(quote) > 1 and quote[1].isdigit() and before.isdigit()
@@ -536,6 +540,9 @@ def _citation_quote_present(quote: str, text: str) -> bool:
             or ends_number and bool(after) and after in numeric_suffixes
             or ends_number and number_end != len(quote) - 1 and word_char(after)
             or quote[0] in numeric_suffixes and before.isdigit()
+            or (word_char(quote[0]) or quote[0] in numeric_suffixes)
+            and bool(before) and before in numeric_suffixes
+            and before_number >= 0 and text[before_number].isdigit()
         )
         if not splits_word and not splits_number:
             return True

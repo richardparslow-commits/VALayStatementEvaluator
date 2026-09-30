@@ -142,6 +142,24 @@ class TestCompleteQuoteMatching(unittest.TestCase):
                 self.assertEqual(verify_citations([fact(quote)], [document(source)])["missing"], 1)
                 self.assertEqual(verify_citations([fact(source)], [document(source)])["verified"], 1)
 
+    def test_temperature_unit_or_uncertainty_sign_cannot_be_detached(self):
+        for quote, source in (
+            ("C patient was discharged", "37°C patient was discharged"),
+            ("F patient was discharged", "98°F patient was discharged"),
+            ("5 mg taken orally daily", "±5 mg taken orally daily"),
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(verify_citations([fact(quote)], [document(source)])["missing"], 1)
+                self.assertEqual(verify_citations([fact(source)], [document(source)])["verified"], 1)
+
+    def test_sentence_dashes_are_boundaries_but_numeric_ranges_are_not(self):
+        quote = "he reports knee pain"
+        for dash in ("–", "—"):
+            with self.subTest(dash=dash):
+                self.assertEqual(verify_citations([fact(quote)], [document("fell" + dash + quote)])["verified"], 1)
+                self.assertEqual(verify_citations([fact(quote)], [document(quote + dash + "walks slowly")])["verified"], 1)
+                self.assertEqual(verify_citations([fact("5 mg taken orally daily")], [document("3" + dash + "5 mg taken orally daily")])["missing"], 1)
+
     def test_hyphenated_terms_and_contractions_cannot_be_split(self):
         for quote, source in (
             ("weight bearing for six weeks", "non-weight bearing for six weeks"),
@@ -276,6 +294,8 @@ class TestPilotCitationGate(unittest.TestCase):
         for quote, source in (
             ("oxygen saturation was 95", "oxygen saturation was 95%"),
             ("weight bearing for six weeks", "non-weight bearing for six weeks"),
+            ("C patient was discharged", "37°C patient was discharged"),
+            ("5 mg taken orally daily", "±5 mg taken orally daily"),
         ):
             with self.subTest(source=source):
                 llm = _SyntheticLLM([fact(quote)])
