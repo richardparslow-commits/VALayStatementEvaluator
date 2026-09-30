@@ -45,6 +45,8 @@ kubectl port-forward -n va-lse svc/va-lse 8501:80
 | `k8s-hpa.yaml` | Horizontal Pod Autoscaler (CPU-based, 3–20 replicas) |
 | `k8s-redis.yaml` | Redis StatefulSet backing the Pattern C job queue |
 | `k8s-worker.yaml` | Worker Deployment that executes queued runs (Pattern C) |
+| `k8s-blobs.yaml` | Shared filesystem PVC for large Pattern C job inputs |
+| `k8s-blob-cleanup.yaml` | Independent five-minute filesystem retention pass; requires matching TTL and tested cross-pod locking |
 | `k8s-logs.yaml` | ReadWriteMany PVC for the audit + run logs (mount it before applying the rest) |
 | `k8s-audit-backup.yaml` | CronJob that ships the audit log off-pod and enforces retention |
 

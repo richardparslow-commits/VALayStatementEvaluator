@@ -10,6 +10,7 @@ Two failure modes matter most here and both are covered directly:
   sha256 + size verification on every read is there to prevent.
 """
 import json
+import multiprocessing
 import os
 import sys
 import time
@@ -54,6 +55,20 @@ def _job(text: str = "EVT knee pain noted.", name: str = "a.txt") -> EvaluateJob
         request_id="req_blob",
         record_sources=["Upload"],
     )
+
+
+def _renew_in_process(root, attempted, finished):
+    import fcntl
+    flock = fcntl.flock
+
+    def announce(fd, operation):
+        if operation == fcntl.LOCK_EX:
+            attempted.set()
+        return flock(fd, operation)
+
+    with patch.object(fcntl, "flock", side_effect=announce):
+        FilesystemBlobStore(root, sweep_age_seconds=60).put(b"shared synthetic record")
+    finished.set()
 
 
 class TestContentAddressing(unittest.TestCase):
@@ -140,7 +155,9 @@ class TestFilesystemBlobStore(unittest.TestCase):
 
     def test_sweep_removes_expired_blobs_and_prunes_shards(self):
         ref = self.store.put(b"old")
-        self.assertEqual(self.store.sweep(max_age_seconds=-1), 1)
+        past = time.time() - 7200
+        os.utime(Path(self._tmp.name) / ref.key, (past, past))
+        self.assertEqual(self.store.sweep(max_age_seconds=3600), 1)
         with self.assertRaises(BlobNotFound):
             self.store.get(ref)
         # The empty shard directory is cleaned up too.
@@ -323,6 +340,89 @@ class TestInlineThreshold(unittest.TestCase):
 
 
 class TestSweepTiming(unittest.TestCase):
+    def test_reusing_expired_content_returns_a_readable_renewed_reference(self):
+        with TemporaryDirectory() as tmp:
+            store = FilesystemBlobStore(tmp, sweep_age_seconds=60)
+            ref = store.put(b"synthetic record")
+            old = time.time() - 120
+            os.utime(Path(tmp) / ref.key, (old, old))
+            # A new web process performs its first opportunistic sweep on put.
+            fresh_store = FilesystemBlobStore(tmp, sweep_age_seconds=60)
+            renewed = fresh_store.put(b"synthetic record")
+            self.assertEqual(renewed.key, ref.key)
+            self.assertEqual(fresh_store.get(renewed), b"synthetic record")
+            self.assertEqual(store.sweep(), 0)
+
+    def test_reuse_repairs_corrupt_content(self):
+        with TemporaryDirectory() as tmp:
+            store = FilesystemBlobStore(tmp)
+            ref = store.put(b"original")
+            (Path(tmp) / ref.key).write_bytes(b"corrupt!")
+            self.assertEqual(store.get(store.put(b"original")), b"original")
+
+    def test_cleanup_and_renewal_share_a_cross_process_lock(self):
+        ctx = multiprocessing.get_context("spawn")
+        with TemporaryDirectory() as tmp:
+            store = FilesystemBlobStore(tmp, sweep_age_seconds=60)
+            ref = store.put(b"shared synthetic record")
+            old = time.time() - 120
+            os.utime(Path(tmp) / ref.key, (old, old))
+            attempted, finished = ctx.Event(), ctx.Event()
+            child = ctx.Process(target=_renew_in_process, args=(tmp, attempted, finished))
+            try:
+                with store._storage_lock():
+                    child.start()
+                    self.assertTrue(attempted.wait(10), "writer never attempted the shared lock")
+                    self.assertFalse(finished.wait(0.2), "writer bypassed cleanup's shared lock")
+                    # Model deletion after cleanup has inspected the old mtime.
+                    (Path(tmp) / ref.key).unlink()
+                child.join(10)
+                self.assertEqual(child.exitcode, 0)
+                self.assertTrue(finished.is_set())
+                self.assertEqual(store.get(ref), b"shared synthetic record")
+                self.assertEqual(store.sweep(), 0)
+            finally:
+                if child.is_alive():
+                    child.terminate()
+                    child.join(5)
+
+    def test_invalid_retention_cannot_delete_fresh_data(self):
+        with TemporaryDirectory() as tmp:
+            store = FilesystemBlobStore(tmp)
+            ref = store.put(b"keep")
+            for age in (0, -1):
+                with self.assertRaises(BlobStoreError):
+                    store.sweep(max_age_seconds=age)
+                with self.assertRaises(BlobStoreError):
+                    FilesystemBlobStore(tmp, sweep_age_seconds=age)
+            self.assertEqual(store.get(ref), b"keep")
+
+    def test_crashed_write_is_swept_but_fresh_temporary_file_is_kept(self):
+        with TemporaryDirectory() as tmp:
+            store = FilesystemBlobStore(tmp, sweep_age_seconds=60)
+            ref = store.put(b"fresh")
+            shard = (Path(tmp) / ref.key).parent
+            abandoned = shard / ".tmp-abandoned"
+            active = shard / ".tmp-fresh"
+            abandoned.write_bytes(b"synthetic interrupted record")
+            active.write_bytes(b"synthetic fresh record")
+            old = time.time() - 120
+            os.utime(abandoned, (old, old))
+            self.assertEqual(store.sweep(dry_run=True), 1)
+            self.assertTrue(abandoned.exists())
+            self.assertEqual(store.sweep(), 1)
+            self.assertFalse(abandoned.exists())
+            self.assertTrue(active.exists())
+            self.assertEqual(store.get(ref), b"fresh")
+
+    def test_failed_atomic_write_leaves_no_temporary_record(self):
+        with TemporaryDirectory() as tmp:
+            store = FilesystemBlobStore(tmp)
+            with patch.object(os, "replace", side_effect=OSError("synthetic failure")):
+                with self.assertRaises(BlobStoreError):
+                    store.put(b"interrupted synthetic record")
+            self.assertEqual(list(Path(tmp).rglob(".tmp-*")), [])
+
     def test_opportunistic_sweep_is_rate_limited(self):
         """Many puts in a burst must not walk the whole tree each time."""
         with TemporaryDirectory() as tmp:

@@ -32,7 +32,9 @@
 #   # MinIO / R2 / DO Spaces also work: set VA_LSE_BLOB_S3_ENDPOINT_URL.
 #
 # Files are content-addressed and expire on a TTL sweep (VA_LSE_JOB_QUEUE_TTL_SECONDS,
-# 24 h default), so size the volume for roughly one day of peak traffic:
+# 24 h default, renewed on reuse). Apply k8s-blob-cleanup.yaml with matching TTL
+# and image to clean idle storage; verify cross-pod advisory flock on this PVC.
+# Size the volume for roughly one day of peak traffic:
 # concurrent_jobs x extracted_text_per_job. A 2,000-page bundle is single-digit MB
 # of text, not the size of the PDF.
 apiVersion: v1

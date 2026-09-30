@@ -9,8 +9,7 @@ that text is tens of megabytes. Pushing it through the queue works but has real
 costs:
 
 * Redis holds every in-flight payload in memory (the reference StatefulSet ships
-  with a 256 MB ``maxmemory`` and an LRU policy that will happily evict a queued
-  job).
+  with a 256 MB ``maxmemory`` and refuses writes when full).
 * Upstash REST bills per request and per byte, so a 15 MB payload is an expensive
   round trip on both ends.
 * ``VA_LSE_JOB_QUEUE_MAX_PAYLOAD_BYTES`` has to be generous enough for the worst
@@ -45,6 +44,8 @@ import re
 import tempfile
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -58,8 +59,8 @@ logger = logging.getLogger("app.blob_store")
 # blob root (``../`` in a key would otherwise read arbitrary files).
 _KEY_RE = re.compile(r"^blobs/[0-9a-f]{2}/[0-9a-f]{64}\.json$")
 
-# Files older than this are removed by the opportunistic sweep. Matches the job
-# TTL: a blob must outlive the job that references it, and no longer.
+# Retention starts again on each put because several jobs can share a blob.
+# Cleanup also needs an independent schedule; writes alone do not bound retention.
 _DEFAULT_SWEEP_AGE_SECONDS = 24 * 3600
 _SWEEP_MIN_INTERVAL_SECONDS = 300.0
 
@@ -191,6 +192,8 @@ class FilesystemBlobStore(BlobStore):
     is_shared = True
 
     def __init__(self, root: str | Path, *, sweep_age_seconds: int = _DEFAULT_SWEEP_AGE_SECONDS) -> None:
+        if sweep_age_seconds <= 0:
+            raise BlobStoreError("blob retention age must be positive")
         self._root = Path(root).expanduser()
         self._sweep_age = sweep_age_seconds
         self._lock = threading.Lock()
@@ -207,27 +210,60 @@ class FilesystemBlobStore(BlobStore):
     def _path_for(self, key: str) -> Path:
         if not _KEY_RE.match(key):
             raise BlobStoreError(f"refusing to use an unrecognized blob key: {key!r}")
-        return self._root / key
+        path = self._root / key
+        if (self._root / "blobs").is_symlink() or path.parent.is_symlink() or path.is_symlink():
+            raise BlobStoreError("refusing a symlink in the filesystem blob namespace")
+        return path
+
+    @contextmanager
+    def _storage_lock(self) -> Iterator[None]:
+        """Serialize writers and cleanup across processes sharing a POSIX volume.
+
+        Keep the lock inode permanently: unlinking it could let a second process
+        lock a different inode. Closing the descriptor releases crashed writers'
+        locks. The deployed volume must support cross-pod advisory flock.
+        """
+        try:
+            import fcntl
+        except ImportError as exc:
+            raise BlobStoreError("filesystem blobs require POSIX advisory file locking") from exc
+        self._root.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self._root / ".blob-store.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "r+b") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def put(self, data: bytes) -> BlobRef:
         self._check_size(data)
         key = content_key(data)
         path = self._path_for(key)
         digest = hashlib.sha256(data).hexdigest()
+        tmp_path: Path | None = None
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            if not path.exists():
-                # Atomic write: a reader must never observe a partial blob.
+            with self._storage_lock():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                # Rewrite even reused keys: renew retention and repair an existing
+                # corrupt blob. Cleanup cannot unlink a refreshed file using an
+                # old stat result while this shared lock is held.
                 with tempfile.NamedTemporaryFile(
                     dir=str(path.parent), prefix=".tmp-", delete=False
                 ) as handle:
+                    tmp_path = Path(handle.name)
                     handle.write(data)
                     handle.flush()
                     os.fsync(handle.fileno())
-                    tmp_path = Path(handle.name)
                 os.replace(tmp_path, path)
         except OSError as exc:
             raise BlobStoreError(f"could not write blob {key}: {type(exc).__name__}: {exc}") from exc
+        finally:
+            if tmp_path is not None:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("could not remove an interrupted blob write; scheduled cleanup is required")
         self._maybe_sweep()
         return BlobRef(key=key, size=len(data), sha256=digest, backend=self.name)
 
@@ -247,7 +283,9 @@ class FilesystemBlobStore(BlobStore):
 
     def delete(self, ref: BlobRef) -> None:
         try:
-            self._path_for(ref.key).unlink(missing_ok=True)
+            path = self._path_for(ref.key)
+            with self._storage_lock():
+                path.unlink(missing_ok=True)
         except (OSError, BlobStoreError) as exc:
             logger.warning("could not delete blob %s: %s", ref.key, exc)
 
@@ -263,29 +301,61 @@ class FilesystemBlobStore(BlobStore):
         except Exception as exc:  # noqa: BLE001 - housekeeping is never fatal
             logger.warning("blob sweep failed: %s", exc)
 
-    def sweep(self, *, max_age_seconds: int | None = None) -> int:
+    def sweep(self, *, max_age_seconds: int | None = None, dry_run: bool = False) -> int:
         limit = self._sweep_age if max_age_seconds is None else max_age_seconds
+        if limit <= 0:
+            raise BlobStoreError("blob retention age must be positive")
         cutoff = time.time() - limit
         removed = 0
         if not self._root.exists():
             return 0
-        for path in self._root.glob("blobs/*/*.json"):
-            try:
-                if path.stat().st_mtime < cutoff:
-                    path.unlink()
-                    removed += 1
-            except OSError:
-                continue
-        # Prune the empty shard directories too, so the volume does not fill with
-        # thousands of empty two-character dirs.
-        for shard in self._root.glob("blobs/*"):
-            try:
-                if shard.is_dir() and not any(shard.iterdir()):
-                    shard.rmdir()
-            except OSError:
-                continue
+        try:
+            with self._storage_lock():
+                # Crash-interrupted writes contain record text too. Expire their
+                # temporary files on the same schedule, without touching fresh ones.
+                namespace = self._root / "blobs"
+                if namespace.is_symlink():
+                    raise BlobStoreError("refusing a symlink in the filesystem blob namespace")
+                # Path.glob suppresses directory scan errors on some Python
+                # versions. Explicit scans must report an unreadable mount.
+                paths: list[Path] = []
+                shards: list[Path] = []
+                try:
+                    with os.scandir(namespace) as entries:
+                        for entry in entries:
+                            if not re.fullmatch(r"[0-9a-f]{2}", entry.name):
+                                continue
+                            if entry.is_symlink():
+                                raise BlobStoreError("refusing a symlink in the filesystem blob namespace")
+                            if not entry.is_dir(follow_symlinks=False):
+                                continue
+                            shard = Path(entry.path)
+                            shards.append(shard)
+                            with os.scandir(shard) as files:
+                                for item in files:
+                                    if item.is_file(follow_symlinks=False) and (
+                                        _KEY_RE.fullmatch(f"blobs/{entry.name}/{item.name}")
+                                        or item.name.startswith(".tmp-")
+                                    ):
+                                        paths.append(Path(item.path))
+                except FileNotFoundError:
+                    if namespace.exists():
+                        raise  # A disappearing shard is not a successful pass.
+                for path in paths:
+                    if path.stat().st_mtime < cutoff:
+                        if not dry_run:
+                            path.unlink()
+                        removed += 1
+                if not dry_run:
+                    for shard in shards:
+                        try:
+                            shard.rmdir()
+                        except OSError:
+                            pass  # Nonempty directories do not contain expired data.
+        except OSError as exc:
+            raise BlobStoreError("filesystem blob cleanup failed") from exc
         if removed:
-            logger.info("blob sweep removed %d expired blob(s)", removed)
+            logger.info("blob sweep %s %d expired file(s)", "found" if dry_run else "removed", removed)
         return removed
 
     def ping(self) -> bool:

@@ -1,0 +1,58 @@
+# Optional Pattern C filesystem cleanup; excluded from the real-data pilot.
+# Apply k8s-blobs.yaml first. Use the same image and retention setting as ALL
+# web/worker pods. Verify cross-pod flock on the actual RWX volume before use.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: va-lse-blob-cleanup
+  namespace: va-lse
+spec:
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 240
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            fsGroup: 65534
+          containers:
+            - name: blob-cleanup
+              image: va-lse:latest  # replace with the tested web/worker image digest
+              imagePullPolicy: IfNotPresent
+              command: ["python", "-m", "app.blob_cleanup"]
+              env:
+                - name: VA_LSE_BLOB_STORE
+                  value: filesystem
+                - name: VA_LSE_BLOB_DIR
+                  value: /app/blobs
+                - name: VA_LSE_JOB_QUEUE_TTL_SECONDS
+                  value: "86400"  # MUST match web/worker retention; do not shorten
+              resources:
+                requests:
+                  cpu: "50m"
+                  memory: "128Mi"
+                limits:
+                  cpu: "500m"
+                  memory: "256Mi"
+              securityContext:
+                readOnlyRootFilesystem: true
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - name: job-blobs
+                  mountPath: /app/blobs
+          volumes:
+            - name: job-blobs
+              persistentVolumeClaim:
+                claimName: va-lse-blobs
