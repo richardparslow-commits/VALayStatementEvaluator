@@ -248,7 +248,7 @@ class TestPromptTemplatesGuardNote(unittest.TestCase):
                 if phase == "claims":
                     return {"claimed_condition": "knee", "writer_role": "veteran", "claims": [{"id": 1, "text": "claim", "type": "other"}]}
                 if phase == "verify":
-                    return {"verifications": [{"id": 1, "verdict": "SUPPORTED", "record_reference": "", "note": ""}]}
+                    return {"verifications": [{"id": 1, "verdict": "NOT FOUND", "record_reference": "", "note": ""}]}
                 if phase == "rubric":
                     return {"scores": {}, "rationales": {}, "improvements": [], "omitted_record_facts": [], "executive_summary": ""}
                 if phase == "topic":

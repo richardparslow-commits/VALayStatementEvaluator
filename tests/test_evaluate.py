@@ -489,7 +489,7 @@ class TestVerifyClaims(unittest.TestCase):
             # return verdicts for ids in this batch — parse batch from user is complex; just return generic
             start = (call_count["n"] - 1) * 8 + 1
             end = min(start + 7, 10)
-            return {"verifications": [{"id": i, "verdict": "SUPPORTED", "record_reference": "a.txt", "note": "ok"} for i in range(start, end + 1)]}
+            return {"verifications": [{"id": i, "verdict": "SUPPORTED", "record_reference": "a.txt p.1", "note": "ok"} for i in range(start, end + 1)]}
 
         llm = _FakeLLM(overrides={"verify": _verify})
         claims = [{"id": i, "text": f"claim {i}"} for i in range(1, 11)]
@@ -510,7 +510,7 @@ class TestVerifyClaims(unittest.TestCase):
     def test_contradicted_and_not_found_preserved(self):
         llm = _FakeLLM(overrides={
             "verify": {"verifications": [
-                {"id": 1, "verdict": "CONTRADICTED", "record_reference": "a.txt p.2", "note": "Wrong date."},
+                {"id": 1, "verdict": "CONTRADICTED", "record_reference": "a.txt p.1", "note": "Wrong date."},
                 {"id": 2, "verdict": "NOT FOUND", "record_reference": "", "note": "No record."},
             ]}
         })
@@ -530,7 +530,7 @@ class TestVerifyClaims(unittest.TestCase):
         """An absent record must not be reported to the veteran as a conflict."""
         llm = _FakeLLM(overrides={
             "verify": {"verifications": [
-                {"id": 1, "verdict": "CONTRADICTED", "record_reference": "", "note": "No record of this."},
+                {"id": 1, "verdict": "CONTRADICTED", "record_reference": "a.txt p.1", "note": "No record of this."},
             ]}
         })
         claims = [{"id": 1, "text": "Torn rotator cuff from the 2003 deployment."}]
@@ -560,55 +560,19 @@ class TestVerifyClaims(unittest.TestCase):
         self.assertEqual(result[0]["verdict"], "CONTRADICTED")
         self.assertEqual(gaps, [])
 
-    def test_an_uncited_contradiction_is_a_gap_even_when_records_cover_the_topic(self):
-        """Overlapping record text must not stand in for the cited conflict.
-
-        The batch here plainly documents knee pain, so the ``evidence_absent`` rule
-        does not apply — the verdict is unsubstantiated purely because it names no
-        conflicting record entry. Letting that through would penalise the score, print
-        a conflict in the report, and instruct the reviser to rewrite the claim to match
-        records nobody cited.
-        """
-        llm = _FakeLLM(overrides={
-            "verify": {"verifications": [
-                {"id": 1, "verdict": "CONTRADICTED", "record_reference": "", "note": "No record of this."},
-            ]}
-        })
-        claims = [{"id": 1, "text": "Knee pain began in service."}]
-        result, gaps = _verify_claims(llm, claims, _fake_digest(), [_doc()], lambda f, m: None)
-        self.assertEqual(result[0]["verdict"], "NOT FOUND")
-        self.assertIn("Downgraded from CONTRADICTED", result[0]["note"])
-        self.assertIn("no conflicting record entry was cited", result[0]["note"])
-        self.assertEqual(len(gaps), 1)
-        self.assertIn("no conflicting record entry was cited", gaps[0]["reason"])
-
-    def test_a_whitespace_only_citation_is_not_a_citation(self):
-        llm = _FakeLLM(overrides={
-            "verify": {"verifications": [
-                {"id": 1, "verdict": "CONTRADICTED", "record_reference": "   ", "note": "Wrong date."},
-            ]}
-        })
-        claims = [{"id": 1, "text": "Knee pain began in service."}]
-        result, gaps = _verify_claims(llm, claims, _fake_digest(), [_doc()], lambda f, m: None)
-        self.assertEqual(result[0]["verdict"], "NOT FOUND")
-        self.assertEqual(len(gaps), 1)
-
-    def test_an_uncited_supporting_verdict_is_not_downgraded(self):
-        """Only the contradiction direction is enforced here.
-
-        An uncited SUPPORTED verdict cannot put a false conflict in front of the
-        witness; it is the evidence-density component that reports the missing
-        citation, so verification must leave the verdict itself alone.
-        """
-        llm = _FakeLLM(overrides={
-            "verify": {"verifications": [
-                {"id": 1, "verdict": "SUPPORTED", "record_reference": "", "note": "Matches."},
-            ]}
-        })
-        claims = [{"id": 1, "text": "Knee pain began in service."}]
-        result, gaps = _verify_claims(llm, claims, _fake_digest(), [_doc()], lambda f, m: None)
-        self.assertEqual(result[0]["verdict"], "SUPPORTED")
-        self.assertEqual(gaps, [])
+    def test_uncited_evidence_verdicts_stop_after_bounded_retries(self):
+        for verdict in ("CONTRADICTED", "SUPPORTED", "PARTIALLY SUPPORTED"):
+            for reference in ("", "   "):
+                with self.subTest(verdict=verdict, reference=reference):
+                    llm = _FakeLLM(overrides={"verify": {"verifications": [{
+                        "id": 1, "verdict": verdict, "record_reference": reference,
+                        "note": "Synthetic assertion.",
+                    }]}})
+                    with self.assertRaises(VerificationIncompleteError):
+                        _verify_claims(llm, [{"id": 1, "text": "Knee pain."}],
+                                       _fake_digest(), [_doc()], lambda f, m: None)
+                    self.assertEqual(llm.calls.count(("chat_json", "verify")),
+                                     VERIFICATION_MAX_ATTEMPTS)
 
 
 class TestContradictionDowngradeReason(unittest.TestCase):
@@ -963,7 +927,7 @@ class TestRunEvaluationHappyPath(unittest.TestCase):
             ]},
             "verify": {"verifications": [
                 {"id": 1, "verdict": "SUPPORTED", "record_reference": "a.txt p.1", "note": "ok"},
-                {"id": 2, "verdict": "CONTRADICTED", "record_reference": "a.txt p.2", "note": "bad"},
+                {"id": 2, "verdict": "CONTRADICTED", "record_reference": "a.txt p.1", "note": "bad"},
                 {"id": 3, "verdict": "PARTIALLY SUPPORTED", "record_reference": "a.txt p.1", "note": "partial"},
                 {"id": 4, "verdict": "NOT FOUND", "record_reference": "", "note": "not found"},
             ]},
@@ -1077,7 +1041,7 @@ class TestRunEvaluationEdgeCases(unittest.TestCase):
                 {"id": 1, "text": "Treated in 2009."}, {"id": 2, "text": "Daily panic."}
             ]},
             "verify": {"verifications": [
-                {"id": 1, "verdict": "CONTRADICTED", "record_reference": "a.txt p.2 2010-03", "note": "Records show 2010."},
+                {"id": 1, "verdict": "CONTRADICTED", "record_reference": "a.txt p.1", "note": "Records show 2010."},
                 {"id": 2, "verdict": "SUPPORTED", "record_reference": "a.txt p.1", "note": "Supported."},
             ]},
             "revision": {"revision_notes": "Corrected date.", "changes": [{"category": "contradiction_fix", "original": "2009", "revised": "2010 [Confirm: date]", "reason": "Fix contradicted date."}], "revised_statement": "Corrected [Confirm: date].", "added_facts_to_verify": []},

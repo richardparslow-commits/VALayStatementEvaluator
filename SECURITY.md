@@ -329,6 +329,19 @@ rather than being accepted as verbatim. Such mismatches and short or unresolved 
 block pilot generation. Older saved prefix checks are labeled as requiring a source re-run.
 Quote matching does not verify a generated description, date or interpretation.
 
+Evaluation verification separately resolves each evidence-based verdict citation to
+one readable, unambiguous uploaded page or block before scoring and revision. The
+lookup is built from extracted uploads, not model-generated digest references.
+Exact single-unit label aliases allow case and whitespace differences; collisions,
+missing sources, unreadable units, ranges and multiple-source references are invalid.
+`NOT FOUND` may remain uncited, but a nonempty reference must also resolve. Invalid
+batches receive at most three attempts, then raise `VerificationIncompleteError`;
+errors and retry logs do not echo the model's reference. Successful results persist
+`verification_policy=uploaded_source_unit_v1`; legacy/unknown policies warn in the
+results panel and report download. Address resolution does not prove textual or
+semantic support for a verdict. Human comparison with the original source remains
+necessary; this does not close the broader factual-grounding risk.
+
 **What is not, and cannot be.** No instruction is filtered: a record may legitimately discuss
 instructions, and blocking phrases would corrupt analyses rather than protect them. The
 answers are: the guard note lives in the **system** message of every prompt that carries

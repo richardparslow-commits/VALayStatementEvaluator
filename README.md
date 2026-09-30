@@ -654,6 +654,18 @@ digits are required; a date is one word rather than separate numeric components.
 unresolved and older checks open the coverage panel. Saved coverage ratios also count all
 facts, including skipped ones.
 
+Evaluation verdicts also pass a source-address check before scoring or rewriting.
+`SUPPORTED`, `PARTIALLY SUPPORTED` and `CONTRADICTED` must cite exactly one readable,
+unambiguous uploaded page or text block, such as `clinic.pdf p.3` or `notes.docx b.2`.
+`NOT FOUND` may have no citation; any citation it supplies must pass the same check.
+Invented filenames/pages, unreadable units, duplicate addresses, ranges and composite
+references are rejected. Invalid batches retry up to three times, then stop as
+incomplete rather than becoming record gaps. Dates and explanations belong in the
+verdict note. Saved results record policy `uploaded_source_unit_v1`; results missing
+that policy, or using an unknown policy, show a re-run warning in the UI and report
+download. This checks the source address only. It does not establish that the cited
+text supports the verdict, or validate the model's interpretation or factual claims.
+
 Records that arrive as a **`.zip`** (provider portals and My HealtheVet hand back
 folders) can be uploaded as they came: members are extracted like standalone uploads, and
 every bound — member count, per-member and total uncompressed size, compression ratio — is
