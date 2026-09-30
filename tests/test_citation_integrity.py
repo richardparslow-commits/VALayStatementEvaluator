@@ -78,6 +78,29 @@ class TestCompleteQuoteMatching(unittest.TestCase):
         self.assertEqual(verify_citations([fact(source.upper())], [document(source)])["verified"], 1)
         self.assertEqual(verify_citations([fact(source.replace("Café", "Cafe"))], [document(source)])["missing"], 1)
 
+    def test_unicode_caseless_matching_in_both_directions(self):
+        for source, quote in (
+            ("Patient visited Straße after treatment", "PATIENT VISITED STRASSE AFTER TREATMENT"),
+            ("PATIENT VISITED STRASSE AFTER TREATMENT", "Patient visited Straße after treatment"),
+            ("Patient reports ΟΣ after treatment", "Patient reports ος after treatment"),
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(verify_citations([fact(quote)], [document(source)])["verified"], 1)
+
+    def test_caseless_matching_does_not_erase_accents_or_digit_width(self):
+        source = "Patient takes medication ５ mg daily"
+        quote = "Patient takes medication 5 mg daily"
+        self.assertEqual(verify_citations([fact(quote)], [document(source)])["missing"], 1)
+
+    def test_short_numeric_or_hyphenated_quote_cannot_inflate_word_count(self):
+        for quote in ("2024-01-02 5 mg", "2024-01-02 1.5 mg", "patient-reports-knee-pain"):
+            with self.subTest(quote=quote):
+                stats = verify_citations([fact(quote)], [document(quote)])
+                self.assertEqual((stats["checked"], stats["verified"], stats["skipped"]), (0, 0, 1))
+        # A dosage within four actual words remains checkable.
+        quote = "Take 5 mg daily"
+        self.assertEqual(verify_citations([fact(quote)], [document(quote)])["verified"], 1)
+
     def test_word_fragments_do_not_match(self):
         for quote, source in (
             ("Pain persists during walking", "NoPain persists during walking"),
@@ -104,6 +127,31 @@ class TestCompleteQuoteMatching(unittest.TestCase):
     def test_combining_accent_cannot_be_dropped_at_quote_boundary(self):
         self.assertEqual(verify_citations([fact("Patient visited local Cafe")], [document("Patient visited local Cafe\u0301")])["missing"], 1)
         self.assertEqual(verify_citations([fact("Patient visited local Cafe\u0301")], [document("Patient visited local Cafe\u0301")])["verified"], 1)
+
+    def test_clinical_numeric_suffixes_cannot_be_omitted(self):
+        for quote, source in (
+            ("oxygen saturation was 95", "oxygen saturation was 95%"),
+            ("reflex grade was recorded as 3", "reflex grade was recorded as 3+"),
+            ("recorded body temperature was 37", "recorded body temperature was 37°C"),
+            ("recorded body temperature was 37°", "recorded body temperature was 37°C"),
+            ("reflex grade was recorded as 3+", "reflex grade was recorded as 3++"),
+            ("% oxygen saturation was recorded", "95% oxygen saturation was recorded"),
+            ("5 mg taken orally daily", "<5 mg taken orally daily"),
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(verify_citations([fact(quote)], [document(source)])["missing"], 1)
+                self.assertEqual(verify_citations([fact(source)], [document(source)])["verified"], 1)
+
+    def test_hyphenated_terms_and_contractions_cannot_be_split(self):
+        for quote, source in (
+            ("weight bearing for six weeks", "non-weight bearing for six weeks"),
+            ("weight bearing for six weeks", "non‐weight bearing for six weeks"),
+            ("Patient was instructed to avoid weight", "Patient was instructed to avoid weight-bearing"),
+            ("t take medication every day", "can't take medication every day"),
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(verify_citations([fact(quote)], [document(source)])["missing"], 1)
+                self.assertEqual(verify_citations([fact(source)], [document(source)])["verified"], 1)
 
     def test_later_complete_occurrence_can_match_after_an_invalid_fragment(self):
         quote = "Pain persists during walking"
@@ -148,11 +196,19 @@ class TestCompleteQuoteMatching(unittest.TestCase):
         facts = [fact(), fact("knee"), fact(""), fact(filename="missing.pdf"), replace(fact(), document="", page=0)]
         stats = verify_citations(facts, [document()])
         self.assertEqual((stats["total"], stats["verified"], stats["checked"], stats["missing"], stats["skipped"]), (5, 1, 2, 1, 3))
+        self.assertEqual(stats["verified_ratio"], 0.2)
         self.assertEqual(stats["examples"][0]["reason"], "source_not_found")
         lines = "\n".join(coverage_lines(MedicalDigest(facts=facts, citation_check=stats)))
         self.assertIn("1 of 5 fact(s) had a complete quote matched", lines)
         self.assertIn("3 too short or unresolved", lines)
         self.assertIn("source page unavailable", lines)
+
+    def test_all_skipped_or_empty_checks_never_report_a_complete_ratio(self):
+        skipped = verify_citations([fact("knee"), fact("")], [document()])
+        self.assertEqual(skipped["verified_ratio"], 0.0)
+        empty = verify_citations([], [document()])
+        self.assertEqual((empty["total"], empty["verified"]), (0, 0))
+        self.assertNotIn("verified_ratio", empty)
 
 
 class TestCitationCoverage(unittest.TestCase):
@@ -216,6 +272,26 @@ class _SyntheticLLM:
 
 
 class TestPilotCitationGate(unittest.TestCase):
+    def test_incomplete_clinical_values_or_negating_prefixes_block_pilot(self):
+        for quote, source in (
+            ("oxygen saturation was 95", "oxygen saturation was 95%"),
+            ("weight bearing for six weeks", "non-weight bearing for six weeks"),
+        ):
+            with self.subTest(source=source):
+                llm = _SyntheticLLM([fact(quote)])
+                with patch("app.pilot.enabled", return_value=True):
+                    with self.assertRaisesRegex(pilot.PilotBlocked, "unverified citations"):
+                        review_medical_records(llm, [document(source)])
+                self.assertNotIn("records:summary", llm.phases)
+
+    def test_short_date_and_dose_quote_blocks_pilot_before_summary(self):
+        quote = "2024-01-02 5 mg"
+        llm = _SyntheticLLM([fact(quote)])
+        with patch("app.pilot.enabled", return_value=True):
+            with self.assertRaisesRegex(pilot.PilotBlocked, "unverified citations"):
+                review_medical_records(llm, [document("Synthetic prescription note records " + quote)])
+        self.assertNotIn("records:summary", llm.phases)
+
     def test_invented_tail_blocks_pilot_before_summary(self):
         llm = _SyntheticLLM([fact(OPENING + " for twenty years with frequent falls.")])
         with patch("app.pilot.enabled", return_value=True):

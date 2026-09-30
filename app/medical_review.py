@@ -482,11 +482,13 @@ _CITATION_MIN_PROBE_WORDS = 4
 
 
 def _citation_probe(quote: str) -> str:
-    """The entire quote, allowing only case/whitespace differences."""
-    words = re.findall(r"\w+", quote, flags=re.UNICODE)
+    """The entire quote, allowing Unicode case/whitespace differences."""
+    # Count space-separated words, not numeric components: a date such as
+    # 2024-01-02 is one word, not three opportunities to meet the minimum.
+    words = [word for word in quote.split() if any(char.isalnum() for char in word)]
     if len(words) < _CITATION_MIN_PROBE_WORDS:
         return ""
-    return " ".join(quote.lower().split())
+    return " ".join(quote.casefold().split())
 
 
 def _citation_quote_present(quote: str, text: str) -> bool:
@@ -497,6 +499,14 @@ def _citation_quote_present(quote: str, text: str) -> bool:
         )
 
     separators = ".,:/-"
+    lexical_joiners = "-‐‑–—'’/"
+    numeric_suffixes = "%％‰‱+−-°℃℉±"
+    # Suffixes belong to the value: 95%, 3+, and 37°C cannot be shortened to
+    # 95, 3, or 37, nor can 37° be accepted as the complete 37°C token.
+    number_end = len(quote) - 1
+    while number_end >= 0 and quote[number_end] in numeric_suffixes:
+        number_end -= 1
+    ends_number = number_end >= 0 and quote[number_end].isdigit()
     start = text.find(quote)
     while start != -1:
         end = start + len(quote)
@@ -505,18 +515,27 @@ def _citation_quote_present(quote: str, text: str) -> bool:
         splits_word = (
             word_char(quote[0]) and word_char(before)
             or word_char(quote[-1]) and word_char(after)
+            # Do not drop a lexical prefix such as non- in non-weight bearing,
+            # or split a contraction; punctuation elsewhere is still allowed.
+            or word_char(quote[0]) and bool(before) and before in lexical_joiners
+            and start >= 2 and word_char(text[start - 2])
+            or word_char(quote[-1]) and bool(after) and after in lexical_joiners
+            and end + 1 < len(text) and word_char(text[end + 1])
         )
         # "5 mg orally daily" must not validate against "1.5 mg orally daily";
         # likewise do not certify a prefix of a decimal, date or signed value.
         splits_number = (
             quote[0].isdigit() and bool(before) and (
-                before in "+-−"
+                before in "+-−<>≤≥≈~="
                 or (before in separators and start >= 2 and text[start - 2].isdigit())
             )
             or quote[0] in separators and len(quote) > 1 and quote[1].isdigit() and before.isdigit()
             or quote[-1].isdigit() and bool(after) and after in separators
             and end + 1 < len(text) and text[end + 1].isdigit()
             or quote[-1] in separators and len(quote) > 1 and quote[-2].isdigit() and after.isdigit()
+            or ends_number and bool(after) and after in numeric_suffixes
+            or ends_number and number_end != len(quote) - 1 and word_char(after)
+            or quote[0] in numeric_suffixes and before.isdigit()
         )
         if not splits_word and not splits_number:
             return True
@@ -546,7 +565,7 @@ def verify_citations(
             key = (doc.filename, page.page)
             if key in page_texts:
                 ambiguous_sources.add(key)
-            page_texts[key] = " ".join(page.text.lower().split())
+            page_texts[key] = " ".join(page.text.casefold().split())
     checked = 0
     skipped = 0
     missing: list[dict[str, Any]] = []
@@ -586,8 +605,10 @@ def verify_citations(
         "skipped": skipped,
         "examples": missing[:5],
     }
-    if checked:
-        result["verified_ratio"] = round((checked - len(missing)) / checked, 3)
+    if facts:
+        # The persisted ratio uses the same denominator as visible coverage;
+        # skipped facts must not make a partial review look fully verified.
+        result["verified_ratio"] = round(result["verified"] / len(facts), 3)
     logger.info(
         "citation check checked=%d missing=%d skipped=%d",
         checked,

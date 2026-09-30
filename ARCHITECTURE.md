@@ -209,6 +209,13 @@ Designed to handle 1 to ~5,000 pages without truncation-driven evidence loss.
 
 Performance note: `scripts/scale_sim.py` simulates the orchestration (chunking, dedup, merge batching) for a 2,000-page bundle offline, without LLM calls. `scripts/smoke_test.py all` is the live E2E gate (requires `.env`).
 
+The citation minimum is four whitespace-separated words containing letters or digits; a
+date or hyphenated term counts once. Unicode case-folding allows genuine capitalization
+differences without stripping accents or changing digit width. Matches cannot split a
+hyphenated term, contraction or clinical numeric token (for example, `non-weight`, `95%`,
+`3+` or `37°C`). Both visible coverage and the saved `verified_ratio` use all facts as the
+denominator, including skipped citations.
+
 ## 7. Record-source abstraction (why Fetch Sandbox and VA.gov are optional)
 
 The app supports **four** record sources, selected per tab via a radio:

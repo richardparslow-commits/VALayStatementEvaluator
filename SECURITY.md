@@ -322,8 +322,8 @@ lookalikes (fullwidth `＜`, CJK `⟨`) are translated to ASCII first, invisible
 (zero-widths, bidi overrides, Unicode tag characters) are dropped, and chat-template role
 tokens and line-leading role labels (`<|im_start|>`, `<system>`, `[INST]`, `System:`) are
 neutralized so record text cannot speak in the system role. `verify_citations` requires the
-complete contiguous quote to occur on an unambiguous cited page, allowing only case and
-whitespace differences. Punctuation, numbers and negation are preserved. If prompt escaping
+complete contiguous quote to occur on an unambiguous cited page, allowing only Unicode
+case-folding and whitespace differences. Punctuation, numbers and negation are preserved. If prompt escaping
 changes a quoted passage and the model echoes that change, the citation remains unresolved
 rather than being accepted as verbatim. Such mismatches and short or unresolved quotes
 block pilot generation. Older saved prefix checks are labeled as requiring a source re-run.

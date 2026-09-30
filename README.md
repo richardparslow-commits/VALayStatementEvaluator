@@ -644,12 +644,15 @@ questions a plausible-looking report otherwise hides:
 | Coverage gaps | Claims with no matching record text anywhere — reported instead of being called contradictions |
 
 The same summary is written into the report (`## Record Coverage Gaps`), so a report shared
-with a VSO carries the caveat rather than losing it. Quote checks allow differences in case
-and whitespace only: the full contiguous quote must occur on the cited page, including
+with a VSO carries the caveat rather than losing it. Quote checks allow Unicode case-folding
+and whitespace differences only: the full contiguous quote must occur on the cited page, including
 punctuation, numbers and negation. Duplicate file/page addresses cannot be verified.
 Earlier saved prefix checks require a re-run from the source records. A quote match does
 not verify the model's interpretation, generated dates or factual conclusions; human
-review remains necessary. Short, unresolved and older checks open the coverage panel.
+review remains necessary. At least four whitespace-separated words containing letters or
+digits are required; a date is one word rather than separate numeric components. Short,
+unresolved and older checks open the coverage panel. Saved coverage ratios also count all
+facts, including skipped ones.
 
 Records that arrive as a **`.zip`** (provider portals and My HealtheVet hand back
 folders) can be uploaded as they came: members are extracted like standalone uploads, and
