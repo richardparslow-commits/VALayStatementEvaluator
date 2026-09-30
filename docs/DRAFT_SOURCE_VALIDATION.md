@@ -12,11 +12,11 @@ Witness-only observations need no record citation. The prompt preserves uncertai
 
 ## Failure and saved results
 
-Invalid responses receive at most three whole grounding attempts in the app. The batch final phase validates inside its existing two-attempt wrapper. Exhaustion stops before statement generation or self-review. Validation errors and retry logs contain no model-supplied private fields. Cancellation is checked before each app attempt.
+Invalid responses receive at most three whole grounding attempts in the app. The batch final phase passes an explicit two-attempt limit with no outer retry sleep. Exhaustion stops before statement generation or self-review. Validation errors and retry logs contain no model-supplied private fields. Cancellation is checked before each app attempt.
 
-The batch path re-extracts successful batch source files within its configured glob, excludes failed/quarantined inputs, and checks current source units rather than trusting digest checkpoints as source text. Changed or unavailable source material cannot establish record support just because a saved digest carries its old label or quote. New checkpoints retain successful source membership; legacy checkpoints recover it from the deterministic batch plan. Re-extraction failures for selected successful inputs propagate; an empty catalog permits witness-only rows but no record-based rows.
+The batch path re-extracts successful batch source files within its configured glob, excludes failed/quarantined inputs, and checks current source units rather than trusting digest checkpoints as source text. Changed or unavailable source material cannot establish record support just because a saved digest carries its old label or quote. New checkpoints retain successful source membership; legacy checkpoints recover it from the deterministic batch plan. Selected inputs that now yield no extractable documents are excluded and reported in a source-coverage warning, preserving legacy extraction skips. Other extraction failures propagate; an empty catalog permits witness-only rows but no record-based rows.
 
-Successful results persist `grounding_policy=retained_fact_full_quote_source_unit_v1`; source labels and complete quotes are escaped for literal Markdown display and rendered for human review. Older or unknown policies receive an explicit re-run warning rather than being silently relabelled.
+Successful results persist `grounding_policy=retained_fact_full_quote_source_unit_v1`; source labels and complete quotes are escaped for literal Markdown display and rendered for human review. Older or unknown policies receive an explicit re-run warning rather than being silently relabelled, including cached batch finals resumed without generation.
 
 ## Limits
 

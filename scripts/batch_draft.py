@@ -669,7 +669,7 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
     """
     from app.grounding_sources import GROUNDING_SOURCE_POLICY, grounding_catalog, validate_grounding_sources
     from app.source_validation import build_source_index
-    from app.documents import records_from_local_path
+    from app.documents import ExtractionError, records_from_local_path
     from app.config import load_knowledge
     from app.documents import DRAFT_INTERNAL_MAX_CHARS, MAX_OBSERVATIONS_CHARS
     from app.draft import (
@@ -772,9 +772,16 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
         if selected_names - {path.name for path in part_files}:
             raise ValueError("A successful batch source file is unavailable.")
         source_docs = []
+        unavailable_sources = []
         for path in part_files:
             if path.name in selected_names:
-                docs, _ = records_from_local_path(str(path))
+                try:
+                    docs, _ = records_from_local_path(str(path))
+                except ExtractionError:
+                    # Legacy successful groups may include skipped image-only
+                    # inputs. Their absence cannot validate any record row.
+                    unavailable_sources.append(path.name)
+                    continue
                 source_docs.extend(docs)
         catalog, catalog_text = grounding_catalog(combined, source_docs, grounding_query)
         source_index = build_source_index(source_docs)
@@ -803,7 +810,7 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
                 ),
                 phase="grounding",
             ), observations_present=bool(obs_for_prompt.strip())), catalog, source_index),
-            "grounding",
+            "grounding", attempts=2, base_wait_s=0.0,
         )
         log(f"grounding done: {len(grounding)} keys")
 
@@ -899,13 +906,18 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
                     final = improved.strip()
             log(f"review done: {len(issues)} issue(s)")
 
+        coverage_notice = (
+            f"> ⚠️ Source coverage: {len(unavailable_sources)} selected input(s) yielded no extractable records; "
+            "record grounding uses the readable inputs only.\n\n"
+        ) if unavailable_sources else ""
         return {
             "statement": final,
-            "grounding_markdown": grounding_markdown(
+            "grounding_markdown": coverage_notice + grounding_markdown(
                 DraftResult(grounding=grounding, grounding_policy=GROUNDING_SOURCE_POLICY)
             ) if isinstance(grounding, dict) else "",
             "grounding_raw": grounding if isinstance(grounding, dict) else {},
             "grounding_policy": GROUNDING_SOURCE_POLICY,
+            "unavailable_source_files": unavailable_sources,
             "review_issues": issues,
             "facts_total": len(combined.facts),
             "facts_pre_merge": len(deduped),
@@ -913,6 +925,16 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
         }
 
     return run_with_timeout(work, timeout_seconds=cfg.final_timeout_s)
+
+
+def saved_grounding_markdown(final: dict) -> str:
+    """Annotate resumed legacy/unknown finals without relabelling their policy."""
+    from app.grounding_sources import GROUNDING_SOURCE_POLICY, LEGACY_GROUNDING_SOURCE_NOTICE
+
+    markdown = str(final.get("grounding_markdown", ""))
+    if final.get("grounding_policy") != GROUNDING_SOURCE_POLICY and LEGACY_GROUNDING_SOURCE_NOTICE not in markdown:
+        return f"> ⚠️ **Drafting source validation:** {LEGACY_GROUNDING_SOURCE_NOTICE}\n\n{markdown}"
+    return markdown
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1101,7 +1123,7 @@ def main(argv: list[str] | None = None) -> int:
         f"# Draft lay statement — {cfg.condition}\n\n{final['statement']}\n",
         encoding="utf-8",
     )
-    (cfg.out_dir / "grounding.md").write_text(final["grounding_markdown"], encoding="utf-8")
+    (cfg.out_dir / "grounding.md").write_text(saved_grounding_markdown(final), encoding="utf-8")
     log(f"ALL DONE in {(time.time() - t_all) / 60:.1f} min — statement "
         f"{len(final['statement']):,} chars, {final['facts_total']} facts "
         f"(pre-merge {final['facts_pre_merge']}), review issues {len(final['review_issues'])}")

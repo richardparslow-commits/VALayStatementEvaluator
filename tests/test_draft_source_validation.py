@@ -404,6 +404,91 @@ class TestDraftingSourceGate(unittest.TestCase):
             self.assertEqual(calls, ["Part1.pdf"])
             self.assertEqual(result["grounding_policy"], GROUNDING_SOURCE_POLICY)
 
+    def test_batch_grounding_sets_explicit_two_attempt_limit_without_sleep(self):
+        from tests.test_batch_draft import batch_draft, TestFinalPhaseSemantics
+        with patch.object(batch_draft, "_retry_phase", wraps=batch_draft._retry_phase) as retry:
+            TestFinalPhaseSemantics()._run_final("ok")
+        grounding_calls = [call for call in retry.call_args_list if call.args[1] == "grounding"]
+        self.assertEqual(len(grounding_calls), 1)
+        self.assertEqual(grounding_calls[0].kwargs["attempts"], 2)
+        self.assertEqual(grounding_calls[0].kwargs["base_wait_s"], 0.0)
+
+    def test_cached_batch_final_warns_for_missing_and_unknown_policy_without_redrafting(self):
+        import tempfile
+        from pathlib import Path
+        from app.llm import ChatProbe
+        from tests.test_batch_draft import batch_draft, _gate_settings, _retry_argv
+
+        for policy in (None, "unknown-policy", GROUNDING_SOURCE_POLICY):
+            with tempfile.TemporaryDirectory() as raw:
+                directory = Path(raw)
+                final = {"statement": "Original cached statement", "grounding_markdown": "Original analysis",
+                         "facts_total": 1, "facts_pre_merge": 1, "review_issues": []}
+                if policy is not None:
+                    final["grounding_policy"] = policy
+                argv = _retry_argv(directory, final_result=final)
+                with patch("app.config.load_settings", return_value=_gate_settings()), \
+                     patch("app.llm.probe_chat", return_value=ChatProbe(200, "ok")), \
+                     patch.object(batch_draft, "final_phase") as generate:
+                    self.assertEqual(batch_draft.main(argv), 0)
+                generate.assert_not_called()
+                markdown = (directory / "out" / "grounding.md").read_text()
+                self.assertIn("Original analysis", markdown)
+                self.assertEqual(LEGACY_GROUNDING_SOURCE_NOTICE in markdown, policy != GROUNDING_SOURCE_POLICY)
+
+    def test_legacy_skipped_input_does_not_abort_successful_record_grounding(self):
+        import re
+        import tempfile
+        from pathlib import Path
+        from app.documents import ExtractionError
+        from scripts import batch_draft
+        from tests.test_batch_draft import _make_cfg
+        cfg = _make_cfg(Path(tempfile.mkdtemp()))
+        for name in ("Part1.pdf", "Part2.pdf"):
+            (cfg.records_dir / name).write_text("Synthetic", encoding="utf-8")
+        docs, digest = evidence()
+
+        def extract(path):
+            if Path(path).name == "Part2.pdf":
+                raise ExtractionError("No extractable documents")
+            return docs, []
+
+        class FakeLLM:
+            def chat_json(self, system, user, **kwargs):
+                if kwargs.get("phase") == "review":
+                    return {"issues_found": [], "improved_statement": ""}
+                match = re.search(r"MEDICAL RECORD FACT CATALOG \(JSON\):\n<<<\n(.*?)\n>>>", user, re.DOTALL)
+                return record_grounding(json.loads(match[1])[0])
+
+            def chat(self, *args, **kwargs):
+                return "Synthetic statement"
+
+        with patch("app.pipeline_guard.run_with_timeout", side_effect=lambda fn, **kw: fn()), \
+             patch("app.documents.records_from_local_path", side_effect=extract), \
+             patch("app.medical_review._merge_facts", side_effect=lambda llm, d, **kw: d.facts), \
+             patch("app.medical_review._summarize", return_value="Synthetic summary"), \
+             patch.object(batch_draft, "_wait_for_breaker"):
+            result = batch_draft.final_phase(FakeLLM(), cfg, {"batch_01": batch_draft.digest_to_state(digest)})
+        self.assertEqual(result["unavailable_source_files"], ["Part2.pdf"])
+        self.assertIn("Source coverage: 1", result["grounding_markdown"])
+        self.assertEqual(result["grounding_raw"]["supported_observations"][0]["quote"], QUOTE)
+
+    def test_new_batch_checkpoint_records_only_inputs_that_produced_documents(self):
+        import tempfile
+        from pathlib import Path
+        from scripts import batch_draft
+        from tests.test_batch_draft import _make_cfg
+        cfg = _make_cfg(Path(tempfile.mkdtemp()))
+        paths = [cfg.records_dir / name for name in ("Part1.pdf", "Part2.pdf")]
+        for path in paths:
+            path.write_text("Synthetic", encoding="utf-8")
+        doc = ExtractedDocument("Part1.pdf", [DocumentPage("Part1.pdf", 1, QUOTE)])
+        with patch("app.documents.records_from_local_path", return_value=([doc], ["Part2.pdf unavailable"])), \
+             patch("app.medical_review.review_medical_records", return_value=MedicalDigest()), \
+             patch("app.pipeline_guard.run_with_timeout", side_effect=lambda fn, *args, **kw: fn(*args)):
+            state, _ = batch_draft.digest_group(object(), cfg, "batch_01", paths)
+        self.assertEqual(state["source_files"], ["Part1.pdf"])
+
     def test_batch_witness_only_result_records_new_policy(self):
         from tests.test_batch_draft import TestFinalPhaseSemantics
         result = TestFinalPhaseSemantics()._run_final("ok")
