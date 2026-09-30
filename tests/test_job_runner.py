@@ -307,7 +307,9 @@ class TestSubmitAndPoll(unittest.TestCase):
         )
         with patch.object(job_runner, "get_job_backend", return_value=backend), patch.object(
             job_runner, "get_blob_store", return_value=store
-        ), patch.object(config, "JOB_QUEUE_INLINE_MAX_BYTES", 1024), patch.object(
+        ), patch("app.blob_store.get_blob_store", return_value=store), patch.object(
+            config, "JOB_QUEUE_INLINE_MAX_BYTES", 1024
+        ), patch.object(
             config, "JOB_QUEUE_UI_POLL_SECONDS", 0.01
         ):
             outcome = job_runner.submit_job(

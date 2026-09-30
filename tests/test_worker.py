@@ -463,6 +463,11 @@ class TestBlobReferencedJob(_WorkerCase):
 
         store = FilesystemBlobStore(tmp_root)
         ref = store.put(documents_bundle(job))
+        # Submission now verifies the producer's store before queue admission.
+        # Worker-side missing/misconfigured stores are injected after admission.
+        producer = patch("app.blob_store.get_blob_store", return_value=store)
+        producer.start()
+        self.addCleanup(producer.stop)
         return store, encode_job_with_blob(KIND_EVALUATE, job, ref)
 
     def test_worker_resolves_documents_from_the_blob_store(self):

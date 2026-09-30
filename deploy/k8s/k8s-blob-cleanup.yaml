@@ -1,0 +1,88 @@
+# Optional Pattern C filesystem cleanup; excluded from the real-data pilot.
+# Apply k8s-blobs.yaml first. Use the same image and retention setting as ALL
+# web/worker pods. Verify cross-pod flock on the actual RWX volume before use.
+# Queue settings come from the same secret keys as web/workers, selecting only
+# those values. The cleaner needs SCAN/MGET; no LLM credentials are injected.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: va-lse-blob-cleanup
+  namespace: va-lse
+spec:
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 240
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            fsGroup: 65534
+          containers:
+            - name: blob-cleanup
+              image: va-lse:latest  # replace with the tested web/worker image digest
+              imagePullPolicy: IfNotPresent
+              command: ["python", "-m", "app.blob_cleanup"]
+              env:
+                - name: VA_LSE_REDIS_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: va-lse-env
+                      key: VA_LSE_REDIS_URL
+                      optional: true
+                - name: VA_LSE_SHARED_CACHE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: va-lse-env
+                      key: VA_LSE_SHARED_CACHE_URL
+                      optional: true
+                - name: VA_LSE_SHARED_CACHE_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: va-lse-env
+                      key: VA_LSE_SHARED_CACHE_TOKEN
+                      optional: true
+                - name: VA_LSE_JOB_QUEUE_PREFIX
+                  valueFrom:
+                    secretKeyRef:
+                      name: va-lse-env
+                      key: VA_LSE_JOB_QUEUE_PREFIX
+                      optional: true
+                - name: VA_LSE_BLOB_STORE
+                  value: filesystem
+                - name: VA_LSE_BLOB_DIR
+                  value: /app/blobs
+                - name: VA_LSE_JOB_QUEUE_TTL_SECONDS
+                  valueFrom:
+                    secretKeyRef:
+                      name: va-lse-env  # same TTL source as the web/worker tiers
+                      key: VA_LSE_JOB_QUEUE_TTL_SECONDS
+                      optional: true  # all tiers use the 86400-second default if absent
+              resources:
+                requests:
+                  cpu: "50m"
+                  memory: "128Mi"
+                limits:
+                  cpu: "500m"
+                  memory: "256Mi"
+              securityContext:
+                readOnlyRootFilesystem: true
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - name: job-blobs
+                  mountPath: /app/blobs
+          volumes:
+            - name: job-blobs
+              persistentVolumeClaim:
+                claimName: va-lse-blobs

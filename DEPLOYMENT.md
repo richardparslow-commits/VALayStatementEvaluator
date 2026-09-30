@@ -544,11 +544,62 @@ nodes in another region. `deploy/k8s/k8s-deployment.yaml` / `k8s-worker.yaml` th
 
 Blobs are content-addressed (the key is derived from the bytes), so two users uploading the
 same bundle in one deployment share one object, and re-submitting a failed run re-uses it.
-Terminal jobs do not currently delete content-addressed blobs. The filesystem backend
-performs an opportunistic 24-hour sweep on writes; idle deployments need a scheduled
-cleanup, and S3 deployments need a verified lifecycle policy. Until those controls and
-atomic queue admission are separately validated, Pattern C is excluded from the
-controlled real-data pilot (see [PILOT.md](PILOT.md)). Storage needed is roughly `queue depth × average job text`;
+Terminal jobs do not delete these shared blobs. Filesystem retention starts at the
+**latest successful write or submission**, including reuse of the same content.
+Files become eligible after `VA_LSE_JOB_QUEUE_TTL_SECONDS` (24 hours by default),
+and are removed only when no retained queue input references them. Claimed,
+heartbeating and re-queued jobs extend their input TTL; terminal inputs are also
+conservatively protected until expiry. Each write atomically replaces the file
+and renews its age. Writers, submissions, explicit deletion and cleanup share a permanent
+`.blob-store.lock` file using POSIX advisory locking; never remove that lock file
+while a tier is running. Windows filesystem blob storage is unsupported. Verify
+cross-pod locking on the actual shared volume before using this backend, and roll
+all writers/cleaners to the same version before enabling cleanup.
+
+Queue inventory runs **before** taking the filesystem lock and uses batched reads.
+Cleanup keeps the cutoff captured before inventory, then checks current file ages
+under the lock. Concurrent admissions renew their files beyond that cutoff, so
+new inputs missed by inventory remain safe. Filesystem scanning runs outside the
+lock; each eligible file is checked again and deleted under a short lock. Deletion
+starts as files are discovered, so interrupted passes keep their progress and a
+retry has fewer expired files to visit. Lock acquisition times out after five
+seconds. Slow filesystem calls still need the orchestrator deadline; failed or
+incomplete passes must be retried and alerted on.
+
+Writes perform a rate-limited cleanup, but idle storage needs an independent schedule:
+
+```bash
+# Use the SAME queue URL/credentials, prefix, mount and TTL as web/workers.
+# Independent cleanup requires a reachable distributed queue (SCAN/MGET access).
+VA_LSE_BLOB_STORE=filesystem python -m app.blob_cleanup --dry-run
+VA_LSE_BLOB_STORE=filesystem python -m app.blob_cleanup
+
+# Kubernetes: queue connection, prefix and TTL read the SAME va-lse-env keys
+# as web/workers; only those keys are injected, excluding LLM credentials.
+# Configure the tested image before applying the template.
+kubectl apply -f deploy/k8s/k8s-blob-cleanup.yaml
+kubectl create job --from=cronjob/va-lse-blob-cleanup blob-cleanup-canary -n va-lse
+kubectl logs -n va-lse job/blob-cleanup-canary
+```
+
+For Compose, schedule `docker compose --profile pattern-c exec -T worker python -m
+app.blob_cleanup` on the host while the worker service is running. The command returns
+count-only JSON on success and exits 2 for backend, mount, locking, queue inventory,
+scan or deletion failures; alert on failed/missed passes. Malformed retained inputs
+also refuse cleanup. Use one queue prefix per blob root and roll all producers to
+the guarded-submission version before scheduling cleanup. It removes unreferenced,
+expired blobs and interrupted
+temporary writes, and keeps fresh files. Successful cleanup with the provided five-minute
+schedule bounds normal unreferenced idle retention to TTL plus scheduling delay;
+retained jobs can extend that period. Outages, lock
+contention and failed passes also extend that period. Prove deletion with a synthetic idle
+canary and verify that concurrent renewal stays readable on the deployed volume.
+
+S3 still needs a verified lifecycle policy, including any versioned objects. Shared
+keys do not provide case-specific erasure, and this command does not erase backups,
+downloads or provider copies. Queue admission is atomic, but these deployment controls
+and full retention/deletion obligations remain unvalidated. Pattern C remains excluded
+from the controlled real-data pilot (see [PILOT.md](PILOT.md)). Storage needed is roughly `queue depth × average job text`;
 a handful of concurrent 2,000-page bundles is a few hundred MB.
 
 The sidebar's **🛠️ Job queue** panel and `GET /health → job_queue` report which blob
