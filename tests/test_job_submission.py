@@ -8,7 +8,6 @@ from concurrent.futures import ThreadPoolExecutor
 from tests import hermetic  # noqa: F401
 from app import config, job_queue
 from app.job_queue import JobQueueError
-from tests import test_job_queue as backend_tests
 
 
 class SubmissionContract:
@@ -88,15 +87,21 @@ class SubmissionContract:
 
 
 class TestInProcessSubmission(SubmissionContract, unittest.TestCase):
-    make_backend = backend_tests.TestInProcessBackend.make_backend
+    def make_backend(self):
+        from tests.test_job_queue import TestInProcessBackend
+        return TestInProcessBackend.make_backend(self)
 
 
 class TestRedisSubmission(SubmissionContract, unittest.TestCase):
-    make_backend = backend_tests.TestRedisBackend.make_backend
+    def make_backend(self):
+        from tests.test_job_queue import TestRedisBackend
+        return TestRedisBackend.make_backend(self)
 
 
 class TestUpstashSubmission(SubmissionContract, unittest.TestCase):
-    make_backend = backend_tests.TestUpstashBackend.make_backend
+    def make_backend(self):
+        from tests.test_job_queue import TestUpstashBackend
+        return TestUpstashBackend.make_backend(self)
 
 
 def interrupt_submission(index, after):
@@ -154,11 +159,15 @@ class SubmissionFailures:
 
 
 class TestRedisSubmissionFailures(SubmissionFailures, unittest.TestCase):
-    make_backend = backend_tests.TestRedisBackend.make_backend
+    def make_backend(self):
+        from tests.test_job_queue import TestRedisBackend
+        return TestRedisBackend.make_backend(self)
 
 
 class TestUpstashSubmissionFailures(SubmissionFailures, unittest.TestCase):
-    make_backend = backend_tests.TestUpstashBackend.make_backend
+    def make_backend(self):
+        from tests.test_job_queue import TestUpstashBackend
+        return TestUpstashBackend.make_backend(self)
 
 
 class TestBrowserSubmissionRetry(unittest.TestCase):
