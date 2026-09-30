@@ -64,7 +64,6 @@ _KEY_RE = re.compile(r"^blobs/[0-9a-f]{2}/[0-9a-f]{64}\.json$")
 _DEFAULT_SWEEP_AGE_SECONDS = 24 * 3600
 _SWEEP_MIN_INTERVAL_SECONDS = 300.0
 _STORAGE_LOCK_TIMEOUT_SECONDS = 5.0
-_SWEEP_LOCK_BUDGET_SECONDS = 5.0
 
 
 class BlobStoreError(RuntimeError):
@@ -339,59 +338,63 @@ class FilesystemBlobStore(BlobStore):
         # Every concurrently admitted blob is renewed under that lock, so its
         # mtime is newer than this cutoff even if SCAN misses the new input key.
         protected = (retained_keys or self._retained_keys)()
-        try:
-            with self._storage_lock():
-                deadline = time.monotonic() + _SWEEP_LOCK_BUDGET_SECONDS
-                def check_budget() -> None:
-                    if time.monotonic() >= deadline:
-                        raise BlobStoreError("filesystem blob cleanup exceeded its lock budget")
-                # Crash-interrupted writes contain record text too. Expire their
-                # temporary files on the same schedule, without touching fresh ones.
-                namespace = self._root / "blobs"
-                if namespace.is_symlink():
-                    raise BlobStoreError("refusing a symlink in the filesystem blob namespace")
-                # Path.glob suppresses directory scan errors on some Python
-                # versions. Explicit scans must report an unreadable mount.
-                paths: list[Path] = []
-                shards: list[Path] = []
-                try:
-                    with os.scandir(namespace) as entries:
-                        for entry in entries:
-                            check_budget()
-                            if not re.fullmatch(r"[0-9a-f]{2}", entry.name):
-                                continue
-                            if entry.is_symlink():
-                                raise BlobStoreError("refusing a symlink in the filesystem blob namespace")
-                            if not entry.is_dir(follow_symlinks=False):
-                                continue
-                            shard = Path(entry.path)
-                            shards.append(shard)
-                            with os.scandir(shard) as files:
-                                for item in files:
-                                    check_budget()
-                                    if item.is_file(follow_symlinks=False) and (
-                                        _KEY_RE.fullmatch(f"blobs/{entry.name}/{item.name}")
-                                        or item.name.startswith(".tmp-")
-                                    ):
-                                        paths.append(Path(item.path))
-                except FileNotFoundError:
-                    if namespace.exists():
-                        raise  # A disappearing shard is not a successful pass.
-                for path in paths:
-                    check_budget()
-                    if path.relative_to(self._root).as_posix() in protected:
-                        continue
+        namespace = self._root / "blobs"
+        if namespace.is_symlink():
+            raise BlobStoreError("refusing a symlink in the filesystem blob namespace")
+
+        def expire(path: Path) -> None:
+            nonlocal removed
+            if path.relative_to(self._root).as_posix() in protected:
+                return
+            try:
+                # Directory scanning and candidate filtering do not hold the
+                # writer lock. Recheck age after acquiring it: a producer may
+                # have renewed/replaced this file since the candidate scan.
+                if path.stat().st_mtime >= cutoff:
+                    return
+                with self._storage_lock():
+                    if namespace.is_symlink() or path.parent.is_symlink() or path.is_symlink():
+                        raise BlobStoreError("refusing a symlink in the filesystem blob namespace")
                     if path.stat().st_mtime < cutoff:
                         if not dry_run:
                             path.unlink()
                         removed += 1
-                if not dry_run:
-                    for shard in shards:
-                        check_budget()
-                        try:
-                            shard.rmdir()
-                        except OSError:
-                            pass  # Nonempty directories do not contain expired data.
+            except FileNotFoundError:
+                pass  # Another cooperating cleaner already removed this file.
+
+        try:
+            # Process files as they are discovered, rather than building the
+            # whole inventory before deletion. Interrupted passes retain useful
+            # progress and the next pass has fewer expired files to visit.
+            with os.scandir(namespace) as entries:
+                for entry in entries:
+                    if not re.fullmatch(r"[0-9a-f]{2}", entry.name):
+                        continue
+                    if entry.is_symlink():
+                        raise BlobStoreError("refusing a symlink in the filesystem blob namespace")
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    shard = Path(entry.path)
+                    try:
+                        with os.scandir(shard) as files:
+                            for item in files:
+                                if item.is_file(follow_symlinks=False) and (
+                                    _KEY_RE.fullmatch(f"blobs/{entry.name}/{item.name}")
+                                    or item.name.startswith(".tmp-")
+                                ):
+                                    expire(Path(item.path))
+                    except FileNotFoundError:
+                        continue  # Another cleaner pruned an empty shard.
+                    if not dry_run:
+                        with self._storage_lock():
+                            try:
+                                shard.rmdir()
+                            except OSError:
+                                pass  # Nonempty directories do not contain expired data.
+        except FileNotFoundError:
+            if not self._root.is_dir() or namespace.exists():
+                raise BlobStoreError("filesystem blob cleanup lost its shared directory")
+            # A configured, empty store has no blobs directory yet.
         except OSError as exc:
             raise BlobStoreError("filesystem blob cleanup failed") from exc
         if removed:

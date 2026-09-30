@@ -559,10 +559,12 @@ all writers/cleaners to the same version before enabling cleanup.
 Queue inventory runs **before** taking the filesystem lock and uses batched reads.
 Cleanup keeps the cutoff captured before inventory, then checks current file ages
 under the lock. Concurrent admissions renew their files beyond that cutoff, so
-new inputs missed by inventory remain safe. Lock acquisition times out after five
-seconds, and cleanup checks a five-second work budget between filesystem entries.
-Slow filesystem calls still need the orchestrator deadline; failed or incomplete
-passes must be retried and alerted on.
+new inputs missed by inventory remain safe. Filesystem scanning runs outside the
+lock; each eligible file is checked again and deleted under a short lock. Deletion
+starts as files are discovered, so interrupted passes keep their progress and a
+retry has fewer expired files to visit. Lock acquisition times out after five
+seconds. Slow filesystem calls still need the orchestrator deadline; failed or
+incomplete passes must be retried and alerted on.
 
 Writes perform a rate-limited cleanup, but idle storage needs an independent schedule:
 

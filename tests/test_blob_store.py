@@ -15,6 +15,7 @@ import os
 import sys
 import time
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -348,17 +349,60 @@ class TestSweepTiming(unittest.TestCase):
                     second.put(b"busy synthetic record")
             self.assertEqual(list(Path(tmp).rglob("*.json")), [])
 
-    def test_cleanup_budget_failure_preserves_records_and_releases_lock(self):
+    def test_interrupted_scan_keeps_deletion_progress_and_retry_finishes(self):
         with TemporaryDirectory() as tmp:
             store = FilesystemBlobStore(tmp, sweep_age_seconds=60)
             ref = store.put(b"synthetic expired record")
+            path = Path(tmp) / ref.key
+            abandoned = path.parent / ".tmp-unvisited"
+            abandoned.write_bytes(b"synthetic interrupted write")
             past = time.time() - 120
-            os.utime(Path(tmp) / ref.key, (past, past))
-            with patch.object(blob_mod, "_SWEEP_LOCK_BUDGET_SECONDS", 0):
+            for candidate in (path, abandoned):
+                os.utime(candidate, (past, past))
+            scandir = os.scandir
+
+            @contextmanager
+            def interrupted_scan(directory):
+                with scandir(directory) as entries:
+                    if Path(directory) == path.parent:
+                        def partial_entries():
+                            yield next(entry for entry in entries if entry.name == path.name)
+                            raise OSError("synthetic scan interruption")
+                        yield partial_entries()
+                    else:
+                        yield entries
+
+            with patch.object(os, "scandir", side_effect=interrupted_scan):
                 with self.assertRaises(BlobStoreError):
                     store.sweep()
-            self.assertEqual(store.get(ref), b"synthetic expired record")
+            self.assertFalse(path.exists())
+            self.assertTrue(abandoned.exists())
             self.assertEqual(store.sweep(), 1)
+            self.assertFalse(abandoned.exists())
+
+    def test_writer_can_renew_a_scanned_candidate_before_deletion(self):
+        with TemporaryDirectory() as tmp:
+            store = FilesystemBlobStore(tmp, sweep_age_seconds=60)
+            data = b"synthetic renewed during scan"
+            ref = store.put(data)
+            path = Path(tmp) / ref.key
+            past = time.time() - 120
+            os.utime(path, (past, past))
+            stat = Path.stat
+            renewed = False
+
+            def renew_after_stat(candidate, *args, **kwargs):
+                nonlocal renewed
+                snapshot = stat(candidate, *args, **kwargs)
+                if candidate == path and kwargs.get("follow_symlinks", True) and not renewed:
+                    renewed = True
+                    store.put(data)
+                return snapshot
+
+            with patch.object(Path, "stat", new=renew_after_stat):
+                self.assertEqual(store.sweep(), 0)
+            self.assertTrue(renewed)
+            self.assertEqual(store.get(ref), data)
 
     def test_reusing_expired_content_returns_a_readable_renewed_reference(self):
         with TemporaryDirectory() as tmp:
