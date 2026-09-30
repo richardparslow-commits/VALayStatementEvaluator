@@ -913,8 +913,9 @@ def _citation_display(value: Any) -> str:
     return "".join("\\" + char if char in string.punctuation else char for char in text)
 
 
-def grounding_markdown(result: DraftResult) -> str:
+def grounding_markdown(result: DraftResult, *, literal: bool = False) -> str:
     """Render the grounding analysis as readable markdown for the UI."""
+    display = (lambda value: str(value or "")) if literal else _citation_display
     lines: list[str] = []
     if result.truncation_warning:
         lines.append(f"> ⚠️ **Truncated observations:** {result.truncation_warning}")
@@ -938,7 +939,7 @@ def grounding_markdown(result: DraftResult) -> str:
         for item in supported:
             lines.append(f"- **{item.get('observation', '')}**")
             lines.append(f"  - Record support: {item.get('record_support', '')}")
-            lines.append(f"  - Source: {_citation_display(item.get('source', ''))} — Quote: {_citation_display(item.get('quote', ''))}")
+            lines.append(f"  - Source: {display(item.get('source', ''))} — Quote: {display(item.get('quote', ''))}")
         lines.append("")
     unverified = _grounding_rows(grounding, "unverified_observations")
     if unverified:
@@ -952,15 +953,15 @@ def grounding_markdown(result: DraftResult) -> str:
         for item in conflicts:
             lines.append(f"- Observation: {item.get('observation', '')}")
             lines.append(f"  - Records show: {item.get('record_fact', '')}")
-            lines.append(f"  - Source: {_citation_display(item.get('source', ''))} — Quote: {_citation_display(item.get('quote', ''))}")
+            lines.append(f"  - Source: {display(item.get('source', ''))} — Quote: {display(item.get('quote', ''))}")
             lines.append(f"  - Guidance: {item.get('resolution_note', '')}")
         lines.append("")
     suggested = _grounding_rows(grounding, "suggested_inclusions")
     if suggested:
         lines.append("### Record facts to include only if the witness confirms")
         for item in suggested:
-            lines.append(f"- {_citation_display(item.get('fact', ''))} — {_citation_display(item.get('source', ''))}")
-            lines.append(f"  - Quote: {_citation_display(item.get('quote', ''))}")
+            lines.append(f"- {display(item.get('fact', ''))} — {display(item.get('source', ''))}")
+            lines.append(f"  - Quote: {display(item.get('quote', ''))}")
         lines.append("")
     topics = _grounding_rows(grounding, "topic_coverage")
     if topics:

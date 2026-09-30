@@ -790,7 +790,7 @@ def _render_draft_results(draft_result: Any) -> None:
     st.subheader("📋 Draft Results")
 
     with st.expander("Grounding analysis — how the draft ties to the records", expanded=True):
-        pilot.display(grounding_markdown(draft_result), container=st, method="markdown")
+        pilot.display(grounding_markdown(draft_result, literal=pilot.enabled()), container=st, method="markdown")
 
     render_follow_up_questions(
         slot="draft",

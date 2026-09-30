@@ -692,6 +692,7 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
     from app.medical_review import (
         MedicalDigest,
         _dedupe_facts,
+        _parse_citation,
         _merge_facts,
         _summarize,
     )
@@ -754,17 +755,27 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
         # authenticated source text. Never validate a quote against a summary.
         quarantined = {name for state in batch_states.values() for name in state.get("quarantined", [])}
         part_files = sorted(cfg.records_dir.glob(cfg.part_glob))
-        planned = {f"batch_{i:02d}": paths for i, paths in enumerate(
-            plan_batches(part_files, cfg.parts_per_batch), start=1)}
         selected_names = set()
-        for key, state in batch_states.items():
+        legacy_unresolved_facts = 0
+        for state in batch_states.values():
             if "facts" not in state:
                 continue
-            # New checkpoints record successful inputs. Legacy checkpoints
-            # recover membership from the same deterministic batch plan.
             names = state.get("source_files")
             if names is None:
-                names = [path.name for path in planned.get(key, [])]
+                # Batch numbering is not stable when inputs/size change. Recover
+                # legacy source membership from saved fact provenance instead.
+                names = []
+                for fact in digest_from_state(state).facts:
+                    filename = fact.document or _parse_citation(fact.source)[0]
+                    if not filename:
+                        legacy_unresolved_facts += 1
+                        continue
+                    matching = [path.name for path in part_files if
+                        path.name.casefold() == filename.casefold()
+                        or (path.suffix.lower() == ".zip" and filename.casefold().startswith(path.stem.casefold() + "/"))]
+                    if not matching:
+                        raise ValueError("A retained legacy source input is unavailable; restore it or re-run record review.")
+                    names.extend(matching)
             if not isinstance(names, list) or any(not isinstance(name, str) for name in names):
                 raise ValueError("Successful batch source membership is invalid.")
             selected_names.update(names)
@@ -910,6 +921,11 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
             f"> ⚠️ Source coverage: {len(unavailable_sources)} selected input(s) yielded no extractable records; "
             "record grounding uses the readable inputs only.\n\n"
         ) if unavailable_sources else ""
+        if legacy_unresolved_facts:
+            coverage_notice += (
+                f"> ⚠️ Legacy source coverage: {legacy_unresolved_facts} fact(s) have no recoverable source filename; "
+                "re-run record review before relying on those facts.\n\n"
+            )
         return {
             "statement": final,
             "grounding_markdown": coverage_notice + grounding_markdown(
@@ -918,6 +934,7 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
             "grounding_raw": grounding if isinstance(grounding, dict) else {},
             "grounding_policy": GROUNDING_SOURCE_POLICY,
             "unavailable_source_files": unavailable_sources,
+            "legacy_source_facts_unresolved": legacy_unresolved_facts,
             "review_issues": issues,
             "facts_total": len(combined.facts),
             "facts_pre_merge": len(deduped),

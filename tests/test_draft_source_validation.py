@@ -26,11 +26,11 @@ from tests.test_draft import WITNESS, _FakeLLM
 QUOTE = "Patient reports knee pain every morning."
 
 
-def evidence(kind=PAGE):
-    doc = ExtractedDocument("clinic.txt", [DocumentPage("clinic.txt", 1, QUOTE, kind)], pagination=kind)
+def evidence(kind=PAGE, filename="clinic.txt"):
+    doc = ExtractedDocument(filename, [DocumentPage(filename, 1, QUOTE, kind)], pagination=kind)
     source = doc.pages[0].label
     digest = MedicalDigest(facts=[MedicalFact("2024-01", "symptom", QUOTE, source, QUOTE,
-                                             document="clinic.txt", page=1)])
+                                             document=filename, page=1)])
     return [doc], digest
 
 
@@ -258,6 +258,13 @@ class TestGroundingSources(unittest.TestCase):
         self.assertNotIn("\n# heading", markdown)
         self.assertEqual(markdown.count(_citation_display(payload)), 6)
 
+    def test_plain_text_pilot_report_keeps_original_citation_punctuation(self):
+        data = record_grounding(self.entry)
+        markdown = grounding_markdown(DraftResult(grounding=data, grounding_policy=GROUNDING_SOURCE_POLICY), literal=True)
+        self.assertIn("clinic.txt p.1", markdown)
+        self.assertIn(QUOTE, markdown)
+        self.assertNotIn("clinic\\.txt", markdown)
+
     def test_policy_and_provenance_survive_saved_result_roundtrip(self):
         data = self.validate(record_grounding(self.entry))
         restored = draft_from_json(draft_to_json(DraftResult(grounding=data, grounding_policy=GROUNDING_SOURCE_POLICY)))
@@ -333,7 +340,7 @@ class TestDraftingSourceGate(unittest.TestCase):
         from tests.test_batch_draft import _make_cfg
 
         cfg = _make_cfg(Path(tempfile.mkdtemp()))
-        docs, digest = evidence()
+        docs, digest = evidence(filename="Part1.pdf")
         # Match the configured input glob; extraction returns a named synthetic unit.
         (cfg.records_dir / "Part1.pdf").write_text("Synthetic fixture", encoding="utf-8")
         phases = []
@@ -362,7 +369,7 @@ class TestDraftingSourceGate(unittest.TestCase):
              patch("app.medical_review._merge_facts", side_effect=lambda llm, d, **kw: d.facts), \
              patch("app.medical_review._summarize", return_value="Synthetic summary"), \
              patch.object(batch_draft.time, "sleep"), patch.object(batch_draft, "_wait_for_breaker"):
-            result = batch_draft.final_phase(FakeLLM(), cfg, {"batch_01": batch_draft.digest_to_state(digest)})
+            result = batch_draft.final_phase(FakeLLM(), cfg, {"batch_99": batch_draft.digest_to_state(digest)})
         extract.assert_called_once_with(str(cfg.records_dir / "Part1.pdf"))
         self.assertEqual(phases, ["grounding", "grounding", "draft", "review"])
         self.assertEqual(result["grounding_policy"], GROUNDING_SOURCE_POLICY)
@@ -378,7 +385,7 @@ class TestDraftingSourceGate(unittest.TestCase):
             cfg = _make_cfg(Path(tempfile.mkdtemp()), parts_per_batch=1)
             for name in ("Part1.pdf", "Part2.pdf", "Part3.pdf"):
                 (cfg.records_dir / name).write_text("Synthetic", encoding="utf-8")
-            docs, digest = evidence()
+            docs, digest = evidence(filename="Part1.pdf")
             good_state = batch_draft.digest_to_state(digest)
             excluded_state = batch_draft.digest_to_state(MedicalDigest())
             excluded_state["quarantined"] = ["Part3.pdf"]
@@ -446,7 +453,9 @@ class TestDraftingSourceGate(unittest.TestCase):
         cfg = _make_cfg(Path(tempfile.mkdtemp()))
         for name in ("Part1.pdf", "Part2.pdf"):
             (cfg.records_dir / name).write_text("Synthetic", encoding="utf-8")
-        docs, digest = evidence()
+        docs, digest = evidence(filename="Part1.pdf")
+
+        digest.facts.append(MedicalFact("2024", "symptom", QUOTE, "Part2.pdf p.1", QUOTE, document="Part2.pdf", page=1))
 
         def extract(path):
             if Path(path).name == "Part2.pdf":
@@ -488,6 +497,27 @@ class TestDraftingSourceGate(unittest.TestCase):
              patch("app.pipeline_guard.run_with_timeout", side_effect=lambda fn, *args, **kw: fn(*args)):
             state, _ = batch_draft.digest_group(object(), cfg, "batch_01", paths)
         self.assertEqual(state["source_files"], ["Part1.pdf"])
+
+    def test_missing_legacy_source_stops_generation_instead_of_silently_losing_support(self):
+        import tempfile
+        from pathlib import Path
+        from scripts import batch_draft
+        from tests.test_batch_draft import _make_cfg
+        cfg = _make_cfg(Path(tempfile.mkdtemp()))
+        docs, digest = evidence(filename="Missing.pdf")
+        llm = _FakeLLM({"grounding": complete_grounding()})
+        with patch("app.pipeline_guard.run_with_timeout", side_effect=lambda fn, **kw: fn()), \
+             patch("app.medical_review._merge_facts", side_effect=lambda llm, d, **kw: d.facts), \
+             patch("app.medical_review._summarize", return_value="Synthetic summary"), \
+             self.assertRaisesRegex(ValueError, "legacy source input is unavailable"):
+            batch_draft.final_phase(llm, cfg, {"batch_99": batch_draft.digest_to_state(digest)})
+        self.assertEqual(llm.calls, [])
+
+    def test_unknown_legacy_fact_sources_produce_explicit_coverage_warning(self):
+        from tests.test_batch_draft import TestFinalPhaseSemantics
+        result = TestFinalPhaseSemantics()._run_final("ok")
+        self.assertEqual(result["legacy_source_facts_unresolved"], 1)
+        self.assertIn("Legacy source coverage", result["grounding_markdown"])
 
     def test_batch_witness_only_result_records_new_policy(self):
         from tests.test_batch_draft import TestFinalPhaseSemantics
