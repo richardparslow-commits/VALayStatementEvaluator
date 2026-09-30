@@ -171,6 +171,21 @@ class TestCompleteQuoteMatching(unittest.TestCase):
                 self.assertEqual(verify_citations([fact(quote)], [document(source)])["missing"], 1)
                 self.assertEqual(verify_citations([fact(source)], [document(source)])["verified"], 1)
 
+    def test_medical_prefixes_stay_attached_across_dash_variants(self):
+        for dash in ("–", "—", "−"):
+            for prefix, quote in (
+                ("non", "weight bearing for six weeks"),
+                ("anti", "inflammatory treatment was prescribed"),
+                ("post", "operative pain persisted for weeks"),
+                ("pre", "existing knee pain was documented"),
+            ):
+                with self.subTest(dash=dash, prefix=prefix):
+                    source = prefix + dash + quote
+                    self.assertEqual(verify_citations([fact(quote)], [document(source)])["missing"], 1)
+                    self.assertEqual(verify_citations([fact(source)], [document(source)])["verified"], 1)
+        # Do not detach the root at the other end of a quoted prefix either.
+        self.assertEqual(verify_citations([fact("The patient was kept non")], [document("The patient was kept non–weight bearing")])["missing"], 1)
+
     def test_later_complete_occurrence_can_match_after_an_invalid_fragment(self):
         quote = "Pain persists during walking"
         source = "NoPain persists during walking; " + quote + "."
@@ -294,6 +309,8 @@ class TestPilotCitationGate(unittest.TestCase):
         for quote, source in (
             ("oxygen saturation was 95", "oxygen saturation was 95%"),
             ("weight bearing for six weeks", "non-weight bearing for six weeks"),
+            ("weight bearing for six weeks", "non–weight bearing for six weeks"),
+            ("weight bearing for six weeks", "non—weight bearing for six weeks"),
             ("C patient was discharged", "37°C patient was discharged"),
             ("5 mg taken orally daily", "±5 mg taken orally daily"),
         ):

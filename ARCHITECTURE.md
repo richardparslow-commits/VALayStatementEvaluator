@@ -215,6 +215,9 @@ differences without stripping accents or changing digit width. Matches cannot sp
 hyphenated term, contraction or clinical numeric token (for example, `non-weight`, `95%`,
 `3+` or `37°C`). Both visible coverage and the saved `verified_ratio` use all facts as the
 denominator, including skipped citations.
+Common medical prefixes such as `non`, `anti`, `pre` and `post` stay attached across
+unspaced en/em dashes too; ordinary sentence clauses can still provide a matching excerpt.
+These are conservative text-boundary rules, not validation of clinical meaning.
 
 ## 7. Record-source abstraction (why Fetch Sandbox and VA.gov are optional)
 

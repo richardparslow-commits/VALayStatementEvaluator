@@ -479,6 +479,14 @@ CITATION_MATCH_POLICY = "full_quote_page_v1"
 # Very short quotes do not establish a meaningful excerpt; retain them as
 # unresolved rather than claiming their citations have been validated.
 _CITATION_MIN_PROBE_WORDS = 4
+# These prefixes can qualify clinical meaning even when OCR/editor formatting
+# substitutes a sentence dash for a hyphen. This is a conservative token-boundary
+# rule, not a clinical vocabulary or a check of the passage's interpretation.
+_CITATION_TERM_PREFIXES = frozenset({
+    "non", "un", "anti", "contra", "pre", "post", "hypo", "hyper", "pseudo",
+    "intra", "inter", "extra", "peri", "para", "sub", "supra", "infra", "super",
+    "re", "de", "dis", "mis",
+})
 
 
 def _citation_probe(quote: str) -> str:
@@ -499,9 +507,20 @@ def _citation_quote_present(quote: str, text: str) -> bool:
         )
 
     separators = ".,:/‐‑–—−-"
-    # Hyphens join lexical terms; en/em dashes separate sentence clauses.
+    # Hyphens join terms; sentence dashes can also attach a clinical prefix.
     lexical_joiners = "-‐‑'’/"
     numeric_suffixes = "%％‰‱+−-°℃℉±"
+
+    def joins_term(index: int) -> bool:
+        if text[index] in lexical_joiners:
+            return True
+        if text[index] not in "–—−":
+            return False
+        prefix_start = index
+        while prefix_start > 0 and word_char(text[prefix_start - 1]):
+            prefix_start -= 1
+        return text[prefix_start:index] in _CITATION_TERM_PREFIXES
+
     # Suffixes belong to the value: 95%, 3+, and 37°C cannot be shortened to
     # 95, 3, or 37, nor can 37° be accepted as the complete 37°C token.
     number_end = len(quote) - 1
@@ -521,9 +540,9 @@ def _citation_quote_present(quote: str, text: str) -> bool:
             or word_char(quote[-1]) and word_char(after)
             # Do not drop a lexical prefix such as non- in non-weight bearing,
             # or split a contraction; punctuation elsewhere is still allowed.
-            or word_char(quote[0]) and bool(before) and before in lexical_joiners
+            or word_char(quote[0]) and bool(before) and joins_term(start - 1)
             and start >= 2 and word_char(text[start - 2])
-            or word_char(quote[-1]) and bool(after) and after in lexical_joiners
+            or word_char(quote[-1]) and bool(after) and joins_term(end)
             and end + 1 < len(text) and word_char(text[end + 1])
         )
         # "5 mg orally daily" must not validate against "1.5 mg orally daily";
