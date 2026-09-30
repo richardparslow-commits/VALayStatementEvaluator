@@ -313,31 +313,14 @@ class MedicalDigest:
             picked[-1] = ordered[-1]
         return "\n".join(_lines(picked))
 
-    def relevant_facts_text(
-        self,
-        query: str,
-        *,
-        max_facts: int = 150,
-        budget_chars: int = 90_000,
+    def ranked_facts(
+        self, query: str, *,
         always_include_types: tuple[str, ...] = ("in_service_event", "hospitalization"),
-        sort_dates: bool = False,
-    ) -> str:
-        """Return digest facts ranked by relevance to a claim/observation query.
-
-        Replaces naive head-truncation of the full JSON digest: for large record
-        sets the evidence relevant to a given claim can sit anywhere in thousands
-        of facts, so each verification/grounding prompt receives the facts that
-        actually match it (plus all high-priority event types), within a budget.
-
-        With ``sort_dates=True`` the retained facts are *presented* in
-        chronological order (undated last; relevance order breaks ties), while
-        selection is still relevance-ranked — the right facts are kept, and a
-        drafting prompt reads them as a timeline. Verification prompts keep the
-        default relevance order: for judging a claim, best evidence first.
-        """
+    ) -> list[MedicalFact]:
+        """Rank retained facts without copying or truncating their evidence."""
         query_tokens = set(_tokens(query))
         if not self.facts:
-            return "(no facts extracted from records)"
+            return []
 
         # IDF-weighted scoring so distinctive terms (dates, names, numbers)
         # outrank boilerplate shared by every fact — critical when thousands
@@ -370,6 +353,34 @@ class MedicalDigest:
         fillers = [item for item in scored if item[0] < 0.15]
         fillers.sort(key=lambda item: (-item[0], item[1]))
 
+        return [fact for _, _, fact in matches + fillers]
+
+    def relevant_facts_text(
+        self,
+        query: str,
+        *,
+        max_facts: int = 150,
+        budget_chars: int = 90_000,
+        always_include_types: tuple[str, ...] = ("in_service_event", "hospitalization"),
+        sort_dates: bool = False,
+    ) -> str:
+        """Return digest facts ranked by relevance to a claim/observation query.
+
+        Replaces naive head-truncation of the full JSON digest: for large record
+        sets the evidence relevant to a given claim can sit anywhere in thousands
+        of facts, so each verification/grounding prompt receives the facts that
+        actually match it (plus all high-priority event types), within a budget.
+
+        With ``sort_dates=True`` the retained facts are *presented* in
+        chronological order (undated last; relevance order breaks ties), while
+        selection is still relevance-ranked — the right facts are kept, and a
+        drafting prompt reads them as a timeline. Verification prompts keep the
+        default relevance order: for judging a claim, best evidence first.
+        """
+        ranked = self.ranked_facts(query, always_include_types=always_include_types)
+        if not ranked:
+            return "(no facts extracted from records)"
+
         limit = max(0, min(max_facts, config.MAX_DIGEST_FACTS, len(self.facts)))
 
         def selection_header(count: int, *, chronological: bool = False) -> str:
@@ -385,7 +396,7 @@ class MedicalDigest:
         used = len(selection_header(limit, chronological=sort_dates)) + 1
         entries: list[tuple[str, str, int]] = []  # (date_sort_key, line, selection_rank)
         count = 0
-        for rank, (_, _, fact) in enumerate(matches + fillers):
+        for rank, fact in enumerate(ranked):
             if count >= limit:
                 break
             line = f"[{fact.date}] ({fact.type}) {fact.description} — {fact.source}"
@@ -567,6 +578,12 @@ def _citation_quote_present(quote: str, text: str) -> bool:
             return True
         start = text.find(quote, start + 1)
     return False
+
+
+def quote_matches_source(quote: str, text: str) -> bool:
+    """Check the complete excerpt with the digest's word/value boundary rules."""
+    probe = _citation_probe(quote)
+    return bool(probe) and _citation_quote_present(probe, " ".join(text.casefold().split()))
 
 
 def verify_citations(

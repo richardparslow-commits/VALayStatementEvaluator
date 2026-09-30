@@ -17,9 +17,11 @@ from .documents import (
     BLOCK,
     EVALUATE_INTERNAL_MAX_CHARS,
     ExtractedDocument,
+    DocumentPage,
     MAX_STATEMENT_CHARS,
     PAGE,
 )
+from .source_validation import build_source_index, source_reference_key
 from .exporter import parse_source
 from .llm import LLMClient, LLMError, LLMParseError, LLMService
 from . import tracing
@@ -1063,58 +1065,8 @@ def evaluation_report_markdown(result: EvaluationResult) -> str:
     return report
 
 
-def _source_reference_key(reference: str) -> str:
-    return " ".join(reference.split()).casefold()
-
-
-def _source_reference_aliases(filename: str, kind: str, number: int) -> set[str]:
-    prefix = "p." if kind == PAGE else "b."
-    labels = (
-        f"{filename} {prefix}{number}",
-        f"{filename} — {kind} {number}",
-        f"{filename} - {kind} {number}",
-    )
-    return {
-        _source_reference_key(alias)
-        for label in labels for alias in (label, f"[{label}]")
-    }
-
-
-def _verification_source_index(records: list[ExtractedDocument]) -> dict[str, str | None]:
-    """Index exact single-unit aliases; collisions are deliberately unusable.
-
-    An uploaded filename is not necessarily unique. Even duplicate pages with
-    identical text remain ambiguous: we cannot tell which upload was cited.
-    Unreadable units reserve their aliases so a duplicate readable unit cannot
-    disguise the ambiguity. No model-generated digest labels are trusted here.
-    """
-    index: dict[str, str | None] = {}
-    for document in records:
-        # Image-only pages are normally absent from extracted units. Reserve
-        # these addresses too, including collisions with another upload.
-        if document.pagination in (PAGE, BLOCK):
-            for number in document.unreadable_pages:
-                if type(number) is int and number > 0:
-                    for alias in _source_reference_aliases(document.filename, document.pagination, number):
-                        index[alias] = None
-        for unit in document.pages:
-            if unit.kind not in (PAGE, BLOCK) or type(unit.page) is not int or unit.page < 1:
-                continue
-            readable = (
-                unit.filename == document.filename
-                and bool(unit.text.strip())
-                and unit.page not in document.unreadable_pages
-            )
-            canonical = unit.label if readable else None
-            # Reserve both names on a malformed/mislabelled extracted unit.
-            for filename in {document.filename, unit.filename}:
-                for alias in _source_reference_aliases(filename, unit.kind, unit.page):
-                    index[alias] = None if alias in index else canonical
-    return index
-
-
 def _validate_verification_sources(
-    verifications: list[dict], source_index: dict[str, str | None],
+    verifications: list[dict], source_index: dict[str, DocumentPage | None],
 ) -> None:
     """Require evidence verdicts to resolve to one readable uploaded unit.
 
@@ -1125,12 +1077,12 @@ def _validate_verification_sources(
         reference = item["record_reference"]
         if not reference and item["verdict"] == "NOT FOUND":
             continue
-        canonical = source_index.get(_source_reference_key(reference))
+        canonical = source_index.get(source_reference_key(reference))
         if canonical is None:
             raise LLMParseError(
                 "Verification citation must identify one readable, unambiguous uploaded source unit."
             )
-        item["record_reference"] = canonical
+        item["record_reference"] = canonical.label
 
 
 def _verify_claims(
@@ -1157,7 +1109,7 @@ def _verify_claims(
     verification error before downstream scoring instead of inventing verdicts.
     """
     claims = _normalize_claims(claims)
-    source_index = _verification_source_index(records)
+    source_index = build_source_index(records)
     verdict_by_id: dict[int, dict] = {}
     evidence_gaps: list[dict] = []
     batch_size = 8

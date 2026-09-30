@@ -406,7 +406,7 @@ def merge_states(a: dict, b: dict) -> dict:
         return a
     m = dict(a)
     m["facts"] = a["facts"] + b["facts"]
-    for k in ("conditions", "providers"):
+    for k in ("conditions", "providers", "source_files"):
         m[k] = sorted(set(a.get(k, [])) | set(b.get(k, [])))
     for k in ("pages_reviewed", "chunks_reviewed", "duplicates_skipped",
               "unreadable_pages", "pages_in_files", "chunks_without_facts"):
@@ -575,7 +575,9 @@ def digest_group(llm: Any, cfg: BatchConfig, group_label: str,
     dur = time.time() - t0
     state = digest_to_state(digest)
     state.update({"duration_s": round(dur, 1), "files": len(files), "pages": pages,
-                  "quarantined": []})
+                  "quarantined": [], "source_files": [f.name for f in files if any(
+                      doc.filename == f.name or (f.suffix.lower() == ".zip" and doc.filename.startswith(f.stem + "/"))
+                      for doc in docs)]})
     log(f"{group_label}: OK in {dur:.0f}s — facts={len(digest.facts)} "
         f"chunks={digest.chunks_reviewed} pages={pages} cov={digest.coverage_ratio:.0%}")
     return state, []
@@ -665,6 +667,9 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
     combined digest, and treats a failed review pass as non-fatal the way
     ``run_draft`` does.
     """
+    from app.grounding_sources import GROUNDING_SOURCE_POLICY, grounding_catalog, validate_grounding_sources
+    from app.source_validation import build_source_index
+    from app.documents import ExtractionError, records_from_local_path
     from app.config import load_knowledge
     from app.documents import DRAFT_INTERNAL_MAX_CHARS, MAX_OBSERVATIONS_CHARS
     from app.draft import (
@@ -687,6 +692,7 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
     from app.medical_review import (
         MedicalDigest,
         _dedupe_facts,
+        _parse_citation,
         _merge_facts,
         _summarize,
     )
@@ -694,7 +700,7 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
     from app.prompt_sanitize import GUARD_NOTE, sanitize_digest_text, sanitize_for_prompt
 
     def work() -> dict:
-        parts = [digest_from_state(s) for s in batch_states.values()]
+        parts = [digest_from_state(s) for s in batch_states.values() if "facts" in s]
         all_facts = [f for d in parts for f in d.facts]
         log(f"combined: {len(all_facts)} facts from {len(parts)} batches -> dedupe")
         # Memory pressure warning: at the 6,000+ fact design scale (5,000-page
@@ -745,6 +751,53 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
                 f"{removed:,} truncated for prompts; details at the end may be missed")
         grounding_query = f"{cfg.condition} {obs_for_prompt}"
 
+        # Re-extract current source units: legacy checkpoints contain facts, not
+        # authenticated source text. Never validate a quote against a summary.
+        quarantined = {name for state in batch_states.values() for name in state.get("quarantined", [])}
+        part_files = sorted(cfg.records_dir.glob(cfg.part_glob))
+        selected_names = set()
+        legacy_unresolved_facts = 0
+        for state in batch_states.values():
+            if "facts" not in state:
+                continue
+            names = state.get("source_files")
+            if names is None:
+                # Batch numbering is not stable when inputs/size change. Recover
+                # legacy source membership from saved fact provenance instead.
+                names = []
+                for fact in digest_from_state(state).facts:
+                    filename = fact.document or _parse_citation(fact.source)[0]
+                    if not filename:
+                        legacy_unresolved_facts += 1
+                        continue
+                    matching = [path.name for path in part_files if
+                        path.name.casefold() == filename.casefold()
+                        or (path.suffix.lower() == ".zip" and filename.casefold().startswith(path.stem.casefold() + "/"))]
+                    if not matching:
+                        raise ValueError("A retained legacy source input is unavailable; restore it or re-run record review.")
+                    names.extend(matching)
+            if not isinstance(names, list) or any(not isinstance(name, str) for name in names):
+                raise ValueError("Successful batch source membership is invalid.")
+            selected_names.update(names)
+        selected_names -= quarantined
+        if selected_names - {path.name for path in part_files}:
+            raise ValueError("A successful batch source file is unavailable.")
+        source_docs = []
+        for path in part_files:
+            if path.name in selected_names:
+                try:
+                    docs, _ = records_from_local_path(str(path))
+                except ExtractionError as exc:
+                    # Membership now comes from successful source metadata or
+                    # retained fact provenance. An original skip is not selected;
+                    # failure of a selected source is a new loss of evidence.
+                    raise ValueError(
+                        "A retained batch source input could not be re-extracted; restore it or re-run record review."
+                    ) from exc
+                source_docs.extend(docs)
+        catalog, catalog_text = grounding_catalog(combined, source_docs, grounding_query)
+        source_index = build_source_index(source_docs)
+
         log("grounding call…")
         care_block = _care_block(cfg.witness)
         # Normalization runs INSIDE the retry: chat_json guarantees parseable
@@ -752,7 +805,7 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
         # shape-invalid answer (2026-09-23 23:21: a bare array) died outside
         # the wrapper one second after a 4-minute call, discarding the merge.
         grounding = _retry_phase(
-            lambda: _normalize_grounding(llm.chat_json(
+            lambda: validate_grounding_sources(_normalize_grounding(llm.chat_json(
                 GROUNDING_SYSTEM,
                 _format_with(
                     GROUNDING_USER,
@@ -763,17 +816,13 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
                     credentials_block=witness_credentials_block(cfg.witness),
                     care_block=care_block,
                     observations=sanitize_for_prompt(obs_for_prompt, max_chars=DRAFT_INTERNAL_MAX_CHARS),
-                    digest=sanitize_digest_text(
-                        combined.relevant_facts_text(
-                            grounding_query, **_facts_text_kwargs(combined)),
-                        max_chars=120_000,
-                    ),
+                    digest=catalog_text,
                     checklist=load_knowledge("topic_checklist.md"),
                     guard_note=GUARD_NOTE,
                 ),
                 phase="grounding",
-            ), observations_present=bool(obs_for_prompt.strip())),
-            "grounding",
+            ), observations_present=bool(obs_for_prompt.strip())), catalog, source_index),
+            "grounding", attempts=2, base_wait_s=0.0,
         )
         log(f"grounding done: {len(grounding)} keys")
 
@@ -869,12 +918,20 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
                     final = improved.strip()
             log(f"review done: {len(issues)} issue(s)")
 
+        coverage_notice = ""
+        if legacy_unresolved_facts:
+            coverage_notice += (
+                f"> ⚠️ Legacy source coverage: {legacy_unresolved_facts} fact(s) have no recoverable source filename; "
+                "re-run record review before relying on those facts.\n\n"
+            )
         return {
             "statement": final,
-            "grounding_markdown": grounding_markdown(
-                DraftResult(grounding=grounding)
+            "grounding_markdown": coverage_notice + grounding_markdown(
+                DraftResult(grounding=grounding, grounding_policy=GROUNDING_SOURCE_POLICY)
             ) if isinstance(grounding, dict) else "",
             "grounding_raw": grounding if isinstance(grounding, dict) else {},
+            "grounding_policy": GROUNDING_SOURCE_POLICY,
+            "legacy_source_facts_unresolved": legacy_unresolved_facts,
             "review_issues": issues,
             "facts_total": len(combined.facts),
             "facts_pre_merge": len(deduped),
@@ -882,6 +939,16 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
         }
 
     return run_with_timeout(work, timeout_seconds=cfg.final_timeout_s)
+
+
+def saved_grounding_markdown(final: dict) -> str:
+    """Annotate resumed legacy/unknown finals without relabelling their policy."""
+    from app.grounding_sources import GROUNDING_SOURCE_POLICY, LEGACY_GROUNDING_SOURCE_NOTICE
+
+    markdown = str(final.get("grounding_markdown", ""))
+    if final.get("grounding_policy") != GROUNDING_SOURCE_POLICY and LEGACY_GROUNDING_SOURCE_NOTICE not in markdown:
+        return f"> ⚠️ **Drafting source validation:** {LEGACY_GROUNDING_SOURCE_NOTICE}\n\n{markdown}"
+    return markdown
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1070,7 +1137,7 @@ def main(argv: list[str] | None = None) -> int:
         f"# Draft lay statement — {cfg.condition}\n\n{final['statement']}\n",
         encoding="utf-8",
     )
-    (cfg.out_dir / "grounding.md").write_text(final["grounding_markdown"], encoding="utf-8")
+    (cfg.out_dir / "grounding.md").write_text(saved_grounding_markdown(final), encoding="utf-8")
     log(f"ALL DONE in {(time.time() - t_all) / 60:.1f} min — statement "
         f"{len(final['statement']):,} chars, {final['facts_total']} facts "
         f"(pre-merge {final['facts_pre_merge']}), review issues {len(final['review_issues'])}")
