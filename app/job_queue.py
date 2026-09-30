@@ -107,13 +107,17 @@ class JobRecord:
     updated_at: float = 0.0
     heartbeat_at: float = 0.0
     attempts: int = 0
+    # Per-response availability, not persisted job state.
+    recovery_available: bool = True
 
     @property
     def is_terminal(self) -> bool:
         return self.status in TERMINAL_STATUSES
 
     def to_json(self) -> str:
-        return json.dumps(asdict(self))
+        data = asdict(self)
+        data.pop('recovery_available')
+        return json.dumps(data)
 
     @classmethod
     def from_json(cls, raw: str | None) -> JobRecord | None:
@@ -543,7 +547,14 @@ if raw then
         return redis.error_reply('retained submission has no valid expiry')
     end
     if not indexed or redis.call('PTTL', KEYS[4]) < remaining then
-        redis.call('SET', KEYS[4], id, 'PX', remaining)
+        local restored = pcall(function()
+            return redis.call('SET', KEYS[4], id, 'PX', remaining)
+        end)
+        if not restored then
+            -- Memory pressure must not hide an already committed submission.
+            -- Report that reference repair is unavailable; retain the job as-is.
+            return {raw, 'reference_unavailable'}
+        end
     end
     -- Return running/terminal work as-is. A lost reply never starts it again.
     return raw
@@ -759,10 +770,14 @@ class _AtomicJobBackend(JobBackend):
             raw = self._command(*command)
             if raw == ["queue_full"]:
                 raise JobQueueError("job queue is full; retry the same submission later")
+        recovery_available = True
+        if isinstance(raw, list) and len(raw) == 2 and raw[1] == 'reference_unavailable':
+            raw = raw[0]
+            recovery_available = False
         record = JobRecord.from_json(raw)
         if record is None or record.job_id != candidate.job_id:
             raise JobQueueError("submission returned invalid metadata; retry the same reference")
-        return record
+        return replace(record, recovery_available=recovery_available)
 
     def _prune_expired_queue(self, kind: str) -> None:
         # Bound script size and work for legacy queues larger than today's cap.

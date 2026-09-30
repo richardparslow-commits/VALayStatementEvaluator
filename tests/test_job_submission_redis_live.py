@@ -106,6 +106,34 @@ class TestIsolatedRedisSubmission(SubmissionContract, SubmissionFailures, Submis
         self.assertEqual(backend.get_result(original.job_id), 'synthetic result')
         self.assertEqual(backend.depth(), 0)
 
+    def test_memory_pressure_can_confirm_retained_work_without_reference_repair(self):
+        for status in ('queued', 'running', 'done'):
+            with self.subTest(status=status):
+                backend = self.make_backend()
+                original = backend.enqueue('evaluate', 'input', request_id='reference', owner_id='owner')
+                if status != 'queued':
+                    claimed, _ = backend.claim(['evaluate'], worker_id='worker')
+                    if status == 'done':
+                        backend.store_result(claimed.job_id, 'result', claim_token=claimed.claim_token)
+                        backend.complete(claimed.job_id, claim_token=claimed.claim_token)
+                reference_key = job_queue._recovery_key(backend._prefix, 'reference')
+                self.admin.pexpire(reference_key, 1)
+                time.sleep(0.02)
+                self.assertIsNone(backend.lookup_by_request_id('reference'))
+                self.admin.config_set('maxmemory', 1)
+                try:
+                    retried = backend.enqueue('evaluate', 'input', request_id='reference', owner_id='owner')
+                    self.assertEqual((retried.job_id, retried.status), (original.job_id, status))
+                    self.assertFalse(retried.recovery_available)
+                    self.assertIsNone(backend.lookup_by_request_id('reference'))
+                    self.assertEqual(backend.depth(), 1 if status == 'queued' else 0)
+                finally:
+                    self.admin.config_set('maxmemory', 0)
+                restored = backend.enqueue('evaluate', 'input', request_id='reference', owner_id='owner')
+                self.assertTrue(restored.recovery_available)
+                self.assertEqual(backend.lookup_by_request_id('reference'), original.job_id)
+                self.assertEqual(backend.depth(), 1 if status == 'queued' else 0)
+
     def test_acl_write_rejection_happens_before_partial_submission(self):
         import redis
         backend = self.make_backend()

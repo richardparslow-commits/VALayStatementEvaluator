@@ -1,6 +1,7 @@
 """Producer retries, concurrency, admission and partial-write regressions."""
 import sys
 import time
+from dataclasses import replace
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -122,6 +123,26 @@ class SubmissionExpiry:
         self.assertAlmostEqual(backend._command('PTTL', reference_key), remaining, delta=100)
         self.assertEqual(backend.depth(), 0)
 
+    def test_reference_repair_failure_still_confirms_retained_work(self):
+        backend = self.make_backend()
+        original = backend.enqueue('evaluate', 'input', request_id='reference', owner_id='owner')
+        reference_key = job_queue._recovery_key(backend._prefix, 'reference')
+        backend._command('DEL', reference_key)
+        script = job_queue._ENQUEUE_SCRIPT.replace(
+            "return redis.call('SET', KEYS[4], id, 'PX', remaining)",
+            "error('synthetic reference repair refusal')")
+        with patch.object(job_queue, '_ENQUEUE_SCRIPT', script):
+            retried = backend.enqueue('evaluate', 'input', request_id='reference', owner_id='owner')
+        self.assertEqual(retried.job_id, original.job_id)
+        self.assertFalse(retried.recovery_available)
+        self.assertNotIn('recovery_available', retried.to_json())
+        self.assertIsNone(backend.lookup_by_request_id('reference'))
+        self.assertEqual(backend.depth(), 1)
+        restored = backend.enqueue('evaluate', 'input', request_id='reference', owner_id='owner')
+        self.assertTrue(restored.recovery_available)
+        self.assertEqual(backend.lookup_by_request_id('reference'), original.job_id)
+        self.assertEqual(backend.depth(), 1)
+
 
 class TestInProcessSubmission(SubmissionContract, unittest.TestCase):
     def make_backend(self):
@@ -233,6 +254,36 @@ class TestBrowserSubmissionRetry(unittest.TestCase):
         self.assertEqual((claimed.request_id, payload), ('original-reference', 'original payload'))
         self.assertNotIn('eval_queue_submission', ui.session_state)
         self.assertIn('original-reference', display.call_args.args[0])
+
+    def test_unavailable_reference_is_explained_without_hiding_the_job(self):
+        from app.views import job_runner
+        from app.job_payload import EvaluateJob
+        backend = job_queue.InProcessJobBackend(prefix='warning-test', ttl_seconds=60)
+        record = backend.enqueue('evaluate', 'input', request_id='reference', owner_id='owner')
+        ui = MagicMock()
+        ui.session_state = {}
+        with patch.object(job_runner, 'st', ui), \
+                patch.object(job_runner, 'get_job_backend', return_value=backend), \
+                patch.object(backend, 'enqueue', side_effect=[replace(record, recovery_available=False), record]), \
+                patch.object(job_runner.pilot, 'current_owner', return_value='owner'), \
+                patch.object(job_runner, '_encode_payload', return_value='input'), \
+                patch.object(job_runner, '_poll', side_effect=[
+                    job_runner.QueueOutcome(ok=False, still_running=True),
+                    job_runner.QueueOutcome(ok=True, request_id='reference')]) as poll, \
+                patch.object(job_runner, 'run_log_event'), \
+                patch.object(job_runner.pilot, 'display') as display:
+            result = job_runner.submit_job(slot='eval', job=EvaluateJob(statement_text='input', records=[]),
+                                           request_id='reference', condition=None, sources=[], files=0,
+                                           pages=0, action_label='Evaluation')
+            self.assertTrue(result.still_running)
+            self.assertEqual(ui.session_state['eval_queue_submission']['confirmed_job_id'], record.job_id)
+            ui.button.side_effect = lambda label, **kwargs: label == 'Check earlier submission'
+            job_runner._render_uncertain_submission('eval')
+        self.assertEqual(poll.call_count, 2)
+        self.assertNotIn('eval_queue_submission', ui.session_state)
+        warnings = [call.args[0] for call in display.call_args_list if call.kwargs.get('method') == 'warning']
+        self.assertTrue(any('Keep this tab open' in warning for warning in warnings))
+        self.assertEqual(backend.depth(), 1)
 
     def test_discard_requires_explicit_acknowledgement_and_allows_current_inputs(self):
         from app.views import job_runner

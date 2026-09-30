@@ -437,6 +437,10 @@ inputs, owner or kind is refused. Calls without a reference remain independent
 submissions. Deduplication lasts while job metadata is retained, not forever.
 An accepted retry restores an expired recovery mapping for the retained job's
 remaining lifetime without restarting its work.
+If memory pressure or command permissions refuse that repair, the existing job
+is still confirmed. The tab warns that reference recovery is unavailable, keeps
+the saved submission for another repair attempt, and advises keeping the tab
+open. New submissions remain subject to the normal memory and admission limits.
 Use a new reference for an intentional new analysis. The reference is never an
 authorization credential.
 

@@ -311,7 +311,8 @@ def submit_job(
             record_in_flight = backend.get(existing)
         except Exception:  # noqa: BLE001 - fall through and let the submit fail loudly
             record_in_flight = None
-        if record_in_flight is not None and not record_in_flight.is_terminal:
+        checking_confirmed = isinstance(pending, dict) and pending.get("confirmed_job_id") == existing
+        if record_in_flight is not None and not record_in_flight.is_terminal and not checking_confirmed:
             run_log_event(
                 kind,
                 "rejected",
@@ -382,9 +383,21 @@ def submit_job(
             , container=st, method="error")
             return None
 
-    st.session_state.pop(submission_key, None)
+    if record.recovery_available:
+        st.session_state.pop(submission_key, None)
+    else:
+        # Keep exact inputs for a safe reference-repair retry, including while
+        # the confirmed job is still running. Never submit current edits here.
+        st.session_state[submission_key]["confirmed_job_id"] = record.job_id
     st.session_state[_pending_key(slot)] = record.job_id
     st.session_state[_pending_request_key(slot)] = request_id
+    if not record.recovery_available:
+        pilot.display(
+            "This run is confirmed, but its recovery reference could not be restored. "
+            "Keep this tab open. Check the earlier submission again after queue capacity "
+            "is available to restore recovery from another session.",
+            container=st, method="warning",
+        )
     # The producer committed recovery indexing with the job, before returning.
     # The worker writes the audit start/ok/error pair, so the web pod records
     # only that the work was handed off — one audit record per run either way.
@@ -415,7 +428,9 @@ def _render_uncertain_submission(slot: str) -> None:
     if not isinstance(pending, dict):
         return
     pilot.display(
-        f"An earlier submission is unconfirmed (reference `{pending['request_id']}`). "
+        (f"An earlier run is confirmed, but reference recovery is unavailable "
+         f"(reference `{pending['request_id']}`). " if pending.get("confirmed_job_id") else
+         f"An earlier submission is unconfirmed (reference `{pending['request_id']}`). ") +
         "Checking it uses the inputs saved with that attempt. To use your recent edits, "
         "discard the earlier attempt first. It may still run and incur charges.",
         container=st, method="warning",
