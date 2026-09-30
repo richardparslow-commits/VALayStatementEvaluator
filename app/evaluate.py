@@ -14,9 +14,11 @@ import streamlit as st
 from .agiloop_telemetry import track_feature_error, track_goal
 from .config import load_knowledge
 from .documents import (
+    BLOCK,
     EVALUATE_INTERNAL_MAX_CHARS,
     ExtractedDocument,
     MAX_STATEMENT_CHARS,
+    PAGE,
 )
 from .exporter import parse_source
 from .llm import LLMClient, LLMError, LLMParseError, LLMService
@@ -47,6 +49,19 @@ SEARCH_FEATURE_ID = "22bc7e10-dcda-431e-b3fb-4e8ff9b532cb"  # medical-record-sea
 EFFECTIVENESS_FEATURE_ID = "94104045-aa12-4018-95c6-e6912e659803"  # statement-effectiveness-score-improvement-recommendations
 
 VERIFICATION_MAX_ATTEMPTS = 3
+SOURCE_REFERENCE_POLICY = "uploaded_source_unit_v1"
+SOURCE_REFERENCE_NOTICE = (
+    "Verdict citations were checked against readable, unambiguous uploaded pages or "
+    "text blocks. This checks source addresses, not whether the text supports the "
+    "verdict or whether the interpretation is correct. Review each finding against "
+    "the original records before using the evaluation or revision."
+)
+LEGACY_REFERENCE_NOTICE = (
+    "This saved evaluation has no recognized source-reference validation policy. "
+    "Its verdict citations have not been confirmed against uploaded pages or text "
+    "blocks by the current check. Re-run the evaluation before relying on its "
+    "findings, scores, or revision."
+)
 CLAIM_TYPES = frozenset({
     "in_service_event", "onset", "symptom", "diagnosis_reference",
     "treatment_reference", "date_or_place", "functional_impact", "continuity", "other",
@@ -141,7 +156,7 @@ records and (2) raw record excerpts. Be rigorous but fair:
   "denies pain", "no tenderness", "gait normal", the other side, an incompatible date or \
   facility. A contradiction is an affirmative finding, so it MUST name the conflicting record \
   entry in record_reference. If you cannot point to that specific record text, the verdict is \
-  NOT FOUND, not CONTRADICTED; the tool downgrades an uncited contradiction to a record gap.
+  NOT FOUND, not CONTRADICTED; an uncited evidence-based verdict is invalid.
 - NOT FOUND: nothing in the records confirms or denies it. This is the correct verdict for \
   silence, and it is not an accuracy failure. Absence of evidence on a question is not \
   substantive negative evidence against a claimant (Buczynski v. Shinseki; Horn v. Shinseki; \
@@ -177,9 +192,12 @@ respect it:
   grades competence separately. Never mark it CONTRADICTED merely because a lay witness could \
   not assert it, and never mark it SUPPORTED merely because the record repeats the writer's own \
   words back to them.
-Cite the supporting or conflicting record fact, with its source label and date, on every \
-verdict: a named record entry for SUPPORTED, PARTIALLY SUPPORTED and CONTRADICTED; empty is \
-correct only for NOT FOUND.
+Cite exactly one uploaded page or text block for SUPPORTED, PARTIALLY SUPPORTED and \
+CONTRADICTED. Copy its source label into record_reference (for example, "clinic.pdf p.3" \
+or "clinic.txt b.2"). Put the record date and explanation in note, not record_reference. \
+Do not invent a source, use a bare filename, cite a range, or combine multiple sources. \
+Empty record_reference is correct only for NOT FOUND; any nonempty reference must also \
+name one readable uploaded page or block.
 Do not describe a NOT FOUND claim as unsupported, unverified, inaccurate or inconsistent, and \
 never write that the records "show no" or "contain no record of" the fact — write that the \
 provided records do not address it."""
@@ -195,7 +213,7 @@ Return JSON:
     {{
       "id": <claim id>,
       "verdict": "SUPPORTED | PARTIALLY SUPPORTED | CONTRADICTED | NOT FOUND",
-      "record_reference": "source label + date of the supporting/conflicting record fact, or empty",
+      "record_reference": "one exact uploaded page/block source label, or empty for NOT FOUND",
       "note": "one short sentence explaining the verdict"
     }}
   ]
@@ -524,6 +542,8 @@ class EvaluationResult:
     # verification. Summaries and selected facts in this result are derived
     # views of this store; prompt budget limits never truncate it.
     evidence_source: list[dict] = field(default_factory=list)
+    # Missing/unknown policies on saved results must never imply current validation.
+    verification_policy: str = ""
 
     @property
     def contradiction_count(self) -> int:
@@ -828,6 +848,7 @@ def _run_evaluation(
             result.verifications, result.evidence_gaps = _verify_claims(
                 llm, result.claims, result.digest, records, report
             )
+            result.verification_policy = SOURCE_REFERENCE_POLICY
 
     with tracing.phase_span("rubric"), PhaseTimer(logger, "rubric", request_id=rid):
         with phase_timer("rubric"):
@@ -1024,6 +1045,94 @@ def _contradiction_downgrade_reason(verification: dict, evidence_absent: bool) -
     return ""
 
 
+def source_reference_notice(result: EvaluationResult) -> str:
+    """Describe only the address check actually recorded on this result."""
+    if getattr(result, "verification_policy", "") == SOURCE_REFERENCE_POLICY:
+        return SOURCE_REFERENCE_NOTICE
+    return LEGACY_REFERENCE_NOTICE
+
+
+def evaluation_report_markdown(result: EvaluationResult) -> str:
+    """Keep saved report content, adding the missing-policy notice to exports."""
+    report = result.report_markdown
+    if (
+        getattr(result, "verification_policy", "") != SOURCE_REFERENCE_POLICY
+        and LEGACY_REFERENCE_NOTICE not in report
+    ):
+        return f"> **Source-reference validation:** {LEGACY_REFERENCE_NOTICE}\n\n{report}"
+    return report
+
+
+def _source_reference_key(reference: str) -> str:
+    return " ".join(reference.split()).casefold()
+
+
+def _source_reference_aliases(filename: str, kind: str, number: int) -> set[str]:
+    prefix = "p." if kind == PAGE else "b."
+    labels = (
+        f"{filename} {prefix}{number}",
+        f"{filename} — {kind} {number}",
+        f"{filename} - {kind} {number}",
+    )
+    return {
+        _source_reference_key(alias)
+        for label in labels for alias in (label, f"[{label}]")
+    }
+
+
+def _verification_source_index(records: list[ExtractedDocument]) -> dict[str, str | None]:
+    """Index exact single-unit aliases; collisions are deliberately unusable.
+
+    An uploaded filename is not necessarily unique. Even duplicate pages with
+    identical text remain ambiguous: we cannot tell which upload was cited.
+    Unreadable units reserve their aliases so a duplicate readable unit cannot
+    disguise the ambiguity. No model-generated digest labels are trusted here.
+    """
+    index: dict[str, str | None] = {}
+    for document in records:
+        # Image-only pages are normally absent from extracted units. Reserve
+        # these addresses too, including collisions with another upload.
+        if document.pagination in (PAGE, BLOCK):
+            for number in document.unreadable_pages:
+                if type(number) is int and number > 0:
+                    for alias in _source_reference_aliases(document.filename, document.pagination, number):
+                        index[alias] = None
+        for unit in document.pages:
+            if unit.kind not in (PAGE, BLOCK) or type(unit.page) is not int or unit.page < 1:
+                continue
+            readable = (
+                unit.filename == document.filename
+                and bool(unit.text.strip())
+                and unit.page not in document.unreadable_pages
+            )
+            canonical = unit.label if readable else None
+            # Reserve both names on a malformed/mislabelled extracted unit.
+            for filename in {document.filename, unit.filename}:
+                for alias in _source_reference_aliases(filename, unit.kind, unit.page):
+                    index[alias] = None if alias in index else canonical
+    return index
+
+
+def _validate_verification_sources(
+    verifications: list[dict], source_index: dict[str, str | None],
+) -> None:
+    """Require evidence verdicts to resolve to one readable uploaded unit.
+
+    This intentionally does not prove that the cited text supports the claim.
+    Errors remain static: references can contain private record information.
+    """
+    for item in verifications:
+        reference = item["record_reference"]
+        if not reference and item["verdict"] == "NOT FOUND":
+            continue
+        canonical = source_index.get(_source_reference_key(reference))
+        if canonical is None:
+            raise LLMParseError(
+                "Verification citation must identify one readable, unambiguous uploaded source unit."
+            )
+        item["record_reference"] = canonical
+
+
 def _verify_claims(
     llm: LLMService,
     claims: list[dict],
@@ -1034,19 +1143,21 @@ def _verify_claims(
     """Verify claims in small batches so each prompt stays focused.
 
     Returns ``(verifications, evidence_gaps)``. ``evidence_gaps`` lists the claims a
-    CONTRADICTED verdict could not be substantiated for — either the batch found no
-    raw record text at all, or the verifier cited no conflicting record entry. Both
-    are downgraded to NOT FOUND, because "the records disagree" and "nothing in the
-    records addresses this" are different findings and only one of them is true.
+    CONTRADICTED verdict could not be substantiated for because the batch found no
+    matching raw record text and no matching digest facts. These are downgraded
+    to NOT FOUND, because "the records disagree" and "nothing in the records
+    addresses this" are different findings and only one of them is true.
     Reporting a coverage gap as a contradiction would put a false statement in front
     of a veteran who is about to sign it (see
     :func:`_contradiction_downgrade_reason`).
 
-    Each batch must pass schema, identity, uniqueness and coverage validation.
+    Each batch must pass schema, identity, uniqueness, coverage and source-address
+    validation.
     Invalid batches are retried in full; exhaustion raises an explicit incomplete
     verification error before downstream scoring instead of inventing verdicts.
     """
     claims = _normalize_claims(claims)
+    source_index = _verification_source_index(records)
     verdict_by_id: dict[int, dict] = {}
     evidence_gaps: list[dict] = []
     batch_size = 8
@@ -1089,12 +1200,14 @@ def _verify_claims(
             try:
                 data = llm.chat_json(VERIFY_SYSTEM, prompt + retry_note, phase="verify")
                 verified = _normalize_verifications(data, {c["id"] for c in batch})
+                _validate_verification_sources(verified, source_index)
                 break
             except LLMParseError as exc:
                 if attempt == VERIFICATION_MAX_ATTEMPTS:
                     raise VerificationIncompleteError(
                         f"Verification incomplete: batch {index}/{len(batches)} did not return "
-                        f"exactly one valid verdict per claim after {attempt} attempts. "
+                        "exactly one valid verdict per claim with valid source citations "
+                        f"after {attempt} attempts. "
                         "These claims remain unverified, not NOT FOUND. Evaluation stopped "
                         "before scoring or rewriting; please re-run."
                     ) from exc
@@ -1109,7 +1222,11 @@ def _verify_claims(
                     "\n\nThe previous response was incomplete or invalid. Return a fresh "
                     "complete verifications list with exactly one valid verdict per "
                     "submitted id, and no other ids. Include string record_reference "
-                    "and note fields for every verdict."
+                    "and note fields for every verdict. Evidence-based verdicts must cite "
+                    "exactly one readable uploaded page or text block using its source "
+                    "label. Do not include dates, explanations, ranges or multiple "
+                    "sources in record_reference; use note for the explanation. Only "
+                    "NOT FOUND may have an empty record_reference."
                 )
         for item in verified:
             claim_id = item["id"]
@@ -1758,6 +1875,8 @@ def build_report(
     """
     lines: list[str] = []
     lines.append("# Lay Statement Evaluation Report")
+    lines.append("")
+    lines.append(f"> **Source-reference validation:** {source_reference_notice(result)}")
     lines.append("")
     if result.truncation_warning:
         lines.append(f"> ⚠️ **Truncated input:** {result.truncation_warning}")

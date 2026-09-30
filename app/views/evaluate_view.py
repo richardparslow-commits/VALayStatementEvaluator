@@ -34,12 +34,15 @@ from ..agiloop_telemetry import (
 )
 from ..evaluate import (
     DIMENSION_LABELS,
+    SOURCE_REFERENCE_POLICY,
     VERDICTS,
     build_evidence_dashboard,
     compute_score_band,
     coverage_lines,
+    evaluation_report_markdown,
     rubric_and_positive_sources,
     run_evaluation,
+    source_reference_notice,
 )
 from ..exporter import export_facts, filter_facts
 from ..job_payload import EvaluateJob
@@ -1363,6 +1366,11 @@ def _render_framework_currency_flags(eval_result: Any) -> None:
 
 def _render_evaluation_results(eval_result: Any) -> None:
     render_usage_summary(st.session_state.get("eval_usage"))
+    pilot.display(
+        source_reference_notice(eval_result), container=st,
+        method=("caption" if getattr(eval_result, "verification_policy", "") == SOURCE_REFERENCE_POLICY
+                else "warning"),
+    )
 
     rid = _result_reference()
     if rid:
@@ -1555,10 +1563,10 @@ def _render_evaluation_results(eval_result: Any) -> None:
     _render_medical_timeline(eval_result, request_reference=_result_reference())
 
     with st.expander("Full markdown report"):
-        pilot.display(eval_result.report_markdown, container=st, method="markdown")
+        pilot.display(evaluation_report_markdown(eval_result), container=st, method="markdown")
     pilot.file_download(
         "⬇️ Download evaluation report (.md)",
-        data=eval_result.report_markdown.encode("utf-8"),
+        data=evaluation_report_markdown(eval_result).encode("utf-8"),
         file_name="lay_statement_evaluation.md",
         mime="text/markdown",
      container=st)
