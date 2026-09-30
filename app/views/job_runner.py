@@ -275,7 +275,7 @@ def _encode_payload(kind: str, job: EvaluateJob | DraftJob) -> str:
 def submit_job(
     *,
     slot: str,
-    job: EvaluateJob | DraftJob,
+    job: EvaluateJob | DraftJob | None,
     request_id: str,
     condition: str | None,
     sources: list[str],
@@ -290,7 +290,14 @@ def submit_job(
     in this session so a retry cannot start duplicate work.
     """
     backend = get_job_backend()
-    kind = KIND_EVALUATE if isinstance(job, EvaluateJob) else KIND_DRAFT
+    submission_key = f"{slot}_queue_submission"
+    pending = st.session_state.get(submission_key)
+    if job is None:
+        if not isinstance(pending, dict) or pending.get("kind") not in (KIND_EVALUATE, KIND_DRAFT):
+            return None
+        kind = pending["kind"]
+    else:
+        kind = KIND_EVALUATE if isinstance(job, EvaluateJob) else KIND_DRAFT
 
     # One run per tab at a time. The in-process pattern gets this for free — a
     # running pipeline owns the script run, so no further widget event is
@@ -323,9 +330,7 @@ def submit_job(
     with tracing.phase_span(
         "queue:submit", kind=kind, files=files, pages=pages, backend=backend.name
     ):
-        submission_key = f"{slot}_queue_submission"
         owner = pilot.current_owner()
-        pending = st.session_state.get(submission_key)
         try:
             if isinstance(pending, dict):
                 if pending["owner_id"] != owner or pending["kind"] != kind:
@@ -335,9 +340,12 @@ def submit_job(
                 files, pages = pending["files"], pending["pages"]
                 condition, sources = pending["condition"], pending["sources"]
                 action_label = pending["action_label"]
-                pilot.display("Checking the previous submission before starting another run.",
+                pilot.display("Checking the earlier submission using its saved inputs. "
+                              "Recent edits will apply only after you discard that attempt.",
                               container=st, method="info")
             else:
+                if job is None:
+                    raise PayloadError("No earlier submission is available to check.")
                 payload = _encode_payload(kind, job)
                 st.session_state[submission_key] = {
                     "payload": payload, "request_id": request_id, "owner_id": owner,
@@ -402,6 +410,36 @@ def submit_job(
     return outcome
 
 
+def _render_uncertain_submission(slot: str) -> None:
+    pending = st.session_state.get(f"{slot}_queue_submission")
+    if not isinstance(pending, dict):
+        return
+    pilot.display(
+        f"An earlier submission is unconfirmed (reference `{pending['request_id']}`). "
+        "Checking it uses the inputs saved with that attempt. To use your recent edits, "
+        "discard the earlier attempt first. It may still run and incur charges.",
+        container=st, method="warning",
+    )
+    if st.button("Check earlier submission", key=f"check_submission_{slot}"):
+        outcome = submit_job(
+            slot=slot, job=None, request_id=pending["request_id"],
+            condition=pending["condition"], sources=pending["sources"],
+            files=pending["files"], pages=pending["pages"], action_label=pending["action_label"],
+        )
+        if outcome is not None and outcome.ok:
+            pilot.display(f"Run complete — reference `{outcome.request_id}`.", container=st, method="success")
+        return
+    discard_allowed = st.checkbox(
+        "I understand the earlier job may still run; I want to start a separate run.",
+        key=f"confirm_discard_submission_{slot}",
+    )
+    if st.button("Discard earlier submission", key=f"discard_submission_{slot}",
+                 disabled=not discard_allowed) and discard_allowed:
+        st.session_state.pop(f"{slot}_queue_submission", None)
+        pilot.display("Earlier attempt discarded. Your next submission will use the current inputs.",
+                      container=st, method="info")
+
+
 def resume_pending_job(slot: str, *, action_label: str) -> None:
     """Re-attach to a run queued earlier in this session, if any.
 
@@ -421,6 +459,7 @@ def resume_pending_job(slot: str, *, action_label: str) -> None:
     """
     if not queue_mode_active():
         return
+    _render_uncertain_submission(slot)
     job_id = st.session_state.get(_pending_key(slot))
     if not isinstance(job_id, str) or not job_id:
         # No direct job_id, but maybe we still have the request_id from this

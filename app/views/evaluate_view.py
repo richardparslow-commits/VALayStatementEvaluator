@@ -608,7 +608,7 @@ def _run_evaluation_queued(
         action_label="Evaluation",
     )
     if outcome is not None and outcome.ok:
-        pilot.display(f"Evaluation complete — reference `{rid}`.", container=st, method="success")
+        pilot.display(f"Evaluation complete — reference `{outcome.request_id}`.", container=st, method="success")
 
 
 def _result_reference() -> str:

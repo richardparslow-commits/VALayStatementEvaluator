@@ -435,6 +435,8 @@ an idempotency key bound to the owner, job kind and exact serialized inputs.
 Retrying it returns the original queued, running or completed job; changing its
 inputs, owner or kind is refused. Calls without a reference remain independent
 submissions. Deduplication lasts while job metadata is retained, not forever.
+An accepted retry restores an expired recovery mapping for the retained job's
+remaining lifetime without restarting its work.
 Use a new reference for an intentional new analysis. The reference is never an
 authorization credential.
 
@@ -443,11 +445,18 @@ runtime errors. The producer checks key types, limits and (on Redis 7+) command
 permissions before writing, and removes its own writes on a rejected submission.
 An interrupted network reply may still have committed: retry the exact same
 reference and inputs. The web session retains an unconfirmed submission for that
-retry instead of silently sending newly edited inputs. Clearing the session
+retry. The tab shows its original reference and offers **Check earlier submission**
+using the saved inputs, or **Discard earlier submission** after acknowledging
+that the earlier job may still run and incur charges. Only an intentional new
+submission uses current edits. Discarding an attempt or clearing the session
 does not cancel an already accepted job.
 
 `VA_LSE_JOB_QUEUE_MAX_PENDING` limits waiting jobs **per kind** (100 by default),
 checked inside admission. Running work is bounded separately by worker capacity.
+When admission reports full, the producer inspects up to 100 oldest entries and
+atomically removes entries whose metadata or payload expired, then checks
+admission again. Workers do not need to be running for this cleanup. Oversized
+legacy backlogs may require repeated attempts to advance bounded cleanup.
 Keep `noeviction`, monitor memory/disk use and size storage for payloads, results,
 metadata and peak concurrency. A count limit does not replace byte sizing. The
 Compose/Kubernetes examples use AOF with `appendfsync always`, trading write

@@ -536,6 +536,15 @@ if raw then
         or r.submission_digest ~= candidate.submission_digest then
         return redis.error_reply('retry inputs differ from the original submission')
     end
+    -- Workers can refresh metadata after the original reference expires.
+    -- Restore the immutable mapping for the remaining retained-job lifetime.
+    local remaining = redis.call('PTTL', KEYS[1])
+    if remaining <= 0 then
+        return redis.error_reply('retained submission has no valid expiry')
+    end
+    if not indexed or redis.call('PTTL', KEYS[4]) < remaining then
+        redis.call('SET', KEYS[4], id, 'PX', remaining)
+    end
     -- Return running/terminal work as-is. A lost reply never starts it again.
     return raw
 end
@@ -543,7 +552,7 @@ if indexed or redis.call('EXISTS', KEYS[2]) ~= 0 then
     return redis.error_reply('incomplete submission requires operator reconciliation')
 end
 if redis.call('LLEN', KEYS[3]) >= limit then
-    return redis.error_reply('job queue is full; retry the same submission later')
+    return {'queue_full'}
 end
 local writes = {
     {'SET', KEYS[1], ARGV[2], 'EX', ttl},
@@ -572,6 +581,25 @@ if not ok then
     return redis.error_reply('submission writes rejected')
 end
 return ARGV[2]
+"""
+
+
+# Cleanup runs only after admission reports full. Every inspected job key is
+# explicit; the producer then retries the same atomic admission check. Expired
+# membership can therefore be removed even while all workers are offline.
+_PRUNE_QUEUE_SCRIPT = """
+local actual = redis.call('TYPE', KEYS[1]).ok
+if actual ~= 'none' and actual ~= 'list' then
+    return redis.error_reply('invalid queue key type')
+end
+local removed = 0
+for i, id in ipairs(ARGV) do
+    if redis.call('EXISTS', KEYS[2 * i]) == 0
+        or redis.call('EXISTS', KEYS[2 * i + 1]) == 0 then
+        removed = removed + redis.call('LREM', KEYS[1], 0, id)
+    end
+end
+return removed
 """
 
 
@@ -719,16 +747,34 @@ class _AtomicJobBackend(JobBackend):
         candidate = _submission(kind, payload, request_id, owner_id)
         reference_key = (_recovery_key(self._prefix, request_id) if request_id
                          else f"{self._prefix}:job:{candidate.job_id}:submission")
-        raw = self._command(
+        command = (
             "EVAL", _ENQUEUE_SCRIPT, 4,
             _meta_key(self._prefix, candidate.job_id), _payload_key(self._prefix, candidate.job_id),
             _queue_key(self._prefix, kind), reference_key,
             candidate.job_id, candidate.to_json(), payload, self._ttl, config.JOB_QUEUE_MAX_PENDING,
         )
+        raw = self._command(*command)
+        if raw == ["queue_full"]:
+            self._prune_expired_queue(kind)
+            raw = self._command(*command)
+            if raw == ["queue_full"]:
+                raise JobQueueError("job queue is full; retry the same submission later")
         record = JobRecord.from_json(raw)
         if record is None or record.job_id != candidate.job_id:
             raise JobQueueError("submission returned invalid metadata; retry the same reference")
         return record
+
+    def _prune_expired_queue(self, kind: str) -> None:
+        # Bound script size and work for legacy queues larger than today's cap.
+        # Repeated attempts advance cleanup without requiring a worker claim.
+        queue_key = _queue_key(self._prefix, kind)
+        ids = self._command("LRANGE", queue_key, -100, -1)
+        if not ids:
+            return
+        keys = [queue_key]
+        for job_id in ids:
+            keys.extend((_meta_key(self._prefix, job_id), _payload_key(self._prefix, job_id)))
+        self._command("EVAL", _PRUNE_QUEUE_SCRIPT, len(keys), *keys, *ids)
 
     def _transition(
         self, operation: str, job_id: str, kind: str, token: str, *args: str | int | float

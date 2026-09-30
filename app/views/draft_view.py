@@ -380,7 +380,7 @@ def _run_draft_queued(
         action_label="Drafting",
     )
     if outcome is not None and outcome.ok:
-        pilot.display(f"Draft complete — reference `{rid}`.", container=st, method="success")
+        pilot.display(f"Draft complete — reference `{outcome.request_id}`.", container=st, method="success")
 
 
 def _render_observations_length_guidance(observations: str) -> None:

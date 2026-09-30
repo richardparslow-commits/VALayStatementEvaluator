@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 
 from tests import hermetic  # noqa: F401
-from tests.test_job_submission import SubmissionContract, SubmissionFailures
+from tests.test_job_submission import SubmissionContract, SubmissionFailures, SubmissionExpiry
 from app import job_queue
 from app.job_queue import JobQueueError, RedisJobBackend
 
@@ -17,7 +17,7 @@ REDIS_SERVER = os.getenv('VA_LSE_TEST_REDIS_SERVER', '') or shutil.which('redis-
 
 
 @unittest.skipUnless(REDIS_SERVER, 'temporary Redis tests require redis-server')
-class TestIsolatedRedisSubmission(SubmissionContract, SubmissionFailures, unittest.TestCase):
+class TestIsolatedRedisSubmission(SubmissionContract, SubmissionFailures, SubmissionExpiry, unittest.TestCase):
     def setUp(self):
         self.scratch = tempfile.TemporaryDirectory(prefix='lse-redis-', dir='/tmp')
         self.addCleanup(self.scratch.cleanup)

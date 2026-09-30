@@ -1,5 +1,6 @@
 """Producer retries, concurrency, admission and partial-write regressions."""
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -86,19 +87,55 @@ class SubmissionContract:
         self.assertEqual(backend.lookup_by_request_id('reference'), job.job_id)
 
 
+class SubmissionExpiry:
+    def test_expired_entries_do_not_block_admission_without_a_worker(self):
+        backend = self.make_backend()
+        with patch.object(config, 'JOB_QUEUE_MAX_PENDING', 2):
+            expired = backend.enqueue('evaluate', 'expired', request_id='expired', owner_id='owner')
+            live = backend.enqueue('evaluate', 'live', request_id='live', owner_id='owner')
+            for key in (job_queue._meta_key(backend._prefix, expired.job_id),
+                        job_queue._payload_key(backend._prefix, expired.job_id),
+                        job_queue._recovery_key(backend._prefix, expired.request_id)):
+                backend._command('PEXPIRE', key, 1)
+            time.sleep(0.02)
+            self.assertIsNone(backend.get(expired.job_id))
+            fresh = backend.enqueue('evaluate', 'fresh', request_id='fresh', owner_id='owner')
+        self.assertEqual(backend.depth(), 2)
+        claimed, payload = backend.claim(['evaluate'], worker_id='worker')
+        self.assertEqual((claimed.job_id, payload), (live.job_id, 'live'))
+        claimed, payload = backend.claim(['evaluate'], worker_id='worker')
+        self.assertEqual((claimed.job_id, payload), (fresh.job_id, 'fresh'))
+
+    def test_retry_restores_expired_reference_for_retained_job(self):
+        backend = self.make_backend()
+        original = backend.enqueue('evaluate', 'input', request_id='reference', owner_id='owner')
+        claimed, _ = backend.claim(['evaluate'], worker_id='worker')
+        reference_key = job_queue._recovery_key(backend._prefix, 'reference')
+        backend._command('PEXPIRE', reference_key, 1)
+        time.sleep(0.02)
+        self.assertIsNone(backend.lookup_by_request_id('reference'))
+        retried = backend.enqueue('evaluate', 'input', request_id='reference', owner_id='owner')
+        self.assertEqual(retried.job_id, original.job_id)
+        self.assertEqual(retried.claim_token, claimed.claim_token)
+        self.assertEqual(backend.lookup_by_request_id('reference'), original.job_id)
+        remaining = backend._command('PTTL', job_queue._meta_key(backend._prefix, original.job_id))
+        self.assertAlmostEqual(backend._command('PTTL', reference_key), remaining, delta=100)
+        self.assertEqual(backend.depth(), 0)
+
+
 class TestInProcessSubmission(SubmissionContract, unittest.TestCase):
     def make_backend(self):
         from tests.test_job_queue import TestInProcessBackend
         return TestInProcessBackend.make_backend(self)
 
 
-class TestRedisSubmission(SubmissionContract, unittest.TestCase):
+class TestRedisSubmission(SubmissionContract, SubmissionExpiry, unittest.TestCase):
     def make_backend(self):
         from tests.test_job_queue import TestRedisBackend
         return TestRedisBackend.make_backend(self)
 
 
-class TestUpstashSubmission(SubmissionContract, unittest.TestCase):
+class TestUpstashSubmission(SubmissionContract, SubmissionExpiry, unittest.TestCase):
     def make_backend(self):
         from tests.test_job_queue import TestUpstashBackend
         return TestUpstashBackend.make_backend(self)
@@ -171,6 +208,84 @@ class TestUpstashSubmissionFailures(SubmissionFailures, unittest.TestCase):
 
 
 class TestBrowserSubmissionRetry(unittest.TestCase):
+    def _pending(self):
+        return dict(payload='original payload', request_id='original-reference', owner_id='owner',
+                    kind='evaluate', files=1, pages=1, condition=None, sources=['Upload'],
+                    action_label='Evaluation')
+
+    def test_check_earlier_submission_needs_no_current_form_inputs(self):
+        from app.views import job_runner
+        backend = job_queue.InProcessJobBackend(prefix='check-test', ttl_seconds=60)
+        ui = MagicMock()
+        ui.session_state = {'eval_queue_submission': self._pending()}
+        ui.button.side_effect = lambda label, **kwargs: label == 'Check earlier submission'
+        outcome = job_runner.QueueOutcome(ok=True, request_id='original-reference')
+        with patch.object(job_runner, 'st', ui), \
+                patch.object(job_runner, 'get_job_backend', return_value=backend), \
+                patch.object(job_runner.pilot, 'current_owner', return_value='owner'), \
+                patch.object(job_runner, '_encode_payload') as encode, \
+                patch.object(job_runner, '_poll', return_value=outcome), \
+                patch.object(job_runner, 'run_log_event'), \
+                patch.object(job_runner.pilot, 'display') as display:
+            job_runner._render_uncertain_submission('eval')
+        encode.assert_not_called()
+        claimed, payload = backend.claim(['evaluate'], worker_id='worker')
+        self.assertEqual((claimed.request_id, payload), ('original-reference', 'original payload'))
+        self.assertNotIn('eval_queue_submission', ui.session_state)
+        self.assertIn('original-reference', display.call_args.args[0])
+
+    def test_discard_requires_explicit_acknowledgement_and_allows_current_inputs(self):
+        from app.views import job_runner
+        from app.job_payload import EvaluateJob
+        for acknowledgement in (False, True):
+            with self.subTest(acknowledgement=acknowledgement):
+                backend = job_queue.InProcessJobBackend(prefix='discard-test', ttl_seconds=60)
+                original = backend.enqueue('evaluate', 'original payload',
+                                           request_id='original-reference', owner_id='owner')
+                ui = MagicMock()
+                ui.session_state = {'eval_queue_submission': self._pending()}
+                ui.button.side_effect = lambda label, **kwargs: label == 'Discard earlier submission'
+                ui.checkbox.return_value = acknowledgement
+                with patch.object(job_runner, 'st', ui), \
+                        patch.object(job_runner, 'get_job_backend', return_value=backend), \
+                        patch.object(job_runner.pilot, 'current_owner', return_value='owner'), \
+                        patch.object(job_runner, '_encode_payload', return_value='changed payload'), \
+                        patch.object(job_runner, '_poll', return_value=job_runner.QueueOutcome(ok=True)), \
+                        patch.object(job_runner, 'run_log_event'), \
+                        patch.object(job_runner.pilot, 'display'):
+                    job_runner._render_uncertain_submission('eval')
+                    self.assertEqual('eval_queue_submission' in ui.session_state, not acknowledgement)
+                    if acknowledgement:
+                        job_runner.submit_job(slot='eval', job=EvaluateJob(statement_text='Changed', records=[]),
+                                              request_id='new-reference', condition=None, sources=[], files=0,
+                                              pages=0, action_label='Evaluation')
+                self.assertIsNotNone(backend.get(original.job_id))
+                self.assertEqual(backend.depth(), 2 if acknowledgement else 1)
+                if acknowledgement:
+                    backend.claim(['evaluate'], worker_id='worker')
+                    fresh, payload = backend.claim(['evaluate'], worker_id='worker')
+                    self.assertEqual((fresh.request_id, payload), ('new-reference', 'changed payload'))
+
+    def test_completed_callers_show_the_confirmed_reference(self):
+        from app.views import job_runner, evaluate_view, draft_view
+        for module in (evaluate_view, draft_view):
+            with self.subTest(view=module.__name__), \
+                    patch.object(module, 'check_shutdown_gate', return_value=True), \
+                    patch.object(module, 'audit_record_meta', return_value=([], 0, 0)), \
+                    patch.object(module.pilot, 'display') as display, \
+                    patch.object(job_runner, 'worker_config_error', return_value=''), \
+                    patch.object(job_runner, 'submit_job',
+                                 return_value=job_runner.QueueOutcome(ok=True, request_id='confirmed-reference')):
+                if module is evaluate_view:
+                    with patch.object(module, 'new_run_request_id', return_value='new-click-reference'), \
+                            patch.object(module, 'audit_condition_for_slot', return_value=None):
+                        module._run_evaluation_queued('input', [], {})
+                else:
+                    module._run_draft_queued(rid='new-click-reference', records=[], condition='',
+                                            claim_type='', witness={}, observations='')
+                self.assertIn('confirmed-reference', display.call_args.args[0])
+                self.assertNotIn('new-click-reference', display.call_args.args[0])
+
     def test_lost_reply_retains_original_inputs_and_reference(self):
         from app.views import job_runner
         from app.job_payload import EvaluateJob
