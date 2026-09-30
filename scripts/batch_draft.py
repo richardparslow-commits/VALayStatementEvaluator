@@ -783,16 +783,17 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
         if selected_names - {path.name for path in part_files}:
             raise ValueError("A successful batch source file is unavailable.")
         source_docs = []
-        unavailable_sources = []
         for path in part_files:
             if path.name in selected_names:
                 try:
                     docs, _ = records_from_local_path(str(path))
-                except ExtractionError:
-                    # Legacy successful groups may include skipped image-only
-                    # inputs. Their absence cannot validate any record row.
-                    unavailable_sources.append(path.name)
-                    continue
+                except ExtractionError as exc:
+                    # Membership now comes from successful source metadata or
+                    # retained fact provenance. An original skip is not selected;
+                    # failure of a selected source is a new loss of evidence.
+                    raise ValueError(
+                        "A retained batch source input could not be re-extracted; restore it or re-run record review."
+                    ) from exc
                 source_docs.extend(docs)
         catalog, catalog_text = grounding_catalog(combined, source_docs, grounding_query)
         source_index = build_source_index(source_docs)
@@ -917,10 +918,7 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
                     final = improved.strip()
             log(f"review done: {len(issues)} issue(s)")
 
-        coverage_notice = (
-            f"> ⚠️ Source coverage: {len(unavailable_sources)} selected input(s) yielded no extractable records; "
-            "record grounding uses the readable inputs only.\n\n"
-        ) if unavailable_sources else ""
+        coverage_notice = ""
         if legacy_unresolved_facts:
             coverage_notice += (
                 f"> ⚠️ Legacy source coverage: {legacy_unresolved_facts} fact(s) have no recoverable source filename; "
@@ -933,7 +931,6 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
             ) if isinstance(grounding, dict) else "",
             "grounding_raw": grounding if isinstance(grounding, dict) else {},
             "grounding_policy": GROUNDING_SOURCE_POLICY,
-            "unavailable_source_files": unavailable_sources,
             "legacy_source_facts_unresolved": legacy_unresolved_facts,
             "review_issues": issues,
             "facts_total": len(combined.facts),

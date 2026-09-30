@@ -443,7 +443,7 @@ class TestDraftingSourceGate(unittest.TestCase):
                 self.assertIn("Original analysis", markdown)
                 self.assertEqual(LEGACY_GROUNDING_SOURCE_NOTICE in markdown, policy != GROUNDING_SOURCE_POLICY)
 
-    def test_legacy_skipped_input_does_not_abort_successful_record_grounding(self):
+    def test_unreadable_retained_legacy_source_stops_before_generation(self):
         import re
         import tempfile
         from pathlib import Path
@@ -472,15 +472,16 @@ class TestDraftingSourceGate(unittest.TestCase):
             def chat(self, *args, **kwargs):
                 return "Synthetic statement"
 
+        llm = FakeLLM()
         with patch("app.pipeline_guard.run_with_timeout", side_effect=lambda fn, **kw: fn()), \
              patch("app.documents.records_from_local_path", side_effect=extract), \
              patch("app.medical_review._merge_facts", side_effect=lambda llm, d, **kw: d.facts), \
              patch("app.medical_review._summarize", return_value="Synthetic summary"), \
-             patch.object(batch_draft, "_wait_for_breaker"):
-            result = batch_draft.final_phase(FakeLLM(), cfg, {"batch_01": batch_draft.digest_to_state(digest)})
-        self.assertEqual(result["unavailable_source_files"], ["Part2.pdf"])
-        self.assertIn("Source coverage: 1", result["grounding_markdown"])
-        self.assertEqual(result["grounding_raw"]["supported_observations"][0]["quote"], QUOTE)
+             patch.object(batch_draft, "_wait_for_breaker"), \
+             patch.object(llm, "chat_json", wraps=llm.chat_json) as generate, \
+             self.assertRaisesRegex(ValueError, "could not be re-extracted"):
+            batch_draft.final_phase(llm, cfg, {"batch_01": batch_draft.digest_to_state(digest)})
+        generate.assert_not_called()
 
     def test_new_batch_checkpoint_records_only_inputs_that_produced_documents(self):
         import tempfile
