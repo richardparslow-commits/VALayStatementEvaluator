@@ -123,7 +123,7 @@ def map_drafting_exception(exc: Exception, *, request_id: str, phase: str) -> Dr
         )
     if isinstance(exc, LLMParseError):
         return DraftingParseError(
-            "The drafting service returned an unreadable response. Please retry. If it repeats, use the reference when checking logs.",
+            "The drafting service returned an incomplete or unreadable response. Please retry. If it repeats, use the reference when checking logs.",
             request_id=request_id,
             error_kind="parse_error",
             diagnostics=f"{phase}: {type(exc).__name__}: {exc}",

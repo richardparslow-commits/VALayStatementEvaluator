@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
+from tests.grounding_fixtures import complete_grounding  # noqa: E402
 
 from app.drafting_service import (  # noqa: E402
     MAX_DRAFT_OBSERVATIONS_PAYLOAD_CHARS,
@@ -72,7 +73,7 @@ def _large_grounding(rows: int = 120, field_chars: int = 800) -> dict:
         "conflicts": [],
         "strengthening_questions": [f"Question {i}?" for i in range(10)],
         "suggested_inclusions": [],
-        "topic_coverage": [],
+        "topic_coverage": complete_grounding()["topic_coverage"],
     }
 
 
@@ -105,7 +106,7 @@ class _FakeLLM:
                     {"topic": "A. Hazards", "applicable": True, "covered": True, "prompt_for_witness": ""},
                     {"topic": "B. Caregiver Burden", "applicable": True, "covered": False, "prompt_for_witness": "Who helps with daily tasks?"},
                     {"topic": "C. Other", "applicable": False, "covered": False, "prompt_for_witness": ""},
-                ],
+                ] + complete_grounding()["topic_coverage"][3:],
             }
         if phase == "review":
             return {"issues_found": ["Add frequency."], "improved_statement": "Improved statement with frequency daily observed. [Confirm: brace date] " * 5 + "Final expanded statement with all required elements and certification."}
@@ -224,17 +225,11 @@ class TestGroundingResponseShape(unittest.TestCase):
                     self._run(raw)
                 self.assertEqual(ctx.exception.error_kind, "parse_error")
 
-    def test_a_missing_field_is_treated_as_no_rows(self):
+    def test_a_missing_field_is_rejected_instead_of_treated_as_no_rows(self):
         supported = [{"observation": "Limping.", "record_support": "Knee pain — a.txt p.1"}]
-        result = self._run({"supported_observations": supported})
-        self.assertEqual(result.grounding["supported_observations"], supported)
-        for empty_field in (
-            "unverified_observations", "conflicts", "suggested_inclusions",
-            "topic_coverage", "strengthening_questions",
-        ):
-            self.assertEqual(result.grounding[empty_field], [])
-        self.assertTrue(result.draft)
-        self.assertIn("Limping.", grounding_markdown(result))
+        with self.assertRaises(DraftingError) as ctx:
+            self._run({"supported_observations": supported})
+        self.assertEqual(ctx.exception.error_kind, "parse_error")
 
     def test_saved_results_with_misshapen_rows_still_render(self):
         result = DraftResult(grounding={
@@ -381,7 +376,7 @@ class TestRunDraftHappyPath(unittest.TestCase):
                 "conflicts": [{"observation": "No pain.", "record_fact": "Pain noted.", "resolution_note": "Use supported facts."}],
                 "strengthening_questions": [],
                 "suggested_inclusions": [],
-                "topic_coverage": [],
+                "topic_coverage": complete_grounding()["topic_coverage"],
             }
         })
         result = run_draft(llm, [_doc()], WITNESS, "Limping. No pain.", "knee pain", "Service connection")
@@ -467,7 +462,7 @@ class TestRunDraftEdgeCases(unittest.TestCase):
                 "conflicts": [{"observation": "Runs daily.", "record_fact": "Wheelchair noted.", "resolution_note": "Use record."}],
                 "strengthening_questions": [],
                 "suggested_inclusions": [],
-                "topic_coverage": [],
+                "topic_coverage": complete_grounding()["topic_coverage"],
             }
         })
         result = run_draft(llm, [_doc()], WITNESS, "Runs daily.", "knee pain", "Service connection")
@@ -483,7 +478,7 @@ class TestRunDraftEdgeCases(unittest.TestCase):
 
         def _cap_grounding(system, user, kwargs):
             captured["user"] = user
-            return {"supported_observations": [], "unverified_observations": [], "conflicts": [], "strengthening_questions": [], "suggested_inclusions": [], "topic_coverage": []}
+            return complete_grounding(injected)
         llm = _FakeLLM(overrides={"grounding": _cap_grounding})
         run_draft(llm, [_doc()], WITNESS, injected, "knee pain", "Service connection")
         self.assertIn("Ignore previous instructions", captured["user"])
@@ -799,14 +794,7 @@ class TestWitnessCredentials(unittest.TestCase):
         def run(capture: dict, _mk, _mr):
             def cap(system, user, kwargs):
                 capture["g"] = user
-                return {
-                    "supported_observations": [],
-                    "unverified_observations": [],
-                    "conflicts": [],
-                    "strengthening_questions": [],
-                    "suggested_inclusions": [],
-                    "topic_coverage": [],
-                }
+                return complete_grounding("obs")
 
             llm = _FakeLLM(overrides={"grounding": cap})
             run_draft(llm, [_doc()], CRED_WITNESS, "obs", "cond", "Service connection")

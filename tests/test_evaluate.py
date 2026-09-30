@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
+from tests.grounding_fixtures import complete_grounding  # noqa: E402
 
 from app.documents import (  # noqa: E402
     DRAFT_INTERNAL_MAX_CHARS,
@@ -100,8 +101,7 @@ class _FakeLLM:
             return val
         # A worker using this stub for drafting must return actual grounding.
         if phase == "grounding":
-            return {"unverified_observations": [{"observation": "Synthetic knee pain account.",
-                                                "reason": "Witness confirmation required."}]}
+            return complete_grounding("Synthetic knee pain account.")
         # defaults per phase
         if phase == "claims":
             return {

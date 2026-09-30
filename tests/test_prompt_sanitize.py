@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
+from tests.grounding_fixtures import complete_grounding
 
 from app.prompt_sanitize import (  # noqa: E402
     GUARD_NOTE,
@@ -255,7 +256,7 @@ class TestPromptTemplatesGuardNote(unittest.TestCase):
                 if phase == "revision":
                     return {"revision_notes": "", "changes": [], "revised_statement": "", "added_facts_to_verify": []}
                 if phase == "grounding":
-                    return {"supported_observations": [], "unverified_observations": [], "conflicts": [], "strengthening_questions": [], "suggested_inclusions": [], "topic_coverage": []}
+                    return complete_grounding()
                 if phase == "review":
                     return {"issues_found": [], "improved_statement": ""}
                 if phase.startswith("records:"):

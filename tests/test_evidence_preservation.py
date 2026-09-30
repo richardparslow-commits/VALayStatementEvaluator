@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
+from tests.grounding_fixtures import complete_grounding
 from app import config
 from app.documents import DocumentPage, ExtractedDocument, document_from_text
 from app.draft import run_draft
@@ -31,14 +32,7 @@ class _EvidenceLLM:
             return {"facts": facts[:1] if self.lossy_merge else facts}
         if phase == "grounding":
             self.grounding_prompt = user
-            return {
-                "supported_observations": [],
-                "record_conflicts": [],
-                "observations_needing_verification": [],
-                "grounded_in_records": [],
-                "unverifiable_observations": [],
-                "follow_up_questions": [],
-            }
+            return complete_grounding()
         if phase == "claims":
             # Produce one claim per fact to keep verification balanced
             _FACT_TO_CLAIM_TYPE = {

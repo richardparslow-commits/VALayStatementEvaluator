@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tests import hermetic  # noqa: E402,F401  (hermetic test session)
+from tests.grounding_fixtures import complete_grounding
 
 from app.documents import document_from_text  # noqa: E402
 from app.draft import (  # noqa: E402
@@ -158,14 +159,7 @@ class _FakeLLM:
             val = self.overrides[phase]
             return val(system, user, kwargs) if callable(val) else val
         if phase == "grounding":
-            return {
-                "supported_observations": [],
-                "unverified_observations": [],
-                "conflicts": [],
-                "strengthening_questions": [],
-                "suggested_inclusions": [],
-                "topic_coverage": [],
-            }
+            return complete_grounding()
         if phase == "review":
             return {"issues_found": [], "improved_statement": "Improved statement long enough to satisfy the preservation checks with all required elements and certification. [Confirm: brace date]"}
         if phase == "records:digest":

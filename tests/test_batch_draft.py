@@ -31,6 +31,7 @@ from pathlib import Path
 from unittest import mock
 
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
+from tests.grounding_fixtures import complete_grounding
 
 from app import config  # noqa: E402
 from app.llm import ChatProbe  # noqa: E402
@@ -487,7 +488,7 @@ class TestFinalPhaseSemantics(unittest.TestCase):
     ) + DRAFT
 
     def _run_final(self, review_behavior: str, *,
-                   bad_grounding_once: bool = False) -> dict:
+                   bad_grounding_once: bool = False, grounding_override=None) -> dict:
         from app.medical_review import MedicalDigest, MedicalFact
 
         cfg = _make_cfg(Path(tempfile.mkdtemp()))
@@ -526,7 +527,7 @@ class TestFinalPhaseSemantics(unittest.TestCase):
                     # _normalize_grounding then rejects it — the 2026-09-23
                     # 23:21 failure mode (a bare array).
                     return ["not", "an", "object"]
-                return {"supported_observations": []}
+                return complete_grounding() if grounding_override is None else grounding_override
 
         llm = FakeLLM()
         # The final phase's own resilience (_retry_phase sleeps between outer
@@ -574,6 +575,13 @@ class TestFinalPhaseSemantics(unittest.TestCase):
         self.assertEqual(result["statement"], self.DRAFT)
         self.assertTrue(
             any("Self-review not applied" in i for i in result["review_issues"]))
+
+    def test_incomplete_grounding_cannot_produce_a_batch_statement(self) -> None:
+        from app.llm import LLMParseError
+        for raw in ({"supported_observations": [{}]}, complete_grounding("")):
+            with self.subTest(raw=raw):
+                with self.assertRaises(LLMParseError):
+                    self._run_final("ok", grounding_override=raw)
 
 
 class TestConfigFromArgs(unittest.TestCase):
@@ -1176,7 +1184,7 @@ class TestMergeRoundCheckpointing(unittest.TestCase):
                     self.merge_calls += 1
                     facts = json.loads(user.split("\n\n", 1)[1])
                     return {"facts": facts[: max(1, (len(facts) * 3) // 4)]}
-                return {"supported_observations": []}  # grounding / review
+                return complete_grounding()  # grounding / review
 
         # The exact fingerprint final_phase will derive: dedupe of all batch facts.
         all_facts = [MedicalFact(**f) for f in batch_state["facts"]]
