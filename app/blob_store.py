@@ -44,7 +44,7 @@ import re
 import tempfile
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -135,6 +135,12 @@ class BlobStore:
     def delete(self, ref: BlobRef) -> None:
         raise NotImplementedError
 
+    @contextmanager
+    def submission_guard(self, ref: BlobRef) -> Iterator[None]:
+        """Refuse submissions referencing absent/corrupt documents."""
+        self.get(ref)
+        yield
+
     def sweep(self, *, max_age_seconds: int | None = None) -> int:
         """Delete blobs older than the age limit. Returns the count removed."""
         return 0
@@ -191,11 +197,13 @@ class FilesystemBlobStore(BlobStore):
     # surface the mistake with a specific message.
     is_shared = True
 
-    def __init__(self, root: str | Path, *, sweep_age_seconds: int = _DEFAULT_SWEEP_AGE_SECONDS) -> None:
+    def __init__(self, root: str | Path, *, sweep_age_seconds: int = _DEFAULT_SWEEP_AGE_SECONDS,
+                 retained_keys: Callable[[], set[str]] | None = None) -> None:
         if sweep_age_seconds <= 0:
             raise BlobStoreError("blob retention age must be positive")
         self._root = Path(root).expanduser()
         self._sweep_age = sweep_age_seconds
+        self._retained_keys = retained_keys or (lambda: set())
         self._lock = threading.Lock()
         # ``-inf`` rather than 0.0: this is compared against ``time.monotonic()``,
         # which counts from an arbitrary origin — on a freshly booted host (a CI
@@ -281,6 +289,13 @@ class FilesystemBlobStore(BlobStore):
             raise BlobStoreError(f"could not read blob {ref.key}: {type(exc).__name__}: {exc}") from exc
         return self._verify(ref, data)
 
+    @contextmanager
+    def submission_guard(self, ref: BlobRef) -> Iterator[None]:
+        with self._storage_lock():
+            self.get(ref)  # Verify before a retained wire payload is admitted.
+            os.utime(self._path_for(ref.key), None)
+            yield
+
     def delete(self, ref: BlobRef) -> None:
         try:
             path = self._path_for(ref.key)
@@ -301,7 +316,8 @@ class FilesystemBlobStore(BlobStore):
         except Exception as exc:  # noqa: BLE001 - housekeeping is never fatal
             logger.warning("blob sweep failed: %s", exc)
 
-    def sweep(self, *, max_age_seconds: int | None = None, dry_run: bool = False) -> int:
+    def sweep(self, *, max_age_seconds: int | None = None, dry_run: bool = False,
+              retained_keys: Callable[[], set[str]] | None = None) -> int:
         limit = self._sweep_age if max_age_seconds is None else max_age_seconds
         if limit <= 0:
             raise BlobStoreError("blob retention age must be positive")
@@ -311,6 +327,7 @@ class FilesystemBlobStore(BlobStore):
             return 0
         try:
             with self._storage_lock():
+                protected = (retained_keys or self._retained_keys)()
                 # Crash-interrupted writes contain record text too. Expire their
                 # temporary files on the same schedule, without touching fresh ones.
                 namespace = self._root / "blobs"
@@ -342,6 +359,8 @@ class FilesystemBlobStore(BlobStore):
                     if namespace.exists():
                         raise  # A disappearing shard is not a successful pass.
                 for path in paths:
+                    if path.relative_to(self._root).as_posix() in protected:
+                        continue
                     if path.stat().st_mtime < cutoff:
                         if not dry_run:
                             path.unlink()
@@ -516,7 +535,15 @@ def build_blob_store() -> BlobStore:
             "and every worker)",
             config.BLOB_DIR,
         )
-        return FilesystemBlobStore(config.BLOB_DIR, sweep_age_seconds=config.JOB_QUEUE_TTL_SECONDS)
+        from .job_queue import build_job_backend, get_job_backend
+        def retained_keys() -> set[str]:
+            # Queue-off web tiers may still share storage with workers draining
+            # older jobs. Inspect the configured remote tier even in that case.
+            if config.JOB_QUEUE_REDIS_URL or (config.SHARED_CACHE_URL and config.SHARED_CACHE_TOKEN):
+                return build_job_backend(require_distributed=True).retained_blob_keys()
+            return get_job_backend().retained_blob_keys()
+        return FilesystemBlobStore(config.BLOB_DIR, sweep_age_seconds=config.JOB_QUEUE_TTL_SECONDS,
+                                   retained_keys=retained_keys)
     return NullBlobStore()
 
 

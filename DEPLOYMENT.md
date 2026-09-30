@@ -545,9 +545,12 @@ nodes in another region. `deploy/k8s/k8s-deployment.yaml` / `k8s-worker.yaml` th
 Blobs are content-addressed (the key is derived from the bytes), so two users uploading the
 same bundle in one deployment share one object, and re-submitting a failed run re-uses it.
 Terminal jobs do not delete these shared blobs. Filesystem retention starts at the
-**latest successful write**, including reuse of the same content, and lasts
-`VA_LSE_JOB_QUEUE_TTL_SECONDS` (24 hours by default). Each write atomically replaces
-the file and renews its age. Writers, explicit deletion and cleanup share a permanent
+**latest successful write or submission**, including reuse of the same content.
+Files become eligible after `VA_LSE_JOB_QUEUE_TTL_SECONDS` (24 hours by default),
+and are removed only when no retained queue input references them. Claimed,
+heartbeating and re-queued jobs extend their input TTL; terminal inputs are also
+conservatively protected until expiry. Each write atomically replaces the file
+and renews its age. Writers, submissions, explicit deletion and cleanup share a permanent
 `.blob-store.lock` file using POSIX advisory locking; never remove that lock file
 while a tier is running. Windows filesystem blob storage is unsupported. Verify
 cross-pod locking on the actual shared volume before using this backend, and roll
@@ -556,11 +559,13 @@ all writers/cleaners to the same version before enabling cleanup.
 Writes perform a rate-limited cleanup, but idle storage needs an independent schedule:
 
 ```bash
-# Use the same mount and TTL configuration as the web and worker tiers.
+# Use the SAME queue URL/credentials, prefix, mount and TTL as web/workers.
+# Independent cleanup requires a reachable distributed queue (SCAN/GET access).
 VA_LSE_BLOB_STORE=filesystem python -m app.blob_cleanup --dry-run
 VA_LSE_BLOB_STORE=filesystem python -m app.blob_cleanup
 
-# Kubernetes: configure the tested image digest and matching TTL first.
+# Kubernetes: create va-lse-blob-cleanup-env with queue connection + prefix,
+# excluding LLM credentials; configure the tested image and matching TTL first.
 kubectl apply -f deploy/k8s/k8s-blob-cleanup.yaml
 kubectl create job --from=cronjob/va-lse-blob-cleanup blob-cleanup-canary -n va-lse
 kubectl logs -n va-lse job/blob-cleanup-canary
@@ -568,11 +573,15 @@ kubectl logs -n va-lse job/blob-cleanup-canary
 
 For Compose, schedule `docker compose --profile pattern-c exec -T worker python -m
 app.blob_cleanup` on the host while the worker service is running. The command returns
-count-only JSON on success and exits 2 for backend, mount, locking, scan or deletion
-failures; alert on failed/missed passes. It removes expired blobs and interrupted
+count-only JSON on success and exits 2 for backend, mount, locking, queue inventory,
+scan or deletion failures; alert on failed/missed passes. Malformed retained inputs
+also refuse cleanup. Use one queue prefix per blob root and roll all producers to
+the guarded-submission version before scheduling cleanup. It removes unreferenced,
+expired blobs and interrupted
 temporary writes, and keeps fresh files. Successful cleanup with the provided five-minute
-schedule bounds normal idle retention to TTL plus scheduling delay; outages, lock
-contention and failed passes extend that period. Prove deletion with a synthetic idle
+schedule bounds normal unreferenced idle retention to TTL plus scheduling delay;
+retained jobs can extend that period. Outages, lock
+contention and failed passes also extend that period. Prove deletion with a synthetic idle
 canary and verify that concurrent renewal stays readable on the deployed volume.
 
 S3 still needs a verified lifecycle policy, including any versioned objects. Shared

@@ -1,6 +1,8 @@
 # Optional Pattern C filesystem cleanup; excluded from the real-data pilot.
 # Apply k8s-blobs.yaml first. Use the same image and retention setting as ALL
 # web/worker pods. Verify cross-pod flock on the actual RWX volume before use.
+# Create va-lse-blob-cleanup-env with matching queue URL/credentials and prefix.
+# The cleaner only needs SCAN/GET; do not include LLM credentials in that secret.
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -30,6 +32,9 @@ spec:
               image: va-lse:latest  # replace with the tested web/worker image digest
               imagePullPolicy: IfNotPresent
               command: ["python", "-m", "app.blob_cleanup"]
+              envFrom:
+                - secretRef:
+                    name: va-lse-blob-cleanup-env
               env:
                 - name: VA_LSE_BLOB_STORE
                   value: filesystem

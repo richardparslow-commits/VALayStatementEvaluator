@@ -11,6 +11,7 @@ import sys
 
 from . import config
 from .blob_store import BlobStoreError, FilesystemBlobStore, build_blob_store
+from .job_queue import JobQueueError, build_job_backend
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -23,10 +24,11 @@ def main(argv: list[str] | None = None) -> int:
             raise BlobStoreError("cleanup requires the configured filesystem blob backend")
         if not store.root.is_dir():
             raise BlobStoreError("configured blob directory is missing; check the shared mount")
-        removed = store.sweep(dry_run=args.dry_run)
-    except (BlobStoreError, OSError):
+        backend = build_job_backend(require_distributed=True)
+        removed = store.sweep(dry_run=args.dry_run, retained_keys=backend.retained_blob_keys)
+    except (BlobStoreError, JobQueueError, OSError):
         # Do not emit document keys, filesystem paths, credentials, or raw errors.
-        print("filesystem blob cleanup failed; check backend, mount, permissions and locking", file=sys.stderr)
+        print("filesystem blob cleanup failed; check queue configuration, backend, mount, permissions and locking", file=sys.stderr)
         return 2
     print(json.dumps({"dry_run": args.dry_run, "expired_files": removed,
                       "retention_seconds": config.JOB_QUEUE_TTL_SECONDS}))

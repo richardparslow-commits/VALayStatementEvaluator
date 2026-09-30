@@ -11,14 +11,23 @@ import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from tests import hermetic  # noqa: F401
 from app import blob_cleanup
 from app.blob_store import BlobStoreError, FilesystemBlobStore, NullBlobStore
+from app.job_queue import JobQueueError
+from tests import test_job_submission_redis_live as redis_fixture
 
 
 class TestBlobCleanup(unittest.TestCase):
+    def setUp(self):
+        self.queue = Mock()
+        self.queue.retained_blob_keys.return_value = set()
+        patcher = patch.object(blob_cleanup, "build_job_backend", return_value=self.queue)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_idle_store_expires_without_another_upload(self):
         with TemporaryDirectory() as tmp:
             store = FilesystemBlobStore(tmp, sweep_age_seconds=60)
@@ -85,21 +94,17 @@ class TestBlobCleanup(unittest.TestCase):
                 with self.assertRaises(BlobStoreError):
                     store.sweep()
 
-    def test_actual_cli_cleans_an_idle_store(self):
+    def test_queue_inventory_failure_preserves_expired_records(self):
         with TemporaryDirectory() as tmp:
             store = FilesystemBlobStore(tmp, sweep_age_seconds=60)
-            ref = store.put(b"CLI synthetic canary")
+            ref = store.put(b"synthetic retained input")
             old = time.time() - 120
             os.utime(Path(tmp) / ref.key, (old, old))
-            env = dict(os.environ, VA_LSE_BLOB_STORE="filesystem", VA_LSE_BLOB_DIR=tmp,
-                       VA_LSE_JOB_QUEUE_TTL_SECONDS="60")
-            result = subprocess.run([sys.executable, "-m", "app.blob_cleanup"], env=env,
-                                    cwd=Path(__file__).resolve().parent.parent,
-                                    capture_output=True, text=True, timeout=15)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(json.loads(result.stdout), {"dry_run": False, "expired_files": 1,
-                                                        "retention_seconds": 60})
-            self.assertFalse((Path(tmp) / ref.key).exists())
+            self.queue.retained_blob_keys.side_effect = JobQueueError("private queue details")
+            with patch.object(blob_cleanup, "build_blob_store", return_value=store), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(blob_cleanup.main([]), 2)
+            self.assertTrue((Path(tmp) / ref.key).exists())
 
     def test_symlinked_namespace_cannot_delete_outside_the_store(self):
         with TemporaryDirectory() as tmp, TemporaryDirectory() as outside:
@@ -123,6 +128,60 @@ class TestBlobCleanup(unittest.TestCase):
             with self.assertRaises(BlobStoreError):
                 FilesystemBlobStore(tmp).put(b"synthetic record")
             self.assertEqual(target.read_bytes(), b"keep")
+
+
+@unittest.skipUnless(redis_fixture.REDIS_SERVER, "native cleanup tests require redis-server")
+class TestNativeBlobCleanup(unittest.TestCase):
+    # Reuse the isolated-server fixture without inheriting its submission tests.
+    setUp = redis_fixture.TestIsolatedRedisSubmission.setUp
+    _start = redis_fixture.TestIsolatedRedisSubmission._start
+    _stop = redis_fixture.TestIsolatedRedisSubmission._stop
+
+    def _cli(self, root, prefix):
+        env = dict(os.environ, VA_LSE_BLOB_STORE="filesystem", VA_LSE_BLOB_DIR=str(root),
+                   VA_LSE_JOB_QUEUE_TTL_SECONDS="60", VA_LSE_REDIS_URL=self.url,
+                   VA_LSE_JOB_QUEUE_PREFIX=prefix)
+        return subprocess.run([sys.executable, "-m", "app.blob_cleanup"], env=env,
+                              cwd=Path(__file__).resolve().parent.parent,
+                              capture_output=True, text=True, timeout=15)
+
+    def test_actual_cli_cleans_an_idle_store(self):
+        root = self.directory / "blobs"
+        store = FilesystemBlobStore(root, sweep_age_seconds=60)
+        ref = store.put(b"CLI synthetic canary")
+        old = time.time() - 120
+        os.utime(root / ref.key, (old, old))
+        result = self._cli(root, "isolated-cleanup")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"dry_run": False, "expired_files": 1,
+                                                    "retention_seconds": 60})
+        self.assertFalse((root / ref.key).exists())
+
+    def test_actual_cli_preserves_requeued_input_then_expires_it(self):
+        from app import blob_store, config, job_queue
+        root = self.directory / "blobs"
+        store = FilesystemBlobStore(root, sweep_age_seconds=60)
+        ref = store.put(b"synthetic retry records")
+        backend = job_queue.RedisJobBackend(self.url, prefix="isolated-cleanup", ttl_seconds=60)
+        payload = json.dumps({"documents_ref": ref.to_json()})
+        with patch.object(blob_store, "get_blob_store", return_value=store):
+            record = backend.enqueue("evaluate", payload)
+        claimed, _ = backend.claim(["evaluate"], worker_id="crashed-worker")
+        with patch.object(config, "JOB_QUEUE_LEASE_SECONDS", 0):
+            self.assertEqual(backend.requeue_stale(), 1)
+        old = time.time() - 120
+        os.utime(root / ref.key, (old, old))
+        result = self._cli(root, "isolated-cleanup")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["expired_files"], 0)
+        self.assertEqual(store.get(ref), b"synthetic retry records")
+        recovered, _ = backend.claim(["evaluate"], worker_id="healthy-worker")
+        self.assertEqual(recovered.job_id, claimed.job_id)
+        # Model natural Redis payload expiry; cleanup may delete only afterwards.
+        self.admin.delete(job_queue._payload_key(backend._prefix, record.job_id))
+        result = self._cli(root, "isolated-cleanup")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["expired_files"], 1)
 
 
 if __name__ == "__main__":

@@ -188,6 +188,47 @@ def _now() -> float:
     return time.time()
 
 
+def _retained_blob_key(payload: Any) -> str | None:
+    try:
+        envelope = json.loads(payload)
+    except (TypeError, ValueError) as exc:
+        raise JobQueueError("cannot inspect retained job input for blob cleanup") from exc
+    if not isinstance(envelope, dict):
+        raise JobQueueError("cannot inspect retained job input for blob cleanup")
+    ref = envelope.get("documents_ref")
+    if ref is None:
+        return None
+    if not isinstance(ref, dict) or not isinstance(ref.get("key"), str) or not ref["key"]:
+        raise JobQueueError("invalid retained blob reference; cleanup refused")
+    return str(ref["key"])
+
+
+@contextlib.contextmanager
+def _blob_submission_guard(payload: str) -> Iterator[None]:
+    """Commit blob-backed submissions while cleanup is excluded.
+
+    This also covers retries using an old serialized reference. A deleted blob
+    must be refused before recreating a valid queue job that cannot be decoded.
+    """
+    try:
+        envelope = json.loads(payload)
+    except ValueError:
+        envelope = None  # Legacy inline inputs do not reference a blob.
+    raw = envelope.get("documents_ref") if isinstance(envelope, dict) else None
+    if raw is None:
+        yield
+        return
+    from .blob_store import BlobRef, get_blob_store
+    try:
+        ref = BlobRef.from_json(raw)
+    except (TypeError, ValueError) as exc:
+        raise JobQueueError("invalid submission blob reference") from exc
+    if ref is None:
+        raise JobQueueError("invalid submission blob reference")
+    with get_blob_store().submission_guard(ref):
+        yield
+
+
 # -------------------------------------------------------------------- protocol
 class JobBackend:
     """Storage contract shared by the queue backends.
@@ -249,6 +290,14 @@ class JobBackend:
 
     def depth(self) -> int:
         raise NotImplementedError
+
+    def retained_blob_keys(self) -> set[str]:
+        """References in retained inputs, including claimed/re-queued jobs.
+
+        Cleanup must fail closed if the backend cannot provide this inventory.
+        Terminal inputs are conservatively protected until their payload expires.
+        """
+        raise JobQueueError("job backend cannot inventory retained blob references")
 
     def ping(self) -> bool:
         raise NotImplementedError
@@ -332,7 +381,7 @@ class InProcessJobBackend(JobBackend):
     # -- producer -----------------------------------------------------------
     def enqueue(self, kind: str, payload: str, *, request_id: str = "", owner_id: str = "") -> JobRecord:
         record = _submission(kind, payload, request_id, owner_id)
-        with self._cv:
+        with _blob_submission_guard(payload), self._cv:
             existing = self._records.get(record.job_id)
             indexed = self._recovery_index.get(request_id) if request_id else None
             if indexed and indexed != record.job_id:
@@ -492,6 +541,11 @@ class InProcessJobBackend(JobBackend):
         with self._lock:
             return sum(len(q) for q in self._queues.values())
 
+    def retained_blob_keys(self) -> set[str]:
+        with self._lock:
+            keys = (_retained_blob_key(payload) for payload in self._payloads.values())
+            return {key for key in keys if key is not None}
+
     def ping(self) -> bool:
         return True
 
@@ -642,6 +696,9 @@ if raw then
     r = parsed
 end
 local function save()
+    -- Cleanup inventories retained payloads. Keep their lifetime aligned with
+    -- metadata through recovery and terminal transitions as well as progress.
+    redis.call('EXPIRE', KEYS[2], ttl)
     redis.call('SET', KEYS[1], cjson.encode(r), 'EX', ttl)
 end
 local function clear_queue()
@@ -755,6 +812,10 @@ class _AtomicJobBackend(JobBackend):
         raise NotImplementedError
 
     def enqueue(self, kind: str, payload: str, *, request_id: str = "", owner_id: str = "") -> JobRecord:
+        with _blob_submission_guard(payload):
+            return self._enqueue(kind, payload, request_id=request_id, owner_id=owner_id)
+
+    def _enqueue(self, kind: str, payload: str, *, request_id: str, owner_id: str) -> JobRecord:
         candidate = _submission(kind, payload, request_id, owner_id)
         reference_key = (_recovery_key(self._prefix, request_id) if request_id
                          else f"{self._prefix}:job:{candidate.job_id}:submission")
@@ -778,6 +839,37 @@ class _AtomicJobBackend(JobBackend):
         if record is None or record.job_id != candidate.job_id:
             raise JobQueueError("submission returned invalid metadata; retry the same reference")
         return replace(record, recovery_available=recovery_available)
+
+    def retained_blob_keys(self) -> set[str]:
+        # SCAN includes keys present for the whole iteration. Payload keys remain
+        # present when claim/progress renews TTLs. The shared filesystem lock keeps
+        # new submissions from reviving aged references during this inventory.
+        cursor = "0"
+        seen: set[str] = set()
+        protected: set[str] = set()
+        prefix = f"{self._prefix}:job:"
+        pattern = prefix
+        for char in ("\\", "*", "?", "[", "]"):
+            pattern = pattern.replace(char, "\\" + char)
+        while True:
+            reply = self._command("SCAN", cursor, "MATCH", f"{pattern}*:payload", "COUNT", 100)
+            if not isinstance(reply, (list, tuple)) or len(reply) != 2 or not isinstance(reply[1], list):
+                raise JobQueueError("invalid retained-input inventory; cleanup refused")
+            next_cursor, keys = str(reply[0]), reply[1]
+            if not next_cursor.isdigit() or next_cursor in seen:
+                raise JobQueueError("invalid retained-input cursor; cleanup refused")
+            for key in keys:
+                if not isinstance(key, str) or not key.startswith(prefix) or not key.endswith(":payload"):
+                    raise JobQueueError("invalid retained-input key; cleanup refused")
+                raw = self._command("GET", key)
+                if raw is not None:  # Expiry between SCAN and GET is safe.
+                    blob_key = _retained_blob_key(raw)
+                    if blob_key is not None:
+                        protected.add(blob_key)
+            if next_cursor == "0":
+                return protected
+            seen.add(next_cursor)
+            cursor = next_cursor
 
     def _prune_expired_queue(self, kind: str) -> None:
         # Bound script size and work for legacy queues larger than today's cap.
@@ -1107,11 +1199,11 @@ _backend: JobBackend | None = None
 _backend_lock = threading.Lock()
 
 
-def build_job_backend() -> JobBackend:
+def build_job_backend(*, require_distributed: bool = False) -> JobBackend:
     """Select a backend from configuration (see the module docstring)."""
     prefix = config.JOB_QUEUE_PREFIX
     ttl = config.JOB_QUEUE_TTL_SECONDS
-    if not config.JOB_QUEUE_ENABLED:
+    if not config.JOB_QUEUE_ENABLED and not require_distributed:
         logger.info("job queue disabled; runs execute in-process (VA_LSE_JOB_QUEUE unset)")
         return InProcessJobBackend(prefix=prefix, ttl_seconds=ttl)
     if config.JOB_QUEUE_REDIS_URL:
@@ -1131,6 +1223,8 @@ def build_job_backend() -> JobBackend:
             ttl_seconds=ttl,
             timeout_seconds=config.SHARED_CACHE_TIMEOUT_SECONDS,
         )
+    if require_distributed:
+        raise JobQueueUnavailable("filesystem cleanup requires the matching distributed queue configuration")
     logger.warning(
         "VA_LSE_JOB_QUEUE is enabled but no shared backend is configured "
         "(set VA_LSE_REDIS_URL or VA_LSE_SHARED_CACHE_URL/_TOKEN) — falling back to the "
