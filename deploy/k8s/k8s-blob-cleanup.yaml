@@ -41,7 +41,11 @@ spec:
                 - name: VA_LSE_BLOB_DIR
                   value: /app/blobs
                 - name: VA_LSE_JOB_QUEUE_TTL_SECONDS
-                  value: "86400"  # MUST match web/worker retention; do not shorten
+                  valueFrom:
+                    secretKeyRef:
+                      name: va-lse-env  # same TTL source as the web/worker tiers
+                      key: VA_LSE_JOB_QUEUE_TTL_SECONDS
+                      optional: true  # all tiers use the 86400-second default if absent
               resources:
                 requests:
                   cpu: "50m"
