@@ -43,15 +43,15 @@ from app.prompt_sanitize import sanitize_for_prompt  # noqa: E402
 # ---------------------------------------------------------------- helpers
 
 
-def _doc(text: str = "Knee pain noted during service.", name: str = "a.txt"):
+def _doc(text: str = "Knee pain noted during service. Prescribed a brace for knee support.", name: str = "a.txt"):
     return document_from_text(name, text)
 
 
 def _fake_digest() -> MedicalDigest:
     return MedicalDigest(
         facts=[
-            MedicalFact("2020-01", "symptom", "Knee pain after lifting.", "a.txt p.1"),
-            MedicalFact("2021-06", "treatment", "Prescribed brace.", "a.txt p.1"),
+            MedicalFact("2020-01", "symptom", "Knee pain noted during service.", "a.txt p.1", "Knee pain noted during service."),
+            MedicalFact("2021-06", "treatment", "Prescribed a brace for knee support.", "a.txt p.1", "Prescribed a brace for knee support."),
         ],
         conditions=["knee pain"],
         providers=["Dr. Smith (ortho)"],
@@ -59,6 +59,17 @@ def _fake_digest() -> MedicalDigest:
         pages_reviewed=1,
         chunks_reviewed=1,
     )
+
+
+def _record_row(field: str, *, observation: str = "", index: int = 0, **extra) -> dict:
+    from app.grounding_sources import grounding_catalog
+    catalog, _ = grounding_catalog(_fake_digest(), [_doc()], "")
+    entry = list(catalog.values())[index]
+    row = {name: entry[name] for name in ("fact_id", "source", "source_unit", "quote")}
+    row[field] = entry["description"]
+    if observation:
+        row["observation"] = observation
+    return {**row, **extra}
 
 
 def _large_grounding(rows: int = 120, field_chars: int = 800) -> dict:
@@ -97,11 +108,11 @@ class _FakeLLM:
             return val
         if phase == "grounding":
             return {
-                "supported_observations": [{"observation": "Daily knee pain.", "record_support": "Knee pain after lifting — a.txt p.1"}],
+                "supported_observations": [_record_row("record_support", observation="Daily knee pain.")] if "fact-" in user else [],
                 "unverified_observations": [{"observation": "Cannot sleep.", "action": "keep as lay evidence"}],
                 "conflicts": [],
                 "strengthening_questions": ["How often does the pain occur?"],
-                "suggested_inclusions": [{"fact": "Brace prescribed.", "source": "a.txt p.1"}],
+                "suggested_inclusions": [_record_row("fact", index=1)] if "fact-" in user else [],
                 "topic_coverage": [
                     {"topic": "A. Hazards", "applicable": True, "covered": True, "prompt_for_witness": ""},
                     {"topic": "B. Caregiver Burden", "applicable": True, "covered": False, "prompt_for_witness": "Who helps with daily tasks?"},
@@ -226,7 +237,7 @@ class TestGroundingResponseShape(unittest.TestCase):
                 self.assertEqual(ctx.exception.error_kind, "parse_error")
 
     def test_a_missing_field_is_rejected_instead_of_treated_as_no_rows(self):
-        supported = [{"observation": "Limping.", "record_support": "Knee pain — a.txt p.1"}]
+        supported = [_record_row("record_support", observation="Limping.")]
         with self.assertRaises(DraftingError) as ctx:
             self._run({"supported_observations": supported})
         self.assertEqual(ctx.exception.error_kind, "parse_error")
@@ -371,9 +382,9 @@ class TestRunDraftHappyPath(unittest.TestCase):
         mock_review.return_value = _fake_digest()
         llm = _FakeLLM(overrides={
             "grounding": {
-                "supported_observations": [{"observation": "Limping.", "record_support": "Knee pain — a.txt p.1"}],
+                "supported_observations": [_record_row("record_support", observation="Limping.")],
                 "unverified_observations": [],
-                "conflicts": [{"observation": "No pain.", "record_fact": "Pain noted.", "resolution_note": "Use supported facts."}],
+                "conflicts": [_record_row("record_fact", observation="No pain.", resolution_note="Use supported facts.")],
                 "strengthening_questions": [],
                 "suggested_inclusions": [],
                 "topic_coverage": complete_grounding()["topic_coverage"],
@@ -404,13 +415,16 @@ class TestRunDraftHappyPath(unittest.TestCase):
             captured["user"] = user
             return "Draft statement."
 
-        llm = _FakeLLM(overrides={"grounding": _large_grounding(), "draft": capture_draft})
+        large = _large_grounding()
+        large["unverified_observations"] = [{"observation": row["observation"], "action": row["record_support"]} for row in large["supported_observations"]]
+        large["supported_observations"] = []
+        llm = _FakeLLM(overrides={"grounding": large, "draft": capture_draft})
         run_draft(llm, [_doc()], WITNESS, "Daily knee pain observed.", "knee pain", "Service connection")
         section = re.search(r"GROUNDING ANALYSIS \(JSON\):\n<<<\n(.*?)\n>>>", captured["user"], re.DOTALL)
         self.assertIsNotNone(section)
         parsed = json.loads(section.group(1))
         self.assertIn("_note", parsed)
-        self.assertEqual(parsed["supported_observations"][0]["observation"], "Supported observation 0.")
+        self.assertEqual(parsed["unverified_observations"][0]["observation"], "Supported observation 0.")
 
 
 class TestRunDraftEdgeCases(unittest.TestCase):
@@ -459,7 +473,7 @@ class TestRunDraftEdgeCases(unittest.TestCase):
             "grounding": {
                 "supported_observations": [],
                 "unverified_observations": [],
-                "conflicts": [{"observation": "Runs daily.", "record_fact": "Wheelchair noted.", "resolution_note": "Use record."}],
+                "conflicts": [_record_row("record_fact", observation="Runs daily.", resolution_note="Use record.")],
                 "strengthening_questions": [],
                 "suggested_inclusions": [],
                 "topic_coverage": complete_grounding()["topic_coverage"],

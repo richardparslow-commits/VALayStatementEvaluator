@@ -665,6 +665,9 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
     combined digest, and treats a failed review pass as non-fatal the way
     ``run_draft`` does.
     """
+    from app.grounding_sources import GROUNDING_SOURCE_POLICY, grounding_catalog, validate_grounding_sources
+    from app.source_validation import build_source_index
+    from app.documents import records_from_local_path
     from app.config import load_knowledge
     from app.documents import DRAFT_INTERNAL_MAX_CHARS, MAX_OBSERVATIONS_CHARS
     from app.draft import (
@@ -745,6 +748,17 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
                 f"{removed:,} truncated for prompts; details at the end may be missed")
         grounding_query = f"{cfg.condition} {obs_for_prompt}"
 
+        # Re-extract current source units: legacy checkpoints contain facts, not
+        # authenticated source text. Never validate a quote against a summary.
+        quarantined = {name for state in batch_states.values() for name in state.get("quarantined", [])}
+        source_docs = []
+        for path in sorted(cfg.records_dir.glob(cfg.part_glob)):
+            if path.name not in quarantined:
+                docs, _ = records_from_local_path(str(path))
+                source_docs.extend(docs)
+        catalog, catalog_text = grounding_catalog(combined, source_docs, grounding_query)
+        source_index = build_source_index(source_docs)
+
         log("grounding call…")
         care_block = _care_block(cfg.witness)
         # Normalization runs INSIDE the retry: chat_json guarantees parseable
@@ -752,7 +766,7 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
         # shape-invalid answer (2026-09-23 23:21: a bare array) died outside
         # the wrapper one second after a 4-minute call, discarding the merge.
         grounding = _retry_phase(
-            lambda: _normalize_grounding(llm.chat_json(
+            lambda: validate_grounding_sources(_normalize_grounding(llm.chat_json(
                 GROUNDING_SYSTEM,
                 _format_with(
                     GROUNDING_USER,
@@ -763,16 +777,12 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
                     credentials_block=witness_credentials_block(cfg.witness),
                     care_block=care_block,
                     observations=sanitize_for_prompt(obs_for_prompt, max_chars=DRAFT_INTERNAL_MAX_CHARS),
-                    digest=sanitize_digest_text(
-                        combined.relevant_facts_text(
-                            grounding_query, **_facts_text_kwargs(combined)),
-                        max_chars=120_000,
-                    ),
+                    digest=catalog_text,
                     checklist=load_knowledge("topic_checklist.md"),
                     guard_note=GUARD_NOTE,
                 ),
                 phase="grounding",
-            ), observations_present=bool(obs_for_prompt.strip())),
+            ), observations_present=bool(obs_for_prompt.strip())), catalog, source_index),
             "grounding",
         )
         log(f"grounding done: {len(grounding)} keys")
@@ -872,9 +882,10 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
         return {
             "statement": final,
             "grounding_markdown": grounding_markdown(
-                DraftResult(grounding=grounding)
+                DraftResult(grounding=grounding, grounding_policy=GROUNDING_SOURCE_POLICY)
             ) if isinstance(grounding, dict) else "",
             "grounding_raw": grounding if isinstance(grounding, dict) else {},
+            "grounding_policy": GROUNDING_SOURCE_POLICY,
             "review_issues": issues,
             "facts_total": len(combined.facts),
             "facts_pre_merge": len(deduped),

@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tests import hermetic  # noqa: E402,F401  (hermetic test session)
 from tests.grounding_fixtures import complete_grounding
 
-from app.documents import document_from_text  # noqa: E402
+from app.documents import DocumentPage, ExtractedDocument, document_from_text  # noqa: E402
 from app.draft import (  # noqa: E402
     DRAFT_SYSTEM_TEMPLATE,
     GROUNDING_PROMPT_MAX_CHARS,  # noqa: F401  (import guard: module still exports it)
@@ -189,20 +189,31 @@ class TestDraftPromptChronology(unittest.TestCase):
     def _run(self, llm, digest):
         with patch("app.draft.review_medical_records", return_value=digest), \
                 patch("app.draft.load_knowledge", return_value="k"):
-            return run_draft(llm, [document_from_text("a.txt", "note")], WITNESS,
+            docs = []
+            for fact in digest.facts:
+                filename, number = fact.source.rsplit(" p.", 1)
+                fact.quote = fact.description + " documented in the record."
+                docs.append(ExtractedDocument(filename, [DocumentPage(filename, int(number), fact.quote)]))
+            grouped = {}
+            for doc in docs:
+                grouped.setdefault(doc.filename, []).extend(doc.pages)
+            docs = [ExtractedDocument(name, pages) for name, pages in grouped.items()]
+            return run_draft(llm, docs, WITNESS,
                              "observed knee pain", "knee pain", "Increase")
 
     def test_grounding_receives_the_chronological_digest(self):
         llm = _FakeLLM()
         self._run(llm, _digest())
         grounding_user = next(user for kind, phase, user in llm.calls if phase == "grounding")
-        section = grounding_user.split("MEDICAL RECORD DIGEST (JSON):", 1)[1]
-        dates = [line.split("]")[0][1:] for line in section.splitlines() if line.startswith("[")]
+        section = grounding_user.split("MEDICAL RECORD FACT CATALOG (JSON):", 1)[1]
+        import json
+        catalog = json.loads(section.split("<<<", 1)[1].split(">>>", 1)[0])
+        dates = [entry["date"] for entry in catalog]
         self.assertEqual(
             dates,
             ["2018-11", "2019-03", "circa 2019", "2020-01", "2021-06", "unknown"],
         )
-        self.assertIn("chronological order", section)
+        self.assertIn("chronological order", grounding_user)
 
     def test_the_digest_summary_prompt_reads_chronologically(self):
         # records:summary is a fast-model chat inside review_medical_records;

@@ -178,7 +178,10 @@ class TestEvidencePreservation(unittest.TestCase):
             with self.subTest(lossy_merge=lossy):
                 facts = _facts()
                 llm = _EvidenceLLM(facts, lossy_merge=lossy)
-                docs = [document_from_text("records.txt", "Routine assessment history.")]
+                docs = [
+                    document_from_text("records.txt", "Routine assessment history."),
+                    ExtractedDocument("late-record.txt", [DocumentPage("late-record.txt", 1, facts[-1].quote, "block")], pagination="block"),
+                ]
                 with patch.object(config, "MAX_DIGEST_FACTS", 1500):
                     result = run_draft(
                         llm, docs, {"name": "Witness", "relationship": "Spouse"},

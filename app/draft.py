@@ -19,6 +19,11 @@ from .documents import (
     ExtractedDocument,
     MAX_OBSERVATIONS_CHARS,
 )
+from .grounding_sources import (
+    GROUNDING_SOURCE_POLICY, LEGACY_GROUNDING_SOURCE_NOTICE,
+    grounding_catalog, validate_grounding_sources,
+)
+from .source_validation import build_source_index
 from .llm import LLMClient, LLMError, LLMParseError, LLMService
 from . import tracing
 from .logging_config import PhaseTimer, get_request_id
@@ -197,19 +202,19 @@ record digest and produce a grounding analysis.
 Return JSON:
 {{
   "supported_observations": [
-    {{ "observation": "witness observation", "record_support": "matching record fact + source" }}
+    {{ "observation": "witness observation", "record_support": "copy catalog description", "fact_id": "copy catalog fact_id", "source": "copy catalog source", "source_unit": {{"filename": "copy filename", "kind": "page or block", "number": 1}}, "quote": "copy complete catalog quote" }}
   ],
   "unverified_observations": [
     {{ "observation": "witness observation not in records", "action": "keep as lay evidence but witness should double-check before signing" }}
   ],
   "conflicts": [
-    {{ "observation": "...", "record_fact": "...", "resolution_note": "draft only what the witness can truthfully support" }}
+    {{ "observation": "...", "record_fact": "copy catalog description", "fact_id": "copy catalog fact_id", "source": "copy catalog source", "source_unit": {{"filename": "copy filename", "kind": "page or block", "number": 1}}, "quote": "copy complete catalog quote", "resolution_note": "draft only what the witness can truthfully support" }}
   ],
   "strengthening_questions": [
     "6-10 targeted questions for the witness, prioritizing applicable checklist topics the observations do not yet cover (hazards, before/after baseline, family impact, medication management) plus record facts they may be able to confirm personally"
   ],
   "suggested_inclusions": [
-    {{ "fact": "record fact worth including if witness confirms", "source": "..." }}
+    {{ "fact": "copy catalog description", "source": "copy catalog source", "fact_id": "copy catalog fact_id", "source_unit": {{"filename": "copy filename", "kind": "page or block", "number": 1}}, "quote": "copy complete catalog quote" }}
   ],
   "topic_coverage": [
     {{ "topic": "checklist topic label (A-O)", "applicable": true | false, "covered": true | false, "prompt_for_witness": "specific question to elicit this topic if not covered, else empty string" }}
@@ -220,7 +225,14 @@ coverage: mark a topic covered only if the observations genuinely address it.
 Include every top-level field, using empty lists when there are no entries. Analyze the \
 witness observations in supported_observations, unverified_observations, or conflicts; do \
 not omit them. Every row must include the fields shown, with nonempty text except \
-prompt_for_witness. Use JSON booleans, not strings, for applicable and covered. An \
+prompt_for_witness. Record-based rows must copy a supplied catalog fact_id, source, \
+source_unit (including its integer number), complete quote and description exactly. \
+Never invent an ID, source or record fact. The catalog is a bounded selection; absence \
+is not proof that an observation is false. Put witness-only, uncertain or unsupported \
+observations in unverified_observations and preserve their uncertainty. If the catalog \
+is empty, supported_observations, conflicts and suggested_inclusions must be empty. \
+The selected catalog facts are presented in chronological order; preserve date uncertainty. \
+Use JSON booleans, not strings, for applicable and covered. An \
 inapplicable topic cannot be covered; every applicable uncovered topic needs a nonempty \
 prompt_for_witness. Otherwise leave prompt_for_witness empty.
 
@@ -234,7 +246,7 @@ WITNESS OBSERVATIONS:
 {observations}
 >>>
 
-MEDICAL RECORD DIGEST (JSON):
+MEDICAL RECORD FACT CATALOG (JSON):
 <<<
 {digest}
 >>>
@@ -351,6 +363,7 @@ TOPIC CHECKLIST FOR REFERENCE:
 @dataclass
 class DraftResult:
     grounding: dict[str, Any] = field(default_factory=dict)
+    grounding_policy: str = ""
     draft: str = ""
     final_statement: str = ""
     review_issues: list[str] = field(default_factory=list)
@@ -566,6 +579,10 @@ def _normalize_grounding(raw: Any, *, observations_present: bool = False) -> dic
                 if not isinstance(text, str) or (name != "prompt_for_witness" and not text.strip()):
                     raise LLMParseError(f"Grounding analysis is incomplete: {field_name}.{name} needs text.")
                 row[name] = text
+            if field_name in ("supported_observations", "conflicts", "suggested_inclusions"):
+                for name in ("fact_id", "source", "source_unit", "quote"):
+                    if name in item:
+                        row[name] = item[name]
             if field_name == "topic_coverage":
                 for name in ("applicable", "covered"):
                     if type(item.get(name)) is not bool:
@@ -654,29 +671,37 @@ def _run_draft(
             report(0.5, "Step 2/4 — Grounding witness observations against the records and topic checklist…")
             grounding_query = f"{condition} {obs_for_prompt}"
             try:
-                raw_grounding = llm.chat_json(
-                    GROUNDING_SYSTEM,
-                    GROUNDING_USER.format(
+                catalog, catalog_text = grounding_catalog(result.digest, records, grounding_query)
+                source_index = build_source_index(records)
+                grounding_user = GROUNDING_USER.format(
                         condition=sanitize_for_prompt(condition, max_chars=500),
                         claim_type=sanitize_for_prompt(claim_type, max_chars=500),
                         relationship=sanitize_for_prompt(witness.get("relationship", "not specified"), max_chars=500),
                         credentials_block=witness_credentials_block(witness),
                         care_block=care_observation_block(witness),
                         observations=sanitize_for_prompt(obs_for_prompt, max_chars=DRAFT_INTERNAL_MAX_CHARS),
-                        # Chronological presentation: the drafting narrative
-                        # follows the records' timeline, not keyword order.
-                        digest=sanitize_digest_text(
-                            result.digest.relevant_facts_text(grounding_query, max_facts=150, sort_dates=True),
-                            max_chars=120_000,
-                        ),
+                        digest=catalog_text,
                         checklist=load_knowledge("topic_checklist.md"),
                         guard_note=GUARD_NOTE,
-                    ),
-                    phase="grounding",
-                )
-                result.grounding = _normalize_grounding(
-                    raw_grounding, observations_present=bool(obs_for_prompt.strip())
-                )
+                    )
+                for attempt in range(3):
+                    check_pipeline_cancelled()
+                    try:
+                        raw_grounding = llm.chat_json(
+                            GROUNDING_SYSTEM,
+                            grounding_user + ("\nReturn the complete schema and copy only supplied catalog evidence." if attempt else ""),
+                            phase="grounding",
+                        )
+                        result.grounding = validate_grounding_sources(
+                            _normalize_grounding(raw_grounding, observations_present=bool(obs_for_prompt.strip())),
+                            catalog, source_index,
+                        )
+                        result.grounding_policy = GROUNDING_SOURCE_POLICY
+                        break
+                    except LLMParseError:
+                        if attempt == 2:
+                            raise
+                        logger.warning("grounding response validation retry attempt=%d", attempt + 1)
             except Exception as exc:  # noqa: BLE001
                 raise map_drafting_exception(exc, request_id=rid, phase="grounding") from exc
 
@@ -887,6 +912,10 @@ def grounding_markdown(result: DraftResult) -> str:
     if result.truncation_warning:
         lines.append(f"> ⚠️ **Truncated observations:** {result.truncation_warning}")
         lines.append("")
+    if result.grounding_policy != GROUNDING_SOURCE_POLICY:
+        lines.extend([f"> ⚠️ **Drafting source validation:** {LEGACY_GROUNDING_SOURCE_NOTICE}", ""])
+    else:
+        lines.extend(["> **Drafting source validation:** Record rows match retained facts and complete quotes on uploaded source units. Human review is still needed for their meaning and the final statement.", ""])
     grounding = result.grounding if isinstance(result.grounding, dict) else {}
     try:
         _normalize_grounding(grounding)
@@ -902,6 +931,7 @@ def grounding_markdown(result: DraftResult) -> str:
         for item in supported:
             lines.append(f"- **{item.get('observation', '')}**")
             lines.append(f"  - Record support: {item.get('record_support', '')}")
+            lines.append(f"  - Source: {item.get('source', '')} — Quote: {item.get('quote', '')}")
         lines.append("")
     unverified = _grounding_rows(grounding, "unverified_observations")
     if unverified:
@@ -915,7 +945,15 @@ def grounding_markdown(result: DraftResult) -> str:
         for item in conflicts:
             lines.append(f"- Observation: {item.get('observation', '')}")
             lines.append(f"  - Records show: {item.get('record_fact', '')}")
+            lines.append(f"  - Source: {item.get('source', '')} — Quote: {item.get('quote', '')}")
             lines.append(f"  - Guidance: {item.get('resolution_note', '')}")
+        lines.append("")
+    suggested = _grounding_rows(grounding, "suggested_inclusions")
+    if suggested:
+        lines.append("### Record facts to include only if the witness confirms")
+        for item in suggested:
+            lines.append(f"- {item.get('fact', '')} — {item.get('source', '')}")
+            lines.append(f"  - Quote: {item.get('quote', '')}")
         lines.append("")
     topics = _grounding_rows(grounding, "topic_coverage")
     if topics:
