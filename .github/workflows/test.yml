@@ -348,6 +348,15 @@ jobs:
       - name: Job queue integration tests (real Redis)
         run: python -m unittest tests.test_job_queue_redis_live -v
 
+      - name: Install isolated Redis test runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y redis-server
+          command -v redis-server
+
+      - name: Producer crash and memory-pressure tests (private Redis instances)
+        run: python -m unittest tests.test_job_submission_redis_live -v
+
       - name: Worker CLI smoke check against the queue
         env:
           VA_LSE_JOB_QUEUE: "1"

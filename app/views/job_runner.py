@@ -252,7 +252,7 @@ def _encode_payload(kind: str, job: EvaluateJob | DraftJob) -> str:
 
     Small jobs travel inline in the queue; large ones put their extracted record
     text in the blob store and carry a reference, so tens of megabytes never sit
-    in Redis (where the reference StatefulSet's LRU policy would evict them) and
+    in Redis, reducing allocation pressure and explicit capacity failures, and
     are not re-fetched on every status poll. See ``app/blob_store.py``.
 
     Blobs are **not** deleted when a job finishes: keys are content-addressed, so
@@ -283,11 +283,11 @@ def submit_job(
     pages: int,
     action_label: str,
 ) -> QueueOutcome | None:
-    """Enqueue a run and wait for it. Returns None when it never got queued.
+    """Enqueue a run and wait for it; return None without a confirmed outcome.
 
-    None means "the run was not submitted" (the caller should not render
-    results); a :class:`QueueOutcome` always describes a job that reached the
-    queue, including one that failed there.
+    None means "there is no confirmed outcome yet". A lost server reply may
+    still have committed the submission; retain its exact inputs and reference
+    in this session so a retry cannot start duplicate work.
     """
     backend = get_job_backend()
     kind = KIND_EVALUATE if isinstance(job, EvaluateJob) else KIND_DRAFT
@@ -323,8 +323,27 @@ def submit_job(
     with tracing.phase_span(
         "queue:submit", kind=kind, files=files, pages=pages, backend=backend.name
     ):
+        submission_key = f"{slot}_queue_submission"
+        owner = pilot.current_owner()
+        pending = st.session_state.get(submission_key)
         try:
-            payload = _encode_payload(kind, job)
+            if isinstance(pending, dict):
+                if pending["owner_id"] != owner or pending["kind"] != kind:
+                    raise PayloadError("The previous submission belongs to another session.")
+                payload = pending["payload"]
+                request_id = pending["request_id"]
+                files, pages = pending["files"], pending["pages"]
+                condition, sources = pending["condition"], pending["sources"]
+                action_label = pending["action_label"]
+                pilot.display("Checking the previous submission before starting another run.",
+                              container=st, method="info")
+            else:
+                payload = _encode_payload(kind, job)
+                st.session_state[submission_key] = {
+                    "payload": payload, "request_id": request_id, "owner_id": owner,
+                    "kind": kind, "files": files, "pages": pages,
+                    "condition": condition, "sources": sources, "action_label": action_label,
+                }
         except (PayloadError, BlobStoreError) as exc:
             run_log_event(kind, "rejected", request_id=request_id, error=str(exc), reason="payload")
             pilot.display(
@@ -337,16 +356,17 @@ def submit_job(
             , container=st, method="error")
             return None
         try:
-            record = backend.enqueue(kind, payload, request_id=request_id, owner_id=pilot.current_owner())
+            record = backend.enqueue(kind, payload, request_id=request_id, owner_id=owner)
         except Exception as exc:  # noqa: BLE001 - any enqueue failure must surface, not crash the tab
             run_log_event(
-                kind, "rejected", request_id=request_id,
-                error=f"{type(exc).__name__}: {exc}", reason="enqueue_failed",
+                kind, "error", request_id=request_id,
+                error=f"{type(exc).__name__}: {exc}", reason="submission_unconfirmed",
             )
             pilot.display(
                 report_failure(
-                    f"{action_label} could not be queued: {type(exc).__name__}: {exc}. "
-                    "Check the job-queue backend (see /health) and try again.",
+                    f"{action_label} submission is unconfirmed: {type(exc).__name__}: {exc}. "
+                    "It may already be queued. Retry to check the same submission before "
+                    "starting another run.",
                     phase=f"{kind}_enqueue",
                     exc=exc,
                     request_id=request_id,
@@ -354,14 +374,10 @@ def submit_job(
             , container=st, method="error")
             return None
 
+    st.session_state.pop(submission_key, None)
     st.session_state[_pending_key(slot)] = record.job_id
     st.session_state[_pending_request_key(slot)] = request_id
-    # Persist the request_id → job_id mapping in the job backend so a fresh
-    # session (or a different web pod) can recover the result by request_id.
-    try:
-        backend.set_recovery_index(request_id, record.job_id)
-    except Exception:  # noqa: BLE001 - recovery is best-effort; the session copy above is fine
-        pass
+    # The producer committed recovery indexing with the job, before returning.
     # The worker writes the audit start/ok/error pair, so the web pod records
     # only that the work was handed off — one audit record per run either way.
     run_log_event(

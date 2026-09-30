@@ -424,9 +424,37 @@ under `VA_LSE_JOB_QUEUE_PREFIX` (default `va_lse`):
 | `va_lse:job:<id>:meta` | status, progress, message, worker id (small JSON) |
 | `va_lse:job:<id>:payload` | statement/observations + extracted record text — or a blob reference when large |
 | `va_lse:job:<id>:result` | the finished report, usage totals |
+| `va_lse:index:request:<reference>` | immutable submission reference → job id |
 
 All three carry `VA_LSE_JOB_QUEUE_TTL_SECONDS` (24 h default), so completed jobs expire on
 their own.
+
+Producer admission commits metadata, payload, queue membership and recovery
+indexing together through `EVAL` on Redis and Upstash. A nonempty reference is
+an idempotency key bound to the owner, job kind and exact serialized inputs.
+Retrying it returns the original queued, running or completed job; changing its
+inputs, owner or kind is refused. Calls without a reference remain independent
+submissions. Deduplication lasts while job metadata is retained, not forever.
+Use a new reference for an intentional new analysis. The reference is never an
+authorization credential.
+
+Redis scripts isolate concurrent operations but do not automatically roll back
+runtime errors. The producer checks key types, limits and (on Redis 7+) command
+permissions before writing, and removes its own writes on a rejected submission.
+An interrupted network reply may still have committed: retry the exact same
+reference and inputs. The web session retains an unconfirmed submission for that
+retry instead of silently sending newly edited inputs. Clearing the session
+does not cancel an already accepted job.
+
+`VA_LSE_JOB_QUEUE_MAX_PENDING` limits waiting jobs **per kind** (100 by default),
+checked inside admission. Running work is bounded separately by worker capacity.
+Keep `noeviction`, monitor memory/disk use and size storage for payloads, results,
+metadata and peak concurrency. A count limit does not replace byte sizing. The
+Compose/Kubernetes examples use AOF with `appendfsync always`, trading write
+latency for syncing accepted mutations before acknowledgement. Temporary-server
+crash tests exercise this setting; storage hardware, host power loss, replication
+and managed-provider persistence still require deployment acceptance. `everysec`
+allows a write-loss window and must not be described as equivalent durability.
 
 Claims and worker updates use a shared Lua script (`EVAL`) on both Redis and
 Upstash. Claiming records a unique attempt token and recovery lease before
@@ -437,7 +465,7 @@ and let the stale sweep recover it. Execution remains at-least-once, not
 exactly-once. Recovery depends on retaining queue metadata and leases; database
 loss, eviction, and payload expiration are not worker-interruption recovery.
 
-**Upgrade:** drain/stop all old worker processes before starting this version.
+**Upgrade:** drain/stop old web producers and all old worker processes before starting this version.
 Old workers do not enforce attempt ownership and must not overlap new workers.
 Existing queued jobs and leased running jobs keep their key layout and remain
 readable. Jobs already orphaned by an older version (absent from both the queue
@@ -447,6 +475,10 @@ commands it executes. The supplied deployment uses standalone Redis; on Redis
 Cluster, all queue keys must share a hash tag in `VA_LSE_JOB_QUEUE_PREFIX`
 (for example `{va_lse}`). Changing that prefix creates a separate queue, so
 drain the original queue before changing it.
+
+References created by older non-atomic producers remain readable. A new producer
+refuses to reuse a reference bound to a legacy job id; reconcile its original
+state rather than overwriting the mapping or blindly resubmitting paid work.
 
 Redis holds the *payload*, not the uploaded PDFs: extraction still happens on the web pod,
 so what crosses the queue is the page-labelled record text. That text is what makes a large

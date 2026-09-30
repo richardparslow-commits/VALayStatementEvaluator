@@ -294,19 +294,18 @@ class TestUpstashBackend(_BackendCase, unittest.TestCase):
         backend = self.make_backend()
         backend.enqueue(KIND_EVALUATE, '{"k": 1}')
         ops = [str(cmd[0]).upper() for cmd in self.transport.commands]
-        self.assertIn("SET", ops)
-        self.assertIn("LPUSH", ops)
+        self.assertEqual(ops, ["EVAL"])
         expected = "Basic " + base64.b64encode(b"token-123").decode("utf-8")
         self.assertEqual(self.transport.headers[0]["Authorization"], expected)
 
     def test_set_records_carry_a_ttl(self):
         backend = self.make_backend()
         record = backend.enqueue(KIND_EVALUATE, '{"k": 1}')
-        set_commands = [c for c in self.transport.commands if str(c[0]).upper() == "SET"]
-        meta_set = [c for c in set_commands if c[1] == f"t:job:{record.job_id}:meta"]
-        self.assertTrue(meta_set)
-        self.assertEqual(str(meta_set[0][3]).upper(), "EX")
-        self.assertEqual(meta_set[0][4], 60)
+        # Assert the server state, rather than requiring separate SET requests.
+        for suffix in ("meta", "payload"):
+            ttl = self.transport.client.ttl(f"t:job:{record.job_id}:{suffix}")
+            self.assertGreater(ttl, 0)
+            self.assertLessEqual(ttl, 60)
 
     def test_upstash_error_payload_raises(self):
         backend = self.make_backend()

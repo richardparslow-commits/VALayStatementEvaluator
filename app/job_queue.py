@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import hashlib
 import json
 import logging
 import threading
@@ -94,6 +95,7 @@ class JobRecord:
     kind: str
     request_id: str = ""
     owner_id: str = ""
+    submission_digest: str = ""
     status: str = STATUS_QUEUED
     progress: float = 0.0
     message: str = ""
@@ -161,6 +163,21 @@ def _recovery_key(prefix: str, request_id: str) -> str:
 def new_job_id() -> str:
     """Return a short, log-safe job id (``job_…``)."""
     return f"job_{uuid.uuid4().hex[:16]}"
+
+
+def _submission(kind: str, payload: str, request_id: str, owner_id: str) -> JobRecord:
+    if kind not in KINDS:
+        raise JobQueueError(f"unknown job kind: {kind}")
+    if len(payload.encode("utf-8")) > config.JOB_QUEUE_MAX_PAYLOAD_BYTES:
+        raise JobQueueError("job payload exceeds the queue input limit")
+    # The reference is a retry key, never authorization. Bind it to the owner
+    # and kind; bind its immutable inputs separately so reuse cannot change work.
+    identity = json.dumps([owner_id, kind, request_id], ensure_ascii=True)
+    job_id = ("job_" + hashlib.sha256(identity.encode()).hexdigest()[:32]
+              if request_id else new_job_id())
+    return JobRecord(job_id=job_id, kind=kind, request_id=request_id, owner_id=owner_id,
+                     submission_digest=hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+                     created_at=_now(), updated_at=_now())
 
 
 def _now() -> float:
@@ -310,19 +327,22 @@ class InProcessJobBackend(JobBackend):
 
     # -- producer -----------------------------------------------------------
     def enqueue(self, kind: str, payload: str, *, request_id: str = "", owner_id: str = "") -> JobRecord:
-        if kind not in KINDS:
-            raise JobQueueError(f"unknown job kind: {kind}")
-        record = JobRecord(
-            job_id=new_job_id(),
-            kind=kind,
-            request_id=request_id,
-            owner_id=owner_id,
-            created_at=_now(),
-            updated_at=_now(),
-        )
+        record = _submission(kind, payload, request_id, owner_id)
         with self._cv:
+            existing = self._records.get(record.job_id)
+            indexed = self._recovery_index.get(request_id) if request_id else None
+            if indexed and indexed != record.job_id:
+                raise JobQueueError("request reference is already bound to another submission")
+            if existing:
+                if existing.submission_digest != record.submission_digest:
+                    raise JobQueueError("retry inputs differ from the original submission")
+                return replace(existing)
+            if len(self._queues[kind]) >= config.JOB_QUEUE_MAX_PENDING:
+                raise JobQueueError("job queue is full; retry the same submission later")
             self._records[record.job_id] = record
             self._payloads[record.job_id] = payload
+            if request_id:
+                self._recovery_index[request_id] = record.job_id
             self._queues.setdefault(kind, deque()).append(record.job_id)
             self._cv.notify_all()
         return replace(record)
@@ -475,6 +495,9 @@ class InProcessJobBackend(JobBackend):
         if not request_id:
             return
         with self._lock:
+            existing = self._recovery_index.get(request_id)
+            if existing and existing != job_id:
+                raise JobQueueError("request reference is already bound to another submission")
             self._recovery_index[request_id] = job_id
 
     def lookup_by_request_id(self, request_id: str) -> str | None:
@@ -482,6 +505,76 @@ class InProcessJobBackend(JobBackend):
             return None
         with self._lock:
             return self._recovery_index.get(request_id)
+# A producer commits metadata, payload, queue membership and recovery reference
+# in one server operation. Validate before writing and undo failed writes: Lua
+# isolation does not itself roll back a runtime error. Ambiguous transport
+# replies are resolved by retrying the same owner/kind/reference/inputs.
+_ENQUEUE_SCRIPT = """
+local id, ttl, limit = ARGV[1], tonumber(ARGV[4]), tonumber(ARGV[5])
+local expected_types = {'string', 'string', 'list', 'string'}
+for i, expected in ipairs(expected_types) do
+    local actual = redis.call('TYPE', KEYS[i]).ok
+    if actual ~= 'none' and actual ~= expected then
+        return redis.error_reply('invalid submission key type')
+    end
+end
+if not ttl or ttl <= 0 or ttl ~= math.floor(ttl)
+    or not limit or limit <= 0 or limit ~= math.floor(limit) then
+    return redis.error_reply('invalid submission limits')
+end
+local candidate = cjson.decode(ARGV[2])
+local indexed = redis.call('GET', KEYS[4])
+if indexed and indexed ~= id then
+    return redis.error_reply('request reference is already bound to another submission')
+end
+local raw = redis.call('GET', KEYS[1])
+if raw then
+    local ok, r = pcall(cjson.decode, raw)
+    if not ok or type(r) ~= 'table' or r.job_id ~= id
+        or r.kind ~= candidate.kind or r.owner_id ~= candidate.owner_id
+        or r.request_id ~= candidate.request_id
+        or r.submission_digest ~= candidate.submission_digest then
+        return redis.error_reply('retry inputs differ from the original submission')
+    end
+    -- Return running/terminal work as-is. A lost reply never starts it again.
+    return raw
+end
+if indexed or redis.call('EXISTS', KEYS[2]) ~= 0 then
+    return redis.error_reply('incomplete submission requires operator reconciliation')
+end
+if redis.call('LLEN', KEYS[3]) >= limit then
+    return redis.error_reply('job queue is full; retry the same submission later')
+end
+local writes = {
+    {'SET', KEYS[1], ARGV[2], 'EX', ttl},
+    {'SET', KEYS[2], ARGV[3], 'EX', ttl},
+    {'SET', KEYS[4], id, 'EX', ttl},
+    {'LPUSH', KEYS[3], id},
+}
+-- On Redis 7+, also validate write/cleanup permissions before the first write.
+if redis.acl_check_cmd then
+    for _, args in ipairs(writes) do
+        if not redis.acl_check_cmd(unpack(args)) then
+            return redis.error_reply('submission command permission denied')
+        end
+    end
+    if not redis.acl_check_cmd('DEL', KEYS[1], KEYS[2], KEYS[4])
+        or not redis.acl_check_cmd('LREM', KEYS[3], 0, id) then
+        return redis.error_reply('submission cleanup permission denied')
+    end
+end
+local ok, failure = pcall(function()
+    for _, args in ipairs(writes) do redis.call(unpack(args)) end
+end)
+if not ok then
+    redis.call('LREM', KEYS[3], 0, id)
+    redis.call('DEL', KEYS[1], KEYS[2], KEYS[4])
+    return redis.error_reply('submission writes rejected')
+end
+return ARGV[2]
+"""
+
+
 # Lua runs on Redis for both transports. All keys are explicit, and types are
 # checked before any write: Redis scripts are atomic but do not roll back errors.
 # A recovery lease is written BEFORE removing queue membership; recovery removes
@@ -622,6 +715,21 @@ class _AtomicJobBackend(JobBackend):
     def _read_record(self, job_id: str) -> JobRecord | None:
         raise NotImplementedError
 
+    def enqueue(self, kind: str, payload: str, *, request_id: str = "", owner_id: str = "") -> JobRecord:
+        candidate = _submission(kind, payload, request_id, owner_id)
+        reference_key = (_recovery_key(self._prefix, request_id) if request_id
+                         else f"{self._prefix}:job:{candidate.job_id}:submission")
+        raw = self._command(
+            "EVAL", _ENQUEUE_SCRIPT, 4,
+            _meta_key(self._prefix, candidate.job_id), _payload_key(self._prefix, candidate.job_id),
+            _queue_key(self._prefix, kind), reference_key,
+            candidate.job_id, candidate.to_json(), payload, self._ttl, config.JOB_QUEUE_MAX_PENDING,
+        )
+        record = JobRecord.from_json(raw)
+        if record is None or record.job_id != candidate.job_id:
+            raise JobQueueError("submission returned invalid metadata; retry the same reference")
+        return record
+
     def _transition(
         self, operation: str, job_id: str, kind: str, token: str, *args: str | int | float
     ) -> Any:
@@ -712,10 +820,11 @@ class _AtomicJobBackend(JobBackend):
         if not request_id:
             return
         key = _recovery_key(self._prefix, request_id)
-        try:
-            self._command("SET", key, job_id, "EX", self._ttl)
-        except Exception:  # noqa: BLE001 - best-effort
-            logger.debug("recovery index write failed request_id=%s job_id=%s", request_id, job_id)
+        # Legacy callers may add another reference, but cannot replace the
+        # reference committed with a submission (or retarget it to another job).
+        if not self._command("SET", key, job_id, "EX", self._ttl, "NX"):
+            if self._command("GET", key) != job_id:
+                raise JobQueueError("request reference is already bound to another submission")
 
     def lookup_by_request_id(self, request_id: str) -> str | None:
         if not request_id:
@@ -790,28 +899,6 @@ class RedisJobBackend(_AtomicJobBackend):
     def _command(self, *args: str | int | float) -> Any:
         with self._transport(str(args[0])):
             return self._client.execute_command(*args)
-
-    # -- producer -----------------------------------------------------------
-    def enqueue(self, kind: str, payload: str, *, request_id: str = "", owner_id: str = "") -> JobRecord:
-        if kind not in KINDS:
-            raise JobQueueError(f"unknown job kind: {kind}")
-        record = JobRecord(
-            job_id=new_job_id(),
-            kind=kind,
-            request_id=request_id,
-            owner_id=owner_id,
-            created_at=_now(),
-            updated_at=_now(),
-        )
-        try:
-            self._set_record(record)
-            self._client.set(
-                _payload_key(self._prefix, record.job_id), payload, ex=self._ttl
-            )
-            self._client.lpush(_queue_key(self._prefix, kind), record.job_id)
-        except Exception as exc:  # noqa: BLE001 - surface as queue error
-            raise JobQueueError(f"enqueue failed: {type(exc).__name__}: {exc}") from exc
-        return record
 
     def get(self, job_id: str) -> JobRecord | None:
         try:
@@ -922,30 +1009,6 @@ class UpstashJobBackend(_AtomicJobBackend):
     def _read_record(self, job_id: str) -> JobRecord | None:
         raw = self._rest.command("GET", _meta_key(self._prefix, job_id))
         return JobRecord.from_json(raw if isinstance(raw, str) else None)
-
-    # -- producer -----------------------------------------------------------
-    def enqueue(self, kind: str, payload: str, *, request_id: str = "", owner_id: str = "") -> JobRecord:
-        if kind not in KINDS:
-            raise JobQueueError(f"unknown job kind: {kind}")
-        record = JobRecord(
-            job_id=new_job_id(),
-            kind=kind,
-            request_id=request_id,
-            owner_id=owner_id,
-            created_at=_now(),
-            updated_at=_now(),
-        )
-        try:
-            self._set_record(record)
-            self._rest.command(
-                "SET", _payload_key(self._prefix, record.job_id), payload, "EX", self._ttl
-            )
-            self._rest.command("LPUSH", _queue_key(self._prefix, kind), record.job_id)
-        except JobQueueError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            raise JobQueueError(f"enqueue failed: {type(exc).__name__}: {exc}") from exc
-        return record
 
     def get(self, job_id: str) -> JobRecord | None:
         try:

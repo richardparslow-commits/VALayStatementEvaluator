@@ -886,6 +886,9 @@ JOB_QUEUE_PREFIX = os.getenv("VA_LSE_JOB_QUEUE_PREFIX", "va_lse").strip() or "va
 # long enough for a user to come back to a finished report, short enough that
 # abandoned record bundles do not sit in Redis indefinitely.
 JOB_QUEUE_TTL_SECONDS = _positive_int_env("VA_LSE_JOB_QUEUE_TTL_SECONDS", 24 * 3600)
+# Waiting jobs per kind; running jobs are bounded by worker capacity. Check this
+# inside producer admission, not a racing client-side depth probe.
+JOB_QUEUE_MAX_PENDING = _positive_int_env("VA_LSE_JOB_QUEUE_MAX_PENDING", 100)
 # A worker refreshes its lease on every progress update; a job whose lease has
 # expired is considered abandoned and is re-queued for another worker (this is
 # how a SIGKILLed worker's job survives without an orchestrator-specific

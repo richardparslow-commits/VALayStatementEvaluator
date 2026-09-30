@@ -18,8 +18,9 @@
 #
 # Sizing: size --maxmemory for the job PAYLOADS (extracted record text, not the
 # uploaded PDFs) — roughly concurrency x peak batch text. noeviction refuses new
-# writes at capacity; AOF persists acknowledged writes with an approximately
-# one-second crash-loss window. Pattern C is excluded from the real-data pilot.
+# writes at capacity; AOF/fsync-always syncs accepted writes before acknowledgement.
+# Storage durability still needs deployment acceptance. Pattern C is excluded
+# from the real-data pilot.
 
 apiVersion: apps/v1
 kind: StatefulSet
@@ -54,7 +55,7 @@ spec:
             - --appendonly
             - "yes"
             - --appendfsync
-            - everysec
+            - always
           resources:
             requests:
               memory: 128Mi
