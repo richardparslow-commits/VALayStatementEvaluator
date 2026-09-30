@@ -217,6 +217,12 @@ Return JSON:
 }}
 One topic_coverage entry per checklist topic (A through O), in checklist order. Never invent \
 coverage: mark a topic covered only if the observations genuinely address it.
+Include every top-level field, using empty lists when there are no entries. Analyze the \
+witness observations in supported_observations, unverified_observations, or conflicts; do \
+not omit them. Every row must include the fields shown, with nonempty text except \
+prompt_for_witness. Use JSON booleans, not strings, for applicable and covered. An \
+inapplicable topic cannot be covered; every applicable uncovered topic needs a nonempty \
+prompt_for_witness. Otherwise leave prompt_for_witness empty.
 
 CLAIMED CONDITION: {condition}
 CLAIM TYPE: {claim_type}
@@ -526,44 +532,69 @@ _GROUNDING_OBJECT_LISTS = (
     "suggested_inclusions",
     "topic_coverage",
 )
+_GROUNDING_TEXT_FIELDS = {
+    "supported_observations": ("observation", "record_support"),
+    "unverified_observations": ("observation", "action"),
+    "conflicts": ("observation", "record_fact", "resolution_note"),
+    "suggested_inclusions": ("fact", "source"),
+    "topic_coverage": ("topic", "prompt_for_witness"),
+}
+_GROUNDING_TOPICS = tuple("ABCDEFGHIJKLMNO")
 
 
-def _normalize_grounding(raw: Any) -> dict[str, Any]:
-    """Validate the grounding analysis before it feeds the draft, UI, or store.
+def _normalize_grounding(raw: Any, *, observations_present: bool = False) -> dict[str, Any]:
+    """Validate a complete response before drafting; this does not prove its facts.
 
-    ``chat_json`` guarantees parseable JSON, not the object-of-lists-of-objects
-    the grounding prompt asks for: a model can return an array, a bare string,
-    or rows that are not objects. Every downstream reader (the draft prompt,
-    ``grounding_markdown``, the job payload, follow-up questions) reads these
-    entries with ``.get``, so a shape mismatch is rejected here as a parse
-    failure — a statement cannot be grounded in an analysis that is not there —
-    instead of surfacing later as an AttributeError once the digest work is done.
+    Missing fields cannot mean a completed check with no findings. Empty rows,
+    string booleans and omitted checklist topics also cannot establish coverage.
+    Keep saved-result rendering separate so old payloads remain inspectable.
     """
     if not isinstance(raw, dict):
         raise LLMParseError("Grounding analysis is incomplete: expected a JSON object.")
-    from . import pilot
-    if not raw or (pilot.enabled() and not any(isinstance(raw.get(name), list) and raw[name]
-                                              for name in _GROUNDING_OBJECT_LISTS)):
-        raise LLMParseError("Grounding analysis is incomplete: no observations were analyzed.")
-    normalized: dict[str, Any] = dict(raw)
+    normalized: dict[str, Any] = {}
     for field_name in _GROUNDING_OBJECT_LISTS:
-        value = normalized.get(field_name)
-        if value is None:
-            normalized[field_name] = []
-            continue
+        value = raw.get(field_name)
         if not isinstance(value, list):
             raise LLMParseError(f"Grounding analysis is incomplete: {field_name} must be a list.")
-        if any(not isinstance(item, dict) for item in value):
-            raise LLMParseError(
-                f"Grounding analysis is incomplete: each entry in {field_name} must be an object."
-            )
-    questions = normalized.get("strengthening_questions")
-    if questions is None:
-        normalized["strengthening_questions"] = []
-    elif not isinstance(questions, list) or any(not isinstance(item, str) for item in questions):
+        rows: list[dict[str, Any]] = []
+        for item in value:
+            if not isinstance(item, dict):
+                raise LLMParseError(f"Grounding analysis is incomplete: {field_name} has an invalid row.")
+            row: dict[str, Any] = {}
+            for name in _GROUNDING_TEXT_FIELDS[field_name]:
+                text = item.get(name)
+                if not isinstance(text, str) or (name != "prompt_for_witness" and not text.strip()):
+                    raise LLMParseError(f"Grounding analysis is incomplete: {field_name}.{name} needs text.")
+                row[name] = text
+            if field_name == "topic_coverage":
+                for name in ("applicable", "covered"):
+                    if type(item.get(name)) is not bool:
+                        raise LLMParseError(f"Grounding analysis is incomplete: topic {name} needs a boolean.")
+                    row[name] = item[name]
+                if row["covered"] and not row["applicable"]:
+                    raise LLMParseError("Grounding analysis is incomplete: an inapplicable topic is covered.")
+                needs_question = row["applicable"] and not row["covered"]
+                if bool(row["prompt_for_witness"].strip()) != needs_question:
+                    raise LLMParseError("Grounding analysis is incomplete: topic follow-up does not match coverage.")
+            rows.append(row)
+        normalized[field_name] = rows
+    questions = raw.get("strengthening_questions")
+    if not isinstance(questions, list) or any(not isinstance(item, str) or not item.strip() for item in questions):
         raise LLMParseError(
-            "Grounding analysis is incomplete: strengthening_questions must be a list of strings."
+            "Grounding analysis is incomplete: strengthening_questions needs nonempty strings."
         )
+    normalized["strengthening_questions"] = list(questions)
+    topics: dict[str, dict[str, Any]] = {}
+    for row in normalized["topic_coverage"]:
+        match = re.match(r"^([A-O])(?:\s*[.():\-–—]|\s|$)", row["topic"].strip())
+        if not match or match[1] in topics:
+            raise LLMParseError("Grounding analysis is incomplete: invalid or duplicate checklist topic.")
+        topics[match[1]] = row
+    if set(topics) != set(_GROUNDING_TOPICS):
+        raise LLMParseError("Grounding analysis is incomplete: checklist topics A through O are required.")
+    normalized["topic_coverage"] = [topics[label] for label in _GROUNDING_TOPICS]
+    if observations_present and not any(normalized[name] for name in _GROUNDING_OBJECT_LISTS[:3]):
+        raise LLMParseError("Grounding analysis is incomplete: no witness observations were analyzed.")
     return normalized
 
 
@@ -643,7 +674,9 @@ def _run_draft(
                     ),
                     phase="grounding",
                 )
-                result.grounding = _normalize_grounding(raw_grounding)
+                result.grounding = _normalize_grounding(
+                    raw_grounding, observations_present=bool(obs_for_prompt.strip())
+                )
             except Exception as exc:  # noqa: BLE001
                 raise map_drafting_exception(exc, request_id=rid, phase="grounding") from exc
 
@@ -855,6 +888,14 @@ def grounding_markdown(result: DraftResult) -> str:
         lines.append(f"> ⚠️ **Truncated observations:** {result.truncation_warning}")
         lines.append("")
     grounding = result.grounding if isinstance(result.grounding, dict) else {}
+    try:
+        _normalize_grounding(grounding)
+    except LLMParseError:
+        lines.append(
+            "> ⚠️ This saved grounding analysis is incomplete or uses an earlier response format. "
+            "Re-run before relying on topic coverage; the details below remain available for review."
+        )
+        lines.append("")
     supported = _grounding_rows(grounding, "supported_observations")
     if supported:
         lines.append("### ✅ Observations corroborated by the records")
@@ -878,8 +919,8 @@ def grounding_markdown(result: DraftResult) -> str:
         lines.append("")
     topics = _grounding_rows(grounding, "topic_coverage")
     if topics:
-        covered = [t for t in topics if t.get("applicable") and t.get("covered")]
-        missing = [t for t in topics if t.get("applicable") and not t.get("covered")]
+        covered = [t for t in topics if t.get("applicable") is True and t.get("covered") is True]
+        missing = [t for t in topics if t.get("applicable") is True and t.get("covered") is False]
         lines.append("### 🧭 Topic coverage — what the observations do and do not address")
         if covered:
             lines.append("**Covered by the witness's observations:**")
@@ -901,4 +942,6 @@ def grounding_markdown(result: DraftResult) -> str:
         for question in questions:
             lines.append(f"- {question}")
         lines.append("")
-    return "\n".join(lines) or "_No grounding details produced._"
+    if not any(_grounding_rows(grounding, name) for name in _GROUNDING_OBJECT_LISTS) and not questions:
+        lines.append("_No grounding details produced._")
+    return "\n".join(lines)

@@ -193,7 +193,7 @@ def _draft_topic_questions(topic_rows: Any) -> list[dict[str, str]]:
     if not isinstance(topic_rows, list):
         return questions
     for row in topic_rows:
-        if not isinstance(row, dict) or not row.get("applicable") or row.get("covered"):
+        if not isinstance(row, dict) or row.get("applicable") is not True or row.get("covered") is not False:
             continue
         topic = _clean_text(row.get("topic"))
         question = _clean_text(row.get("prompt_for_witness")) or _default_question(topic)

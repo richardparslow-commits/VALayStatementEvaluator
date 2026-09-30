@@ -772,7 +772,7 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
                     guard_note=GUARD_NOTE,
                 ),
                 phase="grounding",
-            )),
+            ), observations_present=bool(obs_for_prompt.strip())),
             "grounding",
         )
         log(f"grounding done: {len(grounding)} keys")

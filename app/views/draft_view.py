@@ -797,8 +797,8 @@ def _render_draft_results(draft_result: Any) -> None:
         source_id=str(st.session_state.get("draft_request_id", "") or ""),
         questions=draft_follow_up_questions(draft_result),
         empty_message=(
-            "No follow-up questions are needed — the grounding analysis found no uncovered "
-            "applicable checklist topics."
+            "No follow-up questions were returned. Review the source records and witness "
+            "observations for missing details before signing."
         ),
         next_run_label="draft",
     )
