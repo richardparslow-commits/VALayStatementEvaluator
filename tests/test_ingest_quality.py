@@ -149,13 +149,13 @@ class TestPdfExtraction(unittest.TestCase):
         with self.assertRaises(ExtractionError):
             _extract_pdf("fake.pdf", b"this is not a pdf at all")
 
-    def test_running_headers_and_footers_are_stripped(self) -> None:
+    def test_repeated_source_lines_are_preserved(self) -> None:
         from app.documents import _extract_pdf
 
         page = "VA.gov | My HealtheVet — medical records\nKnee pain noted on exam {n}.\nPage {n} of 5"
         data = _pdf_bytes([page.format(n=i) for i in range(1, 6)])
         doc = _extract_pdf("va.pdf", data)
-        self.assertNotIn("VA.gov | My HealtheVet", doc.full_text)
+        self.assertIn("VA.gov | My HealtheVet", doc.full_text)
         for index in range(1, 6):
             self.assertIn(f"Knee pain noted on exam {index}.", doc.full_text)
 

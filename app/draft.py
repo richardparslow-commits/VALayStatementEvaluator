@@ -384,7 +384,8 @@ def run_draft(
         extra={"request_id": rid, "phase": "draft_pipeline", "status": "start"},
     )
     # Root span for the run — see run_evaluation for the mirrored comment.
-    with tracing.run_span("draft", files=len(records), pages=pages, chars=len(observations)):
+    from . import pilot
+    with pilot.action_budget(records), tracing.run_span("draft", files=len(records), pages=pages, chars=len(observations)):
         try:
             validate_drafting_request(
                 observations=observations,
@@ -494,6 +495,8 @@ def _review_rejection_reason(original: str, improved: Any) -> str:
         _normalized_text(original[closing.start():])
     ):
         return "the proposed statement did not preserve the certification and signature closing"
+    if _normalized_text(original) != _normalized_text(improved):
+        return "the proposed statement changed witness text; factual changes require human review"
     return ""
 
 
@@ -538,6 +541,10 @@ def _normalize_grounding(raw: Any) -> dict[str, Any]:
     """
     if not isinstance(raw, dict):
         raise LLMParseError("Grounding analysis is incomplete: expected a JSON object.")
+    from . import pilot
+    if not raw or (pilot.enabled() and not any(isinstance(raw.get(name), list) and raw[name]
+                                              for name in _GROUNDING_OBJECT_LISTS)):
+        raise LLMParseError("Grounding analysis is incomplete: no observations were analyzed.")
     normalized: dict[str, Any] = dict(raw)
     for field_name in _GROUNDING_OBJECT_LISTS:
         value = normalized.get(field_name)

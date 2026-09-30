@@ -172,6 +172,7 @@ class ExtractedDocument:
     # their records were never read.
     unreadable_pages: list[int] = field(default_factory=list)
     pagination: str = PAGE
+    coverage_known: bool = True
 
     @property
     def source_page_count(self) -> int:
@@ -393,45 +394,12 @@ def normalize_tabular_rows(text: str) -> str:
 
 
 def strip_running_headers(pages: list[DocumentPage]) -> list[DocumentPage]:
-    """Drop boilerplate lines that repeat on most pages (headers/footers).
+    """Preserve source evidence: repetition alone cannot identify boilerplate.
 
-    A VA.gov export stamps the same running header and page-number footer on
-    every page. Left in, they consume digest prompt budget, repeat on every fact
-    the model extracts, and skew the IDF weighting both retrieval paths use (a
-    token that appears on every page looks like boilerplate rather than signal).
-
-    Only lines that appear on more than ``config.RUNNING_LINE_RATIO`` of pages are
-    removed, and only when at least ``config.RUNNING_LINE_MIN_PAGES`` pages are
-    present — on a three-page document every line already repeats, so stripping
-    would delete real content.
+    Running headers may be suppressed in a derived view with a verified format
+    detector, but source pages and clinical statements must remain immutable.
     """
-    if len(pages) < config.RUNNING_LINE_MIN_PAGES:
-        return pages
-    counts: Counter[str] = Counter()
-    for page in pages:
-        counts.update({line for line in _page_lines(page.text) if len(line) <= 200})
-    threshold = len(pages) * config.RUNNING_LINE_RATIO
-    boilerplate = {
-        line
-        for line, seen in counts.items()
-        # A short numeric line is the page number itself; longer repeats are the
-        # header/footer text. Both are safe to drop, but never drop a line that
-        # carries a date — that is genuinely part of the record.
-        if seen > threshold and not _DATE_TOKEN_RE.search(line)
-    }
-    if not boilerplate:
-        return pages
-    stripped: list[DocumentPage] = []
-    for page in pages:
-        kept = [line for line in page.text.splitlines() if line.strip() not in boilerplate]
-        text = "\n".join(kept).strip()
-        if text:
-            stripped.append(DocumentPage(page.filename, page.page, text, page.kind))
-        else:
-            # Every line was boilerplate: keep the page as unreadable rather than
-            # silently deleting it, so coverage reporting stays honest.
-            stripped.append(page)
-    return stripped
+    return pages
 
 
 def _extract_pdf(filename: str, data: bytes) -> ExtractedDocument:
@@ -456,10 +424,16 @@ def _extract_pdf(filename: str, data: bytes) -> ExtractedDocument:
     except Exception as exc:  # noqa: BLE001 - damaged or unsupported structure
         raise ExtractionError(f"{filename}: could not read PDF pages ({exc})") from exc
 
+    if len(source_pages) > config.MAX_RECORD_PAGES:
+        raise ExtractionError("PDF exceeds the physical page limit before text extraction.")
     doc = ExtractedDocument(filename=filename, total_pages=len(source_pages))
+    extracted_chars = 0
     for index, page in enumerate(source_pages, start=1):
         text = _page_text(page)
         if text:
+            extracted_chars += len(text)
+            if extracted_chars > 20 * 1024 * 1024:
+                raise ExtractionError("Extracted PDF text exceeds the processing limit.")
             doc.pages.append(DocumentPage(filename, index, text))
         else:
             doc.unreadable_pages.append(index)

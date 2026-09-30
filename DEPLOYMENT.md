@@ -1,5 +1,8 @@
 # Deployment Guide — VA Lay Statement Evaluator
 
+For real veteran information, use the restricted [controlled-pilot guide](PILOT.md).
+The general deployment examples are synthetic-data scaffolding until separately reviewed.
+
 This document covers running the app in production at scale, including
 multi-instance deployment behind a load balancer, running the pipeline on a
 worker pool, and graceful failover. For single-user local setup, see
@@ -494,9 +497,11 @@ nodes in another region. `deploy/k8s/k8s-deployment.yaml` / `k8s-worker.yaml` th
 
 Blobs are content-addressed (the key is derived from the bytes), so two users uploading the
 same bundle in one deployment share one object, and re-submitting a failed run re-uses it.
-They are deleted when the job reaches a terminal state, and the filesystem backend also
-sweeps anything older than `VA_LSE_JOB_QUEUE_TTL_SECONDS` on write, so a crashed worker
-cannot leak bytes forever. Storage needed is roughly `queue depth × average job text`;
+Terminal jobs do not currently delete content-addressed blobs. The filesystem backend
+performs an opportunistic 24-hour sweep on writes; idle deployments need a scheduled
+cleanup, and S3 deployments need a verified lifecycle policy. Until those controls and
+atomic queue admission are separately validated, Pattern C is excluded from the
+controlled real-data pilot (see [PILOT.md](PILOT.md)). Storage needed is roughly `queue depth × average job text`;
 a handful of concurrent 2,000-page bundles is a few hundred MB.
 
 The sidebar's **🛠️ Job queue** panel and `GET /health → job_queue` report which blob

@@ -5,6 +5,8 @@ Split out of ``app/views/shared.py``; the estimator itself is
 """
 from __future__ import annotations
 
+from .. import pilot
+
 from typing import Any
 
 import streamlit as st
@@ -92,12 +94,12 @@ def render_usage_summary(usage: Any) -> None:
     # into a claim file that is something the reader should not have to open a
     # details panel to discover. The audit record is the durable record of it.
     if getattr(usage, "used_fallback", False):
-        st.warning(
+        pilot.display(
             "⚠️ Part of this run was served by the **backup LLM endpoint**: the primary "
             "endpoint was unavailable. The result is complete and reviewed the same way, "
             "but its wording may differ from a normal run. This run's audit record "
             "(`llm_endpoints`) and the run log name the endpoint(s) that produced it."
-        )
+        , container=st, method="warning")
 
     with st.expander("⚙️ Estimated API usage (tokens / calls)", expanded=False):
         rows = []
@@ -113,12 +115,12 @@ def render_usage_summary(usage: Any) -> None:
                 }
             )
         st.dataframe(rows, width="stretch", hide_index=True)
-        st.caption(
+        pilot.display(
             f"**Total:** {total.calls} call(s) · "
             f"{total.prompt_tokens:,} input / {total.completion_tokens:,} output tokens "
             f"({total.total_tokens:,} total). Token counts are estimates based on prompt "
             "length and model output; they use the provider's reported usage when available."
-        )
+        , container=st, method="caption")
 
         rates, rate_source = effective_credit_rates()
         credits = usage.credit_estimate(rates)
@@ -126,22 +128,22 @@ def render_usage_summary(usage: Any) -> None:
         if credits is not None:
             if quota:
                 pct = credits / quota * 100
-                st.caption(
+                pilot.display(
                     f"**Estimated credit burn:** {credits:,.0f} / {quota:,.0f} "
                     f"({pct:.1f}% of the weekly quota, {rate_source})"
-                )
+                , container=st, method="caption")
             else:
-                st.caption(
+                pilot.display(
                     f"**Estimated credit burn:** {credits:,.0f} units ({rate_source}). "
                     "Set `VA_LSE_CREDIT_QUOTA` to render this as a percentage of your "
                     "plan's weekly allowance."
-                )
+                , container=st, method="caption")
         else:
-            st.caption(
+            pilot.display(
                 "Set `VA_LSE_CREDITS_PER_1M_MAIN` / `VA_LSE_CREDITS_PER_1M_FAST` in your "
                 ".env — or add console readings in the sidebar's **Usage watchdog** "
                 "panel so the app can estimate your rate — to see credit burn here."
-            )
+            , container=st, method="caption")
 
 
 __all__ = [

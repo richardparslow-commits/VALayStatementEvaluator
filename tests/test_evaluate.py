@@ -98,6 +98,10 @@ class _FakeLLM:
             if isinstance(val, Exception):
                 raise val
             return val
+        # A worker using this stub for drafting must return actual grounding.
+        if phase == "grounding":
+            return {"unverified_observations": [{"observation": "Synthetic knee pain account.",
+                                                "reason": "Witness confirmation required."}]}
         # defaults per phase
         if phase == "claims":
             return {
@@ -787,7 +791,7 @@ class TestRewritePromptContract(unittest.TestCase):
         self.assertIn("LAY ATTRIBUTION — mandatory on every NOT FOUND claim", REVISE_SYSTEM)
 
     def test_the_basis_of_knowledge_is_not_hedging(self):
-        self.assertIn("Attribution is the basis of knowledge, NOT doubt", REVISE_SYSTEM)
+        self.assertIn("Attribution records the basis of knowledge", REVISE_SYSTEM)
         self.assertIn('"I felt", "I noticed", "I still cannot", "it wakes me"', REVISE_SYSTEM)
         self.assertIn('"I saw", "I watched", "I was there when", "I heard"', REVISE_SYSTEM)
 

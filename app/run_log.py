@@ -122,6 +122,9 @@ def run_log_event(
             )
         else:
             payload[str(key)[:40]] = scrub_free_text(repr(value))[:120]
+    from . import pilot
+    if pilot.enabled():
+        payload = {"timestamp": payload["timestamp"], **pilot.safe_metadata(payload)}
     try:
         line = json.dumps(payload, ensure_ascii=False)
         with _LOCK:

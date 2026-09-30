@@ -54,3 +54,7 @@ CLAUDE.md
 .claudeignore
 .implement/
 .opencode/
+
+# Operator-owned pilot configuration; invitations and credentials stay external.
+*.pilot.env
+pilot-approval.json

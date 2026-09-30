@@ -12,6 +12,8 @@ handle, the shutdown gate, progress widgets, and audit metadata.
 """
 from __future__ import annotations
 
+from .. import pilot
+
 import traceback
 from datetime import datetime, timezone
 from typing import Any
@@ -132,6 +134,11 @@ def session_settings() -> Any:
     work. A preflight that checked the *saved* key while the run used the typed one
     would clear a configuration that then fails.
     """
+    from ..config import load_settings
+    managed = load_settings()
+    if pilot.enabled() or managed.api_key or managed.fetch_api_key:
+        st.session_state.settings = managed
+        return managed
     try:
         settings = st.session_state.settings
     except AttributeError:
@@ -158,7 +165,7 @@ def get_llm() -> LLMClient | None:
             "LLM not configured — missing API key",
             extra={"request_id": rid, "phase": "llm_config", "status": "error"},
         )
-        st.error("Enter your LLM API key in the sidebar before running.")
+        pilot.display("Enter your LLM API key in the sidebar before running.", container=st, method="error")
         return None
     try:
         return LLMClient(settings)
@@ -174,7 +181,7 @@ def get_llm() -> LLMClient | None:
                 "error_class": type(exc).__name__,
             },
         )
-        st.error(report_failure(str(exc), phase="llm_config", exc=exc))
+        pilot.display(report_failure(str(exc), phase="llm_config", exc=exc), container=st, method="error")
         return None
 
 
@@ -184,10 +191,10 @@ def check_shutdown_gate(action: str) -> bool:
     ``action`` is "evaluation" or "draft" — used only in the user message.
     """
     if is_shutting_down():
-        st.error(
+        pilot.display(
             f"The app is shutting down to finish a deployment or restart. "
             f"No new {action} runs can start right now — please try again in a moment."
-        )
+        , container=st, method="error")
         return False
     return True
 
@@ -314,16 +321,16 @@ def check_endpoint_gate(action: str, *, log_action: str, request_id: str = "") -
             # banner on screen, so the choice is named where the run starts.
             kind = getattr(verdict, "retired_kind", "")
             label = preflight.RETIRED_PROVIDER_KINDS.get(kind, kind)
-            st.warning(
+            pilot.display(
                 "This run is using a retired provider configuration — "
                 f"{label} is not recommended. Runs here are expected to fail; "
                 "the audit trail records it."
-            )
+            , container=st, method="warning")
         if age is not None:
-            st.caption(
+            pilot.display(
                 f"Endpoint preflight: reused the check from {_age_label(age)} ago — "
                 "no request was sent."
-            )
+            , container=st, method="caption")
         _clear_endpoint_block(action)
         return True
 
@@ -374,27 +381,27 @@ def render_endpoint_preflight_notice(action: str) -> None:
         # a configuration that is no longer in force and must not be shown.
         _clear_endpoint_block(action)
         return
-    st.error(f"⛔ Run not started — {verdict.headline}\n\n{verdict.fix}")
+    pilot.display(f"⛔ Run not started — {verdict.headline}\n\n{verdict.fix}", container=st, method="error")
     if getattr(verdict, "retired", ""):
         # A blocked run on a retired provider is the commonest shape (the Router
         # refuses everything; the gateway rate-limits mid-run), so the block names
         # it even when the provider's own error was the blocker, not retirement.
         kind = getattr(verdict, "retired_kind", "")
         label = preflight.RETIRED_PROVIDER_KINDS.get(kind, kind)
-        st.caption(f"This configuration is also a retired provider ({label}) — see the sidebar banner.")
+        pilot.display(f"This configuration is also a retired provider ({label}) — see the sidebar banner.", container=st, method="caption")
     age = st.session_state.get(_endpoint_age_key(action))
     if isinstance(age, (int, float)):
-        st.caption(
+        pilot.display(
             f"Reused the check from {_age_label(float(age))} ago — no request was sent "
             "when the run was attempted."
-        )
+        , container=st, method="caption")
     with st.expander("The check can be wrong — start the run anyway"):
-        st.caption(
+        pilot.display(
             "Some OpenAI-compatible servers answer `/models` differently than they serve "
             "completions, and a provider's catalog can lag what it actually serves. Tick this "
             "to skip the check for this endpoint, key and model set; changing any of them asks "
             "you again."
-        )
+        , container=st, method="caption")
         st.checkbox("Ignore the endpoint check and run anyway", key=endpoint_waiver_key(action, signature))
 
 

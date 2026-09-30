@@ -75,3 +75,7 @@ _leftover_backup/
 **/.vscode/
 **/* 2.*
 **/* 3.*
+
+# Operator-owned pilot configuration; invitations and credentials stay external.
+**/*.pilot.env
+**/pilot-approval.json

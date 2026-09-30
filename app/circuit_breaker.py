@@ -250,7 +250,8 @@ class CircuitBreaker:
         """
         with self._lock:
             if reason:
-                self._last_failure_reason = reason.strip()[:MAX_FAILURE_REASON_CHARS]
+                from . import pilot
+                self._last_failure_reason = "Service request failed" if pilot.enabled() else reason.strip()[:MAX_FAILURE_REASON_CHARS]
                 self._last_failure_retriable = retriable
             if self._state == "HALF_OPEN":
                 self._opened_at = time.monotonic()

@@ -555,10 +555,10 @@ class TestFinalPhaseSemantics(unittest.TestCase):
         self.assertEqual(result["facts_total"], 1)
         self.assertEqual(result["summary"], "Summary.")
 
-    def test_review_adopted_when_structurally_sound(self) -> None:
+    def test_review_requires_human_adoption_when_text_changes(self) -> None:
         result = self._run_final("ok")
-        self.assertEqual(result["statement"], self.IMPROVED)
-        self.assertEqual(result["review_issues"], ["add dates"])
+        self.assertEqual(result["statement"], self.DRAFT)
+        self.assertIn("add dates", result["review_issues"])
 
     def test_a_shape_invalid_grounding_is_retried_not_fatal(self) -> None:
         # The normalizer must run INSIDE _retry_phase: a parseable-but-wrong-
@@ -567,7 +567,7 @@ class TestFinalPhaseSemantics(unittest.TestCase):
         result = self._run_final("ok", bad_grounding_once=True)
         # grounding chat_json x2 (1 bad shape + 1 good) + review x1, draft x1
         self.assertEqual(result["_calls"], (1, 3))
-        self.assertEqual(result["statement"], self.IMPROVED)
+        self.assertEqual(result["statement"], self.DRAFT)
 
     def test_non_dict_review_preserves_the_draft(self) -> None:
         result = self._run_final("empty")

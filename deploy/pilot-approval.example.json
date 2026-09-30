@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "reviewed_revision": "REPLACE_WITH_IMMUTABLE_REVIEWED_REVISION",
+  "approved_at": "2000-01-01T00:00:00Z",
+  "expires_at": "2000-01-02T00:00:00Z",
+  "deployment_url": "https://pilot.example.invalid",
+  "issuer": "https://identity.example.invalid",
+  "subjects": ["REPLACE_WITH_INVITED_OIDC_SUBJECT"],
+  "operators": ["REPLACE_WITH_OPERATOR_OIDC_SUBJECT"],
+  "provider_base_url": "https://provider.example.invalid/v1",
+  "models": ["REPLACE_WITH_APPROVED_MODEL"],
+  "single_instance": true,
+  "provider_terms": "",
+  "retention_policy": "",
+  "privacy_review": "",
+  "legal_review": "",
+  "accuracy_validation": "",
+  "deployment_validation": "",
+  "incident_response": ""
+}

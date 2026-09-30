@@ -5,6 +5,8 @@ Split out of ``app/views/shared.py``; the actual parsing lives in
 """
 from __future__ import annotations
 
+from .. import pilot
+
 import hashlib
 from typing import Any
 
@@ -117,8 +119,9 @@ def extract_uploads(files: Any, slot: str) -> list[Any]:
             skipped.append(f"✖️ {uploaded.name}: could not read uploaded file.")
             continue
         live_keys.add(cache_key)
-        if cache_key in st.session_state:
-            documents.append(st.session_state[cache_key])
+        if cache_key in st.session_state and isinstance(st.session_state[cache_key], dict):
+            documents.extend(st.session_state[cache_key]["documents"])
+            skipped.extend(st.session_state[cache_key]["skipped"])
             continue
 
         # Extract individually so duplicate names and skipped files cannot shift
@@ -126,7 +129,7 @@ def extract_uploads(files: Any, slot: str) -> list[Any]:
         new_docs, file_skipped = extract_uploaded_documents([uploaded])
         skipped.extend(file_skipped)
         if new_docs:
-            st.session_state[cache_key] = new_docs[0]
+            st.session_state[cache_key] = {"documents": new_docs, "skipped": file_skipped}
             documents.extend(new_docs)
     _prune_upload_cache(slot, live_keys)
     # The uploader re-delivers files on every rerun, so warnings are recomputed
@@ -138,11 +141,14 @@ def extract_uploads(files: Any, slot: str) -> list[Any]:
     # plain strings and would otherwise leave nothing behind. ``once`` because
     # this loop is recomputed on every rerun while the bad file stays uploaded.
     for message in skipped:
-        st.warning(
+        pilot.display(
             report_failure(
                 message, phase="upload_extract", severity="warning", once=True
             )
-        )
+        , container=st, method="warning")
+    if pilot.enabled() and skipped:
+        pilot.display("Some uploaded files could not be read. Resolve each problem before a pilot run.", container=st, method="error")
+        return []
     return documents
 
 
@@ -152,9 +158,9 @@ def _render_skip_summary(files: Any, documents: list[Any], skipped: list[str]) -
         return
     total = len(files)
     loaded = len(documents)
-    st.caption(
+    pilot.display(
         f"Loaded {loaded} of {total} file(s) — {len(skipped)} skipped (listed below)."
-    )
+    , container=st, method="caption")
 
 
 def render_record_volume_warning(documents: list[Any], *, slot: str) -> None:
@@ -170,14 +176,14 @@ def render_record_volume_warning(documents: list[Any], *, slot: str) -> None:
     except Exception:  # noqa: BLE001 - defensive: any doc shape
         total_pages = text_pages
     if total_pages > config.MAX_RECORD_PAGES:
-        st.error(f"⚠️ {page_limit_message(total_pages, config.MAX_RECORD_PAGES)}")
+        pilot.display(f"⚠️ {page_limit_message(total_pages, config.MAX_RECORD_PAGES)}", container=st, method="error")
     elif total_pages > config.RECORD_SIZE_WARN_PAGES:
-        st.warning(
+        pilot.display(
             f"⚠️ Large record set ({total_pages:,} pages): the review will take a long time "
             "and may reach the run timeout. Extracted evidence is retained in full; "
             "individual prompts and narrative summaries use bounded selections. "
             "Consider splitting the records by date range to shorten each run."
-        )
+        , container=st, method="warning")
     logger.debug(
         "record volume slot=%s files=%d pages=%d text_pages=%d",
         slot,

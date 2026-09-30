@@ -223,7 +223,7 @@ class TestScrapeConfig(unittest.TestCase):
     def test_scrapes_both_tiers_on_their_health_ports(self) -> None:
         web = self.jobs["va-lse-web"]["static_configs"][0]["targets"]
         worker = self.jobs["va-lse-worker"]["static_configs"][0]["targets"]
-        self.assertIn("web:8001", web)
+        self.assertIn("streamlit-web:8001", web)
         self.assertIn("worker:8002", worker)
 
     def test_scrape_never_forces_the_expensive_queue_probe(self) -> None:

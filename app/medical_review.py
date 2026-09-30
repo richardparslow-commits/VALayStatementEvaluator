@@ -514,6 +514,10 @@ def verify_citations(
     for fact in facts:
         probe = _citation_probe(fact.quote)
         text = page_texts.get((fact.document, fact.page)) if fact.document else None
+        if text is None and fact.document:
+            checked += 1
+            missing.append({"document": fact.document, "page": fact.page, "reason": "source_not_found"})
+            continue
         if not probe or text is None:
             skipped += 1
             continue
@@ -1130,6 +1134,11 @@ def review_medical_records(
         pass
     check_pipeline_cancelled()
     digest.citation_check = verify_citations(digest.facts, documents)
+    from . import pilot
+    if pilot.enabled() and (not digest.facts or digest.citation_check["missing"]
+                            or digest.citation_check["skipped"]):
+        raise pilot.PilotBlocked("Record analysis contains unverified citations. "
+                                 "No pilot statement can be generated from this analysis.")
     with tracing.phase_span("records:summary"), PhaseTimer(logger, "records:summary", request_id=rid):
         digest.summary = _summarize(llm, replace(digest, facts=summary_facts))
     check_pipeline_cancelled()
@@ -1754,43 +1763,21 @@ def build_timeline_events(digest: MedicalDigest) -> list[TimelineEvent]:
 
 
 def _normalize_date_for_sort(date_str: str) -> str:
-    """Normalize a date string for sorting.
+    """Use the shared precision-aware parser; never read the month as a day.
 
-    Handles various date formats extracted by the LLM:
-    - Full dates: "2023-05-15" -> "2023-05-15"
-    - Month/year: "2023-05" -> "2023-05"
-    - Year only: "2023" -> "2023"
-    - Qualifiers: "unknown", "circa 2019" -> "9999" (sort last)
+    Displayed dates retain source precision. Sort anchors do not establish exact
+    dates; the gap detector checks the original precision before using them.
     """
-    if not date_str or date_str.lower() in ("unknown", "n/a", "none", ""):
+    parsed = _regex_extract_date(date_str)
+    if parsed is None:
         return "9999-99-99"
-
-    date_lower = date_str.lower().strip()
-
-    # Handle qualifiers like "circa 2019", "approx 2020"
-    import re
-
-    circa_match = re.match(r"(circa|approx(?:imately)?)\s*(\d{4})", date_lower)
-    if circa_match:
-        year = circa_match.group(2)
-        return f"{year}-06-15"  # Mid-year for approximate dates
-
-    # Try to extract a 4-digit year
-    year_match = re.search(r"\b(\d{4})\b", date_str)
-    if not year_match:
-        return "9999-99-99"
-
-    year = year_match.group(1)
-
-    # Look for month
-    month_match = re.search(r"\b(0?\d|1[0-2])\b", date_str)
-    month = month_match.group(1).zfill(2) if month_match else "06"  # Default to June
-
-    # Look for day
-    day_match = re.search(r"\b(0?[1-9]|[12]\d|3[01])\b", date_str)
-    day = day_match.group(1).zfill(2) if day_match else "15"  # Default to mid-month
-
-    return f"{year}-{month}-{day}"
+    value, precision = parsed
+    # Sort-only anchors; displayed dates keep the source precision.
+    if precision == "year":
+        return value[:4] + "-06-15"
+    if precision == "month":
+        return value[:7] + "-01"
+    return value
 
 
 def _truncate_description(text: str, max_length: int) -> str:
@@ -1825,6 +1812,10 @@ def detect_timeline_gaps(
         if current.date_sortable == "9999-99-99" or next_event.date_sortable == "9999-99-99":
             continue
 
+        parsed_current = _regex_extract_date(current.date)
+        parsed_next = _regex_extract_date(next_event.date)
+        if not parsed_current or not parsed_next or parsed_current[1] != "day" or parsed_next[1] != "day":
+            continue
         try:
             from datetime import datetime
 
@@ -2135,7 +2126,7 @@ _MONTH_YEAR_RE = re.compile(
 _CIRCA_YEAR_RE = re.compile(
     r"\b(?:circa|c\.|around|approx\.?|approximately)\s*['’]?(\d{4})\b", re.IGNORECASE
 )
-_BARE_YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
+_BARE_YEAR_RE = re.compile(r"\b\d{4}\b")
 
 _TIMELINE_DEFAULT_GAP_DAYS = 180
 
@@ -2192,7 +2183,7 @@ def _regex_extract_date(text: str) -> tuple[str, str] | None:
         try:
             return (datetime.date(year, month, day).isoformat(), "day")
         except ValueError:
-            pass
+            return None  # An invalid full date must not silently become a month/year.
     match = _ISO_MONTH_RE.search(text)
     if match:
         year, month = (int(v) for v in match.groups())
@@ -2432,7 +2423,10 @@ def build_timeline_data(
             grouped.setdefault(event["bucket"], []).append(event)
 
         dated_iso = [e["date_iso"] for e in events if e["date_iso"]]
-        gaps = _detect_timeline_gaps(dated_iso)
+        # Month/year anchors are useful for sorting, not exact gap durations.
+        source_days = [e["date_iso"] for e in events
+                       if e["date_iso"] and e["precision"] == "day" and e["date_source"] == "regex"]
+        gaps = _detect_timeline_gaps(source_days)
 
         dated_count = len(dated_iso)
         undated_count = len(events) - dated_count

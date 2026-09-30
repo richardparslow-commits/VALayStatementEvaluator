@@ -319,10 +319,9 @@ must show HOW THE WITNESS KNOWS IT. State the basis of knowledge in the witness'
   * a witness describing the veteran — "I saw", "I watched", "I was there when", "I heard";
   * something the veteran told the witness — keep it a relay: "he told me", "she described".
 
-Attribution is the basis of knowledge, NOT doubt. Never hedge a competent observation \
-("I believe I may have had trouble sleeping" -> "I woke three times a night and could not fall \
-back asleep"), and never attach "unverified", "allegedly", "claimed", "reportedly" or \
-"supposedly" to the witness's own account.
+Attribution records the basis of knowledge. Preserve the witness's genuine uncertainty,
+including approximate dates and uncertain memory. Do not invent frequency, severity,
+duration, diagnoses or certainty to make an account sound stronger.
 - NO UPGRADE TO DIAGNOSIS on a NOT FOUND claim. Never convert an unverified symptom into a \
 diagnosis, a cause, a prognosis or a rating, and never imply the records support it: do not \
 write "was diagnosed with", "due to", "caused by", "service-connected", "% disabled", "the \
@@ -590,7 +589,8 @@ def run_evaluation(
     )
     # Root span for the run (no-op unless tracing is enabled). Phase spans nest
     # under it, and in Pattern C the worker continues this same trace.
-    with tracing.run_span(
+    from . import pilot
+    with pilot.action_budget(records), tracing.run_span(
         "evaluate", files=len(records), pages=pages, chars=len(statement_text)
     ):
         try:

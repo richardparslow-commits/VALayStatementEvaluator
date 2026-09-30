@@ -55,15 +55,11 @@ from .prompt_sanitize import GUARD_NOTE, sanitize_for_prompt
 
 logger = get_logger("app.knowledge_currency")
 
-# The committed framework this verdict is about. Only the two files the *topics* live in
-# are fingerprinted — the rubric and drafting guide are style/structure documents whose
-# currency is not a legal question, so including them would invalidate a good verdict
-# every time someone rewords a tip. The rubric does carry decision rules that cite
-# authority (a contradiction needs a cited record entry; a normal static exam does not
-# contradict a symptom), but those are rules about how to label evidence rather than
-# statements of current law, and the authorities behind them are stated — and therefore
-# fingerprinted — in the framework and checklist text above.
-FRAMEWORK_FILES: tuple[str, ...] = ("topic_checklist.md", "legal_framework.md")
+# All four knowledge files carry legal or evidence-handling rules. A change to
+# any of them invalidates the cached topic verdict; topic checks still do not
+# certify the entire framework as legally current.
+FRAMEWORK_FILES: tuple[str, ...] = ("topic_checklist.md", "legal_framework.md",
+                                     "evaluation_rubric.md", "drafting_guide.md")
 
 # Stable cache key: deliberately *not* keyed by fingerprint, because the interesting
 # states are "never checked" and "checked, but the text changed since" — a keyed lookup
@@ -535,7 +531,8 @@ class CurrencyFlag:
     @property
     def verified(self) -> bool:
         """Whether a fresh verdict exists for the framework currently on disk."""
-        return self.state == STATE_FRESH
+        return (self.state == STATE_FRESH and self.report is not None
+                and bool(self.report.verdicts) and not self.stale and not self.unconfirmed)
 
     def covered(self) -> tuple[str, ...]:
         """The case's topics this report actually speaks to."""
@@ -569,7 +566,11 @@ def case_currency_flag(
     age = report.age_days(now) if report is not None else None
     if report is None:
         return CurrencyFlag(state=state, report=None, age_days=None)
-    relevant = report.for_topics(topics)
+    relevant = list(report.for_topics(topics))
+    present = {v.topic for v in relevant}
+    relevant.extend(TopicVerdict(topic=t, status=STATUS_UNCONFIRMED,
+                                note="No current verdict covers this topic.")
+                    for t in topics if t not in present)
     return CurrencyFlag(
         state=state,
         report=report,

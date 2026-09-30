@@ -23,6 +23,8 @@ nobody can diagnose.
 """
 from __future__ import annotations
 
+from .. import pilot
+
 import streamlit as st
 
 from .. import audit as audit_log
@@ -84,16 +86,16 @@ def render_research_tab() -> None:
     """Render the Research tab."""
     settings = _settings()
     st.subheader("🧭 Research current VA law")
-    st.caption(
+    pilot.display(
         "Ask a question that needs the live web — current rating criteria, presumptive "
         "status, a recent procedure change — and get an answer with the sources it came "
         "from. This is how you check whether the framework the evaluator reasons from is "
         "still current."
-    )
+    , container=st, method="caption")
 
     reason = unavailable_reason(settings)
     if reason is not None:
-        st.info(reason)
+        pilot.display(reason, container=st, method="info")
         _render_scope_note()
         return
 
@@ -130,18 +132,18 @@ def _render_case_context(*, origin: str, questions: list[ResearchQuestion]) -> N
     if not questions:
         return
     loaded = bool(st.session_state.get(LOADED_CASE_QUESTION_KEY))
-    with st.expander(f"🗂️ Questions from this case ({len(questions)})", expanded=not loaded):
-        st.caption(
+    with st.expander(pilot.text_label(f"🗂️ Questions from this case ({len(questions)})"), expanded=not loaded):
+        pilot.display(
             f"Derived from {origin} — offline, from the conditions and evidence gaps in "
             "the digest. Nothing from the records is sent to produce these."
-        )
+        , container=st, method="caption")
         picked = st.radio(
             "Pick one to load into the form",
             options=questions,
-            format_func=lambda item: item.text,
+            format_func=lambda item: pilot.text_label(item.text),
             key=CASE_QUESTION_KEY,
         )
-        st.caption(f"Why this one: {picked.rationale}")
+        pilot.display(f"Why this one: {picked.rationale}", container=st, method="caption")
         if st.button("Load into the form", key="research_load_case_question"):
             _load_question(picked)
 
@@ -159,13 +161,13 @@ def _render_framework_currency(settings: Settings) -> None:
         "📐 Framework currency — is the committed checklist still current?",
         expanded=state != currency.STATE_FRESH,
     ):
-        st.caption(
+        pilot.display(
             "The evaluator and drafter reason from committed markdown in app/knowledge/ — "
             "static text that encodes VA law as it stood when it was written. This compares "
             "that text against current primary sources and returns one verdict per topic, "
             "which is what lets the Evaluate tab flag a topic that has gone out of date."
-        )
-        st.caption(_currency_state_line(state, report, settings.framework_currency_ttl_days))
+        , container=st, method="caption")
+        pilot.display(_currency_state_line(state, report, settings.framework_currency_ttl_days), container=st, method="caption")
 
         labels = currency.topic_labels()
         options = list(labels)
@@ -173,7 +175,7 @@ def _render_framework_currency(settings: Settings) -> None:
             "Checklist topics to check",
             options=options,
             default=options,
-            format_func=lambda letter: f"{letter} — {labels[letter]}",
+            format_func=lambda letter: pilot.text_label(f"{letter} — {labels[letter]}"),
             key=CURRENCY_TOPICS_KEY,
             help=(
                 "One API call covers the whole selection. Narrow it to a few topics for a "
@@ -185,7 +187,7 @@ def _render_framework_currency(settings: Settings) -> None:
 
         failure = st.session_state.get(CURRENCY_ERROR_KEY)
         if isinstance(failure, str) and failure:
-            st.error(failure)
+            pilot.display(failure, container=st, method="error")
             render_failure_detail(failure.rsplit("reference: ", 1)[-1].rstrip(")"))
 
         if report is not None:
@@ -257,20 +259,20 @@ def _render_currency_report(report: currency.CurrencyReport) -> None:
     )
 
     if report.stale:
-        st.warning(
+        pilot.display(
             "**These committed topics no longer match current law.** Guidance the app "
             "derives from them — evaluation rubrics, drafting advice, and the checklist "
             "itself — should be treated as unreliable until app/knowledge/ is updated:"
-        )
+        , container=st, method="warning")
         for verdict in report.stale:
             suffix = f" — {verdict.authority}" if verdict.authority else ""
-            st.markdown(f"- **{verdict.topic} — {verdict.label}:** {verdict.note}{suffix}")
+            pilot.display(f"- **{verdict.topic} — {verdict.label}:** {verdict.note}{suffix}", container=st, method="markdown")
     if report.unconfirmed:
-        st.info(
+        pilot.display(
             "**Not established either way** (primary sources conflicted, or the check "
             "could not confirm): "
             + ", ".join(f"{v.topic} — {v.label}" for v in report.unconfirmed)
-        )
+        , container=st, method="info")
 
 
 def _run_currency_check(settings: Settings, topics: list[str]) -> None:
@@ -279,7 +281,7 @@ def _run_currency_check(settings: Settings, topics: list[str]) -> None:
     st.session_state.pop(CURRENCY_ERROR_KEY, None)
     letters = currency.normalize_topics(topics)
     if not letters:
-        st.warning("Select at least one checklist topic to check.")
+        pilot.display("Select at least one checklist topic to check.", container=st, method="warning")
         return
     if not check_shutdown_gate("research"):
         return
@@ -449,10 +451,10 @@ def _run(
 
     condition_label = condition.strip()[:120]
     if not question.strip():
-        st.warning("Enter a research question first.")
+        pilot.display("Enter a research question first.", container=st, method="warning")
         return
     if structured and not condition.strip():
-        st.warning("A structured audit needs the condition it should cover.")
+        pilot.display("A structured audit needs the condition it should cover.", container=st, method="warning")
         return
     if not check_shutdown_gate("research"):
         return
@@ -574,7 +576,7 @@ def _render_last_result() -> None:
     """Show the error or the answer from the most recent submit."""
     failure = st.session_state.get(ERROR_KEY)
     if isinstance(failure, str) and failure:
-        st.error(failure)
+        pilot.display(failure, container=st, method="error")
         # The reference in that message resolves here without leaving the app.
         reference = failure.rsplit("reference: ", 1)[-1].rstrip(")")
         render_failure_detail(reference)
@@ -587,29 +589,29 @@ def _render_last_result() -> None:
 
 def _render_answer(answer: GroundedAnswer) -> None:
     """Render prose, structured findings, and the sources — in that order."""
-    st.markdown(answer.text)
+    pilot.display(answer.text, container=st, method="markdown")
 
     if answer.findings:
         _render_findings(answer.findings)
 
     if answer.citations:
-        with st.expander(f"Sources ({answer.citation_count})", expanded=True):
+        with st.expander(pilot.text_label(f"Sources ({answer.citation_count})"), expanded=True):
             for index, citation in enumerate(answer.citations, start=1):
                 date = f" — {citation.date}" if citation.date else ""
-                st.markdown(f"{index}. [{citation.label()}]({citation.url}){date}")
+                pilot.display(f"{index}. [{citation.label()}]({citation.url}){date}", container=st, method="markdown")
                 if citation.snippet:
-                    st.caption(citation.snippet[:280])
+                    pilot.display(citation.snippet[:280], container=st, method="caption")
     else:
-        st.caption(
+        pilot.display(
             "No sources were returned for this answer. Treat it as unverified: the "
             "grounding search may not have run."
-        )
+        , container=st, method="caption")
 
     meta_bits = [bit for bit in (answer.preset, answer.model) if bit]
     if answer.usage.get("total_tokens"):
         meta_bits.append(f"{answer.usage['total_tokens']:,} tokens")
     if meta_bits:
-        st.caption(" · ".join(meta_bits))
+        pilot.display(" · ".join(meta_bits), container=st, method="caption")
     _render_scope_note()
 
 
@@ -629,7 +631,7 @@ def _render_findings(findings: dict[str, object]) -> None:
         ):
             value = findings.get(key)
             if isinstance(value, str) and value.strip():
-                st.markdown(f"**{label}:** {value}")
+                pilot.display(f"**{label}:** {value}", container=st, method="markdown")
 
         for key, label in (
             ("evidence_expectations", "Evidence the rater will expect"),
@@ -638,20 +640,20 @@ def _render_findings(findings: dict[str, object]) -> None:
         ):
             values = findings.get(key)
             if isinstance(values, list) and values:
-                st.markdown(f"**{label}**")
+                pilot.display(f"**{label}**", container=st, method="markdown")
                 for item in values:
-                    st.markdown(f"- {item}")
+                    pilot.display(f"- {item}", container=st, method="markdown")
 
         rows = findings.get("framework_findings")
         if isinstance(rows, list) and rows:
-            st.markdown("**Checklist currency**")
+            pilot.display("**Checklist currency**", container=st, method="markdown")
             st.dataframe(rows, width="stretch", hide_index=True)
 
 
 def _render_scope_note() -> None:
     """The same boundary the rest of the app states, repeated where research happens."""
-    st.info(
+    pilot.display(
         "Research output is web-grounded material to read and verify, not legal advice and "
         "not a finding of fact. Check any source before relying on it, and never submit a "
         "statement whose facts the witness has not personally confirmed."
-    )
+    , container=st, method="info")

@@ -591,7 +591,14 @@ def build_extractor() -> RecordExtractor | None:
     ``app/documents.py``, so an unset or unrecognized mode cannot end up with a
     box-shaped object that fails every file.
     """
+    from . import pilot
     mode = (config.EXTRACTOR_MODE or "in-process").strip().lower()
+    if pilot.enabled() or mode == "isolated":
+        from .isolated_extract import IsolatedExtractor
+        if mode not in ("isolated", "in-process"):
+            raise pilot.PilotBlocked("The pilot requires the isolated local parser; fallback is disabled.")
+        record_configuration(mode="isolated", timeout_seconds=60)
+        return IsolatedExtractor()
     if mode in ("", "in-process", "inprocess", "local"):
         record_configuration(mode="in-process", timeout_seconds=config.EXTRACTOR_TIMEOUT_SECONDS)
         return None

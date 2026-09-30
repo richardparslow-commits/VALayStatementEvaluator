@@ -128,10 +128,10 @@ Look for: what happens with continued or repeated use rather than a single motio
 way on the third flight of stairs); lack of endurance (no longer finishes what he used to
 finish); how long it takes to set in and how long recovery takes; and the concrete, repeated
 task that shows it (carrying groceries up the stairs, stirring a pot, typing, raking, loading a
-dishwasher). Why it matters: 38 C.F.R. § 4.40 defines functional loss to include more frequent
-attacks of the disability than the schedule's minimum — weakened movement, inaccurate movement,
-or excess fatigability after repeated use over time — and DeLuca requires painful, weakened or
-excess movement to be rated as if the loss had a non-painful cause. "He manages on a good day"
+dishwasher). Why it matters: 38 C.F.R. § 4.40 addresses functional loss in normal movement,
+strength, speed, coordination and endurance, including pain and weakness. DeLuca addresses
+consideration of functional loss with repeated use; describe observed limitations without
+claiming that the regulation defines an attack-frequency threshold. "He manages on a good day"
 says nothing; "after two loads of laundry he cannot lift his arm to hang them" is the fact that
 decides these ratings.
 

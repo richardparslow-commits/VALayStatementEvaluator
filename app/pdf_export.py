@@ -270,21 +270,21 @@ def generate_timeline_pdf(events: list[Any]) -> bytes:
 
         # Event date
         date_display = event.date if event.date and event.date != "unknown" else "Date unknown"
-        story.append(Paragraph(date_display, styles["event_date"]))
+        story.append(Paragraph(_escape(date_display), styles["event_date"]))
 
         # Event type
         type_label = event.type.replace("_", " ").title()
-        story.append(Paragraph(type_label, styles["event_type"]))
+        story.append(Paragraph(_escape(type_label), styles["event_type"]))
 
         # Description
-        story.append(Paragraph(event.full_description, styles["event_desc"]))
+        story.append(Paragraph(_escape(event.full_description), styles["event_desc"]))
 
         # Quote if present
         if event.quote:
-            story.append(Paragraph(f"\"{event.quote}\"", styles["event_quote"]))
+            story.append(Paragraph(_escape(f"\"{event.quote}\""), styles["event_quote"]))
 
         # Source
-        story.append(Paragraph(f"Source: {event.source}", styles["event_source"]))
+        story.append(Paragraph(_escape(f"Source: {event.source}"), styles["event_source"]))
 
         story.append(Spacer(1, 8))
 

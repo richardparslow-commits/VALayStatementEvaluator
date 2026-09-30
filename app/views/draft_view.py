@@ -6,6 +6,8 @@ view so a failed run surfaces in the same browser session that started it.
 """
 from __future__ import annotations
 
+from .. import pilot
+
 import time
 import traceback
 from typing import Any
@@ -178,14 +180,14 @@ def _state_text(state_key: str) -> str:
 def _render_witness_credentials() -> None:
     """Step 3b: collect the witness's professional credentials (optional)."""
     st.subheader("Step 3b — Professional credentials (optional, strengthens the statement)")
-    st.caption(
+    pilot.display(
         "A witness who is also a licensed clinician can write a stronger hybrid "
         "statement: clinical descriptions of what they personally observed, "
         "functional/ADL impact, and medication effects. How far the statement may "
         "go depends on the credential — the app keeps every claim inside the "
         "credential's scope, so a nurse's statement will not claim a physician's "
         "diagnosis or nexus opinion."
-    )
+    , container=st, method="caption")
     level = st.selectbox(
         "Medical credential level",
         CREDENTIAL_LEVELS,
@@ -207,11 +209,11 @@ def _render_witness_credentials() -> None:
         "How this expertise relates to what the witness observed",
         key="draft_cred_relevance",
     )
-    st.caption(
+    pilot.display(
         "Included in the statement's introduction (the VA will not assume clinical "
         "competence — it must be claimed) and used to calibrate how the "
         "observations are described."
-    )
+    , container=st, method="caption")
 
 
 
@@ -221,15 +223,15 @@ def render_draft_tab() -> None:
     records = records_uploader("draft")
     if records:
         total_pages = sum(len(d.pages) for d in records)
-        st.success(
+        pilot.display(
             f"Loaded {len(records)} record file(s), {total_pages:,} page(s): "
             + ", ".join(d.filename for d in records)
-        )
+        , container=st, method="success")
         if total_pages > 200:
-            st.info(
+            pilot.display(
                 "Large record set: chunks are digested in parallel with duplicate pages "
                 "skipped, but expect a longer run for a meticulous review."
-            )
+            , container=st, method="info")
 
     render_condition_selector_for_slot("draft")
 
@@ -278,10 +280,10 @@ def render_draft_tab() -> None:
         _render_observations_length_guidance(observations)
 
     if job_runner.queue_mode_active():
-        st.caption(
+        pilot.display(
             f"⚙️ This run is processed by a background worker ({job_runner.queue_status_line()}). "
             "You can close this tab — the results will be waiting when you come back."
-        )
+        , container=st, method="caption")
 
     # A blocked preflight is kept on screen (with its waiver) from here, above the
     # button that would start the run — see app/views/shared.py.
@@ -356,7 +358,7 @@ def _run_draft_queued(
             "draft", "rejected", request_id=rid,
             error=config_error, reason="worker_key_missing",
         )
-        st.error(config_error)
+        pilot.display(config_error, container=st, method="error")
         return
     _sources, _files, _pages = audit_record_meta("draft", records)
     outcome = job_runner.submit_job(
@@ -378,43 +380,43 @@ def _run_draft_queued(
         action_label="Drafting",
     )
     if outcome is not None and outcome.ok:
-        st.success(f"Draft complete — reference `{rid}`.")
+        pilot.display(f"Draft complete — reference `{rid}`.", container=st, method="success")
 
 
 def _render_observations_length_guidance(observations: str) -> None:
     n = len(observations)
-    st.caption(
+    pilot.display(
         f"Observations length: {n:,} / {MAX_OBSERVATIONS_CHARS:,} characters "
         f"(recommended limit; hard prompt limit {DRAFT_INTERNAL_MAX_CHARS:,})."
-    )
+    , container=st, method="caption")
     if n > MAX_OBSERVATIONS_CHARS:
         over = n - MAX_OBSERVATIONS_CHARS
         will_truncate = max(0, n - DRAFT_INTERNAL_MAX_CHARS)
         if will_truncate:
-            st.warning(
+            pilot.display(
                 f"⚠️ Observations are {n:,} characters — {over:,} over the "
                 f"{MAX_OBSERVATIONS_CHARS:,} recommended limit. {will_truncate:,} "
                 f"characters beyond the {DRAFT_INTERNAL_MAX_CHARS:,} internal limit "
                 f"will be truncated and not grounded. Details at the end may be missed. "
                 f"Consider shortening or splitting."
-            )
+            , container=st, method="warning")
         else:
-            st.warning(
+            pilot.display(
                 f"⚠️ Observations are {n:,} characters — {over:,} over the "
                 f"{MAX_OBSERVATIONS_CHARS:,} recommended limit. They will still be "
                 f"grounded in full (internal limit {DRAFT_INTERNAL_MAX_CHARS:,}), but "
                 f"very long inputs may reduce accuracy."
-            )
+            , container=st, method="warning")
         st.checkbox(
             f"I understand the observations are {over:,} characters over the limit and "
             "want to proceed anyway (any truncated portion will be noted in the results).",
             key="draft_confirm_oversize",
         )
     elif n > int(MAX_OBSERVATIONS_CHARS * 0.85):
-        st.caption(
+        pilot.display(
             f"ℹ️ Approaching the {MAX_OBSERVATIONS_CHARS:,} recommended limit "
             f"({MAX_OBSERVATIONS_CHARS - n:,} remaining before confirmation is required)."
-        )
+        , container=st, method="caption")
 
 
 def _validate_draft_inputs(records: list, observations: str, condition: str, rid: str) -> bool:
@@ -429,7 +431,7 @@ def _validate_draft_inputs(records: list, observations: str, condition: str, rid
         run_log_event("draft", "rejected", request_id=rid, error=msg, reason="no_records")
         # Shown with the id the run log recorded, so a rejection the user quotes
         # is findable even though it never reached the audit log.
-        st.error(f"{msg}{reference_suffix(rid)}")
+        pilot.display(f"{msg}{reference_suffix(rid)}", container=st, method="error")
         return False
     if not observations.strip() or not condition.strip():
         msg = "Enter the condition and the witness's observations."
@@ -437,7 +439,7 @@ def _validate_draft_inputs(records: list, observations: str, condition: str, rid
             "draft", "rejected", request_id=rid, error=msg,
             reason="missing_observations" if not observations.strip() else "missing_condition",
         )
-        st.error(f"{msg}{reference_suffix(rid)}")
+        pilot.display(f"{msg}{reference_suffix(rid)}", container=st, method="error")
         return False
     if len(observations) > MAX_OBSERVATIONS_CHARS and not st.session_state.get(
         "draft_confirm_oversize"
@@ -455,7 +457,7 @@ def _validate_draft_inputs(records: list, observations: str, condition: str, rid
             "draft", "rejected", request_id=rid, error=msg,
             reason="observations_oversize", observations_chars=len(observations),
         )
-        st.error(f"{msg}{reference_suffix(rid)}")
+        pilot.display(f"{msg}{reference_suffix(rid)}", container=st, method="error")
         return False
     return True
 
@@ -496,10 +498,10 @@ def _run_draft_flow(
         return
     if not enter_run():
         run_log_event("draft", "rejected", request_id=rid, error="app shutting down", reason="draining")
-        st.error(
+        pilot.display(
             "The app is shutting down — no new draft runs can start right now. "
             "Please try again in a moment."
-        )
+        , container=st, method="error")
         return
 
     # Audit: start — metadata only, never observations/record text.
@@ -549,17 +551,17 @@ def _run_draft_flow(
         )
     except MemoryError as mem_exc:
         _handle_draft_abort(rid, "error", mem_exc, t0, _audit_condition_d, _audit_sources_d, _audit_files_d, _audit_pages_d)
-        st.error(f"Draft aborted: {format_error_for_user(mem_exc, rid)}")
+        pilot.display(f"Draft aborted: {format_error_for_user(mem_exc, rid)}", container=st, method="error")
         render_failure_detail(rid)
         return
     except PipelineTimeoutError as timeout_exc:
         _handle_draft_abort(rid, "timeout", timeout_exc, t0, _audit_condition_d, _audit_sources_d, _audit_files_d, _audit_pages_d)
-        st.error(f"Draft aborted: {format_error_for_user(timeout_exc, rid)}")
+        pilot.display(f"Draft aborted: {format_error_for_user(timeout_exc, rid)}", container=st, method="error")
         render_failure_detail(rid)
         return
     except Exception as exc:  # noqa: BLE001
         _handle_draft_error(rid, exc, t0, _audit_condition_d, _audit_sources_d, _audit_files_d, _audit_pages_d)
-        st.error(f"Drafting failed: {format_error_for_user(exc, rid)}")
+        pilot.display(f"Drafting failed: {format_error_for_user(exc, rid)}", container=st, method="error")
         render_failure_detail(rid)
         return
     finally:
@@ -742,23 +744,23 @@ def _render_pdf_export(statement_text: str) -> None:
     try:
         pdf_bytes = generate_statement_pdf(statement_text, condition, witness_role)
     except Exception as exc:  # noqa: BLE001 - PDF generation is best-effort in the UI
-        st.error(
+        pilot.display(
             report_failure(
                 f"Could not generate the PDF export: {exc}",
                 phase="draft_pdf_export",
                 exc=exc,
             )
-        )
+        , container=st, method="error")
         return
 
     has_placeholders = detect_unconfirmed_placeholders(statement_text)
-    clicked = st.download_button(
+    clicked = pilot.file_download(
         "📄 Export final statement as PDF",
         data=pdf_bytes,
         file_name="VA_Statement.pdf",
         mime="application/pdf",
         key="pdf_export_button_draft",
-    )
+     container=st)
     if clicked:
         try:
             track_interaction(
@@ -779,16 +781,16 @@ def _render_draft_results(draft_result: Any) -> None:
     render_usage_summary(st.session_state.get("draft_usage"))
 
     if getattr(draft_result, "truncation_warning", ""):
-        st.warning(
+        pilot.display(
             f"⚠️ {draft_result.truncation_warning} (input was {draft_result.input_chars:,} chars; "
             f"{draft_result.truncated_chars:,} truncated). Review the grounding section for details."
-        )
+        , container=st, method="warning")
 
     st.divider()
     st.subheader("📋 Draft Results")
 
     with st.expander("Grounding analysis — how the draft ties to the records", expanded=True):
-        st.markdown(grounding_markdown(draft_result))
+        pilot.display(grounding_markdown(draft_result), container=st, method="markdown")
 
     render_follow_up_questions(
         slot="draft",
@@ -803,52 +805,56 @@ def _render_draft_results(draft_result: Any) -> None:
 
     if draft_result.review_issues:
         if not draft_result.final_statement:
-            st.warning("Self-review was not applied. The full original draft is shown; review it before signing.")
+            pilot.display("Self-review was not applied. The full original draft is shown; review it before signing.", container=st, method="warning")
         with st.expander("Self-review findings", expanded=not bool(draft_result.final_statement)):
             for issue in draft_result.review_issues:
-                st.write(f"- {issue}")
+                pilot.display(f"- {issue}", container=st, method="write")
 
-    st.markdown("### Final statement (editable)")
-    st.caption(
+    pilot.display("### Review draft (editable)", container=st, method="markdown")
+    pilot.display(
         "Review every bracketed [Confirm: ...] placeholder and resolve it before signing. "
         "Submit on VA Form 21-10210 (one form per witness)."
-    )
+    , container=st, method="caption")
     edited = st.text_area(
         "Statement", value=draft_result.output_statement, height=460, key="draft_edited"
     )
+    export_confirmed = pilot.confirm_export(edited)
     col_a, col_b = st.columns(2)
-    col_a.download_button(
+    pilot.file_download(
         "⬇️ Download statement (.txt)",
         data=edited.encode("utf-8"),
+        disabled=not export_confirmed,
         file_name="lay_statement_draft.txt",
         mime="text/plain",
-    )
-    col_b.download_button(
+     container=col_a)
+    pilot.file_download(
         "⬇️ Download statement (.md)",
         data=edited.encode("utf-8"),
+        disabled=not export_confirmed,
         file_name="lay_statement_draft.md",
         mime="text/markdown",
-    )
-    _render_pdf_export(edited)
+     container=col_b)
+    if export_confirmed:
+        _render_pdf_export(edited)
 
     if draft_result.digest:
         with st.expander("Medical record digest used for grounding"):
-            st.caption(
+            pilot.display(
                 f"{len(draft_result.digest.facts):,} facts extracted from "
                 f"{draft_result.digest.pages_reviewed:,} pages "
                 f"({draft_result.digest.chunks_reviewed} chunks, "
                 f"{draft_result.digest.duplicates_skipped} duplicate page(s) skipped)"
-            )
-            st.write(draft_result.digest.summary)
+            , container=st, method="caption")
+            pilot.display(draft_result.digest.summary, container=st, method="write")
             st.code(draft_result.digest.timeline_text()[:20000], language=None)
 
         # Timeline view
         st.divider()
         st.subheader("📅 Medical Record Timeline")
-        st.caption(
+        pilot.display(
             "View all medical events extracted from your records, sorted chronologically. "
             "Use filters to focus on specific time periods or event types."
-        )
+        , container=st, method="caption")
 
         # Add timeline tab
         timeline_tab, _ = st.columns([1, 3])

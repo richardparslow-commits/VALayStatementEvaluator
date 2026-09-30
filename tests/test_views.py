@@ -444,7 +444,7 @@ class TestExtractUploadsCaching(unittest.TestCase):
         st_mock, session = _fake_streamlit()
         cached_doc = MagicMock(filename="a.txt")
         uploaded = _UploadedFile("a.txt", 10)
-        session[uploads._upload_cache_key("slot", uploaded)] = cached_doc
+        session[uploads._upload_cache_key("slot", uploaded)] = {"documents": [cached_doc], "skipped": []}
 
         with _patch_st(uploads, st_mock), patch.object(
             uploads, "extract_uploaded_documents"
@@ -465,7 +465,7 @@ class TestExtractUploadsCaching(unittest.TestCase):
         ):
             docs = uploads.extract_uploads([uploaded], "slot")
         self.assertEqual(docs, [doc])
-        self.assertEqual(session[uploads._upload_cache_key("slot", uploaded)], doc)
+        self.assertEqual(session[uploads._upload_cache_key("slot", uploaded)], {"documents": [doc], "skipped": []})
 
     def test_a_replaced_file_is_not_served_from_cache(self) -> None:
         """Same name and byte length, different content: must not reuse the old text.
@@ -2875,6 +2875,9 @@ class TestRenderFailureDetail(unittest.TestCase):
     """The in-place resolve of a failure's own reference (app/views/ops.py)."""
 
     def setUp(self) -> None:
+        operator_mode = patch.dict("os.environ", {"VA_LSE_OPERATOR_DIAGNOSTICS": "1"})
+        operator_mode.start()
+        self.addCleanup(operator_mode.stop)
         from app.diagnostics import install_capture
         from app.logging_config import clear_request_id
 
