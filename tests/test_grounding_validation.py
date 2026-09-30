@@ -185,7 +185,28 @@ class TestGroundingValidation(unittest.TestCase):
         for pilot_mode in (False, True):
             with self.subTest(pilot_mode=pilot_mode):
                 data = complete_grounding("I think the pain started around 2020.")
-                llm = _FakeLLM(overrides={"grounding": data})
+                expected_questions = [
+                    {"topic": "F. Routine Errands and Chores", "question": "Which chores does knee pain limit?"},
+                    {"topic": "M. Painful Motion", "question": "Which movements cause knee pain?"},
+                    {"topic": "N. Functional Loss During Repeated Use", "question": "What changes after repeated walking?"},
+                    {"topic": "O. Flare-Ups", "question": "How often do flares occur and how long do they last?"},
+                ]
+                for question in expected_questions:
+                    index = "ABCDEFGHIJKLMNO".index(question["topic"][0])
+                    data["topic_coverage"][index].update(
+                        topic=question["topic"], applicable=True, covered=False,
+                        prompt_for_witness=question["question"],
+                    )
+                data["topic_coverage"][11].update(
+                    topic="L. Formatting and Certification", applicable=True, covered=True,
+                )
+                draft_prompts = []
+
+                def capture_draft(system, user, kwargs):
+                    draft_prompts.append(user)
+                    return "Synthetic review draft. [Witness to add: answer the functional questions.]"
+
+                llm = _FakeLLM(overrides={"grounding": data, "draft": capture_draft})
                 with patch("app.pilot.enabled", return_value=pilot_mode), \
                         patch("app.pilot.action_budget", return_value=nullcontext()), \
                         patch("app.draft.review_medical_records", return_value=_fake_digest()), \
@@ -195,6 +216,10 @@ class TestGroundingValidation(unittest.TestCase):
                 self.assertEqual(result.grounding, data)
                 self.assertIn(("chat", "draft"), llm.calls)
                 self.assertTrue(result.draft)
+                self.assertEqual(draft_follow_up_questions(result), expected_questions)
+                for question in expected_questions:
+                    self.assertIn(question["question"], draft_prompts[0])
+                    self.assertIn(question["question"], grounding_markdown(result))
 
     def test_legacy_saved_boolean_strings_do_not_claim_topic_coverage(self):
         old = DraftResult(grounding={"topic_coverage": [{
