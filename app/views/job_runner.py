@@ -252,7 +252,7 @@ def _encode_payload(kind: str, job: EvaluateJob | DraftJob) -> str:
 
     Small jobs travel inline in the queue; large ones put their extracted record
     text in the blob store and carry a reference, so tens of megabytes never sit
-    in Redis (where the reference StatefulSet's LRU policy would evict them) and
+    in Redis, reducing allocation pressure and explicit capacity failures, and
     are not re-fetched on every status poll. See ``app/blob_store.py``.
 
     Blobs are **not** deleted when a job finishes: keys are content-addressed, so
@@ -275,22 +275,30 @@ def _encode_payload(kind: str, job: EvaluateJob | DraftJob) -> str:
 def submit_job(
     *,
     slot: str,
-    job: EvaluateJob | DraftJob,
+    job: EvaluateJob | DraftJob | None,
     request_id: str,
     condition: str | None,
     sources: list[str],
     files: int,
     pages: int,
     action_label: str,
+    wait_for_result: bool = True,
 ) -> QueueOutcome | None:
-    """Enqueue a run and wait for it. Returns None when it never got queued.
+    """Enqueue a run and wait for it; return None without a confirmed outcome.
 
-    None means "the run was not submitted" (the caller should not render
-    results); a :class:`QueueOutcome` always describes a job that reached the
-    queue, including one that failed there.
+    None means "there is no confirmed outcome yet". A lost server reply may
+    still have committed the submission; retain its exact inputs and reference
+    in this session so a retry cannot start duplicate work.
     """
     backend = get_job_backend()
-    kind = KIND_EVALUATE if isinstance(job, EvaluateJob) else KIND_DRAFT
+    submission_key = f"{slot}_queue_submission"
+    pending = st.session_state.get(submission_key)
+    if job is None:
+        if not isinstance(pending, dict) or pending.get("kind") not in (KIND_EVALUATE, KIND_DRAFT):
+            return None
+        kind = pending["kind"]
+    else:
+        kind = KIND_EVALUATE if isinstance(job, EvaluateJob) else KIND_DRAFT
 
     # One run per tab at a time. The in-process pattern gets this for free — a
     # running pipeline owns the script run, so no further widget event is
@@ -304,7 +312,8 @@ def submit_job(
             record_in_flight = backend.get(existing)
         except Exception:  # noqa: BLE001 - fall through and let the submit fail loudly
             record_in_flight = None
-        if record_in_flight is not None and not record_in_flight.is_terminal:
+        checking_confirmed = isinstance(pending, dict) and pending.get("confirmed_job_id") == existing
+        if record_in_flight is not None and not record_in_flight.is_terminal and not checking_confirmed:
             run_log_event(
                 kind,
                 "rejected",
@@ -323,8 +332,28 @@ def submit_job(
     with tracing.phase_span(
         "queue:submit", kind=kind, files=files, pages=pages, backend=backend.name
     ):
+        owner = pilot.current_owner()
         try:
-            payload = _encode_payload(kind, job)
+            if isinstance(pending, dict):
+                if pending["owner_id"] != owner or pending["kind"] != kind:
+                    raise PayloadError("The previous submission belongs to another session.")
+                payload = pending["payload"]
+                request_id = pending["request_id"]
+                files, pages = pending["files"], pending["pages"]
+                condition, sources = pending["condition"], pending["sources"]
+                action_label = pending["action_label"]
+                pilot.display("Checking the earlier submission using its saved inputs. "
+                              "Recent edits will apply only after you discard that attempt.",
+                              container=st, method="info")
+            else:
+                if job is None:
+                    raise PayloadError("No earlier submission is available to check.")
+                payload = _encode_payload(kind, job)
+                st.session_state[submission_key] = {
+                    "payload": payload, "request_id": request_id, "owner_id": owner,
+                    "kind": kind, "files": files, "pages": pages,
+                    "condition": condition, "sources": sources, "action_label": action_label,
+                }
         except (PayloadError, BlobStoreError) as exc:
             run_log_event(kind, "rejected", request_id=request_id, error=str(exc), reason="payload")
             pilot.display(
@@ -337,16 +366,17 @@ def submit_job(
             , container=st, method="error")
             return None
         try:
-            record = backend.enqueue(kind, payload, request_id=request_id, owner_id=pilot.current_owner())
+            record = backend.enqueue(kind, payload, request_id=request_id, owner_id=owner)
         except Exception as exc:  # noqa: BLE001 - any enqueue failure must surface, not crash the tab
             run_log_event(
-                kind, "rejected", request_id=request_id,
-                error=f"{type(exc).__name__}: {exc}", reason="enqueue_failed",
+                kind, "error", request_id=request_id,
+                error=f"{type(exc).__name__}: {exc}", reason="submission_unconfirmed",
             )
             pilot.display(
                 report_failure(
-                    f"{action_label} could not be queued: {type(exc).__name__}: {exc}. "
-                    "Check the job-queue backend (see /health) and try again.",
+                    f"{action_label} submission is unconfirmed: {type(exc).__name__}: {exc}. "
+                    "It may already be queued. Retry to check the same submission before "
+                    "starting another run.",
                     phase=f"{kind}_enqueue",
                     exc=exc,
                     request_id=request_id,
@@ -354,14 +384,22 @@ def submit_job(
             , container=st, method="error")
             return None
 
+    if record.recovery_available:
+        st.session_state.pop(submission_key, None)
+    else:
+        # Keep exact inputs for a safe reference-repair retry, including while
+        # the confirmed job is still running. Never submit current edits here.
+        st.session_state[submission_key]["confirmed_job_id"] = record.job_id
     st.session_state[_pending_key(slot)] = record.job_id
     st.session_state[_pending_request_key(slot)] = request_id
-    # Persist the request_id → job_id mapping in the job backend so a fresh
-    # session (or a different web pod) can recover the result by request_id.
-    try:
-        backend.set_recovery_index(request_id, record.job_id)
-    except Exception:  # noqa: BLE001 - recovery is best-effort; the session copy above is fine
-        pass
+    if not record.recovery_available:
+        pilot.display(
+            "This run is confirmed, but its recovery reference could not be restored. "
+            "Keep this tab open. Check the earlier submission again after queue capacity "
+            "is available to restore recovery from another session.",
+            container=st, method="warning",
+        )
+    # The producer committed recovery indexing with the job, before returning.
     # The worker writes the audit start/ok/error pair, so the web pod records
     # only that the work was handed off — one audit record per run either way.
     run_log_event(
@@ -376,14 +414,57 @@ def submit_job(
         pages,
         extra={"request_id": request_id, "phase": kind, "status": "queued", "pages": pages},
     )
+    if not wait_for_result and not record.is_terminal:
+        if record.recovery_available:
+            pilot.display(f"Submission confirmed — recovery reference `{record.request_id}` is available. "
+                          "The worker is still processing this run.", container=st, method="info")
+        return QueueOutcome(ok=False, still_running=True, request_id=record.request_id)
     wait_budget = float(config.PIPELINE_TIMEOUT_SECONDS) + UI_WAIT_SLACK_SECONDS
-    outcome = _poll(backend, record.job_id, slot, wait_seconds=wait_budget)
+    outcome = (_poll(backend, record.job_id, slot, wait_seconds=wait_budget)
+               if wait_for_result else _fetch_outcome(backend, record, slot))
     if outcome.ok or not outcome.still_running:
         # Terminal (done or failed): nothing left to resume.
         st.session_state.pop(_pending_key(slot), None)
     if not outcome.ok:
         _render_failure(outcome, action_label)
     return outcome
+
+
+def _render_uncertain_submission(slot: str) -> None:
+    pending = st.session_state.get(f"{slot}_queue_submission")
+    if not isinstance(pending, dict):
+        return
+    pilot.display(
+        (f"An earlier run is confirmed, but reference recovery is unavailable "
+         f"(reference `{pending['request_id']}`). " if pending.get("confirmed_job_id") else
+         f"An earlier submission is unconfirmed (reference `{pending['request_id']}`). ") +
+        "Checking it uses the inputs saved with that attempt. To use your recent edits, "
+        "discard the earlier attempt first. It may still run and incur charges.",
+        container=st, method="warning",
+    )
+    if st.button("Check earlier submission", key=f"check_submission_{slot}"):
+        outcome = submit_job(
+            slot=slot, job=None, request_id=pending["request_id"],
+            condition=pending["condition"], sources=pending["sources"],
+            files=pending["files"], pages=pending["pages"], action_label=pending["action_label"],
+            wait_for_result=False,
+        )
+        if outcome is not None and outcome.ok:
+            pilot.display(f"Run complete — reference `{outcome.request_id}`.", container=st, method="success")
+        return
+    discard_allowed = st.checkbox(
+        "I understand the earlier job may still run; I want to start a separate run.",
+        key=f"confirm_discard_submission_{slot}",
+    )
+    if st.button("Discard earlier submission", key=f"discard_submission_{slot}",
+                 disabled=not discard_allowed) and discard_allowed:
+        st.session_state.pop(f"{slot}_queue_submission", None)
+        if st.session_state.get(_pending_key(slot)) == pending.get("confirmed_job_id"):
+            st.session_state.pop(_pending_key(slot), None)
+        if st.session_state.get(_pending_request_key(slot)) == pending["request_id"]:
+            st.session_state.pop(_pending_request_key(slot), None)
+        pilot.display("Earlier attempt discarded. Your next submission will use the current inputs.",
+                      container=st, method="info")
 
 
 def resume_pending_job(slot: str, *, action_label: str) -> None:
@@ -405,6 +486,7 @@ def resume_pending_job(slot: str, *, action_label: str) -> None:
     """
     if not queue_mode_active():
         return
+    _render_uncertain_submission(slot)
     job_id = st.session_state.get(_pending_key(slot))
     if not isinstance(job_id, str) or not job_id:
         # No direct job_id, but maybe we still have the request_id from this

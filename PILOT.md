@@ -166,7 +166,7 @@ only after the reviewed revision, invitations, evidence and secrets are current.
 | F10: deployment wiring | Runtime is default non-root image; backup scripts included; health checks use installed Python; service DNS and monitoring targets corrected |
 | F11: hosted access/action controls | Verified invited OIDC identities, operator role, TLS/private pilot proxy, quotas, no media exports; monitoring ports local and anonymous dashboards disabled |
 | F12: dates | Shared calendar parser handles full and named-month dates; invalid full dates do not become partial dates; precise gaps require full dates |
-| F13: queue reliability | Kubernetes Redis uses noeviction/AOF; atomic producer admission remains a separate worker-release requirement; queue disabled in pilot |
+| F13: queue reliability | Atomic, input-bound submission/recovery indexing, bounded admission and AOF/fsync settings; synthetic crash/pressure/retry tests; actual hosted persistence and ownership still need worker-release acceptance; queue disabled in pilot |
 | F14: timeline PDF markup | Dynamic paragraph content escaped; PDF failures handled; file exports disabled in pilot |
 | F15: legal/currency claims | Corrected general doubt/continuity/functional-loss language; all knowledge files fingerprinted; topic status cannot certify full legal currency |
 

@@ -158,13 +158,14 @@ class TestSubmitAndPoll(unittest.TestCase):
             st.session_state[key] = value
 
     def _submit(self, backend, **overrides):  # noqa: ANN201
+        reference = overrides.pop("request_id", "req_q1")
         with patch.object(job_runner, "get_job_backend", return_value=backend), patch.object(
             config, "JOB_QUEUE_UI_POLL_SECONDS", 0.01
         ):
             return job_runner.submit_job(
                 slot="eval",
-                job=_job(),
-                request_id="req_q1",
+                job=_job(request_id=reference),
+                request_id=reference,
                 condition="knee strain",
                 sources=["Upload"],
                 files=1,
@@ -287,7 +288,7 @@ class TestSubmitAndPoll(unittest.TestCase):
         # A stale marker for a *finished* job must not lock the tab.
         record = backend.enqueue(KIND_EVALUATE, encode_job(KIND_EVALUATE, _job()), owner_id=pilot.current_owner())
         st.session_state["va_lse_pending_job_eval"] = record.job_id
-        self.assertTrue(self._submit(backend).ok)
+        self.assertTrue(self._submit(backend, request_id="req_q2").ok)
 
     def test_large_job_is_externalized_to_the_blob_store(self):
         """A big record bundle must reach the worker as a small reference."""

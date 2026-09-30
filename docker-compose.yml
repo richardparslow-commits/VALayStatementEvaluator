@@ -105,6 +105,8 @@ services:
       # Jobs must survive a Redis restart; losing the queue loses users' runs.
       - --appendonly
       - "yes"
+      - --appendfsync
+      - always
     volumes:
       - redis-data:/data
     healthcheck:
