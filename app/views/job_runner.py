@@ -282,6 +282,7 @@ def submit_job(
     files: int,
     pages: int,
     action_label: str,
+    wait_for_result: bool = True,
 ) -> QueueOutcome | None:
     """Enqueue a run and wait for it; return None without a confirmed outcome.
 
@@ -413,8 +414,14 @@ def submit_job(
         pages,
         extra={"request_id": request_id, "phase": kind, "status": "queued", "pages": pages},
     )
+    if not wait_for_result and not record.is_terminal:
+        if record.recovery_available:
+            pilot.display(f"Submission confirmed — recovery reference `{record.request_id}` is available. "
+                          "The worker is still processing this run.", container=st, method="info")
+        return QueueOutcome(ok=False, still_running=True, request_id=record.request_id)
     wait_budget = float(config.PIPELINE_TIMEOUT_SECONDS) + UI_WAIT_SLACK_SECONDS
-    outcome = _poll(backend, record.job_id, slot, wait_seconds=wait_budget)
+    outcome = (_poll(backend, record.job_id, slot, wait_seconds=wait_budget)
+               if wait_for_result else _fetch_outcome(backend, record, slot))
     if outcome.ok or not outcome.still_running:
         # Terminal (done or failed): nothing left to resume.
         st.session_state.pop(_pending_key(slot), None)
@@ -440,6 +447,7 @@ def _render_uncertain_submission(slot: str) -> None:
             slot=slot, job=None, request_id=pending["request_id"],
             condition=pending["condition"], sources=pending["sources"],
             files=pending["files"], pages=pending["pages"], action_label=pending["action_label"],
+            wait_for_result=False,
         )
         if outcome is not None and outcome.ok:
             pilot.display(f"Run complete — reference `{outcome.request_id}`.", container=st, method="success")
@@ -451,6 +459,10 @@ def _render_uncertain_submission(slot: str) -> None:
     if st.button("Discard earlier submission", key=f"discard_submission_{slot}",
                  disabled=not discard_allowed) and discard_allowed:
         st.session_state.pop(f"{slot}_queue_submission", None)
+        if st.session_state.get(_pending_key(slot)) == pending.get("confirmed_job_id"):
+            st.session_state.pop(_pending_key(slot), None)
+        if st.session_state.get(_pending_request_key(slot)) == pending["request_id"]:
+            st.session_state.pop(_pending_request_key(slot), None)
         pilot.display("Earlier attempt discarded. Your next submission will use the current inputs.",
                       container=st, method="info")
 

@@ -279,11 +279,73 @@ class TestBrowserSubmissionRetry(unittest.TestCase):
             self.assertEqual(ui.session_state['eval_queue_submission']['confirmed_job_id'], record.job_id)
             ui.button.side_effect = lambda label, **kwargs: label == 'Check earlier submission'
             job_runner._render_uncertain_submission('eval')
-        self.assertEqual(poll.call_count, 2)
+        self.assertEqual(poll.call_count, 1)
         self.assertNotIn('eval_queue_submission', ui.session_state)
         warnings = [call.args[0] for call in display.call_args_list if call.kwargs.get('method') == 'warning']
         self.assertTrue(any('Keep this tab open' in warning for warning in warnings))
         self.assertEqual(backend.depth(), 1)
+
+    def test_reference_check_returns_promptly_for_a_confirmed_running_job(self):
+        from app.views import job_runner
+        backend = job_queue.InProcessJobBackend(prefix='quick-check-test', ttl_seconds=60)
+        record = backend.enqueue('evaluate', 'original payload',
+                                 request_id='original-reference', owner_id='owner')
+        claimed, _ = backend.claim(['evaluate'], worker_id='worker')
+        pending = self._pending()
+        pending['confirmed_job_id'] = record.job_id
+        ui = MagicMock()
+        ui.session_state = {'eval_queue_submission': pending,
+                            'va_lse_pending_job_eval': record.job_id,
+                            'va_lse_pending_request_eval': 'original-reference'}
+        ui.button.side_effect = lambda label, **kwargs: label == 'Check earlier submission'
+        with patch.object(job_runner, 'st', ui), \
+                patch.object(job_runner, 'get_job_backend', return_value=backend), \
+                patch.object(job_runner.pilot, 'current_owner', return_value='owner'), \
+                patch.object(job_runner, '_poll') as poll, \
+                patch.object(job_runner, 'run_log_event'), \
+                patch.object(job_runner.pilot, 'display') as display:
+            job_runner._render_uncertain_submission('eval')
+        poll.assert_not_called()
+        self.assertNotIn('eval_queue_submission', ui.session_state)
+        self.assertEqual(ui.session_state['va_lse_pending_job_eval'], record.job_id)
+        self.assertEqual(backend.get(record.job_id).claim_token, claimed.claim_token)
+        self.assertEqual(backend.depth(), 0)
+        self.assertIn('recovery reference `original-reference` is available', display.call_args.args[0])
+
+    def test_acknowledged_discard_detaches_confirmed_run_for_intentional_new_work(self):
+        from app.views import job_runner
+        from app.job_payload import EvaluateJob
+        backend = job_queue.InProcessJobBackend(prefix='detach-test', ttl_seconds=60)
+        original = backend.enqueue('evaluate', 'original payload',
+                                   request_id='original-reference', owner_id='owner')
+        claimed, _ = backend.claim(['evaluate'], worker_id='worker')
+        pending = self._pending()
+        pending['confirmed_job_id'] = original.job_id
+        ui = MagicMock()
+        ui.session_state = {'eval_queue_submission': pending,
+                            'va_lse_pending_job_eval': original.job_id,
+                            'va_lse_pending_request_eval': 'original-reference'}
+        ui.button.side_effect = lambda label, **kwargs: label == 'Discard earlier submission'
+        ui.checkbox.return_value = True
+        with patch.object(job_runner, 'st', ui), \
+                patch.object(job_runner, 'get_job_backend', return_value=backend), \
+                patch.object(job_runner.pilot, 'current_owner', return_value='owner'), \
+                patch.object(job_runner, '_encode_payload', return_value='current inputs'), \
+                patch.object(job_runner, '_poll', return_value=job_runner.QueueOutcome(ok=False, still_running=True)), \
+                patch.object(job_runner, 'run_log_event'), \
+                patch.object(job_runner.pilot, 'display'):
+            job_runner._render_uncertain_submission('eval')
+            self.assertNotIn('va_lse_pending_job_eval', ui.session_state)
+            self.assertNotIn('va_lse_pending_request_eval', ui.session_state)
+            result = job_runner.submit_job(slot='eval', job=EvaluateJob(statement_text='Current', records=[]),
+                                           request_id='new-reference', condition=None, sources=[], files=0,
+                                           pages=0, action_label='Evaluation')
+        self.assertTrue(result.still_running)
+        self.assertEqual(backend.get(original.job_id).claim_token, claimed.claim_token)
+        self.assertEqual(backend.get(original.job_id).status, 'running')
+        self.assertEqual(backend.depth(), 1)
+        fresh, payload = backend.claim(['evaluate'], worker_id='other-worker')
+        self.assertEqual((fresh.request_id, payload), ('new-reference', 'current inputs'))
 
     def test_discard_requires_explicit_acknowledgement_and_allows_current_inputs(self):
         from app.views import job_runner

@@ -450,9 +450,11 @@ permissions before writing, and removes its own writes on a rejected submission.
 An interrupted network reply may still have committed: retry the exact same
 reference and inputs. The web session retains an unconfirmed submission for that
 retry. The tab shows its original reference and offers **Check earlier submission**
-using the saved inputs, or **Discard earlier submission** after acknowledging
+using the saved inputs and promptly reporting confirmation without waiting for
+the worker, or **Discard earlier submission** after acknowledging
 that the earlier job may still run and incur charges. Only an intentional new
-submission uses current edits. Discarding an attempt or clearing the session
+submission uses current edits. An acknowledged discard detaches the earlier run
+from the tab so a separate submission can proceed. Discarding an attempt or clearing the session
 does not cancel an already accepted job.
 
 `VA_LSE_JOB_QUEUE_MAX_PENDING` limits waiting jobs **per kind** (100 by default),
