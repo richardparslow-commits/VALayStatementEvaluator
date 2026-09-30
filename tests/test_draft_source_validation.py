@@ -10,7 +10,7 @@ from unittest.mock import patch
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 
 from app.documents import BLOCK, PAGE, DocumentPage, ExtractedDocument
-from app.draft import DraftResult, _normalize_grounding, grounding_markdown, run_draft
+from app.draft import DraftResult, _citation_display, _normalize_grounding, grounding_markdown, run_draft
 from app.drafting_service import DraftingError
 from app.grounding_sources import (
     GROUNDING_SOURCE_POLICY, LEGACY_GROUNDING_SOURCE_NOTICE,
@@ -141,7 +141,7 @@ class TestGroundingSources(unittest.TestCase):
                 self.assertEqual(grounding_catalog(self.digest, docs, "")[0], {})
 
     def test_conflicting_fact_resolution_metadata_is_excluded(self):
-        for field, value in (("document", "other.txt"), ("page", 999), ("source", "clinic.txt p.1-p.2")):
+        for field, value in (("document", "other.txt"), ("page", 999), ("source", "clinic.txt p.2-p.3")):
             digest = copy.deepcopy(self.digest)
             setattr(digest.facts[0], field, value)
             with self.subTest(field=field):
@@ -207,14 +207,65 @@ class TestGroundingSources(unittest.TestCase):
             self.validate(data)
         self.assertNotIn("PRIVATE", str(ctx.exception))
 
+    def test_range_resolves_quote_on_later_unit_and_canonicalizes_address(self):
+        docs, digest = evidence()
+        docs[0].pages = [DocumentPage("clinic.txt", 1, "An unrelated earlier clinical assessment."),
+                        DocumentPage("clinic.txt", 2, QUOTE)]
+        digest.facts[0].source = "clinic.txt p.1-p.2"
+        catalog, _ = grounding_catalog(digest, docs, "")
+        entry = next(iter(catalog.values()))
+        self.assertEqual(entry["source"], "clinic.txt p.2")
+        self.assertEqual(entry["source_unit"]["number"], 2)
+        self.validate(record_grounding(entry), docs, catalog)
+
+    def test_range_does_not_search_outside_scope_or_other_file_or_kind(self):
+        for source in ("clinic.txt p.2-p.3", "other.txt p.1-p.3", "clinic.txt b.1-b.3",
+                       "clinic.txt p.3-p.1", "clinic.txt p.1-b.3"):
+            digest = copy.deepcopy(self.digest)
+            digest.facts[0].source = source
+            with self.subTest(source=source):
+                self.assertEqual(grounding_catalog(digest, self.docs, "")[0], {})
+
+    def test_range_repeated_quote_ambiguous_or_unreadable_units_are_unresolved(self):
+        for docs in ([ExtractedDocument("clinic.txt", [DocumentPage("clinic.txt", 1, QUOTE),
+                                                       DocumentPage("clinic.txt", 2, QUOTE)])],
+                     self.docs * 2,
+                     self.docs + [ExtractedDocument("clinic.txt", [], unreadable_pages=[2])]):
+            digest = copy.deepcopy(self.digest)
+            digest.facts[0].source = "clinic.txt p.1-p.2"
+            with self.subTest(docs=len(docs)):
+                self.assertEqual(grounding_catalog(digest, docs, "")[0], {})
+
+    def test_block_range_resolves_only_one_complete_quote(self):
+        docs, digest = evidence(BLOCK)
+        digest.facts[0].source = "[clinic.txt b.1-b.2]"
+        catalog, _ = grounding_catalog(digest, docs, "")
+        self.assertEqual(next(iter(catalog.values()))["source"], "clinic.txt b.1")
+
+    def test_citation_markdown_escapes_images_links_html_urls_and_newlines(self):
+        data = record_grounding(self.entry)
+        payload = "![image](https://example.test/a) [link](https://example.test) <img src=x>\n# heading"
+        for section in ("supported_observations", "conflicts", "suggested_inclusions"):
+            row = record_grounding(self.entry, section)[section][0]
+            row["source"] = payload
+            row["quote"] = payload
+            data[section] = [row]
+        markdown = grounding_markdown(DraftResult(grounding=data, grounding_policy=GROUNDING_SOURCE_POLICY))
+        self.assertNotIn("![image]", markdown)
+        self.assertNotIn("[link](", markdown)
+        self.assertIn("\\<img", markdown)
+        self.assertNotIn("https://", markdown)
+        self.assertNotIn("\n# heading", markdown)
+        self.assertEqual(markdown.count(_citation_display(payload)), 6)
+
     def test_policy_and_provenance_survive_saved_result_roundtrip(self):
         data = self.validate(record_grounding(self.entry))
         restored = draft_from_json(draft_to_json(DraftResult(grounding=data, grounding_policy=GROUNDING_SOURCE_POLICY)))
         self.assertEqual(restored.grounding_policy, GROUNDING_SOURCE_POLICY)
         self.assertEqual(restored.grounding, data)
         markdown = grounding_markdown(restored)
-        self.assertIn(QUOTE, markdown)
-        self.assertIn("clinic.txt p.1", markdown)
+        self.assertIn(_citation_display(QUOTE), markdown)
+        self.assertIn(_citation_display("clinic.txt p.1"), markdown)
         self.assertNotIn(LEGACY_GROUNDING_SOURCE_NOTICE, markdown)
 
     def test_legacy_and_unknown_policy_have_explicit_warning(self):
@@ -316,6 +367,42 @@ class TestDraftingSourceGate(unittest.TestCase):
         self.assertEqual(phases, ["grounding", "grounding", "draft", "review"])
         self.assertEqual(result["grounding_policy"], GROUNDING_SOURCE_POLICY)
         self.assertEqual(result["grounding_raw"]["supported_observations"][0]["quote"], QUOTE)
+
+    def test_batch_excludes_failed_and_quarantined_inputs_with_new_or_legacy_state(self):
+        import tempfile
+        from pathlib import Path
+        from scripts import batch_draft
+        from tests.test_batch_draft import _make_cfg
+
+        for legacy in (False, True):
+            cfg = _make_cfg(Path(tempfile.mkdtemp()), parts_per_batch=1)
+            for name in ("Part1.pdf", "Part2.pdf", "Part3.pdf"):
+                (cfg.records_dir / name).write_text("Synthetic", encoding="utf-8")
+            docs, digest = evidence()
+            good_state = batch_draft.digest_to_state(digest)
+            excluded_state = batch_draft.digest_to_state(MedicalDigest())
+            excluded_state["quarantined"] = ["Part3.pdf"]
+            if not legacy:
+                good_state["source_files"] = ["Part1.pdf"]
+                excluded_state["source_files"] = []
+            calls = []
+
+            def extract(path):
+                calls.append(Path(path).name)
+                if Path(path).name != "Part1.pdf":
+                    raise RuntimeError("Failed input must never be re-extracted")
+                return docs, []
+
+            llm = _FakeLLM({"grounding": complete_grounding()})
+            with self.subTest(legacy=legacy), \
+                 patch("app.pipeline_guard.run_with_timeout", side_effect=lambda fn, **kw: fn()), \
+                 patch("app.documents.records_from_local_path", side_effect=extract), \
+                 patch("app.medical_review._merge_facts", side_effect=lambda llm, d, **kw: d.facts), \
+                 patch("app.medical_review._summarize", return_value="Synthetic summary"):
+                result = batch_draft.final_phase(llm, cfg, {"batch_01": good_state,
+                    "batch_02": {"error": "Extraction failed"}, "batch_03": excluded_state})
+            self.assertEqual(calls, ["Part1.pdf"])
+            self.assertEqual(result["grounding_policy"], GROUNDING_SOURCE_POLICY)
 
     def test_batch_witness_only_result_records_new_policy(self):
         from tests.test_batch_draft import TestFinalPhaseSemantics

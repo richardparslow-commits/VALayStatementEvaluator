@@ -7,11 +7,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any
 
 from .documents import DocumentPage, ExtractedDocument
 from .llm import LLMParseError
-from .medical_review import MedicalDigest, _normalize_date_for_sort, quote_matches_source
+from .medical_review import MedicalDigest, MedicalFact, _normalize_date_for_sort, quote_matches_source
 from .prompt_sanitize import sanitize_for_prompt
 from .source_validation import build_source_index, source_reference_key
 
@@ -31,6 +32,48 @@ def _text_key(text: str) -> str:
     return " ".join(text.casefold().split())
 
 
+_RANGE_SOURCE = re.compile(
+    r"^(?P<filename>.+?)\s+(?P<kind>[pb])\.(?P<start>[1-9]\d*)\s*[-–]\s*(?P=kind)\.(?P<end>[1-9]\d*)$",
+    re.IGNORECASE,
+)
+
+
+def _fact_source_unit(fact: MedicalFact, index: dict[str, DocumentPage | None]) -> DocumentPage | None:
+    reference = source_reference_key(fact.source)
+    if reference in index:
+        unit = index[reference]
+        if unit is None:
+            return None
+        if (fact.document and fact.document != unit.filename) or (fact.page and fact.page != unit.page):
+            return None
+        return unit
+    # A digest fallback range is a search scope, never a validated final address.
+    # Resolve only a unique complete quote inside that scope; do not trust the
+    # parser's first-page anchor as the location of the excerpt.
+    range_reference = reference[1:-1] if reference.startswith("[") and reference.endswith("]") else reference
+    match = _RANGE_SOURCE.fullmatch(range_reference)
+    if not match:
+        return None
+    filename, prefix = match["filename"], match["kind"].lower()
+    start, end = int(match["start"]), int(match["end"])
+    if end < start or (fact.document and source_reference_key(fact.document) != filename):
+        return None
+    if fact.page and not start <= fact.page <= end:
+        return None
+    address_pattern = re.compile(r"^" + re.escape(filename) + r" " + prefix + r"\.([1-9]\d*)$")
+    matches = []
+    for address, unit in index.items():
+        number_match = address_pattern.fullmatch(address)
+        if number_match and start <= int(number_match[1]) <= end:
+            # An ambiguous/unreadable address in the range prevents a unique
+            # resolution; its unknown text could also contain this excerpt.
+            if unit is None:
+                return None
+            if quote_matches_source(fact.quote, unit.text):
+                matches.append(unit)
+    return matches[0] if len(matches) == 1 else None
+
+
 def grounding_catalog(
     digest: MedicalDigest, records: list[ExtractedDocument], query: str, *,
     max_facts: int = 150, budget_chars: int = 90_000,
@@ -47,10 +90,8 @@ def grounding_catalog(
     for fact in digest.ranked_facts(query):
         if len(catalog) >= max(0, max_facts):
             break
-        unit = index.get(source_reference_key(fact.source))
+        unit = _fact_source_unit(fact, index)
         if unit is None or not fact.description.strip() or not quote_matches_source(fact.quote, unit.text):
-            continue
-        if (fact.document and fact.document != unit.filename) or (fact.page and fact.page != unit.page):
             continue
         address = {"filename": unit.filename, "kind": unit.kind, "number": unit.page}
         fingerprint = json.dumps([address, vars(fact)], sort_keys=True, ensure_ascii=True)

@@ -406,7 +406,7 @@ def merge_states(a: dict, b: dict) -> dict:
         return a
     m = dict(a)
     m["facts"] = a["facts"] + b["facts"]
-    for k in ("conditions", "providers"):
+    for k in ("conditions", "providers", "source_files"):
         m[k] = sorted(set(a.get(k, [])) | set(b.get(k, [])))
     for k in ("pages_reviewed", "chunks_reviewed", "duplicates_skipped",
               "unreadable_pages", "pages_in_files", "chunks_without_facts"):
@@ -575,7 +575,9 @@ def digest_group(llm: Any, cfg: BatchConfig, group_label: str,
     dur = time.time() - t0
     state = digest_to_state(digest)
     state.update({"duration_s": round(dur, 1), "files": len(files), "pages": pages,
-                  "quarantined": []})
+                  "quarantined": [], "source_files": [f.name for f in files if any(
+                      doc.filename == f.name or (f.suffix.lower() == ".zip" and doc.filename.startswith(f.stem + "/"))
+                      for doc in docs)]})
     log(f"{group_label}: OK in {dur:.0f}s — facts={len(digest.facts)} "
         f"chunks={digest.chunks_reviewed} pages={pages} cov={digest.coverage_ratio:.0%}")
     return state, []
@@ -697,7 +699,7 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
     from app.prompt_sanitize import GUARD_NOTE, sanitize_digest_text, sanitize_for_prompt
 
     def work() -> dict:
-        parts = [digest_from_state(s) for s in batch_states.values()]
+        parts = [digest_from_state(s) for s in batch_states.values() if "facts" in s]
         all_facts = [f for d in parts for f in d.facts]
         log(f"combined: {len(all_facts)} facts from {len(parts)} batches -> dedupe")
         # Memory pressure warning: at the 6,000+ fact design scale (5,000-page
@@ -751,9 +753,27 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
         # Re-extract current source units: legacy checkpoints contain facts, not
         # authenticated source text. Never validate a quote against a summary.
         quarantined = {name for state in batch_states.values() for name in state.get("quarantined", [])}
+        part_files = sorted(cfg.records_dir.glob(cfg.part_glob))
+        planned = {f"batch_{i:02d}": paths for i, paths in enumerate(
+            plan_batches(part_files, cfg.parts_per_batch), start=1)}
+        selected_names = set()
+        for key, state in batch_states.items():
+            if "facts" not in state:
+                continue
+            # New checkpoints record successful inputs. Legacy checkpoints
+            # recover membership from the same deterministic batch plan.
+            names = state.get("source_files")
+            if names is None:
+                names = [path.name for path in planned.get(key, [])]
+            if not isinstance(names, list) or any(not isinstance(name, str) for name in names):
+                raise ValueError("Successful batch source membership is invalid.")
+            selected_names.update(names)
+        selected_names -= quarantined
+        if selected_names - {path.name for path in part_files}:
+            raise ValueError("A successful batch source file is unavailable.")
         source_docs = []
-        for path in sorted(cfg.records_dir.glob(cfg.part_glob)):
-            if path.name not in quarantined:
+        for path in part_files:
+            if path.name in selected_names:
                 docs, _ = records_from_local_path(str(path))
                 source_docs.extend(docs)
         catalog, catalog_text = grounding_catalog(combined, source_docs, grounding_query)

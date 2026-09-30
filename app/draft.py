@@ -9,6 +9,7 @@ from typing import Any
 import json
 import logging
 import re
+import string
 import time
 
 from .agiloop_telemetry import track_feature_error
@@ -906,6 +907,12 @@ def _grounding_strings(grounding: dict[str, Any], field_name: str) -> list[str]:
     return [item for item in value if isinstance(item, str)]
 
 
+def _citation_display(value: Any) -> str:
+    """Display untrusted citation fields literally in Markdown, including URLs."""
+    text = " ".join(str(value or "").split())
+    return "".join("\\" + char if char in string.punctuation else char for char in text)
+
+
 def grounding_markdown(result: DraftResult) -> str:
     """Render the grounding analysis as readable markdown for the UI."""
     lines: list[str] = []
@@ -931,7 +938,7 @@ def grounding_markdown(result: DraftResult) -> str:
         for item in supported:
             lines.append(f"- **{item.get('observation', '')}**")
             lines.append(f"  - Record support: {item.get('record_support', '')}")
-            lines.append(f"  - Source: {item.get('source', '')} — Quote: {item.get('quote', '')}")
+            lines.append(f"  - Source: {_citation_display(item.get('source', ''))} — Quote: {_citation_display(item.get('quote', ''))}")
         lines.append("")
     unverified = _grounding_rows(grounding, "unverified_observations")
     if unverified:
@@ -945,15 +952,15 @@ def grounding_markdown(result: DraftResult) -> str:
         for item in conflicts:
             lines.append(f"- Observation: {item.get('observation', '')}")
             lines.append(f"  - Records show: {item.get('record_fact', '')}")
-            lines.append(f"  - Source: {item.get('source', '')} — Quote: {item.get('quote', '')}")
+            lines.append(f"  - Source: {_citation_display(item.get('source', ''))} — Quote: {_citation_display(item.get('quote', ''))}")
             lines.append(f"  - Guidance: {item.get('resolution_note', '')}")
         lines.append("")
     suggested = _grounding_rows(grounding, "suggested_inclusions")
     if suggested:
         lines.append("### Record facts to include only if the witness confirms")
         for item in suggested:
-            lines.append(f"- {item.get('fact', '')} — {item.get('source', '')}")
-            lines.append(f"  - Quote: {item.get('quote', '')}")
+            lines.append(f"- {_citation_display(item.get('fact', ''))} — {_citation_display(item.get('source', ''))}")
+            lines.append(f"  - Quote: {_citation_display(item.get('quote', ''))}")
         lines.append("")
     topics = _grounding_rows(grounding, "topic_coverage")
     if topics:
