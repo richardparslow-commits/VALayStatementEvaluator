@@ -302,7 +302,7 @@ class TestKnowledgeBase(unittest.TestCase):
         self.assertIn("baseline before service", rubric)
         self.assertIn("Never fault a statement\n   for the \"missing\" onset event", rubric)
         self.assertIn("benefit-of-the-doubt rule", rubric)
-        self.assertIn("38 U.S.C. § 1154(b)", rubric)
+        self.assertIn("38 U.S.C. § 5107(b)", rubric)
         self.assertIn("§ 3.102", rubric)
         self.assertIn("immaterial discrepancies do not destroy credibility", rubric)
         self.assertIn("not calendrical precision", rubric)

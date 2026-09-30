@@ -6,6 +6,8 @@ module is the Streamlit skin over it plus session-state bookkeeping.
 """
 from __future__ import annotations
 
+from .. import pilot
+
 from typing import Any
 
 import streamlit as st
@@ -48,7 +50,7 @@ def is_local_run() -> bool:
     """
     import os
 
-    if os.getenv("VA_LSE_ALLOW_LOCAL_PATHS", "").strip() != "1":
+    if pilot.enabled() or os.getenv("VA_LSE_ALLOW_LOCAL_PATHS", "").strip() != "1":
         return False
     address = local_paths.server_bind_address()
     if local_paths.is_loopback(address):
@@ -67,13 +69,13 @@ def _warn_loopback_required(address: Any) -> None:
         if address in (None, "")
         else f"set to {address!r}"
     )
-    st.warning(
+    pilot.display(
         "VA_LSE_ALLOW_LOCAL_PATHS=1 is set, but the server is not bound to the "
         f"loopback interface (server.address is {shown}). Records read from local "
         "paths could then be requested by any machine that can reach this server, "
         "so local imports stay disabled. Restart bound to loopback: "
         "`streamlit run run_app.py --server.address 127.0.0.1`"
-    )
+    , container=st, method="warning")
 
 
 def _track_selector_impression(slot: str) -> None:
@@ -106,7 +108,7 @@ def remember_source_records(slot: str, label: str, docs: list) -> None:
 def records_uploader(slot: str) -> list:
     """Render the record-source widget for a slot and return loaded documents."""
     _track_selector_impression(slot)
-    sources = ["Upload files", "Fetch Sandbox", "VA.gov"]
+    sources = ["Upload files"] if pilot.enabled() else ["Upload files", "Fetch Sandbox", "VA.gov"]
     if is_local_run():
         sources.append("Local folder / file")
     source = st.radio(
@@ -115,6 +117,16 @@ def records_uploader(slot: str) -> list:
         horizontal=True,
         key=f"records_source_{slot}",
     )
+    if pilot.enabled() and source != "Upload files":
+        pilot.display("Only uploads are enabled for this pilot.", container=st, method="error")
+        return []
+    if pilot.enabled():
+        consent = st.checkbox("I have authority to use these records and consent to sending "
+                              "their text and my statement to the approved analysis provider. "
+                              "I understand its retention policy and the pilot privacy notice.",
+                              key=f"pilot_consent_{slot}")
+        if not consent:
+            return []
     if source == "Fetch Sandbox":
         return _fetch_records(slot)
     if source == "VA.gov":
@@ -133,18 +145,18 @@ def records_uploader(slot: str) -> list:
     if files:
         accepted, rejections = check_upload_limits(files)
         for msg in rejections:
-            st.warning(
+            pilot.display(
                 report_failure(
                     msg, phase="upload_limits", severity="warning", once=True
                 )
-            )
+            , container=st, method="warning")
         files = accepted if rejections else files
     documents = extract_uploads(files, slot)
     # Pages the files contain, not pages that yielded text: a scan-only bundle has
     # very few readable pages and must not look like a small record set.
     total_pages = sum(d.source_page_count for d in documents)
     if documents and total_pages > config.MAX_RECORD_PAGES:
-        st.error(page_limit_message(total_pages, config.MAX_RECORD_PAGES))
+        pilot.display(page_limit_message(total_pages, config.MAX_RECORD_PAGES), container=st, method="error")
         return []
     render_record_volume_warning(documents, slot=slot)
     remember_source_records(slot, "Upload", documents)
@@ -163,23 +175,23 @@ def _label_detected_va_gov_exports(slot: str, documents: list[Any]) -> None:
     if not exports:
         return
     remember_source_records(slot, "VA.gov", exports)
-    st.caption(
+    pilot.display(
         f"🔎 Detected a VA.gov medical-records export ({', '.join(names)}) — labelled as "
         "the **VA.gov** source so the merged records summary shows where it came from."
-    )
+    , container=st, method="caption")
 
 
 def _local_records(slot: str) -> list:
     """Load record files straight from a path on the local machine."""
     # Enforce the capability at the handler, including stale source selections.
     if not is_local_run():
-        st.error("Local file access is disabled on this server. Upload records instead.")
+        pilot.display("Local file access is disabled on this server. Upload records instead.", container=st, method="error")
         return []
-    st.caption(
+    pilot.display(
         "Reads supported record files (.pdf/.txt/.md/.docx/.zip) directly from "
         "this machine's filesystem. Available only when "
         "VA_LSE_ALLOW_LOCAL_PATHS=1 is set, for trusted single-user use."
-    )
+    , container=st, method="caption")
     path = st.text_input(
         "Folder or file path",
         key=f"local_path_{slot}",
@@ -193,11 +205,11 @@ def _local_records(slot: str) -> list:
         try:
             records, skipped = records_from_local_path(path)
         except ExtractionError as exc:
-            st.warning(
+            pilot.display(
                 report_failure(
                     str(exc), phase="local_records_load", exc=exc, severity="warning"
                 )
-            )
+            , container=st, method="warning")
         else:
             st.session_state[import_key] = records
             if skipped:
@@ -205,11 +217,11 @@ def _local_records(slot: str) -> list:
     # Replayed from session state on every rerun; ``once`` keeps a file that keeps
     # failing from rewriting the same log line on each interaction.
     for message in st.session_state.get(skipped_key, []):
-        st.warning(
+        pilot.display(
             report_failure(
                 message, phase="local_records_extract", severity="warning", once=True
             )
-        )
+        , container=st, method="warning")
     cached_any: Any = st.session_state.get(import_key, [])
     cached_records: list[Any] = cached_any if isinstance(cached_any, list) else []
     remember_source_records(slot, "Local folder / file", cached_records)
@@ -217,26 +229,28 @@ def _local_records(slot: str) -> list:
 
 
 def _fetch_records(slot: str) -> list[Any]:
+    if pilot.enabled():
+        raise pilot.PilotBlocked("Remote fetching is outside this pilot profile.")
     settings = st.session_state.settings
     patient_id = st.text_input(
         "Patient or record ID",
         key=f"fetch_patient_id_{slot}",
         help="Used for the {patient_id} placeholder in the Fetch records path.",
     )
-    st.caption(
+    pilot.display(
         f"GET {settings.fetch_base_url.rstrip('/')}{settings.fetch_records_path}"
-    )
+    , container=st, method="caption")
     import_key = f"fetch_records_{slot}"
     if st.button("Import medical records from Fetch Sandbox", key=f"fetch_import_{slot}"):
         st.session_state.pop(import_key, None)
         try:
             records = FetchClient(settings).fetch_documents(patient_id)
         except FetchSandboxError as exc:
-            st.warning(
+            pilot.display(
                 report_failure(
                     str(exc), phase="fetch_records_import", exc=exc, severity="warning"
                 )
-            )
+            , container=st, method="warning")
         else:
             st.session_state[import_key] = records
     records_any2: Any = st.session_state.get(import_key, [])
@@ -252,13 +266,15 @@ def _va_gov_records(slot: str) -> list[Any]:
     switching the radio back to Upload/Fetch Sandbox/Local always works
     regardless of VA.gov state.
     """
-    st.caption(
+    pilot.display(
         "⚠️ Fetched documents are sent to the configured LLM endpoint for analysis. "
         "Review privacy before fetching sensitive records — the same warning shown for "
         "every other record source applies equally here."
-    )
+    , container=st, method="caption")
+    if pilot.enabled():
+        raise pilot.PilotBlocked("Simulator login is outside this pilot profile.")
     configured = va_gov_client.va_gov_configured()
-    st.caption(
+    pilot.display(
         ("🔌 **Records API mode** — talking to `VA_GOV_API_BASE_URL`. This is a "
          "sandbox/simulator path: real VA.gov access is ID.me + SMS-MFA protected and "
          "exposes no patient-facing records API.")
@@ -268,29 +284,29 @@ def _va_gov_records(slot: str) -> list[Any]:
               "(ID.me + SMS MFA, no patient-facing records API), so a configured base "
               "URL here is always a sandbox or simulator — use sandbox credentials, "
               "never your real VA.gov password.")
-    )
-    st.caption(
+    , container=st, method="caption")
+    pilot.display(
         "For **your own** records, download them from VA.gov instead: "
         "`scripts/va_records_download.py` automates the download wizard locally "
         "(you sign in and enter the SMS code yourself), or follow "
         "**My Health → Medical records → Download** by hand and upload the PDF as an "
         "*Upload files* source. See `README.md → VA.gov record source`."
-    )
-    st.caption(
+    , container=st, method="caption")
+    pilot.display(
         "Signs in for this session only, then automatically fetches the available "
         "records. Credentials are never stored to disk or `.env`; records stay local "
         "after fetch."
-    )
+    , container=st, method="caption")
     consent = st.checkbox(
-        "I consent to fetching my medical records for this session only. "
-        "Records are not stored beyond this session and my credentials are never saved.",
+        "I consent to fetching these simulator records for analysis. Queued runs and "
+        "blob storage may retain copies until expiry; the analysis provider has its own retention policy.",
         key=f"va_gov_consent_{slot}",
     )
     authed = bool(st.session_state.get(f"va_gov_authed_{slot}"))
     with st.expander("🔒 VA.gov secure login", expanded=not authed):
-        st.caption(
+        pilot.display(
             "Sandbox/simulator credentials — not your VA.gov password."
-        )
+        , container=st, method="caption")
         username = st.text_input("Sandbox username", key=f"va_gov_user_{slot}")
         password = st.text_input(
             "Sandbox password", type="password", key=f"va_gov_pass_{slot}"
@@ -310,12 +326,12 @@ def _va_gov_records(slot: str) -> list[Any]:
             },
         )
         if not consent:
-            st.warning("Consent is required before VA.gov records can be fetched.")
+            pilot.display("Consent is required before VA.gov records can be fetched.", container=st, method="warning")
         else:
             try:
                 session = va_gov_client.authenticate_va_gov(username, password)
             except va_gov_client.VaGovError as exc:
-                st.error(report_failure(str(exc), phase="va_gov_auth", exc=exc))
+                pilot.display(report_failure(str(exc), phase="va_gov_auth", exc=exc), container=st, method="error")
             else:
                 st.session_state[f"va_gov_session_{slot}"] = session
                 st.session_state[f"va_gov_authed_{slot}"] = True
@@ -327,10 +343,10 @@ def _va_gov_records(slot: str) -> list[Any]:
         return []
 
     if result.error_message:
-        st.error(
+        pilot.display(
             f"VA.gov fetch problem: {result.error_message} "
             f"(retrieved {result.retrieved} of {result.expected} expected record(s))."
-        )
+        , container=st, method="error")
         col_retry, col_continue = st.columns(2)
         if col_retry.button("Retry VA.gov fetch", key=f"va_gov_retry_{slot}"):
             session_any: Any = st.session_state.get(f"va_gov_session_{slot}")
@@ -421,9 +437,9 @@ def render_record_search(slot: str, documents: list[Any]) -> None:
                     track_feature_error(SEARCH_FEATURE_ID, exc, stage="search")
                 except Exception:  # noqa: BLE001
                     pass
-                st.error(
+                pilot.display(
                     report_failure(f"Search failed: {exc}", phase="record_search", exc=exc)
-                )
+                , container=st, method="error")
                 results = []
             st.session_state[results_key] = results
             try:
@@ -441,7 +457,7 @@ def render_record_search(slot: str, documents: list[Any]) -> None:
         results_list: list[SearchResult] = results_any if isinstance(results_any, list) else []
         if not results_list:
             if query.strip():
-                st.caption("No matching passages found.")
+                pilot.display("No matching passages found.", container=st, method="caption")
         else:
             _render_search_results(slot, results_list)
 
@@ -450,8 +466,8 @@ def render_record_search(slot: str, documents: list[Any]) -> None:
 
 def _render_search_results(slot: str, results: list[SearchResult]) -> None:
     for i, result in enumerate(results):
-        st.markdown(f"**{result.label}**")
-        st.markdown(result.excerpt)
+        pilot.display(f"**{result.label}**", container=st, method="markdown")
+        pilot.display(result.excerpt, container=st, method="markdown")
         if st.button("➕ Export excerpt", key=f"search_export_{slot}_{i}"):
             citation = {"excerpt": result.excerpt, "source": result.label}
             index_any: Any = st.session_state.setdefault(CITATION_INDEX_KEY, [])
@@ -468,7 +484,7 @@ def _render_search_results(slot: str, results: list[SearchResult]) -> None:
                 )
             except Exception:  # noqa: BLE001 - telemetry must never break the UI
                 pass
-            st.success("Added to citation index.")
+            pilot.display("Added to citation index.", container=st, method="success")
         st.divider()
 
 
@@ -479,7 +495,7 @@ def _render_citation_index_export(slot: str) -> None:
     if not citations:
         return
 
-    st.caption(f"📌 Citation index: {len(citations)} excerpt(s) collected this session.")
+    pilot.display(f"📌 Citation index: {len(citations)} excerpt(s) collected this session.", container=st, method="caption")
     col_csv, col_json = st.columns(2)
     for fmt, col, mime in (("csv", col_csv, "text/csv"), ("json", col_json, "application/json")):
         try:
@@ -490,13 +506,13 @@ def _render_citation_index_export(slot: str) -> None:
             except Exception:  # noqa: BLE001 - telemetry must never break the UI
                 pass
             continue
-        clicked = col.download_button(
+        clicked = pilot.file_download(
             f"⬇️ Export citations (.{fmt})",
             data=data,
             file_name=f"citation_index.{fmt}",
             mime=mime,
             key=f"citation_export_{fmt}_{slot}",
-        )
+         container=col)
         if clicked:
             try:
                 track_interaction(

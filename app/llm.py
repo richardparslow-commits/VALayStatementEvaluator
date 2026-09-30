@@ -353,13 +353,15 @@ def probe_models(base_url: str, api_key: str) -> ModelProbe:
     """
     if not api_key or not api_key.strip():
         return ModelProbe(None, None, "no API key was supplied")
+    from . import pilot
+    pilot.require_destination(base_url)
     url = base_url.rstrip("/") + "/models"
     try:
         import urllib.error
         import urllib.request
 
         req = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_key.strip()}"})
-        with urllib.request.urlopen(req, timeout=MODELS_ENDPOINT_TIMEOUT_SECONDS) as resp:  # noqa: S310
+        with _probe_open(req, timeout=MODELS_ENDPOINT_TIMEOUT_SECONDS) as resp:  # noqa: S310
             data = json.loads(resp.read().decode("utf-8"))
     except Exception as exc:  # noqa: BLE001 - availability check is advisory only
         return ModelProbe(None, _http_status(exc), _probe_error_text(exc))
@@ -691,6 +693,8 @@ def probe_chat(base_url: str, api_key: str, model: str) -> ChatProbe:
         return ChatProbe(None, "no API key was supplied")
     if not model or not model.strip():
         return ChatProbe(None, "no model was configured to call")
+    from . import pilot
+    pilot.require_destination(base_url, model)
     responses = _uses_responses_schema(base_url)
     url = _endpoint_request_url(base_url, responses=responses)
     if responses:
@@ -727,7 +731,7 @@ def probe_chat(base_url: str, api_key: str, model: str) -> ChatProbe:
             },
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=CHAT_PROBE_TIMEOUT_SECONDS) as resp:  # noqa: S310
+        with _probe_open(req, timeout=CHAT_PROBE_TIMEOUT_SECONDS) as resp:  # noqa: S310
             body = json.loads(resp.read().decode("utf-8"))
     except Exception as exc:  # noqa: BLE001 - availability check is advisory only
         return ChatProbe(_http_status(exc), _probe_error_text(exc))
@@ -1348,6 +1352,28 @@ class LLMService(Protocol):
     """
 
 
+def _pilot_transport(base_url: str) -> dict[str, Any]:
+    from . import pilot
+    if not pilot.enabled():
+        return {}
+    pilot.require_destination(base_url)
+    return {"http_client": _sdk_name("DefaultHttpxClient")(
+        follow_redirects=False, trust_env=False,
+    )}
+
+
+def _probe_open(req: Any, timeout: float) -> Any:
+    import urllib.request
+    from . import pilot
+    if not pilot.enabled():
+        return urllib.request.urlopen(req, timeout=timeout)
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req: Any, fp: Any, code: int, msg: str,
+                             headers: Any, newurl: str) -> None:
+            return None
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect()).open(req, timeout=timeout)
+
+
 class LLMClient:
     """Thin wrapper around any OpenAI-compatible endpoint.
 
@@ -1379,6 +1405,7 @@ class LLMClient:
         self._client = cast("type[OpenAI]", OpenAI_cls)(
             api_key=settings.api_key, base_url=settings.base_url, timeout=max(1.0, _timeout_s),
             max_retries=0,  # Application retries must observe pipeline cancellation.
+            **_pilot_transport(settings.base_url),
         )
         # Built once here (not lazily on the failover path) so a bad fallback URL
         # or key is reported at startup rather than discovered mid-outage.
@@ -1390,8 +1417,12 @@ class LLMClient:
                 base_url=fallback.base_url,
                 timeout=max(1.0, _timeout_s),
                 max_retries=0,
+                **_pilot_transport(fallback.base_url),
             )
         self.usage = UsageTracker()
+        self._pilot_calls = 0
+        self._pilot_prompt_chars = 0
+        self._pilot_call_lock = threading.Lock()
 
     # -------------------------------------------------------------- endpoints
 
@@ -1427,11 +1458,13 @@ class LLMClient:
                 base_url=target.base_url,
                 timeout=timeout,
                 max_retries=0,  # Application retries must observe pipeline cancellation.
+                **_pilot_transport(target.base_url),
             )
             return
         self._client = OpenAI_cls(
             api_key=self._settings.api_key,
             base_url=self._settings.base_url,
+            **_pilot_transport(self._settings.base_url),
             timeout=timeout,
             max_retries=0,  # Application retries must observe pipeline cancellation.
         )
@@ -1516,6 +1549,16 @@ class LLMClient:
         alongside the response because the answer and usage live at different keys
         in each shape, and the caller must not guess.
         """
+        from . import pilot
+        if pilot.enabled():
+            pilot.current_owner()
+            pilot.require_destination(self._endpoint_base_url(endpoint), model)
+            with self._pilot_call_lock:
+                if self._pilot_calls >= 200 or self._pilot_prompt_chars + len(system) + len(user) > 2_000_000:
+                    raise pilot.PilotBlocked("Pilot provider-call budget reached. Ask the operator to review this run.")
+                self._pilot_calls += 1
+                self._pilot_prompt_chars += len(system) + len(user)
+            max_tokens = min(max_tokens, 8192)
         client = self._endpoint_client(endpoint)
         if _uses_responses_schema(self._endpoint_base_url(endpoint)):
             request: dict[str, Any] = {
@@ -1537,7 +1580,9 @@ class LLMClient:
             if request_timeout is not NOT_GIVEN:
                 request["timeout"] = request_timeout
             return client.responses.create(**request), True
+        privacy_options: dict[str, Any] = {"store": False} if pilot.enabled() else {}
         return client.chat.completions.create(
+            **privacy_options,
             model=model,
             temperature=temperature,
             max_tokens=max_tokens,

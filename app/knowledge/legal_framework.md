@@ -9,13 +9,18 @@ when it materially supports a finding.
   evidence, along with the places, types, and circumstances of the veteran's service.
 - **38 U.S.C. § 5107(b) — Benefit of the Doubt** — when the positive and negative evidence is
   in approximate balance (equipoise), the benefit of the doubt goes to the claimant. The veteran
-  need only bring evidence to a 50/50 balance, not prove the claim beyond a reasonable doubt.
+  receives the benefit where the evidence is nearly equal, including approximate balance
+  beyond an exact tie (Lynch v. McDonough, 21 F.4th 776 (Fed. Cir. 2021)); the rule is
+  not a numeric probability or a guarantee of an award.
 - **38 C.F.R. § 3.159(a)(2)** — competent lay evidence means testimony by a person with
   knowledge of the facts; it is competent for matters the person observed and is relevant to.
 - **38 C.F.R. § 3.303(a)** — service connection generally requires evidence of incurrence or
   aggravation in service plus a current disability.
 - **38 C.F.R. § 3.303(b)** — continuity of symptomatology for chronic conditions: lay evidence
   of continuous symptoms since service can support the claim even absent continuous treatment.
+  This special route is limited to chronic diseases listed in § 3.309(a), subject to its
+  requirements (Walker v. Shinseki, 708 F.3d 1331 (Fed. Cir. 2013)); other conditions
+  require their applicable service-connection analysis.
 - **Duty to assist (38 U.S.C. § 5103A)** — VA has an affirmative duty to help develop evidence;
   detailed lay evidence can trigger the duty to provide a VA examination.
 

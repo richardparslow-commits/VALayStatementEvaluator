@@ -129,6 +129,9 @@ def track_goal(goal_description: str, feature_id: str | None = None) -> None:
 # ------------------------------------------------------------------ internal
 def _dispatch(event: dict[str, Any]) -> None:
     """Fire-and-forget event send. Never raises, never blocks the caller."""
+    from . import pilot
+    if pilot.enabled():
+        return
     if not _initialized:
         init_telemetry()
 
@@ -143,6 +146,9 @@ def _dispatch(event: dict[str, Any]) -> None:
 
 
 def _send(payload: dict[str, Any]) -> None:
+    from . import pilot
+    if pilot.enabled():
+        return
     configured, _reason = _inspect_configured()
     if not configured:
         logger.debug("telemetry (mock, dropped): %s", payload.get("type"))

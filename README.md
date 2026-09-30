@@ -1,5 +1,8 @@
 # 🎖️ VA Lay Statement Evaluator
 
+For real veteran information, use the restricted [controlled-pilot guide](PILOT.md).
+The general deployment examples are synthetic-data scaffolding until separately reviewed.
+
 A Streamlit application that performs **exhaustive medical-record review** to:
 
 1. **Evaluate** an existing lay/witness statement (VA Form 21-10210 style) — extracting every

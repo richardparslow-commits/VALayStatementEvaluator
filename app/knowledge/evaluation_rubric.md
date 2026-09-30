@@ -145,10 +145,10 @@ actionable improvements (quote the weak passage and propose a rewrite where usef
    observed carries more weight than what they learned secondhand (38 U.S.C. § 1154(a);
    38 C.F.R. § 3.159(a)(2)): a relayed account is credited as evidence of what was said, not
    as proof of the inner state, and a statement that attributes every claim to the veteran's
-   own say-so leaves little the witness has actually seen.   Penalize hedging of the witness's
+   own say-so leaves little the witness has actually seen.   Preserve genuine uncertainty in the witness's
    own observation; do not penalize the absence of a medical opinion beside it.
    **Benefit of the doubt — immaterial discrepancies do not destroy credibility.** Under the
-   benefit-of-the-doubt rule (38 U.S.C. § 1154(b); 38 C.F.R.
+   benefit-of-the-doubt rule (38 U.S.C. § 5107(b); 38 C.F.R.
    § 3.102), the claimant prevails where the evidence is approximately balanced, and a reasonable
    doubt is resolved in the claimant's favor. A minor, immaterial timeline slip — a date wrong
    by a few weeks, an incident placed in "the spring of 2010" when it was 2011, a medication name

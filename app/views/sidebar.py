@@ -6,6 +6,8 @@ in place exactly as before — only the rendering moved here.
 """
 from __future__ import annotations
 
+from .. import pilot
+
 import time
 from copy import copy
 from dataclasses import is_dataclass, replace
@@ -54,6 +56,16 @@ def render_sidebar_settings() -> None:
     if "settings" not in st.session_state:
         st.session_state.settings = load_settings()
     settings = st.session_state.settings
+    managed = load_settings()
+    if pilot.enabled() or managed.api_key or managed.fetch_api_key:
+        # Never copy operator credentials into widget values, even masked widgets.
+        st.session_state.settings = managed
+        with st.sidebar:
+            st.title("Service settings")
+            pilot.display("Services and credentials are configured by the operator.", container=st, method="caption")
+            pilot.display(f"Analysis model: {managed.model_main}", container=st, method="caption")
+            pilot.display(f"Record model: {managed.model_fast}", container=st, method="caption")
+        return
 
     # One-click repair for a retired configuration (the banner below carries the
     # button). Handled here — before the widgets below instantiate — because
@@ -119,7 +131,7 @@ def render_sidebar_settings() -> None:
         # character the clip cuts through can read as part of the id, which is
         # exactly how "perplexity/glm-5.3-flash" comes to look like it ends in a
         # stray period. Print the applied ids where they cannot be clipped.
-        st.caption(_model_ids_note(settings))
+        pilot.display(_model_ids_note(settings), container=st, method="caption")
         st.divider()
         st.subheader("Fetch Sandbox")
         st.session_state.fetch_api_key_input = st.text_input(
@@ -156,11 +168,11 @@ def render_sidebar_settings() -> None:
                 # ("it says my API key is invalid"), so each message carries an id
                 # that resolves to a log line naming which field was rejected.
                 for msg in errors:
-                    st.error(
+                    pilot.display(
                         report_failure(
                             msg, phase="settings_validation", severity="warning"
                         )
-                    )
+                    , container=st, method="error")
             else:
                 settings.api_key = api_key_val
                 settings.base_url = st.session_state.base_url_input.strip() or DEFAULT_BASE_URL
@@ -193,14 +205,14 @@ def render_sidebar_settings() -> None:
         _llm_failover_panel()
         _record_reading_panel()
         st.divider()
-        st.caption(
+        pilot.display(
             "⚠️ Uploaded documents are sent to the configured LLM endpoint for analysis. "
             "Review privacy before uploading sensitive records."
-        )
-        st.caption(
+        , container=st, method="caption")
+        pilot.display(
             "This tool is an aid for drafting and reviewing lay statements. It is not "
             "legal, medical, or claims advice."
-        )
+        , container=st, method="caption")
 
 
 def _job_queue_panel() -> None:
@@ -216,40 +228,40 @@ def _job_queue_panel() -> None:
 
     with st.expander("🛠️ Job queue — how runs execute", expanded=False):
         if not config.JOB_QUEUE_ENABLED:
-            st.caption(
+            pilot.display(
                 "Runs execute inside this Streamlit process. For large record sets that "
                 "means the pod serving your browser also carries the digest (a 2,000-page "
                 "bundle peaks near 1.8 GB) and a pod restart loses the run."
-            )
-            st.caption(
+            , container=st, method="caption")
+            pilot.display(
                 "Set `VA_LSE_JOB_QUEUE=1` and configure Redis or the shared cache to hand "
                 "runs to a worker pool — see DEPLOYMENT.md → Pattern C."
-            )
+            , container=st, method="caption")
             return
         try:
             backend = get_job_backend()
         except Exception as exc:  # noqa: BLE001 - this panel must never break the app
-            st.error(
+            pilot.display(
                 report_failure(
                     f"Job queue unavailable: {type(exc).__name__}: {exc}",
                     phase="job_queue_panel",
                     exc=exc,
                     once=True,  # repainted on every rerun; log the first only
                 )
-            )
+            , container=st, method="error")
             return
 
         distributed = backend.is_distributed
-        st.caption(
+        pilot.display(
             f"Enabled. Runs are submitted to a **{backend.name}** queue for a worker to "
             "execute."
-        )
+        , container=st, method="caption")
         if not distributed:
-            st.warning(
+            pilot.display(
                 f"The active backend (**{backend.name}**) only works inside one process, so "
                 "a separate worker can never claim these jobs. Set `VA_LSE_REDIS_URL` or "
                 "`VA_LSE_SHARED_CACHE_URL`/`_TOKEN`."
-            )
+            , container=st, method="warning")
 
         try:
             blob = get_blob_store()
@@ -281,13 +293,13 @@ def _job_queue_panel() -> None:
                 st.session_state["job_queue_depth"] = None
                 st.session_state["job_queue_reachable"] = False
                 st.session_state["job_queue_probe_at"] = time.time()
-                st.error(
+                pilot.display(
                     report_failure(
                         f"Queue probe failed: {type(exc).__name__}: {exc}",
                         phase="job_queue_probe",
                         exc=exc,
                     )
-                )
+                , container=st, method="error")
         depth = st.session_state.get("job_queue_depth")
         if st.session_state.get("job_queue_probe_at") and depth is not None:
             # A probe that threw already reported its own cause above; reporting a
@@ -295,16 +307,16 @@ def _job_queue_panel() -> None:
             reachable = st.session_state.get("job_queue_reachable")
             age = time.time() - float(st.session_state["job_queue_probe_at"])
             if reachable is False:
-                st.error("Queue unreachable — check Redis/Upstash and the worker pods.")
+                pilot.display("Queue unreachable — check Redis/Upstash and the worker pods.", container=st, method="error")
             elif depth:
-                st.info(f"{depth} job(s) waiting for a worker ({age:.0f}s ago).")
+                pilot.display(f"{depth} job(s) waiting for a worker ({age:.0f}s ago).", container=st, method="info")
             else:
-                st.caption(f"No jobs waiting ({age:.0f}s ago).")
+                pilot.display(f"No jobs waiting ({age:.0f}s ago).", container=st, method="caption")
 
-        st.caption(
+        pilot.display(
             "Full status (backend, backlog, reachability) is on `GET /health` → "
             "`job_queue`. Workers expose the same on their own health port."
-        )
+        , container=st, method="caption")
 
 
 def _audit_backup_panel() -> None:
@@ -325,51 +337,51 @@ def _audit_backup_panel() -> None:
             payload = audit_backup_health()
             disk = disk_status()
         except Exception as exc:  # noqa: BLE001 - the panel must never break the app
-            st.error(
+            pilot.display(
                 report_failure(
                     f"Audit backup status unavailable: {type(exc).__name__}: {exc}",
                     phase="audit_backup_panel",
                     exc=exc,
                     once=True,  # repainted on every rerun; log the first only
                 )
-            )
+            , container=st, method="error")
             return
 
         status = str(payload.get("status") or "unknown")
         if not payload.get("configured"):
-            st.warning(
+            pilot.display(
                 "No backup destination is configured, so the audit log exists only on "
                 "this volume — a pod restart or volume loss takes the record with it."
-            )
-            st.caption(
+            , container=st, method="warning")
+            pilot.display(
                 "Set `VA_LSE_AUDIT_BACKUP_DESTINATION` (filesystem, s3, gcs, or azure) and "
                 "run `scripts/backup_audit_logs.py`. See DEPLOYMENT.md → Audit log "
                 "retention and backup."
-            )
+            , container=st, method="caption")
         elif status == "error":
-            st.error(f"Last backup pass failed: {payload.get('reason') or payload.get('last_error')}")
+            pilot.display(f"Last backup pass failed: {payload.get('reason') or payload.get('last_error')}", container=st, method="error")
         elif status == "never_ran":
-            st.warning(
+            pilot.display(
                 "Configured, but no successful pass has been recorded against this "
                 "volume — check that the CronJob or sidecar is actually running."
-            )
+            , container=st, method="warning")
         elif status == "stale":
-            st.warning(f"Backups have stopped: {payload.get('reason')}")
+            pilot.display(f"Backups have stopped: {payload.get('reason')}", container=st, method="warning")
         else:
             age = payload.get("age_seconds")
-            st.success(
+            pilot.display(
                 "Last pass succeeded"
                 + (f" {age / 3600:.1f}h ago." if isinstance(age, int) else ".")
-            )
+            , container=st, method="success")
 
         # The single most misleading configuration: a "backup" that shares the
         # volume it is supposed to survive.
         if payload.get("configured") and payload.get("off_pod") is False:
-            st.warning(
+            pilot.display(
                 "The destination is on this pod's own volume, so it does **not** survive "
                 "the failure a backup exists for. Point it at object storage or a "
                 "separate mount."
-            )
+            , container=st, method="warning")
 
         pending = payload.get("pending_bytes")
         st.dataframe(
@@ -417,17 +429,17 @@ def _audit_backup_panel() -> None:
         )
 
         if disk.get("checked") and disk.get("below_floor"):
-            st.error(
+            pilot.display(
                 "Free space is below `VA_LSE_DISK_MIN_FREE_BYTES`. Rotation is by count "
                 "and can delete a file that is younger than the retention window — back "
                 "up or prune before records are lost."
-            )
+            , container=st, method="error")
 
-        st.caption(
+        pilot.display(
             "Full status is on `GET /health` → `audit`, `audit_backup`, `disk`, and as "
             "Prometheus metrics on `GET /metrics`. Verify or restore the backup with "
             "`scripts/restore_audit_logs.py`."
-        )
+        , container=st, method="caption")
 
 
 def _primary_breaker_state() -> str:
@@ -474,14 +486,14 @@ def _llm_failover_panel() -> None:
         try:
             status = failover_status()
         except Exception as exc:  # noqa: BLE001 - the panel must never break the app
-            st.error(
+            pilot.display(
                 report_failure(
                     f"Failover status unavailable: {type(exc).__name__}: {exc}",
                     phase="llm_failover_panel",
                     exc=exc,
                     once=True,  # repainted on every rerun; log the first only
                 )
-            )
+            , container=st, method="error")
             return
 
         configured = bool(status.get("configured"))
@@ -490,19 +502,19 @@ def _llm_failover_panel() -> None:
         unhealthy = status.get("primary_unhealthy_seconds")
 
         if not configured:
-            st.caption(
+            pilot.display(
                 "Running on a **single endpoint**, so an extended outage means waiting "
                 "for it to recover (or pointing the app at another one). Set "
                 "`OPENAI_BASE_URL_FALLBACK` to arm a backup endpoint — see "
                 "DEPLOYMENT.md → LLM endpoint failover."
-            )
+            , container=st, method="caption")
         elif active:
-            st.warning(
+            pilot.display(
                 "Calls are being served by the **backup endpoint** because the primary "
                 "has been failing. Output may differ slightly from a normal run, and "
                 "the audit record for these runs records both endpoints "
                 "(`llm_endpoints`). Traffic returns to the primary automatically."
-            )
+            , container=st, method="warning")
         elif isinstance(unhealthy, (int, float)) and unhealthy > 0:
             remaining = max(0.0, float(threshold or 0) - float(unhealthy))
             recovery = _primary_breaker_recovery_seconds()
@@ -510,20 +522,20 @@ def _llm_failover_panel() -> None:
             # recovery window, so calls are not *uniformly* failing here — and a
             # successful retry ends this state. Saying "everything is down" would
             # send someone hunting for a problem that does not exist.
-            st.warning(
+            pilot.display(
                 f"The primary endpoint has been failing for {unhealthy:.0f}s, so most "
                 f"calls are failing fast. It is re-tried every {recovery:.0f}s, and one "
                 f"successful retry puts everything back on it. Failover to the backup "
                 f"engages after {float(threshold or 0):.0f}s of continuous failure — in "
                 f"about {remaining:.0f}s."
-            )
-            st.caption(
+            , container=st, method="warning")
+            pilot.display(
                 "The wait is deliberate: it stops a short provider blip from moving the "
                 "work onto another provider. To fail over immediately instead, set "
                 "`LLM_ENDPOINT_FALLBACK_TIMEOUT_SECONDS=0`."
-            )
+            , container=st, method="caption")
         else:
-            st.success("Primary endpoint healthy; the backup is configured and unused.")
+            pilot.display("Primary endpoint healthy; the backup is configured and unused.", container=st, method="success")
 
         rows = [
             {"Setting": "Backup configured", "Value": "yes" if configured else "no"},
@@ -547,12 +559,12 @@ def _llm_failover_panel() -> None:
             },
         ]
         st.dataframe(rows, width="stretch", hide_index=True)
-        st.caption(
+        pilot.display(
             "The backup is configured through the environment, not this sidebar: a "
             "worker builds its own client from its environment, so a web-only setting "
             "would silently not apply to queued runs. Live state is on `GET /health` "
             "→ `llm_failover` and as `va_lse_llm_failover_active` on `GET /metrics`."
-        )
+        , container=st, method="caption")
 
 
 def _record_reading_panel() -> None:
@@ -570,21 +582,21 @@ def _record_reading_panel() -> None:
     try:
         status = extraction_status()
     except Exception as exc:  # noqa: BLE001 - this panel must never break the app
-        st.error(
+        pilot.display(
             report_failure(
                 f"Extractor status unavailable: {type(exc).__name__}: {exc}",
                 phase="record_reading_panel",
                 exc=exc,
                 once=True,  # repainted on every rerun; log the first only
             )
-        )
+        , container=st, method="error")
         return
 
-    st.caption(f"📄 Records: {_reader_summary(status)}")
+    pilot.display(f"📄 Records: {_reader_summary(status)}", container=st, method="caption")
     if status.problem:
-        st.warning(f"⚠️ {status.problem}")
+        pilot.display(f"⚠️ {status.problem}", container=st, method="warning")
     elif status.fallbacks:
-        st.warning(f"⚠️ {_fallback_warning(status)}")
+        pilot.display(f"⚠️ {_fallback_warning(status)}", container=st, method="warning")
 
     with st.expander("📄 Record reading — where text comes from", expanded=False):
         st.dataframe(
@@ -601,22 +613,22 @@ def _record_reading_panel() -> None:
             ]
         )
         if status.last_fallback is not None:
-            st.caption(
+            pilot.display(
                 f"Most recent fallback: **{status.last_fallback.label}** at "
                 f"{status.last_fallback.at} — {_short(status.last_fallback.reason)}"
-            )
+            , container=st, method="caption")
         if not (status.on_the_box and not status.problem):
-            st.caption(
+            pilot.display(
                 "A scanned page has no text to give here: it comes back empty and is counted "
                 "as unreadable. Set `VA_LSE_EXTRACTOR=sandbox` plus `VA_LSE_EXTRACTOR_RUNNER` "
                 "to read those pages on a box that has OCR — see README → *Scanned pages and "
                 "OCR*."
-            )
-        st.caption(
+            , container=st, method="caption")
+        pilot.display(
             "Before you rely on it: `.venv/bin/python scripts/check_sandbox.py` reports whether "
             "a box would be reached from this host — the runner line, the CLI and the "
             "credential — and creates nothing."
-        )
+        , container=st, method="caption")
 
 
 def _reader_summary(status: ExtractionStatus) -> str:
@@ -680,10 +692,10 @@ def _secrets_source_note(settings: Any) -> None:
     if not names:
         return
     labels = ", ".join(config.SECRET_FIELD_LABELS.get(name, name) for name in names)
-    st.caption(
+    pilot.display(
         f"🔐 From Streamlit secrets: {labels}. Edit the field(s) here and click "
         "**Apply settings** to override for this session."
-    )
+    , container=st, method="caption")
 
 
 def _pending_settings_warning(settings: Any) -> None:
@@ -708,11 +720,11 @@ def _pending_settings_warning(settings: Any) -> None:
     if not pending:
         return
     listed = ", ".join(pending)
-    st.warning(
+    pilot.display(
         f"You edited the {listed}, but it has not been applied — runs will still use the "
         f"saved {listed}. Click **Apply settings** to use the new value(s). "
         "(The API key is used immediately; the base URL and model names are not.)"
-    )
+    , container=st, method="warning")
 
 
 def _test_connection_report(settings: Any) -> None:
@@ -734,7 +746,7 @@ def _test_connection_report(settings: Any) -> None:
     model_fast = _field_value("model_fast_input", settings.model_fast)
 
     if not api_key:
-        st.error("Enter an API key first, then test the connection.")
+        pilot.display("Enter an API key first, then test the connection.", container=st, method="error")
         return
 
     probe_settings = _with_on_screen_fields(
@@ -753,12 +765,12 @@ def _test_connection_report(settings: Any) -> None:
 
     message = verdict.headline if not verdict.fix else f"{verdict.headline}\n\n{verdict.fix}"
     if verdict.kind == OK:
-        st.success(f"✅ {message}")
+        pilot.display(f"✅ {message}", container=st, method="success")
     elif verdict.kind == BLOCKED:
-        st.error(f"⛔ {message}")
+        pilot.display(f"⛔ {message}", container=st, method="error")
     else:
         # UNVERIFIED: the run is allowed, but the check could not tell — say so.
-        st.warning(f"⚠️ {message}")
+        pilot.display(f"⚠️ {message}", container=st, method="warning")
     _render_preflight_evidence(verdict, base_url)
 
 
@@ -791,7 +803,7 @@ def _render_preflight_evidence(verdict: Verdict, base_url: str) -> None:
         # probe on a retired provider is exactly the trap — so the evidence names it.
         label = RETIRED_PROVIDER_KINDS.get(retired_kind, retired_kind)
         parts.append(f"⚠️ retired provider: {label}")
-    st.caption("Preflight: " + " · ".join(parts) + ".")
+    pilot.display("Preflight: " + " · ".join(parts) + ".", container=st, method="caption")
 
 
 def _compat_model_warning(settings: Any) -> None:
@@ -803,7 +815,7 @@ def _compat_model_warning(settings: Any) -> None:
     sig = f"{settings.base_url}|{settings.model_main}|{settings.model_fast}"
     if st.session_state.get("_compat_checked_sig") == sig:
         for msg in st.session_state.get("_compat_warnings", []):
-            st.warning(msg)
+            pilot.display(msg, container=st, method="warning")
         return
     try:
         available = check_model_availability(settings.base_url, settings.api_key)
@@ -831,7 +843,7 @@ def _compat_model_warning(settings: Any) -> None:
     st.session_state["_compat_checked_sig"] = sig
     st.session_state["_compat_warnings"] = warnings
     for msg in warnings:
-        st.warning(msg)
+        pilot.display(msg, container=st, method="warning")
 
 
 def _retired_endpoint_warning(settings: Any) -> None:
@@ -852,7 +864,7 @@ def _retired_endpoint_warning(settings: Any) -> None:
     """
     reason = retired_endpoint_reason(settings)
     if reason:
-        st.warning(reason)
+        pilot.display(reason, container=st, method="warning")
         if st.button(
             "Apply Perplexity defaults",
             help=(
@@ -869,10 +881,10 @@ def _retired_endpoint_warning(settings: Any) -> None:
     elif st.session_state.pop("_applied_perplexity_defaults", False):
         # One-shot confirmation: the flag is consumed here, so it shows exactly
         # once — the paint after the repair — and never gets stale on screen.
-        st.success(
+        pilot.display(
             "✅ Perplexity defaults applied — the endpoint, model ids and key fields "
             "are set. Run **Test connection** to confirm the endpoint answers."
-        )
+        , container=st, method="success")
 
 
 def _credit_calibration_widget() -> None:
@@ -880,10 +892,10 @@ def _credit_calibration_widget() -> None:
     with st.expander("🎚️ Usage watchdog (credit rate)"):
         history = load_usage_history()
         fit = watchdog.fit_effective_rate(history)
-        st.caption(
+        pilot.display(
             "Record the cumulative figure your provider console shows — the unit is "
             "yours (credits, spend), and the app fits a rate in it."
-        )
+        , container=st, method="caption")
 
         last_credits = st.session_state.get("watchdog_last_credits", "")
         credits = st.text_input(
@@ -902,29 +914,29 @@ def _credit_calibration_widget() -> None:
                 st.session_state["watchdog_last_credits"] = credits
                 captured = True
             except (TypeError, ValueError):
-                st.warning("Enter a non-negative number for credits used.")
+                pilot.display("Enter a non-negative number for credits used.", container=st, method="warning")
 
         n_runs = len(history.runs)
         if captured:
-            st.success(
+            pilot.display(
                 f"Reading saved ({n_runs} run(s) recorded). Repeat after more runs to refine."
-            )
+            , container=st, method="success")
 
-        st.caption(
+        pilot.display(
             f"Runs tracked: {n_runs} · calibrations: {len(history.calibrations)}"
-        )
+        , container=st, method="caption")
         if fit.any_rate():
             separate = fit.main_rate != fit.fast_rate
             if separate:
-                st.markdown(
+                pilot.display(
                     f"**Learned rates:** main ≈{fit.main_rate:,.0f} · fast "
                     f"≈{fit.fast_rate:,.0f} credits/1M tokens. {fit.multiline_note}"
-                )
+                , container=st, method="markdown")
             else:
-                st.markdown(
+                pilot.display(
                     f"**Learned effective rate:** ≈{fit.blended_rate:,.0f} credits / 1M "
                     f"tokens {fit.multiline_note}"
-                )
+                , container=st, method="markdown")
             enabled = config.CREDITS_PER_1M_MAIN is None and config.CREDITS_PER_1M_FAST is None
             if enabled:
                 rate_desc = (
@@ -932,17 +944,17 @@ def _credit_calibration_widget() -> None:
                     if separate
                     else f"**{fit.blended_rate:,.0f} credits/1M**"
                 )
-                st.markdown(
+                pilot.display(
                     f"The estimator will now use {rate_desc} as a fallback for the "
                     "credit estimate until you set explicit rates in `.env`."
-                )
+                , container=st, method="markdown")
         else:
-            st.markdown(
+            pilot.display(
                 "Add the total credits your plan reports each time after a run. Once you've "
                 "recorded at least two readings separated by new runs, the app fits your "
                 "effective credits-per-1M rate and starts estimating credit burn."
-            )
-            st.caption(
+            , container=st, method="markdown")
+            pilot.display(
                 "Tip: post each eval/draft run's totals (shown here) and your console's "
                 "cumulative credits to converge in a few runs."
-            )
+            , container=st, method="caption")

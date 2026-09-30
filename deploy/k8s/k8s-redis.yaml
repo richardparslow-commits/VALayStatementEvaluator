@@ -17,9 +17,9 @@
 #   # to your va-lse-env secret
 #
 # Sizing: size --maxmemory for the job PAYLOADS (extracted record text, not the
-# uploaded PDFs) — roughly concurrency x peak batch text. allkeys-lru can evict a
-# queued payload, so prefer noeviction or a generous maxmemory once you rely on
-# the queue.
+# uploaded PDFs) — roughly concurrency x peak batch text. noeviction refuses new
+# writes at capacity; AOF persists acknowledged writes with an approximately
+# one-second crash-loss window. Pattern C is excluded from the real-data pilot.
 
 apiVersion: apps/v1
 kind: StatefulSet
@@ -50,10 +50,11 @@ spec:
             - --maxmemory
             - "256mb"
             - --maxmemory-policy
-            - allkeys-lru
-            - --save
-            - "60"
-            - "1"
+            - noeviction
+            - --appendonly
+            - "yes"
+            - --appendfsync
+            - everysec
           resources:
             requests:
               memory: 128Mi

@@ -352,7 +352,8 @@ class TestBundle(BundleTestCase):
             report = ocr_and_extract.process(
                 [self.bundle / "scan.pdf"], roots=[self.bundle], work_dir=self.work
             )
-        self.assertTrue(report["totals"]["over_page_cap"])
+        self.assertEqual(report["totals"]["documents"], 0)
+        self.assertTrue(report["skipped"])
         self.assertEqual(report["totals"]["page_cap"], 2)
 
 

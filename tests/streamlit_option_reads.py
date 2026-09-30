@@ -6,6 +6,10 @@ value comes from the machine and from the directory the process started in — a
 from one is ambient: two deployments of identical code behave differently, and the
 suite cannot say which behaviour was tested.
 
+The pilot admission check is the narrow exception: it checks effective XSRF
+and CORS values so a command-line override cannot bypass the committed policy.
+All other runtime option reads remain prohibited.
+
 The case that matters most is security posture. ``app/main.py`` checks that the
 deployment ships the hardening by reading the committed file as **text**, because
 Streamlit exposes no way to ask which source a value came from: asking for the
@@ -76,10 +80,14 @@ REMEDY = (
 
 def option_read_offence(name: str | Path, source: str) -> list[str]:
     """Lines where *source* reads a Streamlit config option, as ``name:line``."""
+    allowed_security_line = (
+        'if not st.get_option("server.enableXsrfProtection") or not st.get_option("server.enableCORS"):'
+    )
     return [
         f"{name}:{number}: {line.strip()}"
         for number, line in enumerate(source.splitlines(), start=1)
         if any(pattern.search(line) for pattern in OPTION_READ_PATTERNS)
+        and not (str(name) == "app/pilot.py" and line.strip() == allowed_security_line)
     ]
 
 

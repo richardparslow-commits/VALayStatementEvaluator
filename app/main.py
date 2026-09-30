@@ -50,7 +50,6 @@ st.set_page_config(
 # see app/extractors.py), made once here so the uploader and the local-folder
 # reader keep calling app.documents without knowing the difference. Default is
 # this app's own reader, and the sandbox mode falls back to it per file.
-install_configured_extractor()
 
 
 def _check_streamlit_config_hardening() -> None:
@@ -94,7 +93,10 @@ def _check_streamlit_config_hardening() -> None:
 
 # --------------------------------------------------------------------- layout
 def main() -> None:
+    from . import pilot
     configure_logging()
+    pilot.render_admission()
+    install_configured_extractor()
     try:
         audit_log.configure_audit_logging()
     except Exception:  # noqa: BLE001 - audit is best-effort
@@ -128,8 +130,8 @@ def main() -> None:
     render_sidebar_settings()
     st.title("🎖️ VA Lay Statement Evaluator")
     st.caption(
-        "Exhaustive medical-record review to verify existing lay statements — and to draft "
-        "factually correct new ones. Grounded in 38 U.S.C. § 1154(a), § 5107(b) and the "
+        "Review medical records and prepare lay-statement drafts for human verification. "
+        "Uses 38 U.S.C. § 1154(a), § 5107(b) and the "
         "Jandreau/Buchanan/Caluza line of cases."
     )
 
@@ -147,7 +149,10 @@ def main() -> None:
         with tab_draft:
             render_draft_tab()
         with tab_research:
-            render_research_tab()
+            if pilot.enabled():
+                st.info("Research tools are outside the controlled pilot profile.")
+            else:
+                render_research_tab()
         with tab_about:
             render_about_tab()
     except Exception as exc:  # noqa: BLE001 - root error boundary

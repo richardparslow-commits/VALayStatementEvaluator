@@ -5,6 +5,8 @@ records. Includes gap detection, expandable event details, and PDF export.
 """
 from __future__ import annotations
 
+from .. import pilot
+
 from typing import Any
 
 import streamlit as st
@@ -23,7 +25,7 @@ def render_timeline_tab(digest: medical_review.MedicalDigest) -> None:
     st.subheader("📅 Medical Record Timeline")
 
     if not digest.facts:
-        st.info("No medical events were extracted from the records. Try re-running the review.")
+        pilot.display("No medical events were extracted from the records. Try re-running the review.", container=st, method="info")
         return
 
     events = medical_review.build_timeline_events(digest)
@@ -134,19 +136,19 @@ def render_timeline_tab(digest: medical_review.MedicalDigest) -> None:
     if show_gaps and len(filtered_events) >= 2:
         gaps = medical_review.detect_timeline_gaps(filtered_events, min_gap_months=6)
         if gaps:
-            st.warning(f"⚠️ **{len(gaps)} gap period(s)** detected with no recorded events:")
+            pilot.display(f"⚠️ **{len(gaps)} gap period(s)** detected with no recorded events:", container=st, method="warning")
             for gap in gaps:
-                st.caption(f"• {gap.duration_months} months between {gap.start_date} and {gap.end_date}")
-                st.caption(f"  {gap.note}")
+                pilot.display(f"• {gap.duration_months} months between {gap.start_date} and {gap.end_date}", container=st, method="caption")
+                pilot.display(f"  {gap.note}", container=st, method="caption")
 
     # Timeline visualization
     if not filtered_events:
-        st.info("No events match the current filters.")
+        pilot.display("No events match the current filters.", container=st, method="info")
         return
 
     # Render timeline as an interactive list
     st.divider()
-    st.caption(f"Showing {len(filtered_events)} of {len(events)} events")
+    pilot.display(f"Showing {len(filtered_events)} of {len(events)} events", container=st, method="caption")
 
     # Color coding by event type
     type_colors = {
@@ -170,25 +172,25 @@ def render_timeline_tab(digest: medical_review.MedicalDigest) -> None:
 
         # Event card
         with st.expander(
-            f"📌 **{date_display}** — {event.type.replace('_', ' ').title()}",
+            pilot.text_label(f"📌 **{date_display}** — {event.type.replace('_', ' ').title()}"),
             expanded=False,
         ):
             # Full description
-            st.markdown(f"**{event.full_description}**")
+            pilot.display(f"**{event.full_description}**", container=st, method="markdown")
 
             # Quote if present
             if event.quote:
-                st.markdown(f"> \\\"{event.quote}\\\"")
+                pilot.display(f"> \\\"{event.quote}\\\"", container=st, method="markdown")
 
             # Source citation
-            st.caption(f"📄 Source: {event.source}")
+            pilot.display(f"📄 Source: {event.source}", container=st, method="caption")
 
             # Type badge with color
-            st.markdown(
+            pilot.display(
                 f'<span style="background-color: {color}; color: white; padding: 2px 8px; '
                 f'border-radius: 4px; font-size: 0.8em;">{event.type.replace("_", " ").title()}</span>',
                 unsafe_allow_html=True,
-            )
+             container=st, method="markdown")
 
     # Export options
     st.divider()
@@ -229,17 +231,21 @@ def _export_timeline_pdf(digest: medical_review.MedicalDigest, events: list[medi
     try:
         from ..pdf_export import generate_timeline_pdf
     except ImportError:
-        st.error("PDF export is not available. Please ensure reportlab is installed.")
+        pilot.display("PDF export is not available. Please ensure reportlab is installed.", container=st, method="error")
         return
 
-    pdf_bytes = generate_timeline_pdf(events)
-    st.download_button(
+    try:
+        pdf_bytes = generate_timeline_pdf(events)
+    except Exception:
+        pilot.display("Timeline export failed. No PDF was created. Please retry or contact the operator.", container=st, method="error")
+        return
+    pilot.file_download(
         "⬇️ Download Timeline PDF",
         data=pdf_bytes,
         file_name="medical_record_timeline.pdf",
         mime="application/pdf",
         key="timeline_pdf_download",
-    )
+     container=st)
 
 
 def _copy_timeline_markdown(events: list[medical_review.TimelineEvent]) -> None:
@@ -247,21 +253,21 @@ def _copy_timeline_markdown(events: list[medical_review.TimelineEvent]) -> None:
     markdown = medical_review.render_timeline_markdown(events)
 
     # Offer download
-    st.download_button(
+    pilot.file_download(
         "⬇️ Download as .md",
         data=markdown.encode("utf-8"),
         file_name="medical_record_timeline.md",
         mime="text/markdown",
         key="timeline_md_download",
-    )
+     container=st)
 
     # Also copy to clipboard if possible
     try:
         import pyperclip
         pyperclip.copy(markdown)
-        st.success("Timeline markdown copied to clipboard!")
+        pilot.display("Timeline markdown copied to clipboard!", container=st, method="success")
     except ImportError:
-        st.info("Markdown exported. Install pyperclip for clipboard support.")
+        pilot.display("Markdown exported. Install pyperclip for clipboard support.", container=st, method="info")
 
 
 def render_timeline_in_results(digest: medical_review.MedicalDigest) -> None:
@@ -278,8 +284,8 @@ def render_timeline_in_results(digest: medical_review.MedicalDigest) -> None:
     # Show first 20 events in a compact view
     display_events = events[:20]
 
-    st.markdown("### Key Medical Events")
-    st.caption(f"Showing first 20 of {len(events)} events. View full timeline for all events.")
+    pilot.display("### Key Medical Events", container=st, method="markdown")
+    pilot.display(f"Showing first 20 of {len(events)} events. View full timeline for all events.", container=st, method="caption")
 
     # Compact timeline as a table
     rows = []
@@ -294,7 +300,7 @@ def render_timeline_in_results(digest: medical_review.MedicalDigest) -> None:
     st.dataframe(rows, width="stretch", hide_index=True)
 
     if len(events) > 20:
-        st.caption(f"...and {len(events) - 20} more events. Use the Timeline tab for the full view.")
+        pilot.display(f"...and {len(events) - 20} more events. Use the Timeline tab for the full view.", container=st, method="caption")
 
 
 __all__ = [

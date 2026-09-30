@@ -362,8 +362,8 @@ class TestRunDraftHappyPath(unittest.TestCase):
         self.assertIn("supported_observations", result.grounding)
         self.assertTrue(result.draft)
         self.assertIn("[Confirm:", result.draft)
-        self.assertTrue(result.final_statement)
-        self.assertIn("Improved statement", result.final_statement)
+        self.assertFalse(result.final_statement)
+        self.assertEqual(result.output_statement, result.draft)
         self.assertTrue(result.review_issues)
         self.assertIsNotNone(result.digest)
         phases = [p for _, p in llm.calls]
@@ -658,11 +658,11 @@ class TestSelfReviewPreservation(unittest.TestCase):
         result, _ = self._run(original, {"improved_statement": self.STATEMENT})
         self.assert_preserved(result, original)
 
-    def test_complete_rewrite_can_improve_wording(self):
+    def test_complete_rewrite_requires_human_review(self):
         improved = self.STATEMENT.replace("I see him limp daily.", "I observe him limping every day.")
         result, _ = self._run(self.STATEMENT, {"issues_found": ["Wording."], "improved_statement": improved})
-        self.assertEqual(result.final_statement, improved)
-        self.assertEqual(result.review_issues, ["Wording."])
+        self.assert_preserved(result, self.STATEMENT)
+        self.assertIn("Wording.", result.review_issues)
 
     def test_malformed_review_falls_back_without_losing_draft(self):
         for review in ([], None, "text", {"improved_statement": [self.STATEMENT]}, {"improved_statement": " " * 1000}, {}):

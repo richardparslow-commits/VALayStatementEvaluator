@@ -102,7 +102,8 @@ def report_failure(
         "status": severity,
         "error_class": type(exc).__name__ if exc is not None else None,
     }
-    if once and not _mark_once(phase, message):
+    from . import pilot
+    if once and not pilot.enabled() and not _mark_once(phase, message):
         return f"{message}{reference_suffix(rid)}"
     if severity == "warning":
         logger.warning("%s", message, exc_info=exc, extra=extra)

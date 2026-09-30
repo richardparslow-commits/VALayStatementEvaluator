@@ -1,5 +1,8 @@
 # Security — secrets, keys, and safe deployment
 
+For real veteran information, use the restricted [controlled-pilot guide](PILOT.md).
+The general deployment examples are synthetic-data scaffolding until separately reviewed.
+
 This document describes how to handle secrets (API keys, tokens, and other
 credentials) for this project and how to prevent leaking them.
 

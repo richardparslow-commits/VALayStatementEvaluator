@@ -16,6 +16,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from unittest import mock
 
@@ -321,6 +322,9 @@ class TestThePanelInTheRealApp(unittest.TestCase):
     """
 
     def setUp(self) -> None:
+        operator_mode = patch.dict("os.environ", {"VA_LSE_OPERATOR_DIAGNOSTICS": "1"})
+        operator_mode.start()
+        self.addCleanup(operator_mode.stop)
         isolate_app_logs(self)
         configure_logging()
         install_capture().clear()
@@ -411,6 +415,9 @@ class TestFailureDetailNextToTheError(unittest.TestCase):
     """
 
     def setUp(self) -> None:
+        operator_mode = patch.dict("os.environ", {"VA_LSE_OPERATOR_DIAGNOSTICS": "1"})
+        operator_mode.start()
+        self.addCleanup(operator_mode.stop)
         isolate_app_logs(self)
         configure_logging()
         install_capture().clear()

@@ -142,6 +142,12 @@ class JsonFormatter(logging.Formatter):
     """
 
     def format(self, record: logging.LogRecord) -> str:  # noqa: A003
+        from . import pilot
+        if pilot.enabled():
+            pilot_payload = {"timestamp": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+                       "level": record.levelname, "message": "Application event",
+                       **pilot.safe_metadata(record.__dict__)}
+            return json.dumps(pilot_payload)
         # Ensure request_id is present (fallback to "-")
         request_id = getattr(record, "request_id", None) or getattr(
             record, "requestId", None
@@ -193,6 +199,9 @@ class PlainFormatter(logging.Formatter):
     """Human-readable fallback when ``VA_LSE_LOG_JSON`` is off."""
 
     def format(self, record: logging.LogRecord) -> str:  # noqa: A003
+        from . import pilot
+        if pilot.enabled():
+            return JsonFormatter().format(record)
         request_id = getattr(record, "request_id", None)
         if not request_id:
             try:

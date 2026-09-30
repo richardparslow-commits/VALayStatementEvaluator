@@ -139,7 +139,12 @@ class CaptureHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            self._records.append(_entry(record))
+            from . import pilot
+            if pilot.enabled():
+                self._records.append({"message": "Application event",
+                                      **pilot.safe_metadata(record.__dict__)})
+            else:
+                self._records.append(_entry(record))
         except Exception:  # noqa: BLE001 - a diagnostic buffer must never break logging
             pass
 

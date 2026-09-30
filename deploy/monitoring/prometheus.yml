@@ -34,7 +34,7 @@ scrape_configs:
   - job_name: va-lse-web
     metrics_path: /metrics
     static_configs:
-      - targets: ["web:8001"]
+      - targets: ["streamlit-web:8001"]
         labels:
           tier: web
     # `?probe=1` would force the one metric that costs a network round trip
@@ -62,7 +62,7 @@ scrape_configs:
     params:
       module: [http_2xx]
     static_configs:
-      - targets: ["http://web:8001/ready"]
+      - targets: ["http://streamlit-web:8001/ready"]
     relabel_configs:
       - source_labels: [__address__]
         target_label: __param_target

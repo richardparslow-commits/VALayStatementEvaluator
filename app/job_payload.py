@@ -104,7 +104,12 @@ def _str_map(value: Any) -> dict[str, str]:
 def document_to_json(doc: ExtractedDocument) -> dict[str, Any]:
     return {
         "filename": doc.filename,
-        "pages": [{"page": p.page, "text": p.text} for p in doc.pages],
+        "schema_version": 2,
+        "total_pages": doc.total_pages,
+        "unreadable_pages": doc.unreadable_pages,
+        "pagination": doc.pagination,
+        "coverage_known": doc.coverage_known,
+        "pages": [{"page": p.page, "text": p.text, "kind": p.kind} for p in doc.pages],
     }
 
 
@@ -118,10 +123,20 @@ def document_from_json(raw: Any) -> ExtractedDocument | None:
         text = _as_str(entry.get("text"))
         if not text:
             continue
-        pages.append(DocumentPage(filename, max(1, _as_int(entry.get("page"), 1)), text))
+        kind = _as_str(entry.get("kind")) or "page"
+        if kind not in {"page", "block"}:
+            raise PayloadError("Invalid document citation unit.")
+        pages.append(DocumentPage(filename, max(1, _as_int(entry.get("page"), 1)), text, kind))
     if not pages:
         return None
-    return ExtractedDocument(filename=filename, pages=pages)
+    total = _as_int(data.get("total_pages"), 0)
+    unreadable = [_as_int(n, 0) for n in _as_list(data.get("unreadable_pages"))]
+    pagination = _as_str(data.get("pagination")) or "page"
+    if total < 0 or pagination not in {"page", "block"} or any(n < 1 or n > total for n in unreadable):
+        raise PayloadError("Invalid document coverage metadata.")
+    return ExtractedDocument(filename=filename, pages=pages, total_pages=total,
+                             unreadable_pages=unreadable, pagination=pagination,
+                             coverage_known=data.get("schema_version") == 2 and data.get("coverage_known", True) is True)
 
 
 def documents_to_json(records: list[ExtractedDocument]) -> list[dict[str, Any]]:

@@ -7,6 +7,8 @@ started it.
 """
 from __future__ import annotations
 
+from .. import pilot
+
 import time
 import traceback
 from typing import Any
@@ -145,14 +147,14 @@ def render_evaluate_tab() -> None:
         if files is not None:
             accepted, rejections = check_upload_limits([files])
             for msg in rejections:
-                st.warning(
+                pilot.display(
                     report_failure(
                         msg,
                         phase="statement_upload_limits",
                         severity="warning",
                         once=True,
                     )
-                )
+                , container=st, method="warning")
             if rejections:
                 docs = []
             else:
@@ -167,15 +169,15 @@ def render_evaluate_tab() -> None:
     records = records_uploader("eval")
     if records:
         total_pages = sum(len(d.pages) for d in records)
-        st.success(
+        pilot.display(
             f"Loaded {len(records)} record file(s), {total_pages:,} page(s): "
             + ", ".join(d.filename for d in records)
-        )
+        , container=st, method="success")
         if total_pages > 200:
-            st.info(
+            pilot.display(
                 "Large record set: chunks are digested in parallel with duplicate pages "
                 "skipped, but expect a longer run for a meticulous review."
-            )
+            , container=st, method="info")
         render_record_search("eval", records)
 
     render_condition_selector_for_slot("eval")
@@ -188,10 +190,10 @@ def render_evaluate_tab() -> None:
     render_aa_intake_wizard("eval")
 
     if job_runner.queue_mode_active():
-        st.caption(
+        pilot.display(
             f"⚙️ This run is processed by a background worker ({job_runner.queue_status_line()}). "
             "You can close this tab — the results will be waiting when you come back."
-        )
+        , container=st, method="caption")
 
     # A blocked preflight is kept on screen (with its waiver) from here, above the
     # button that would start the run — see app/views/shared.py.
@@ -221,39 +223,39 @@ def render_evaluate_tab() -> None:
 # ------------------------------------------------------------------ input UI
 def _render_statement_length_guidance(statement_text: str) -> None:
     n = len(statement_text)
-    st.caption(
+    pilot.display(
         f"Statement length: {n:,} / {MAX_STATEMENT_CHARS:,} characters "
         f"(recommended limit; hard prompt limit {EVALUATE_INTERNAL_MAX_CHARS:,})."
-    )
+    , container=st, method="caption")
     if n > MAX_STATEMENT_CHARS:
         over = n - MAX_STATEMENT_CHARS
         will_truncate = max(0, n - EVALUATE_INTERNAL_MAX_CHARS)
         if will_truncate:
-            st.warning(
+            pilot.display(
                 f"⚠️ Statement is {n:,} characters — {over:,} over the {MAX_STATEMENT_CHARS:,} "
                 f"recommended limit. {will_truncate:,} characters beyond the "
                 f"{EVALUATE_INTERNAL_MAX_CHARS:,} internal prompt limit will be "
                 f"truncated and not analyzed. Claims at the end (e.g., family impact, "
                 f"caregiver necessity) may be missed. Consider splitting the statement "
                 f"into smaller parts or shortening it."
-            )
+            , container=st, method="warning")
         else:
-            st.warning(
+            pilot.display(
                 f"⚠️ Statement is {n:,} characters — {over:,} over the {MAX_STATEMENT_CHARS:,} "
                 f"recommended limit. It will still be analyzed in full (internal limit "
                 f"{EVALUATE_INTERNAL_MAX_CHARS:,}), but very long statements may reduce "
                 f"model accuracy. Consider shortening for best results."
-            )
+            , container=st, method="warning")
         st.checkbox(
             f"I understand the statement is {over:,} characters over the limit and "
             "want to proceed anyway (any truncated portion will be noted in the report).",
             key="eval_confirm_oversize",
         )
     elif n > int(MAX_STATEMENT_CHARS * 0.85):
-        st.caption(
+        pilot.display(
             f"ℹ️ Approaching the {MAX_STATEMENT_CHARS:,} character recommended limit "
             f"({MAX_STATEMENT_CHARS - n:,} remaining before a confirmation is required)."
-        )
+        , container=st, method="caption")
 
 
 def _validate_evaluate_inputs(statement_text: str, records: list) -> bool:
@@ -264,7 +266,7 @@ def _validate_evaluate_inputs(statement_text: str, records: list) -> bool:
     if not statement_text.strip():
         msg = "Provide the lay statement first (upload or paste)."
         run_log_event("evaluate", "rejected", request_id=rid, error=msg, reason="no_statement")
-        st.error(f"{msg}{reference_suffix(rid)}")
+        pilot.display(f"{msg}{reference_suffix(rid)}", container=st, method="error")
         return False
     if len(statement_text) > MAX_STATEMENT_CHARS and not st.session_state.get(
         "eval_confirm_oversize"
@@ -282,12 +284,12 @@ def _validate_evaluate_inputs(statement_text: str, records: list) -> bool:
             "evaluate", "rejected", request_id=rid, error=msg,
             reason="statement_oversize", statement_chars=len(statement_text),
         )
-        st.error(f"{msg}{reference_suffix(rid)}")
+        pilot.display(f"{msg}{reference_suffix(rid)}", container=st, method="error")
         return False
     if not records:
         msg = "Upload at least one medical record file."
         run_log_event("evaluate", "rejected", request_id=rid, error=msg, reason="no_records")
-        st.error(f"{msg}{reference_suffix(rid)}")
+        pilot.display(f"{msg}{reference_suffix(rid)}", container=st, method="error")
         return False
     return True
 
@@ -321,10 +323,10 @@ def _run_evaluation_flow(statement_text: str, records: list, witness: dict[str, 
         return
     if not enter_run():
         run_log_event("evaluate", "rejected", request_id=rid, error="app shutting down", reason="draining")
-        st.error(
+        pilot.display(
             "The app is shutting down — no new evaluation runs can start right now. "
             "Please try again in a moment."
-        )
+        , container=st, method="error")
         return
 
     # Audit: start — metadata only, never statement/record text.
@@ -386,7 +388,7 @@ def _run_evaluation_flow(statement_text: str, records: list, witness: dict[str, 
                 "error_class": type(mem_exc).__name__,
             },
         )
-        st.error(f"Evaluation aborted: {format_error_for_user(mem_exc, rid)}")
+        pilot.display(f"Evaluation aborted: {format_error_for_user(mem_exc, rid)}", container=st, method="error")
         render_failure_detail(rid)
         return
     except PipelineTimeoutError as timeout_exc:
@@ -408,7 +410,7 @@ def _run_evaluation_flow(statement_text: str, records: list, witness: dict[str, 
                 "error_class": "PipelineTimeoutError",
             },
         )
-        st.error(f"Evaluation aborted: {format_error_for_user(timeout_exc, rid)}")
+        pilot.display(f"Evaluation aborted: {format_error_for_user(timeout_exc, rid)}", container=st, method="error")
         render_failure_detail(rid)
         return
     except Exception as exc:  # noqa: BLE001
@@ -441,7 +443,7 @@ def _run_evaluation_flow(statement_text: str, records: list, witness: dict[str, 
             record_files=_audit_files,
             record_pages=_audit_pages,
         )
-        st.error(f"Evaluation failed: {format_error_for_user(exc, rid)}")
+        pilot.display(f"Evaluation failed: {format_error_for_user(exc, rid)}", container=st, method="error")
         render_failure_detail(rid)
         return
     except BaseException as ctrl:  # noqa: BLE001 - Streamlit control flow (see comment)
@@ -585,7 +587,7 @@ def _run_evaluation_queued(
             "evaluate", "rejected", request_id=rid,
             error=config_error, reason="worker_key_missing",
         )
-        st.error(config_error)
+        pilot.display(config_error, container=st, method="error")
         return
     _sources, _files, _pages = audit_record_meta("eval", records)
     _condition = audit_condition_for_slot("eval")
@@ -606,7 +608,7 @@ def _run_evaluation_queued(
         action_label="Evaluation",
     )
     if outcome is not None and outcome.ok:
-        st.success(f"Evaluation complete — reference `{rid}`.")
+        pilot.display(f"Evaluation complete — reference `{rid}`.", container=st, method="success")
 
 
 def _result_reference() -> str:
@@ -652,23 +654,23 @@ def _render_pdf_export(statement_text: str, *, entry_point: str) -> None:
     try:
         pdf_bytes = generate_statement_pdf(statement_text, condition, witness_role="")
     except Exception as exc:  # noqa: BLE001 - PDF generation is best-effort in the UI
-        st.error(
+        pilot.display(
             report_failure(
                 f"Could not generate the PDF export: {exc}",
                 phase="evaluate_pdf_export",
                 exc=exc,
             )
-        )
+        , container=st, method="error")
         return
 
     has_placeholders = detect_unconfirmed_placeholders(statement_text)
-    clicked = st.download_button(
+    clicked = pilot.file_download(
         "📄 Export final statement as PDF",
         data=pdf_bytes,
         file_name="VA_Statement.pdf",
         mime="application/pdf",
         key=f"pdf_export_button_{entry_point}",
-    )
+     container=st)
     if clicked:
         try:
             track_interaction(
@@ -724,11 +726,11 @@ def _render_evidence_dashboard(eval_result: Any) -> None:
         st.session_state[impression_key] = True
 
     with st.expander("📊 Evidence strength dashboard", expanded=True):
-        st.caption(
+        pilot.display(
             "Claims grouped by the type of medical record most likely to confirm them, "
             "with verdict counts from the verification step above. Hover a bar segment "
             "for the exact count and percentage of that record type."
-        )
+        , container=st, method="caption")
         chart_df = pd.DataFrame(dashboard).T.reindex(columns=list(VERDICTS)).fillna(0).astype(int)
         st.bar_chart(chart_df, horizontal=True)
 
@@ -770,7 +772,7 @@ def _render_evidence_dashboard(eval_result: Any) -> None:
             + f". **{weakest_type}** evidence is the weakest category — consider requesting "
             "or reviewing additional records in that area."
         )
-        st.write(summary)
+        pilot.display(summary, container=st, method="write")
 
         try:
             track_interaction(
@@ -834,13 +836,13 @@ def _render_fact_export_section(eval_result: Any) -> None:
         st.session_state[impression_key] = True
 
     with st.expander("📑 Medical record digest — export fact citations", expanded=False):
-        st.caption(
+        pilot.display(
             f"{len(digest.facts):,} facts extracted from {digest.pages_reviewed:,} pages "
             f"({digest.chunks_reviewed} chunk(s), {digest.duplicates_skipped} duplicate "
             "page(s) skipped)."
-        )
+        , container=st, method="caption")
         if digest.summary:
-            st.write(digest.summary)
+            pilot.display(digest.summary, container=st, method="write")
 
         only_rubric = st.checkbox(
             "Only show facts cited in rubric verification",
@@ -901,7 +903,7 @@ def _render_fact_export_section(eval_result: Any) -> None:
                 )
             )
             if errors:
-                st.error("Some export formats could not be generated: " + "; ".join(errors))
+                pilot.display("Some export formats could not be generated: " + "; ".join(errors), container=st, method="error")
             if generated:
                 try:
                     track_goal(
@@ -912,7 +914,7 @@ def _render_fact_export_section(eval_result: Any) -> None:
                     )
                 except Exception:  # noqa: BLE001 - telemetry must never break the UI
                     pass
-                st.success(f"Generated export files for {filtered_count} fact row(s).")
+                pilot.display(f"Generated export files for {filtered_count} fact row(s).", container=st, method="success")
 
         files_any: Any = st.session_state.get("export_facts_files")
         files: dict[str, bytes] = files_any if isinstance(files_any, dict) else {}
@@ -928,13 +930,13 @@ def _render_fact_export_section(eval_result: Any) -> None:
                 if data is None:
                     continue
                 label, mime, filename = labels[fmt]
-                clicked = col.download_button(
+                clicked = pilot.file_download(
                     label,
                     data=data,
                     file_name=filename,
                     mime=mime,
                     key=f"export_facts_download_{fmt}",
-                )
+                 container=col)
                 if clicked:
                     try:
                         track_interaction(
@@ -1007,11 +1009,11 @@ def _build_timeline_figure(
 def _render_timeline_event_details(event: dict[str, Any]) -> None:
     """Render the full fact text + source citation for a clicked timeline event."""
     with st.container(border=True):
-        st.markdown(f"**{event.get('date_label', 'unknown')} — {event.get('type', '')}**")
-        st.write(event.get("description", "") or "(no description)")
+        pilot.display(f"**{event.get('date_label', 'unknown')} — {event.get('type', '')}**", container=st, method="markdown")
+        pilot.display(event.get("description", "") or "(no description)", container=st, method="write")
         if event.get("quote"):
-            st.caption(f"“{event['quote']}”")
-        st.caption(f"Source: {event.get('source', 'unknown')}")
+            pilot.display(f"“{event['quote']}”", container=st, method="caption")
+        pilot.display(f"Source: {event.get('source', 'unknown')}", container=st, method="caption")
 
 
 def _render_medical_timeline(eval_result: Any, *, request_reference: str) -> None:
@@ -1033,7 +1035,9 @@ def _render_medical_timeline(eval_result: Any, *, request_reference: str) -> Non
     cached_reference = st.session_state.get("timeline_request_id")
     if st.session_state.get("timeline_data") is None or cached_reference != request_reference:
         try:
-            llm = get_llm()
+            # Pilot dates must remain source-derived; optional date inference
+            # would also run outside the bounded analysis action.
+            llm = None if pilot.enabled() else get_llm()
         except Exception:  # noqa: BLE001 - LLM date-inference fallback is optional
             llm = None
         st.session_state["timeline_data"] = build_timeline_data(
@@ -1059,11 +1063,11 @@ def _render_medical_timeline(eval_result: Any, *, request_reference: str) -> Non
         st.session_state[impression_key] = True
 
     with st.expander("🗓️ Medical event timeline", expanded=True):
-        st.caption(
+        pilot.display(
             f"{len(events)} event(s) — {timeline_data.get('dated_count', 0)} dated, "
             f"{timeline_data.get('undated_count', 0)} undated. "
             f"{timeline_data.get('gap_count', 0)} gap period(s) with no records detected."
-        )
+        , container=st, method="caption")
 
         filter_choice = st.radio(
             "Filter events",
@@ -1086,7 +1090,7 @@ def _render_medical_timeline(eval_result: Any, *, request_reference: str) -> Non
         )
 
         if not filtered:
-            st.info("No events match this filter.")
+            pilot.display("No events match this filter.", container=st, method="info")
             return
 
         undated_in_view = [e for e in filtered if not e.get("date_iso")]
@@ -1118,21 +1122,21 @@ def _render_medical_timeline(eval_result: Any, *, request_reference: str) -> Non
                     track_feature_error(TIMELINE_FEATURE_ID, exc, phase="chart_render")
                 except Exception:  # noqa: BLE001 - telemetry must never break the UI
                     pass
-                st.info(
+                pilot.display(
                     "The interactive timeline chart is unavailable — use the event "
                     "list below instead."
-                )
+                , container=st, method="info")
 
         if undated_in_view:
-            st.caption(f"{len(undated_in_view)} undated event(s) — select below to view details.")
+            pilot.display(f"{len(undated_in_view)} undated event(s) — select below to view details.", container=st, method="caption")
 
         options = list(range(len(filtered)))
         selected_idx = st.selectbox(
             "Or choose an event from the list",
             options=options,
             format_func=lambda i: (
-                f"{filtered[i].get('date_label', 'unknown')} — "
-                f"{filtered[i].get('type', '')}: {filtered[i].get('description', '')[:80]}"
+                pilot.text_label(f"{filtered[i].get('date_label', 'unknown')} — "
+                f"{filtered[i].get('type', '')}: {filtered[i].get('description', '')[:80]}")
             ),
             key=f"timeline_event_select_{selected_filter}",
             index=None,
@@ -1181,7 +1185,7 @@ def _render_effectiveness_score(eval_result: Any) -> None:
     if not recommendations:
         return
 
-    st.markdown("**Top improvement recommendations (ranked by estimated impact):**")
+    pilot.display("**Top improvement recommendations (ranked by estimated impact):**", container=st, method="markdown")
     claims = getattr(eval_result, "claims", None) or []
     claim_text = {c.get("id"): c.get("text", "") for c in claims}
     for index, rec in enumerate(recommendations, start=1):
@@ -1189,8 +1193,8 @@ def _render_effectiveness_score(eval_result: Any) -> None:
         impact = str(rec.get("impact", ""))
         explanation = str(rec.get("explanation", ""))
         claim_id = rec.get("claim_id")
-        st.markdown(f"**{index}. {title}** _{impact}_")
-        st.caption(explanation)
+        pilot.display(f"**{index}. {title}** _{impact}_", container=st, method="markdown")
+        pilot.display(explanation, container=st, method="caption")
         has_matching_claim = claim_id is not None and claim_id in claim_text
         action_label = (
             f"🔍 Jump to claim #{claim_id}" if has_matching_claim else "✏️ Apply to rewrite"
@@ -1212,11 +1216,11 @@ def _render_effectiveness_score(eval_result: Any) -> None:
             except Exception:  # noqa: BLE001 - telemetry must never break the UI
                 pass
             if has_matching_claim:
-                st.info(f"📍 Claim #{claim_id}: {claim_text.get(claim_id, '')}")
+                pilot.display(f"📍 Claim #{claim_id}: {claim_text.get(claim_id, '')}", container=st, method="info")
             else:
-                st.info(
+                pilot.display(
                     "✏️ Marked for rewrite — see 'Suggested improvements — proposed rewrite' below."
-                )
+                , container=st, method="info")
 
 
 def _render_record_coverage(eval_result: Any) -> None:
@@ -1246,12 +1250,12 @@ def _render_record_coverage(eval_result: Any) -> None:
         "🧾 Record coverage & citation check",
         expanded=bool(digest.unreadable_pages or gaps),
     ):
-        st.caption(
+        pilot.display(
             "What the uploaded files contained, what the review actually read, and whether "
             "each citation's quote was found on the page it names."
-        )
+        , container=st, method="caption")
         for line in coverage_lines(digest):
-            st.markdown(line)
+            pilot.display(line, container=st, method="markdown")
         if digest.files:
             st.dataframe(digest.files, width="stretch", hide_index=True)
         if digest.duplicate_pages:
@@ -1260,14 +1264,14 @@ def _render_record_coverage(eval_result: Any) -> None:
                 for row in digest.duplicate_pages[:8]
             )
             more = " …" if len(digest.duplicate_pages) > 8 else ""
-            st.caption(f"Pages skipped as duplicates: {shown}{more}")
+            pilot.display(f"Pages skipped as duplicates: {shown}{more}", container=st, method="caption")
         if gaps:
-            st.warning(
+            pilot.display(
                 "These claims had no matching text in the uploaded records, so nothing could "
                 "be checked against them. That is a record-coverage gap, not a contradiction:"
-            )
+            , container=st, method="warning")
             for gap in gaps:
-                st.write(f"- {gap.get('claim', '')}")
+                pilot.display(f"- {gap.get('claim', '')}", container=st, method="write")
 
 
 def _case_topic_letters(eval_result: Any) -> list[str]:
@@ -1321,36 +1325,36 @@ def _render_framework_currency_flags(eval_result: Any) -> None:
     flag = currency.case_currency_flag(letters, ttl_days=_framework_currency_ttl_days())
 
     if flag.stale:
-        st.warning(
+        pilot.display(
             "⚠️ **These checklist topics have changed under current VA law.** This run's "
             "guidance on them rests on committed text that no longer matches the sources "
             "the app cites, so treat it as unreliable — verify the topics in the Research "
             "tab, and see app/knowledge/ before revising a statement from them:"
-        )
+        , container=st, method="warning")
         for verdict in flag.stale:
             suffix = f" — {verdict.authority}" if verdict.authority else ""
-            st.markdown(f"- **{verdict.topic} — {verdict.label}:** {verdict.note}{suffix}")
+            pilot.display(f"- **{verdict.topic} — {verdict.label}:** {verdict.note}{suffix}", container=st, method="markdown")
 
     if flag.unconfirmed:
-        st.info(
+        pilot.display(
             "❓ **Could not be confirmed as current** (the check found conflicting sources "
             "or could not confirm): "
             + ", ".join(f"{v.topic} — {v.label}" for v in flag.unconfirmed)
-        )
+        , container=st, method="info")
 
     if flag.verified:
         checked = flag.report.checked_at[:10] if flag.report is not None else ""
-        st.caption(
+        pilot.display(
             f"Checklist currency verified for this run's topics on {checked}. "
-            "Verification covers the committed checklist and legal framework, not the "
+            "Verification covers the checked checklist topics only, not the full legal framework or the "
             "statement's facts."
-        )
+        , container=st, method="caption")
     elif not flag.stale and not flag.unconfirmed:
-        st.caption(
+        pilot.display(
             "Checklist currency has not been verified for these topics, so nothing here "
             "confirms the app's committed framework is still current. "
             "See the Research tab → Framework currency."
-        )
+        , container=st, method="caption")
 
 
 def _render_evaluation_results(eval_result: Any) -> None:
@@ -1360,30 +1364,30 @@ def _render_evaluation_results(eval_result: Any) -> None:
     if rid:
         # The panel is cached for the whole session, so say which run it came
         # from: otherwise any rerun makes an old report look like a fresh run.
-        st.caption(
+        pilot.display(
             f"Results for reference `{rid}` — the last completed run in this session. "
             "Each new run mints a new reference (see About → Recent run log)."
-        )
+        , container=st, method="caption")
 
     if _is_empty_analysis(eval_result):
-        st.error(
+        pilot.display(
             "This run returned no usable analysis: 0 claims extracted, no rubric "
             "scores, and no rewrite. The model or endpoint accepted the request but "
             "returned empty output."
             + (f" Reference: {rid}." if rid else "")
             + " Check the sidebar model names and base URL (About → Recent run log "
             "shows the LLM call count for this run), then re-run."
-        )
+        , container=st, method="error")
         # A run that returned nothing usable is still a failed run: the reference
         # is in the message, so the lines it points at belong beside it too.
         if rid:
             render_failure_detail(rid)
 
     if getattr(eval_result, "truncation_warning", ""):
-        st.warning(
+        pilot.display(
             f"⚠️ {eval_result.truncation_warning} (input was {eval_result.input_chars:,} chars; "
             f"{eval_result.truncated_chars:,} truncated). Review the report header for details."
-        )
+        , container=st, method="warning")
 
     st.divider()
     _render_record_coverage(eval_result)
@@ -1405,7 +1409,7 @@ def _render_evaluation_results(eval_result: Any) -> None:
     )
 
     with st.expander("Executive summary", expanded=True):
-        st.write(eval_result.executive_summary)
+        pilot.display(eval_result.executive_summary, container=st, method="write")
 
     with st.expander("Claim-by-claim verification table", expanded=True):
         rows = []
@@ -1443,7 +1447,7 @@ def _render_evaluation_results(eval_result: Any) -> None:
             "🧭 Topic coverage — what the statement does and does not address", expanded=True
         ):
             if eval_result.topic_focus:
-                st.write(f"**Claim focus:** {eval_result.topic_focus}")
+                pilot.display(f"**Claim focus:** {eval_result.topic_focus}", container=st, method="write")
             topic_table = [
                 {
                     "Topic": t.get("topic", ""),
@@ -1460,13 +1464,13 @@ def _render_evaluation_results(eval_result: Any) -> None:
             # the reader acts on the gaps rather than as a footnote.
             _render_framework_currency_flags(eval_result)
             if eval_result.topic_critical_gaps:
-                st.warning(
+                pilot.display(
                     "**Critical gaps — the highest-impact topics this statement still misses:**"
-                )
+                , container=st, method="warning")
                 for gap in eval_result.topic_critical_gaps:
-                    st.write(f"- {gap}")
+                    pilot.display(f"- {gap}", container=st, method="write")
             if eval_result.topic_notes:
-                st.caption(eval_result.topic_notes)
+                pilot.display(eval_result.topic_notes, container=st, method="caption")
 
     render_follow_up_questions(
         slot="eval",
@@ -1481,21 +1485,21 @@ def _render_evaluation_results(eval_result: Any) -> None:
 
     with st.expander("Improvements & record facts to add", expanded=True):
         for imp in eval_result.improvements:
-            st.markdown(f"**{imp.get('priority', '?')}. {imp.get('problem', '')}**")
-            st.write(imp.get("suggestion", ""))
+            pilot.display(f"**{imp.get('priority', '?')}. {imp.get('problem', '')}**", container=st, method="markdown")
+            pilot.display(imp.get("suggestion", ""), container=st, method="write")
             if imp.get("example_rewrite"):
-                st.caption(f"Example: “{imp.get('example_rewrite')}”")
+                pilot.display(f"Example: “{imp.get('example_rewrite')}”", container=st, method="caption")
         if eval_result.omitted_record_facts:
-            st.markdown("**Facts from the records you could add (verify first):**")
+            pilot.display("**Facts from the records you could add (verify first):**", container=st, method="markdown")
             for fact_dict in eval_result.omitted_record_facts:
-                st.write(
+                pilot.display(
                     f"- {fact_dict.get('fact', '')} _(source: {fact_dict.get('source', '')})_"
-                )
+                , container=st, method="write")
 
     if eval_result.revised_statement or eval_result.revision_changes:
         with st.expander("📝 Suggested improvements — proposed rewrite", expanded=True):
             if eval_result.revision_notes:
-                st.info(eval_result.revision_notes)
+                pilot.display(eval_result.revision_notes, container=st, method="info")
             if eval_result.revision_changes:
                 change_rows = [
                     {
@@ -1508,45 +1512,49 @@ def _render_evaluation_results(eval_result: Any) -> None:
                 ]
                 st.dataframe(change_rows, width="stretch", hide_index=True)
             if eval_result.added_facts_to_verify:
-                st.markdown(
+                pilot.display(
                     "**Record-sourced facts added — the witness must confirm each before signing:**"
-                )
+                , container=st, method="markdown")
                 for fact_str in eval_result.added_facts_to_verify:
-                    st.write(f"- {fact_str}")
-            st.markdown("#### Revised statement")
-            st.caption(
-                "Contradictions have been corrected to match the medical records. Resolve every "
+                    pilot.display(f"- {fact_str}", container=st, method="write")
+            pilot.display("#### Revised statement", container=st, method="markdown")
+            pilot.display(
+                "AI revisions require source and witness review. Resolve every "
                 "[Confirm: ...] placeholder with the witness before signing."
-            )
+            , container=st, method="caption")
             revised = st.text_area(
                 "Revised statement (editable)",
                 value=eval_result.revised_statement,
                 height=420,
                 key="eval_revised_statement",
             )
+            export_confirmed = pilot.confirm_export(revised)
             col_a, col_b = st.columns(2)
-            col_a.download_button(
+            pilot.file_download(
                 "⬇️ Download revised statement (.txt)",
                 data=revised.encode("utf-8"),
+                disabled=not export_confirmed,
                 file_name="lay_statement_revised.txt",
                 mime="text/plain",
-            )
-            col_b.download_button(
+             container=col_a)
+            pilot.file_download(
                 "⬇️ Download revised statement (.md)",
                 data=revised.encode("utf-8"),
+                disabled=not export_confirmed,
                 file_name="lay_statement_revised.md",
                 mime="text/markdown",
-            )
-            _render_pdf_export(revised, entry_point="evaluate")
+             container=col_b)
+            if export_confirmed:
+                _render_pdf_export(revised, entry_point="evaluate")
 
     _render_fact_export_section(eval_result)
     _render_medical_timeline(eval_result, request_reference=_result_reference())
 
     with st.expander("Full markdown report"):
-        st.markdown(eval_result.report_markdown)
-    st.download_button(
+        pilot.display(eval_result.report_markdown, container=st, method="markdown")
+    pilot.file_download(
         "⬇️ Download evaluation report (.md)",
         data=eval_result.report_markdown.encode("utf-8"),
         file_name="lay_statement_evaluation.md",
         mime="text/markdown",
-    )
+     container=st)

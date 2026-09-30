@@ -93,6 +93,7 @@ class JobRecord:
     job_id: str
     kind: str
     request_id: str = ""
+    owner_id: str = ""
     status: str = STATUS_QUEUED
     progress: float = 0.0
     message: str = ""
@@ -183,7 +184,7 @@ class JobBackend:
     # reading the backlog is safe on the liveness path.
     depth_is_remote = True
 
-    def enqueue(self, kind: str, payload: str, *, request_id: str = "") -> JobRecord:
+    def enqueue(self, kind: str, payload: str, *, request_id: str = "", owner_id: str = "") -> JobRecord:
         raise NotImplementedError
 
     def claim(
@@ -308,13 +309,14 @@ class InProcessJobBackend(JobBackend):
         self.name = name
 
     # -- producer -----------------------------------------------------------
-    def enqueue(self, kind: str, payload: str, *, request_id: str = "") -> JobRecord:
+    def enqueue(self, kind: str, payload: str, *, request_id: str = "", owner_id: str = "") -> JobRecord:
         if kind not in KINDS:
             raise JobQueueError(f"unknown job kind: {kind}")
         record = JobRecord(
             job_id=new_job_id(),
             kind=kind,
             request_id=request_id,
+            owner_id=owner_id,
             created_at=_now(),
             updated_at=_now(),
         )
@@ -790,13 +792,14 @@ class RedisJobBackend(_AtomicJobBackend):
             return self._client.execute_command(*args)
 
     # -- producer -----------------------------------------------------------
-    def enqueue(self, kind: str, payload: str, *, request_id: str = "") -> JobRecord:
+    def enqueue(self, kind: str, payload: str, *, request_id: str = "", owner_id: str = "") -> JobRecord:
         if kind not in KINDS:
             raise JobQueueError(f"unknown job kind: {kind}")
         record = JobRecord(
             job_id=new_job_id(),
             kind=kind,
             request_id=request_id,
+            owner_id=owner_id,
             created_at=_now(),
             updated_at=_now(),
         )
@@ -921,13 +924,14 @@ class UpstashJobBackend(_AtomicJobBackend):
         return JobRecord.from_json(raw if isinstance(raw, str) else None)
 
     # -- producer -----------------------------------------------------------
-    def enqueue(self, kind: str, payload: str, *, request_id: str = "") -> JobRecord:
+    def enqueue(self, kind: str, payload: str, *, request_id: str = "", owner_id: str = "") -> JobRecord:
         if kind not in KINDS:
             raise JobQueueError(f"unknown job kind: {kind}")
         record = JobRecord(
             job_id=new_job_id(),
             kind=kind,
             request_id=request_id,
+            owner_id=owner_id,
             created_at=_now(),
             updated_at=_now(),
         )

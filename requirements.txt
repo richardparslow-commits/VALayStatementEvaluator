@@ -1,4 +1,4 @@
-streamlit>=1.62
+streamlit[auth]>=1.62
 watchdog>=2.1.5,<7
 openai>=3.0
 pypdf>=6.0
@@ -29,3 +29,6 @@ redis>=5.0
 # controls. Adding it pulls httpx into the lock; that is safe alongside the
 # httpx2 fork because they provide different import names (httpx vs httpx2).
 perplexityai>=0.43
+
+# Native OIDC login in the controlled pilot.
+Authlib>=1.8.0

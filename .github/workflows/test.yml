@@ -496,6 +496,22 @@ jobs:
   # so this builds the stage and nothing else: no registry credentials, nothing pushed,
   # safe on every event. A weekly tick included, because what it catches is a release
   # (python:3.12-slim and tesseract-ocr move) rather than a commit.
+  runtime-image:
+    name: Build and check the non-root runtime image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Build the default production image
+        run: docker build -t va-lse-runtime:ci .
+      - name: Check runtime user and backup entrypoints
+        run: >-
+          docker run --rm va-lse-runtime:ci python -c
+          "import os, pathlib, subprocess; assert os.getuid() != 0;
+          assert pathlib.Path('scripts/restore_audit_logs.py').is_file();
+          subprocess.run(['python', 'scripts/backup_audit_logs.py', '--status'], check=True)"
+
   sandbox-image:
     name: Build the sandbox image stage
     runs-on: ubuntu-latest

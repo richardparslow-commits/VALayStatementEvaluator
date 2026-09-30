@@ -10,6 +10,8 @@ quiet note rather than an exception.
 """
 from __future__ import annotations
 
+from .. import pilot
+
 import json
 from datetime import datetime, timezone
 from typing import Any
@@ -60,6 +62,8 @@ def _event_row(event: dict[str, Any]) -> dict[str, str]:
 
 def render_run_log_tail(limit: int = _RUN_LOG_LIMIT) -> None:
     """Show the latest run-log events (newest last, like the file itself)."""
+    if not pilot.operator_allowed():
+        return
     path = _resolve_log_path()
     events: list[dict[str, Any]] = []
     available = True
@@ -74,20 +78,20 @@ def render_run_log_tail(limit: int = _RUN_LOG_LIMIT) -> None:
         available = False
 
     if not available:
-        st.caption("Run log is unavailable (disabled or not writable on this host).")
+        pilot.display("Run log is unavailable (disabled or not writable on this host).", container=st, method="caption")
         return
     if not events:
-        st.caption(
+        pilot.display(
             "No runs recorded yet — events appear here after the first Evaluate or Draft run."
-        )
+        , container=st, method="caption")
         return
 
     error_count = sum(1 for e in events if str(e.get("status")) in {"error", "timeout"})
-    st.caption(
+    pilot.display(
         f"Last {len(events)} run-log event(s) from `{path}` — newest last. "
         f"{error_count} failure(s) in this window. "
         "Full detail: `grep <request-id> logs/runs.jsonl`."
-    )
+    , container=st, method="caption")
     st.dataframe(
         [_event_row(e) for e in events],
         width="stretch",
@@ -130,10 +134,12 @@ def render_failure_detail(reference: str, *, label: str = "What happened?") -> N
     step they should not have to take. A run executed by a worker is covered too,
     because the lookup reads the shared run log as well as this process's buffer.
     """
+    if not pilot.operator_allowed():
+        return
     if not is_reference(reference):
         return
     detail = _cached_detail(reference)
-    with st.expander(label, expanded=False):
+    with st.expander(pilot.text_label(label), expanded=False):
         if detail.lines:
             st.code("\n".join(detail.lines), language=None)
         if detail.events:
@@ -143,12 +149,12 @@ def render_failure_detail(reference: str, *, label: str = "What happened?") -> N
                 hide_index=True,
             )
         if detail.note:
-            st.caption(detail.note)
-        st.caption(
+            pilot.display(detail.note, container=st, method="caption")
+        pilot.display(
             f"Reference `{detail.reference}` — secrets are redacted above, and "
             "**About → 🔎 Look up a reference** searches the shared run log for any "
             "other reference."
-        )
+        , container=st, method="caption")
 
 
 __all__ = ["render_failure_detail", "render_run_log_tail"]

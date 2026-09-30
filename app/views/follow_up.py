@@ -1,6 +1,8 @@
 """Shared follow-up question helpers for Evaluate and Draft results."""
 from __future__ import annotations
 
+from .. import pilot
+
 from typing import Any
 
 import streamlit as st
@@ -88,32 +90,32 @@ def render_follow_up_questions(
     with st.expander("🤖 Automated follow-up question generator", expanded=bool(questions)):
         notice = _clean_text(st.session_state.get(_key(slot, "notice"), ""))
         if notice:
-            st.success(notice)
+            pilot.display(notice, container=st, method="success")
 
         if not questions:
-            st.info(empty_message)
+            pilot.display(empty_message, container=st, method="info")
             return
 
         if saved:
-            st.caption(
+            pilot.display(
                 f"{len(saved)} accepted answer(s) will be included automatically in the next "
                 f"{next_run_label} run."
-            )
+            , container=st, method="caption")
             for item in saved:
                 topic = _clean_text(item.get("topic")) or "Follow-up"
                 answer = _clean_text(item.get("answer"))
-                st.write(f"- **{topic}** — {answer}")
+                pilot.display(f"- **{topic}** — {answer}", container=st, method="write")
         elif applied_saved:
-            st.caption(
+            pilot.display(
                 f"{len(applied_saved)} accepted answer(s) were already included in the most recent "
                 f"{next_run_label} run."
-            )
+            , container=st, method="caption")
             for item in applied_saved:
                 topic = _clean_text(item.get("topic")) or "Follow-up"
                 answer = _clean_text(item.get("answer"))
-                st.write(f"- **{topic}** — {answer}")
+                pilot.display(f"- **{topic}** — {answer}", container=st, method="write")
         if applied_skipped and not skipped:
-            st.caption(f"Previously skipped questions in the last cycle: {len(applied_skipped)}")
+            pilot.display(f"Previously skipped questions in the last cycle: {len(applied_skipped)}", container=st, method="caption")
         if saved or skipped or applied_saved or applied_skipped:
             if st.button(
                 "Clear saved follow-up answers and skipped questions",
@@ -129,12 +131,12 @@ def render_follow_up_questions(
 
         if index >= len(questions):
             if skipped:
-                st.caption(f"Skipped questions: {len(skipped)}")
-            st.success("You have reviewed every generated follow-up question for this run.")
+                pilot.display(f"Skipped questions: {len(skipped)}", container=st, method="caption")
+            pilot.display("You have reviewed every generated follow-up question for this run.", container=st, method="success")
             return
 
         current = questions[index]
-        st.caption(f"Question {index + 1} of {len(questions)} — {current.get('topic', 'Checklist topic')}")
+        pilot.display(f"Question {index + 1} of {len(questions)} — {current.get('topic', 'Checklist topic')}", container=st, method="caption")
         with st.form(key=_key(slot, f"form_{index}")):
             question_text = st.text_area(
                 "Follow-up question (editable before asking)",
@@ -156,7 +158,7 @@ def render_follow_up_questions(
         if accept:
             cleaned_answer = _clean_text(answer_text)
             if not cleaned_answer:
-                st.warning("Enter the witness's answer before saving it, or skip this question.")
+                pilot.display("Enter the witness's answer before saving it, or skip this question.", container=st, method="warning")
                 return
             saved.append(
                 {

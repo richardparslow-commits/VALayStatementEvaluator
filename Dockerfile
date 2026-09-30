@@ -48,6 +48,7 @@ RUN pip install --no-cache-dir --require-hashes -r requirements.lock
 COPY .streamlit/config.toml ./.streamlit/config.toml
 COPY app/ ./app/
 COPY run_app.py ./
+COPY scripts/backup_audit_logs.py scripts/restore_audit_logs.py ./scripts/
 
 # Build identity: `docker build --build-arg VA_LSE_BUILD_SHA=$(git rev-parse --short HEAD)`
 # stamps the image so the About tab can answer "is this deployment current?".
@@ -209,3 +210,6 @@ ENV VA_LSE_HEALTH_HOST=127.0.0.1
 CMD ["streamlit", "run", "run_app.py", \
      "--server.address=0.0.0.0", \
      "--server.headless=true"]
+
+# Default builds must produce the non-root application, not the dev sandbox.
+FROM runtime AS production

@@ -101,11 +101,7 @@ def _sanitize_error_message(error: BaseException) -> str:
     only forward the exception type plus a short, truncated message — enough
     for triage, not enough to leak substantive record content.
     """
-    message = str(error).replace("\n", " ").replace("\r", " ").strip()
-    truncated = message[:_MAX_ERROR_MESSAGE_LEN]
-    if len(message) > _MAX_ERROR_MESSAGE_LEN:
-        truncated += "…[truncated]"
-    return f"{type(error).__name__}: {truncated}" if truncated else type(error).__name__
+    return type(error).__name__
 
 
 _MAX_ERROR_STACK_LEN = 2000
@@ -120,14 +116,7 @@ def _sanitize_error_stack(error: BaseException) -> str:
     error occurred. It is still truncated defensively so a single event
     cannot balloon in size.
     """
-    try:
-        frames = traceback.format_exception(type(error), error, error.__traceback__)
-    except Exception:  # noqa: BLE001 - formatting the stack must never raise
-        return ""
-    joined = "".join(frames).replace("\r", "")
-    if len(joined) > _MAX_ERROR_STACK_LEN:
-        return joined[:_MAX_ERROR_STACK_LEN] + "…[truncated]"
-    return joined
+    return ""  # Exception chains can contain statement and record text.
 
 
 def track_feature_error(feature_id: str, error: BaseException, **attributes: Any) -> None:
@@ -171,6 +160,9 @@ def _send_event(
     `AGILOOP_PROJECT_ID` is unset; this module never reads those vars or the
     API key directly (see module docstring).
     """
+    from . import pilot
+    if pilot.enabled():
+        return
     if not _telemetry_enabled():
         logger.debug("telemetry mock mode — dropping event %s", event_type)
         return

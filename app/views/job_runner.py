@@ -18,6 +18,8 @@ cannot see.
 """
 from __future__ import annotations
 
+from .. import pilot
+
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -141,6 +143,8 @@ def _hydrate(slot: str, run: RunResult) -> None:
 
 def _fetch_outcome(backend: JobBackend, record: JobRecord, slot: str) -> QueueOutcome:
     """Turn a terminal job record into an outcome, decoding the result on success."""
+    if not pilot.owns(record):
+        return QueueOutcome(ok=False, error="Run unavailable for this session.", error_class="AccessDenied")
     request_id = record.request_id or ""
     if record.status != STATUS_DONE:
         return QueueOutcome(
@@ -207,6 +211,8 @@ def _poll(
                     "please re-run",
                     error_class="JobExpired",
                 )
+            if not pilot.owns(record):
+                return QueueOutcome(ok=False, error="Run unavailable for this session.", error_class="AccessDenied")
             last_progress = max(last_progress, record.progress)
             bar.progress(
                 min(max(last_progress, 0.0), 1.0),
@@ -231,10 +237,10 @@ def _poll(
 def _render_failure(outcome: QueueOutcome, action_label: str) -> None:
     """Show a queued run's failure (or still-running state) to the user."""
     if outcome.still_running:
-        st.info(outcome.error)
+        pilot.display(outcome.error, container=st, method="info")
         return
     reference = f" (reference: {outcome.request_id})" if outcome.request_id else ""
-    st.error(f"{action_label} failed: {outcome.error}{reference}")
+    pilot.display(f"{action_label} failed: {outcome.error}{reference}", container=st, method="error")
     # A queued run is executed by a worker, so its lines are not in this process's
     # buffer — the shared run log is what makes this one resolvable at all.
     if outcome.request_id:
@@ -306,10 +312,10 @@ def submit_job(
                 error=f"run {existing} already in progress",
                 reason="already_running",
             )
-            st.warning(
+            pilot.display(
                 "A run is already in progress for these inputs — wait for it above, or "
                 "reload this page. Only one run per tab is submitted at a time."
-            )
+            , container=st, method="warning")
             return None
 
     # The submit span is what the worker's run span hangs off: it wraps encoding
@@ -321,23 +327,23 @@ def submit_job(
             payload = _encode_payload(kind, job)
         except (PayloadError, BlobStoreError) as exc:
             run_log_event(kind, "rejected", request_id=request_id, error=str(exc), reason="payload")
-            st.error(
+            pilot.display(
                 report_failure(
                     f"{action_label} could not be queued: {exc}",
                     phase=f"{kind}_queue_payload",
                     exc=exc,
                     request_id=request_id,
                 )
-            )
+            , container=st, method="error")
             return None
         try:
-            record = backend.enqueue(kind, payload, request_id=request_id)
+            record = backend.enqueue(kind, payload, request_id=request_id, owner_id=pilot.current_owner())
         except Exception as exc:  # noqa: BLE001 - any enqueue failure must surface, not crash the tab
             run_log_event(
                 kind, "rejected", request_id=request_id,
                 error=f"{type(exc).__name__}: {exc}", reason="enqueue_failed",
             )
-            st.error(
+            pilot.display(
                 report_failure(
                     f"{action_label} could not be queued: {type(exc).__name__}: {exc}. "
                     "Check the job-queue backend (see /health) and try again.",
@@ -345,7 +351,7 @@ def submit_job(
                     exc=exc,
                     request_id=request_id,
                 )
-            )
+            , container=st, method="error")
             return None
 
     st.session_state[_pending_key(slot)] = record.job_id
@@ -362,7 +368,7 @@ def submit_job(
         kind, "queued", request_id=request_id, pages=pages, job_id=record.job_id
     )
     if condition:
-        st.caption(f"Queued as `{record.job_id}` — a worker is picking this up.")
+        pilot.display(f"Queued as `{record.job_id}` — a worker is picking this up.", container=st, method="caption")
     logger.info(
         "queued %s job job_id=%s pages=%d",
         kind,
@@ -424,17 +430,22 @@ def resume_pending_job(slot: str, *, action_label: str) -> None:
         st.session_state.pop(_pending_key(slot), None)
         st.session_state.pop(_pending_request_key(slot), None)
         return
+    if not pilot.owns(record):
+        st.session_state.pop(_pending_key(slot), None)
+        st.session_state.pop(_pending_request_key(slot), None)
+        pilot.display("Run unavailable for this session.", container=st, method="warning")
+        return None
     if record.is_terminal:
         outcome = _fetch_outcome(get_job_backend(), record, slot)
         st.session_state.pop(_pending_key(slot), None)
         if not outcome.ok:
             _render_failure(outcome, action_label)
         return
-    st.info(
+    pilot.display(
         f"A run you started earlier is still in progress on a worker "
         f"({record.progress * 100:.0f}% — {record.message or 'running'}). "
         f"Reference: `{record.request_id or job_id}`."
-    )
+    , container=st, method="info")
     if st.button("⏳ Wait for it to finish", key=f"resume_{slot}"):
         outcome = _poll(
             get_job_backend(),
@@ -472,11 +483,11 @@ def recover_job_by_request_id(
         return None
     job_id = _resolve_job_by_request_id(request_id)
     if job_id is None:
-        st.warning(
+        pilot.display(
             f"No queued job found for reference `{request_id}` — it may have expired "
             f"(results live for {config.JOB_QUEUE_TTL_SECONDS // 3600}h) or the reference "
             f"may be from a different deployment."
-        )
+        , container=st, method="warning")
         return None
     st.session_state[_pending_key(slot)] = job_id
     st.session_state[_pending_request_key(slot)] = request_id
@@ -486,6 +497,11 @@ def recover_job_by_request_id(
         return None
     if record is None:
         st.session_state.pop(_pending_key(slot), None)
+        return None
+    if not pilot.owns(record):
+        st.session_state.pop(_pending_key(slot), None)
+        st.session_state.pop(_pending_request_key(slot), None)
+        pilot.display("Run unavailable for this session.", container=st, method="warning")
         return None
     if record.is_terminal:
         outcome = _fetch_outcome(get_job_backend(), record, slot)
@@ -525,10 +541,10 @@ def render_recovery_form(slot: str, *, action_label: str) -> None:
         return
 
     with st.expander("🔍 Recover a previous run", expanded=False):
-        st.caption(
+        pilot.display(
             "Lost your browser tab or restarted? Paste the reference you saved "
             "(it looks like `req_abc123…`) to recover your completed run."
-        )
+        , container=st, method="caption")
         ref = st.text_input(
             "Run reference (req_…)",
             key=f"recover_{slot}_ref",

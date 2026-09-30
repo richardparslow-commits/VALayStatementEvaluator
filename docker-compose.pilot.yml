@@ -1,0 +1,55 @@
+# Single-instance invite-only pilot. Complete PILOT.md before starting.
+services:
+  streamlit-web:
+    build:
+      context: .
+      target: runtime
+      args:
+        VA_LSE_BUILD_SHA: ${VA_LSE_BUILD_SHA:?Set the reviewed immutable revision}
+    command: [streamlit, run, run_app.py, --server.port=8501, --server.address=0.0.0.0, --server.headless=true, --server.disconnectedSessionTTL=60]
+    env_file: ${VA_LSE_PILOT_ENV_FILE:?Set the operator environment file}
+    environment:
+      VA_LSE_MODE: controlled-pilot
+      VA_LSE_PILOT_APPROVAL_FILE: /run/pilot/approval.json
+      VA_LSE_MAX_RECORD_PAGES: "500"
+      VA_LSE_JOB_QUEUE: "0"
+      VA_LSE_BLOB_STORE: none
+      VA_LSE_EXTRACTOR: isolated
+      VA_LSE_TRACING: "0"
+      VA_LSE_HEALTH_HOST: 127.0.0.1
+      VA_LSE_LOG_JSON: "1"
+      VA_LSE_LOG_DIR: /app/logs
+      VA_LSE_AUDIT_LOG_DIR: /app/logs
+    volumes:
+      - ${VA_LSE_PILOT_APPROVAL_HOST_FILE:?Set the reviewed approval file}:/run/pilot/approval.json:ro
+      - ${VA_LSE_OIDC_SECRETS_FILE:?Set the OIDC secrets file}:/app/.streamlit/secrets.toml:ro
+      - pilot-logs:/app/logs
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8001/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    mem_limit: 3g
+    cpus: 2
+    pids_limit: 128
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs:
+      - /tmp:size=256M,mode=1777
+    restart: unless-stopped
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - ${VA_LSE_BIND_IP:?Set the private ingress bind address}:443:443
+    volumes:
+      - ./nginx/pilot.conf:/etc/nginx/nginx.conf:ro
+      - ${VA_LSE_TLS_CERT:?Set the TLS certificate file}:/run/tls/cert.pem:ro
+      - ${VA_LSE_TLS_KEY:?Set the TLS private key file}:/run/tls/key.pem:ro
+    depends_on:
+      streamlit-web:
+        condition: service_healthy
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+volumes:
+  pilot-logs:

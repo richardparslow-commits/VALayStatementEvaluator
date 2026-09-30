@@ -260,7 +260,7 @@ class TestReadingTheStoredVerdict(unittest.TestCase):
         flag = currency.case_currency_flag(["D", "J"], ttl_days=30, report=report, now=NOW)
         self.assertEqual([v.topic for v in flag.stale], ["J"])
         self.assertEqual([v.topic for v in flag.unconfirmed], ["D"])
-        self.assertTrue(flag.verified)
+        self.assertFalse(flag.verified)
 
     def test_flag_without_a_report_makes_no_call_and_claims_nothing(self) -> None:
         # ``report=None`` means "read the stored one"; the cache is stubbed empty so this

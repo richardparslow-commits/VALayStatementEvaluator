@@ -19,7 +19,7 @@ from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests
 
 import streamlit as st  # noqa: E402
 
-from app import config  # noqa: E402
+from app import config, pilot  # noqa: E402
 from app.documents import document_from_text  # noqa: E402
 from app.evaluate import DIMENSION_LABELS, EvaluationResult  # noqa: E402
 from app.job_payload import (  # noqa: E402
@@ -84,8 +84,8 @@ class _PresetBackend(InProcessJobBackend):
         self._result = result if result is not None else _result_json()
         self.last_payload: str | None = None
 
-    def enqueue(self, kind: str, payload: str, *, request_id: str = ""):  # noqa: ANN201
-        record = super().enqueue(kind, payload, request_id=request_id)
+    def enqueue(self, kind: str, payload: str, *, request_id: str = "", owner_id: str = ""):  # noqa: ANN201
+        record = super().enqueue(kind, payload, request_id=request_id, owner_id=owner_id or pilot.current_owner())
         self.last_payload = payload
         claimed, _ = self.claim([kind], worker_id="w1")
         if self._finish:
@@ -124,7 +124,7 @@ class TestQueueModeDetection(unittest.TestCase):
 
     def test_status_line_describes_the_backend(self):
         backend = _PresetBackend()
-        backend.enqueue(KIND_EVALUATE, "{}")
+        backend.enqueue(KIND_EVALUATE, "{}", owner_id=pilot.current_owner())
         with patch.object(job_runner, "get_job_backend", return_value=backend):
             line = job_runner.queue_status_line()
         self.assertIn("preset", line)
@@ -193,7 +193,7 @@ class TestSubmitAndPoll(unittest.TestCase):
 
     def test_failed_job_reports_the_worker_error(self):
         backend = _PresetBackend(finish=False)
-        record = backend.enqueue(KIND_EVALUATE, encode_job(KIND_EVALUATE, _job()))
+        record = backend.enqueue(KIND_EVALUATE, encode_job(KIND_EVALUATE, _job()), owner_id=pilot.current_owner())
         backend.fail(record.job_id, claim_token=record.claim_token, error="LLMError: endpoint down", error_class="LLMError")
 
         with patch.object(job_runner, "get_job_backend", return_value=backend), patch.object(
@@ -270,7 +270,7 @@ class TestSubmitAndPoll(unittest.TestCase):
     def test_second_submission_is_refused_while_one_is_running(self):
         """Guard against queuing a duplicate digest after giving up on a slow run."""
         backend = _PresetBackend(finish=False)
-        first = backend.enqueue(KIND_EVALUATE, encode_job(KIND_EVALUATE, _job()))
+        first = backend.enqueue(KIND_EVALUATE, encode_job(KIND_EVALUATE, _job()), owner_id=pilot.current_owner())
         st.session_state["va_lse_pending_job_eval"] = first.job_id
 
         outcome = self._submit(backend)
@@ -285,7 +285,7 @@ class TestSubmitAndPoll(unittest.TestCase):
         outcome = self._submit(backend)
         self.assertTrue(outcome.ok)
         # A stale marker for a *finished* job must not lock the tab.
-        record = backend.enqueue(KIND_EVALUATE, encode_job(KIND_EVALUATE, _job()))
+        record = backend.enqueue(KIND_EVALUATE, encode_job(KIND_EVALUATE, _job()), owner_id=pilot.current_owner())
         st.session_state["va_lse_pending_job_eval"] = record.job_id
         self.assertTrue(self._submit(backend).ok)
 
@@ -381,7 +381,7 @@ class TestResume(unittest.TestCase):
 
     def test_finished_job_is_hydrated_on_resume(self):
         backend = _PresetBackend()
-        record = backend.enqueue(KIND_EVALUATE, encode_job(KIND_EVALUATE, _job()))
+        record = backend.enqueue(KIND_EVALUATE, encode_job(KIND_EVALUATE, _job()), owner_id=pilot.current_owner())
         st.session_state["va_lse_pending_job_eval"] = record.job_id
 
         with patch.object(config, "JOB_QUEUE_ENABLED", True), patch.object(
@@ -405,7 +405,7 @@ class TestResume(unittest.TestCase):
 
     def test_running_job_keeps_the_marker_and_offers_to_wait(self):
         backend = _PresetBackend(finish=False)
-        record = backend.enqueue(KIND_EVALUATE, encode_job(KIND_EVALUATE, _job()))
+        record = backend.enqueue(KIND_EVALUATE, encode_job(KIND_EVALUATE, _job()), owner_id=pilot.current_owner())
         st.session_state["va_lse_pending_job_eval"] = record.job_id
 
         with patch.object(config, "JOB_QUEUE_ENABLED", True), patch.object(
@@ -472,7 +472,7 @@ class TestRecovery(unittest.TestCase):
             KIND_EVALUATE,
             encode_job(KIND_EVALUATE, _job(request_id="req_resume_rq")),
             request_id="req_resume_rq",
-        )
+         owner_id=pilot.current_owner())
         # Claim the job so it transitions to RUNNING, then complete it.
         claimed = backend.claim([KIND_EVALUATE], worker_id="w1")
         backend.store_result(record.job_id, _result_json(request_id="req_resume_rq"),
@@ -511,7 +511,7 @@ class TestRecovery(unittest.TestCase):
             KIND_EVALUATE,
             encode_job(KIND_EVALUATE, _job(request_id="req_explicit")),
             request_id="req_explicit",
-        )
+         owner_id=pilot.current_owner())
         claimed = backend.claim([KIND_EVALUATE], worker_id="w1")
         backend.store_result(record.job_id, _result_json(request_id="req_explicit"),
                              claim_token=claimed[0].claim_token)
@@ -541,7 +541,7 @@ class TestRecovery(unittest.TestCase):
             )
         self.assertIsNone(outcome)
 
-    def test_full_session_loss_and_recovery_cycle(self):
+    def test_full_session_loss_refuses_reference_only_recovery(self):
         """Submit, simulate total session loss, then recover by request_id."""
         # The preset backend completes the job on enqueue, so the recovery phase
         # finds a terminal record instead of polling a queue with no worker.
@@ -578,7 +578,7 @@ class TestRecovery(unittest.TestCase):
             job_runner.resume_pending_job("eval", action_label="Evaluation")
         self.assertIsNone(st.session_state.get("eval_result"))
 
-        # Phase 4: Recover by request_id — succeeds
+        # Phase 4: A reference alone cannot restore ownership.
         with patch.object(config, "JOB_QUEUE_ENABLED", True), patch.object(
             job_runner, "get_job_backend", return_value=backend
         ):
@@ -586,10 +586,9 @@ class TestRecovery(unittest.TestCase):
                 "eval", request_id, action_label="Evaluation"
             )
 
-        self.assertIsNotNone(outcome)
-        self.assertTrue(outcome.ok)
-        self.assertIsNotNone(st.session_state.get("eval_result"))
-        self.assertEqual(st.session_state.get("va_lse_pending_request_eval"), request_id)
+        self.assertIsNone(outcome)
+        self.assertIsNone(st.session_state.get("eval_result"))
+        self.assertNotIn("va_lse_pending_request_eval", st.session_state)
 
     def test_recovery_index_with_distributed_backend(self):
         """Recovery index works with a preset (distributed-like) backend."""
@@ -598,7 +597,7 @@ class TestRecovery(unittest.TestCase):
             KIND_EVALUATE,
             encode_job(KIND_EVALUATE, _job(request_id="req_dist")),
             request_id="req_dist",
-        )
+         owner_id=pilot.current_owner())
         backend.set_recovery_index("req_dist", record.job_id)
         self.assertEqual(backend.lookup_by_request_id("req_dist"), record.job_id)
 

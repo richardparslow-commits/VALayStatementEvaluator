@@ -630,6 +630,9 @@ def audit_event(
         if error_message and _config.AUDIT_ERROR_MESSAGES:
             payload["error_message"] = _scrub_error_message(error_message)
 
+        from . import pilot
+        if pilot.enabled():
+            payload = {"timestamp": payload["timestamp"], **pilot.safe_metadata(payload)}
         # Emit as structured JSON — the formatter serializes ``audit_payload``.
         audit_logger.info("", extra={"audit_payload": payload})
     except Exception:  # noqa: BLE001 - audit must never break the app

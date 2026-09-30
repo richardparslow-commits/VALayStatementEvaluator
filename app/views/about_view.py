@@ -1,6 +1,8 @@
 """About/Guide tab: static explainer + knowledge-base expanders."""
 from __future__ import annotations
 
+from .. import pilot
+
 import streamlit as st
 
 from ..build_info import build_sha, build_source
@@ -24,20 +26,33 @@ def _render_build_identity() -> None:
         origin = {"environment": "from the image/deployment", "git": "from the git checkout"}.get(
             source, ""
         )
-        st.caption(f"Running build: `{sha}` {origin}")
+        pilot.display(f"Running build: `{sha}` {origin}", container=st, method="caption")
     else:
-        st.caption(
+        pilot.display(
             "Running build: **unknown** — this deployment cannot see its own commit "
             "(source upload, or an image built without `VA_LSE_BUILD_SHA`). If a "
             "recently announced feature appears missing, redeploy from `main` first."
-        )
+        , container=st, method="caption")
 
 
 def render_about_tab() -> None:
     """Render the About / Guide tab (static content, no session state)."""
     _render_build_identity()
+    if pilot.enabled():
+        st.subheader("Controlled pilot guide")
+        pilot.display("Only invited users can upload records and request analysis. Keep the source "
+                 "records and witness account open while reviewing every AI statement. "
+                 "The app blocks unknown page coverage and unverified record citations.", container=st, method="write")
+        pilot.display("Cases remain in the current session. Clear case removes working data and "
+                 "registered uploads; it cannot erase provider copies or text copied elsewhere. "
+                 "Provider retention follows the reviewed pilot notice.", container=st, method="write")
+        pilot.display("File downloads, remote fetching, research tools and worker queues are disabled. "
+                 "Copy reviewed text only to an approved destination. The tool does not certify "
+                 "legal sufficiency or the truth of a witness statement.", container=st, method="write")
+        render_run_log_tail()
+        return
     st.subheader("What this tool does")
-    st.markdown(
+    pilot.display(
         """
 **Pathway 1 — Evaluate:** Upload an already-written lay/witness statement plus the veteran's
 medical records. The app conducts an exhaustive review of the records, extracts every factual
@@ -62,24 +77,24 @@ up to a configurable cap of ~5,000 pages) are supported: chunks are digested in 
 duplicate pages are skipped automatically, and verification always searches the full digest for
 evidence relevant to each claim rather than reading only the first pages.
 """
-    )
+    , container=st, method="markdown")
     st.subheader("Legal foundation")
     with st.expander("Legal framework distilled into this tool"):
-        st.markdown(load_knowledge("legal_framework.md"))
+        pilot.display(load_knowledge("legal_framework.md"), container=st, method="markdown")
     with st.expander("Evaluation rubric"):
-        st.markdown(load_knowledge("evaluation_rubric.md"))
+        pilot.display(load_knowledge("evaluation_rubric.md"), container=st, method="markdown")
     with st.expander("Drafting guide"):
-        st.markdown(load_knowledge("drafting_guide.md"))
+        pilot.display(load_knowledge("drafting_guide.md"), container=st, method="markdown")
     with st.expander("Topic checklist"):
-        st.markdown(load_knowledge("topic_checklist.md"))
-    st.info(
+        pilot.display(load_knowledge("topic_checklist.md"), container=st, method="markdown")
+    pilot.display(
         "This tool is an educational and drafting aid. It is not legal, medical, or claims "
         "advice, and no output should be submitted without the witness personally verifying "
         "every fact. For accredited help: www.va.gov/ogc/apps/accreditation"
-    )
+    , container=st, method="info")
 
     st.subheader("If something goes wrong — error references")
-    st.markdown(
+    pilot.display(
         """
 When a run fails, the error message includes a **reference** such as
 ``(reference: req_4f8a2b1c9d0e)``. That id identifies your exact run so the
@@ -107,7 +122,7 @@ messages, because "which file failed" is usually the whole question — they are
 stored in the log exactly as the file was named. Secret-shaped strings are
 replaced with ``[redacted]`` before anything is shown here.
 """
-    )
+    , container=st, method="markdown")
 
     with st.expander("🔎 Look up a reference", expanded=False):
         _render_reference_lookup()
@@ -125,10 +140,12 @@ def _render_reference_lookup() -> None:
     ``0.0.0.0`` with no authentication, and log content should not be published to
     it. The user's own session is the authorization.
     """
-    st.caption(
+    if not pilot.operator_allowed():
+        return
+    pilot.display(
         "Paste a reference from an error message — the whole message works — to see "
         "what this app recorded for that run. Nothing is sent anywhere."
-    )
+    , container=st, method="caption")
     with st.form("diagnostics_lookup", clear_on_submit=False):
         query = st.text_input(
             "Reference",
@@ -142,34 +159,34 @@ def _render_reference_lookup() -> None:
 
     detail = lookup(query)
     if not detail.valid:
-        st.warning(detail.problem)
+        pilot.display(detail.problem, container=st, method="warning")
         return
 
-    st.markdown(f"**Reference `{detail.reference}`**")
+    pilot.display(f"**Reference `{detail.reference}`**", container=st, method="markdown")
 
     if detail.events:
-        st.markdown(
+        pilot.display(
             f"**Run-log events** ({len(detail.events)} of {detail.scanned} examined) — "
             "written by whichever process ran the job, including workers:"
-        )
+        , container=st, method="markdown")
         st.dataframe(detail.events, width="stretch", hide_index=True)
     else:
-        st.caption(
+        pilot.display(
             f"No run-log event for `{detail.reference}` in the last "
             f"{detail.scanned} event(s)."
-        )
+        , container=st, method="caption")
 
     if detail.lines:
-        st.markdown(
+        pilot.display(
             f"**Log lines** ({len(detail.lines)} from this process's last "
             f"{detail.buffered} record(s)):"
-        )
+        , container=st, method="markdown")
         st.code("\n".join(detail.lines), language=None)
     elif detail.note:
-        st.info(detail.note)
+        pilot.display(detail.note, container=st, method="info")
 
     if detail.truncated:
-        st.caption(
+        pilot.display(
             f"Showing at most {MAX_LINES} lines and {CAPTURE_LIMIT} buffered records; "
             "older detail is on the server's log files."
-        )
+        , container=st, method="caption")

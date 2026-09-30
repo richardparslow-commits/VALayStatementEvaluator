@@ -29,6 +29,8 @@ in this app.
 """
 from __future__ import annotations
 
+from .. import pilot
+
 from typing import Callable, Mapping
 
 import streamlit as st
@@ -148,15 +150,15 @@ def render_aa_intake_wizard(prefix: str, *, expanded: bool = False) -> None:
         if answered
         else "Aid & Attendance intake — 16 questions (optional, but they make the statement stronger)"
     )
-    with st.expander(label, expanded=expanded):
-        st.caption(_INTRO)
+    with st.expander(pilot.text_label(label), expanded=expanded):
+        pilot.display(_INTRO, container=st, method="caption")
 
         step_index = max(0, min(int(st.session_state.get(_step_key(prefix), 0) or 0), len(_STEPS) - 1))
         title, slugs = _STEPS[step_index]
         # Canonical question numbering across steps ("Question 6 of 16").
         offset = sum(len(s) for _, s in _STEPS[:step_index])
 
-        st.markdown(f"**Step {step_index + 1} of {len(_STEPS)} — {title}**")
+        pilot.display(f"**Step {step_index + 1} of {len(_STEPS)} — {title}**", container=st, method="markdown")
 
         form_key = f"{prefix}_aa_form_{step_index}"
         with st.form(form_key, clear_on_submit=False):
@@ -187,7 +189,7 @@ def render_aa_intake_wizard(prefix: str, *, expanded: bool = False) -> None:
                         options=("", *question.choices),
                         key=key,
                         format_func=lambda option: (
-                            "— not answered —" if option == "" else option
+                            pilot.text_label("— not answered —" if option == "" else option)
                         ),
                         help=help_text,
                     )
@@ -212,9 +214,9 @@ def render_aa_intake_wizard(prefix: str, *, expanded: bool = False) -> None:
                 on_click=_goto_step(prefix, step_index - 1),
             )
         if answered:
-            st.caption(
+            pilot.display(
                 "Answers are saved per step. Reopen any earlier step to change them."
-            )
+            , container=st, method="caption")
 
 
 def collect_aa_answers(prefix: str) -> dict[str, str]:
