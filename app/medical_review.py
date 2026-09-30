@@ -24,6 +24,7 @@ from typing import Any, Callable
 import contextvars
 import logging
 import time
+import unicodedata
 
 from . import config, tracing
 from .agiloop_telemetry import track_feature_error, track_goal
@@ -93,7 +94,10 @@ Return JSON with this exact shape:
 Rules:
 - Capture every distinct fact; do NOT summarize multiple events into one unless identical.
 - Preserve exact dates, dosages, pain scores, and proper nouns.
-- 'quote' must be a real excerpt from the chunk, <= 40 words.
+- 'quote' must be a contiguous verbatim excerpt from one cited page, 4-40 words.
+  Do not add an ellipsis, join different passages/pages, or change punctuation,
+  dates, numbers, negation or wording. If no such excerpt supports the fact,
+  leave its quote empty; it will remain unresolved for human review.
 - 'source' must name the file and page the quoted text sits under, copied from the
   nearest [file — page N] marker above it. Never answer 'chunk', 'records' or a
   bare page number: a citation that cannot be checked is useless downstream.
@@ -233,8 +237,8 @@ class MedicalDigest:
     # their warning on reload; new reviews retain evidence and leave this at zero.
     facts_dropped_by_cap: int = 0
     # Result of checking each fact's quote against the page it cites (see
-    # ``verify_citations``): the one measurement that turns "the report cites
-    # page 7" into "page 7 really says this".
+    # ``verify_citations``). A matching quote does not establish that the model's
+    # description, date or interpretation of that passage is accurate.
     citation_check: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -470,21 +474,99 @@ def _fact_from_raw(
     )
 
 
-# How many leading words of a quote are matched against the page text. A whole
-# quote can straddle a page break or contain the model's ellipsis; a long prefix
-# is enough to prove the fact came from the page it cites.
-_CITATION_PROBE_WORDS = 12
-# Quotes shorter than this cannot be checked meaningfully — four words appear on
-# hundreds of pages, so "not found on this page" would be noise.
+# Saved prefix-based checks cannot be presented as full-quote validation.
+CITATION_MATCH_POLICY = "full_quote_page_v1"
+# Very short quotes do not establish a meaningful excerpt; retain them as
+# unresolved rather than claiming their citations have been validated.
 _CITATION_MIN_PROBE_WORDS = 4
+# These prefixes can qualify clinical meaning even when OCR/editor formatting
+# substitutes a sentence dash for a hyphen. This is a conservative token-boundary
+# rule, not a clinical vocabulary or a check of the passage's interpretation.
+_CITATION_TERM_PREFIXES = frozenset({
+    "non", "un", "anti", "contra", "pre", "post", "hypo", "hyper", "pseudo",
+    "intra", "inter", "extra", "peri", "para", "sub", "supra", "infra", "super",
+    "re", "de", "dis", "mis",
+})
 
 
 def _citation_probe(quote: str) -> str:
-    """Normalized leading words of a quote, or "" when too short to check."""
-    words = re.findall(r"[a-z0-9]+", quote.lower())
+    """The entire quote, allowing Unicode case/whitespace differences."""
+    # Count space-separated words, not numeric components: a date such as
+    # 2024-01-02 is one word, not three opportunities to meet the minimum.
+    words = [word for word in quote.split() if any(char.isalnum() for char in word)]
     if len(words) < _CITATION_MIN_PROBE_WORDS:
         return ""
-    return " ".join(words[:_CITATION_PROBE_WORDS])
+    return " ".join(quote.casefold().split())
+
+
+def _citation_quote_present(quote: str, text: str) -> bool:
+    """Find a literal excerpt without splitting words or numeric values."""
+    def word_char(char: str) -> bool:
+        return bool(char) and (
+            char.isalnum() or char == "_" or unicodedata.category(char).startswith("M")
+        )
+
+    separators = ".,:/‐‑–—−-"
+    # Hyphens join terms; sentence dashes can also attach a clinical prefix.
+    lexical_joiners = "-‐‑'’/"
+    numeric_suffixes = "%％‰‱+−-°℃℉±"
+
+    def joins_term(index: int) -> bool:
+        if text[index] in lexical_joiners:
+            return True
+        if text[index] not in "–—−":
+            return False
+        prefix_start = index
+        while prefix_start > 0 and word_char(text[prefix_start - 1]):
+            prefix_start -= 1
+        return text[prefix_start:index] in _CITATION_TERM_PREFIXES
+
+    # Suffixes belong to the value: 95%, 3+, and 37°C cannot be shortened to
+    # 95, 3, or 37, nor can 37° be accepted as the complete 37°C token.
+    number_end = len(quote) - 1
+    while number_end >= 0 and quote[number_end] in numeric_suffixes:
+        number_end -= 1
+    ends_number = number_end >= 0 and quote[number_end].isdigit()
+    start = text.find(quote)
+    while start != -1:
+        end = start + len(quote)
+        before = text[start - 1] if start else ""
+        after = text[end] if end < len(text) else ""
+        before_number = start - 1
+        while before_number >= 0 and text[before_number] in numeric_suffixes:
+            before_number -= 1
+        splits_word = (
+            word_char(quote[0]) and word_char(before)
+            or word_char(quote[-1]) and word_char(after)
+            # Do not drop a lexical prefix such as non- in non-weight bearing,
+            # or split a contraction; punctuation elsewhere is still allowed.
+            or word_char(quote[0]) and bool(before) and joins_term(start - 1)
+            and start >= 2 and word_char(text[start - 2])
+            or word_char(quote[-1]) and bool(after) and joins_term(end)
+            and end + 1 < len(text) and word_char(text[end + 1])
+        )
+        # "5 mg orally daily" must not validate against "1.5 mg orally daily";
+        # likewise do not certify a prefix of a decimal, date or signed value.
+        splits_number = (
+            quote[0].isdigit() and bool(before) and (
+                before in "+-−±<>≤≥≈~="
+                or (before in separators and start >= 2 and text[start - 2].isdigit())
+            )
+            or quote[0] in separators and len(quote) > 1 and quote[1].isdigit() and before.isdigit()
+            or quote[-1].isdigit() and bool(after) and after in separators
+            and end + 1 < len(text) and text[end + 1].isdigit()
+            or quote[-1] in separators and len(quote) > 1 and quote[-2].isdigit() and after.isdigit()
+            or ends_number and bool(after) and after in numeric_suffixes
+            or ends_number and number_end != len(quote) - 1 and word_char(after)
+            or quote[0] in numeric_suffixes and before.isdigit()
+            or (word_char(quote[0]) or quote[0] in numeric_suffixes)
+            and bool(before) and before in numeric_suffixes
+            and before_number >= 0 and text[before_number].isdigit()
+        )
+        if not splits_word and not splits_number:
+            return True
+        start = text.find(quote, start + 1)
+    return False
 
 
 def verify_citations(
@@ -493,25 +575,33 @@ def verify_citations(
     """Check that each fact's quote actually occurs on the page the fact cites.
 
     The digest is produced by an LLM reading overlapping chunks, so a fact can
-    cite a page it does not appear on — the quote came from the neighbouring
-    chunk, or the model reached for a plausible page number. The check is cheap
-    because both sides are already in memory, and it is the only thing standing
-    between a citation and an assertion: a report a veteran signs should say how
-    many of its citations were actually verified.
+    cite a page it does not appear on, or preserve an authentic opening while
+    inventing the ending. Match the complete contiguous quote on an unambiguous
+    cited page, preserving punctuation and Unicode text. Only whitespace and
+    case are normalized. Quote presence does not validate the interpretation of
+    that passage, or the date/description generated by the model.
 
     Facts without a resolved page, or with a quote too short to be meaningful,
     are counted as ``skipped`` rather than guessed at.
     """
     page_texts: dict[tuple[str, int], str] = {}
+    ambiguous_sources: set[tuple[str, int]] = set()
     for doc in documents:
         for page in doc.pages:
-            page_texts[(doc.filename, page.page)] = re.sub(
-                r"\s+", " ", page.text.lower()
-            )
+            key = (doc.filename, page.page)
+            if key in page_texts:
+                ambiguous_sources.add(key)
+            page_texts[key] = " ".join(page.text.casefold().split())
     checked = 0
     skipped = 0
     missing: list[dict[str, Any]] = []
     for fact in facts:
+        if (fact.document, fact.page) in ambiguous_sources:
+            checked += 1
+            missing.append(
+                {"document": fact.document, "page": fact.page, "reason": "source_ambiguous"}
+            )
+            continue
         probe = _citation_probe(fact.quote)
         text = page_texts.get((fact.document, fact.page)) if fact.document else None
         if text is None and fact.document:
@@ -522,23 +612,29 @@ def verify_citations(
             skipped += 1
             continue
         checked += 1
-        if probe not in text:
+        if not _citation_quote_present(probe, text):
             missing.append(
                 {
                     "document": fact.document,
                     "page": fact.page,
                     "description": fact.description[:160],
                     "quote": fact.quote[:160],
+                    "reason": "quote_not_found",
                 }
             )
     result: dict[str, Any] = {
+        "match_policy": CITATION_MATCH_POLICY,
+        "total": len(facts),
+        "verified": checked - len(missing),
         "checked": checked,
         "missing": len(missing),
         "skipped": skipped,
         "examples": missing[:5],
     }
-    if checked:
-        result["verified_ratio"] = round((checked - len(missing)) / checked, 3)
+    if facts:
+        # The persisted ratio uses the same denominator as visible coverage;
+        # skipped facts must not make a partial review look fully verified.
+        result["verified_ratio"] = round(result["verified"] / len(facts), 3)
     logger.info(
         "citation check checked=%d missing=%d skipped=%d",
         checked,
@@ -547,7 +643,7 @@ def verify_citations(
         extra={
             "request_id": get_request_id() or "-",
             "phase": "records:citations",
-            "status": "ok" if not missing else "mismatch",
+            "status": "mismatch" if missing else ("partial" if skipped else "ok"),
             "checked": checked,
             "missing": len(missing),
         },

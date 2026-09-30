@@ -205,9 +205,19 @@ Designed to handle 1 to ~5,000 pages without truncation-driven evidence loss.
    * `MedicalDigest.relevant_facts_text` — IDF-weighted fact ranking per claim/observation batch, `always_include_types=("in_service_event","hospitalization")` as anchors, char budget `90_000`.
    * `retrieve_evidence` (and its string wrapper `find_relevant_excerpts`) — raw paragraph excerpts (dependency-free keyword overlap) from the original documents, cached per-document paragraph index, deduped by excerpt prefix. Ranking is **not** gated by a score threshold: the best available context always reaches the verifier, and `RetrievedEvidence.weak` (`best_overlap < EVIDENCE_WEAK_OVERLAP`) reports when that context is effectively nothing, which is what lets the verify step distinguish a record-coverage gap from a contradiction (see `app/evaluate.py`).
    * Tokenization adds a stem and a small curated lay↔clinical synonym (`neck`→`cervical`, `ringing`→`tinnitus`) so a veteran's wording can match a clinician's, additively — a literal match is never lost.
-7. **Provenance and coverage.** Facts cite the file and page they came from (`source_hint` from the chunk's page span; unresolvable model answers fall back to the chunk's own pages rather than a chunk number). `verify_citations` then checks each fact's quote against the cited page, and `MedicalDigest` carries `pages_in_files`, `unreadable_pages`, `chunks_without_facts`, `duplicate_pages`, per-file rows and `citation_check` — rendered as the results panel's *Record coverage & citation check* and written into the report's coverage section. A review that could not read part of the record set says so instead of implying full coverage.
+7. **Provenance and coverage.** Facts cite the file and page they came from (`source_hint` from the chunk's page span; unresolvable model answers fall back to the chunk's own pages rather than a chunk number). `verify_citations` requires the full contiguous quote on that page, allowing only case and whitespace differences; duplicate `(filename, page)` addresses fail as ambiguous. Checks include the `full_quote_page_v1` policy, the total facts and matched/missing/skipped counts. Saved checks without this policy require a source re-run rather than being relabeled as full-quote checks. Matching does not validate generated descriptions, dates or interpretations. `MedicalDigest` also carries `pages_in_files`, `unreadable_pages`, `chunks_without_facts`, `duplicate_pages` and per-file rows — rendered with `citation_check` in the results panel's *Record coverage & citation check* and the report's coverage section. A review that could not read part of the record set says so instead of implying full coverage.
 
 Performance note: `scripts/scale_sim.py` simulates the orchestration (chunking, dedup, merge batching) for a 2,000-page bundle offline, without LLM calls. `scripts/smoke_test.py all` is the live E2E gate (requires `.env`).
+
+The citation minimum is four whitespace-separated words containing letters or digits; a
+date or hyphenated term counts once. Unicode case-folding allows genuine capitalization
+differences without stripping accents or changing digit width. Matches cannot split a
+hyphenated term, contraction or clinical numeric token (for example, `non-weight`, `95%`,
+`3+` or `37°C`). Both visible coverage and the saved `verified_ratio` use all facts as the
+denominator, including skipped citations.
+Common medical prefixes such as `non`, `anti`, `pre` and `post` stay attached across
+unspaced en/em dashes too; ordinary sentence clauses can still provide a matching excerpt.
+These are conservative text-boundary rules, not validation of clinical meaning.
 
 ## 7. Record-source abstraction (why Fetch Sandbox and VA.gov are optional)
 
