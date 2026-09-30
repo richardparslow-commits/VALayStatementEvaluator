@@ -63,6 +63,8 @@ _KEY_RE = re.compile(r"^blobs/[0-9a-f]{2}/[0-9a-f]{64}\.json$")
 # Cleanup also needs an independent schedule; writes alone do not bound retention.
 _DEFAULT_SWEEP_AGE_SECONDS = 24 * 3600
 _SWEEP_MIN_INTERVAL_SECONDS = 300.0
+_STORAGE_LOCK_TIMEOUT_SECONDS = 5.0
+_SWEEP_LOCK_BUDGET_SECONDS = 5.0
 
 
 class BlobStoreError(RuntimeError):
@@ -238,7 +240,15 @@ class FilesystemBlobStore(BlobStore):
         self._root.mkdir(parents=True, exist_ok=True)
         fd = os.open(self._root / ".blob-store.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "r+b") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            deadline = time.monotonic() + _STORAGE_LOCK_TIMEOUT_SECONDS
+            while True:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError as exc:
+                    if time.monotonic() >= deadline:
+                        raise BlobStoreError("filesystem blob lock timed out") from exc
+                    time.sleep(0.01)
             try:
                 yield
             finally:
@@ -325,9 +335,16 @@ class FilesystemBlobStore(BlobStore):
         removed = 0
         if not self._root.exists():
             return 0
+        # Capture the cutoff BEFORE inventory, without holding the writer lock.
+        # Every concurrently admitted blob is renewed under that lock, so its
+        # mtime is newer than this cutoff even if SCAN misses the new input key.
+        protected = (retained_keys or self._retained_keys)()
         try:
             with self._storage_lock():
-                protected = (retained_keys or self._retained_keys)()
+                deadline = time.monotonic() + _SWEEP_LOCK_BUDGET_SECONDS
+                def check_budget() -> None:
+                    if time.monotonic() >= deadline:
+                        raise BlobStoreError("filesystem blob cleanup exceeded its lock budget")
                 # Crash-interrupted writes contain record text too. Expire their
                 # temporary files on the same schedule, without touching fresh ones.
                 namespace = self._root / "blobs"
@@ -340,6 +357,7 @@ class FilesystemBlobStore(BlobStore):
                 try:
                     with os.scandir(namespace) as entries:
                         for entry in entries:
+                            check_budget()
                             if not re.fullmatch(r"[0-9a-f]{2}", entry.name):
                                 continue
                             if entry.is_symlink():
@@ -350,6 +368,7 @@ class FilesystemBlobStore(BlobStore):
                             shards.append(shard)
                             with os.scandir(shard) as files:
                                 for item in files:
+                                    check_budget()
                                     if item.is_file(follow_symlinks=False) and (
                                         _KEY_RE.fullmatch(f"blobs/{entry.name}/{item.name}")
                                         or item.name.startswith(".tmp-")
@@ -359,6 +378,7 @@ class FilesystemBlobStore(BlobStore):
                     if namespace.exists():
                         raise  # A disappearing shard is not a successful pass.
                 for path in paths:
+                    check_budget()
                     if path.relative_to(self._root).as_posix() in protected:
                         continue
                     if path.stat().st_mtime < cutoff:
@@ -367,6 +387,7 @@ class FilesystemBlobStore(BlobStore):
                         removed += 1
                 if not dry_run:
                     for shard in shards:
+                        check_budget()
                         try:
                             shard.rmdir()
                         except OSError:

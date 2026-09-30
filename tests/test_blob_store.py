@@ -62,7 +62,7 @@ def _renew_in_process(root, attempted, finished):
     flock = fcntl.flock
 
     def announce(fd, operation):
-        if operation == fcntl.LOCK_EX:
+        if operation & fcntl.LOCK_EX:
             attempted.set()
         return flock(fd, operation)
 
@@ -340,6 +340,26 @@ class TestInlineThreshold(unittest.TestCase):
 
 
 class TestSweepTiming(unittest.TestCase):
+    def test_busy_lock_times_out_without_writing_a_blob(self):
+        with TemporaryDirectory() as tmp:
+            first, second = FilesystemBlobStore(tmp), FilesystemBlobStore(tmp)
+            with first._storage_lock(), patch.object(blob_mod, "_STORAGE_LOCK_TIMEOUT_SECONDS", 0):
+                with self.assertRaises(BlobStoreError):
+                    second.put(b"busy synthetic record")
+            self.assertEqual(list(Path(tmp).rglob("*.json")), [])
+
+    def test_cleanup_budget_failure_preserves_records_and_releases_lock(self):
+        with TemporaryDirectory() as tmp:
+            store = FilesystemBlobStore(tmp, sweep_age_seconds=60)
+            ref = store.put(b"synthetic expired record")
+            past = time.time() - 120
+            os.utime(Path(tmp) / ref.key, (past, past))
+            with patch.object(blob_mod, "_SWEEP_LOCK_BUDGET_SECONDS", 0):
+                with self.assertRaises(BlobStoreError):
+                    store.sweep()
+            self.assertEqual(store.get(ref), b"synthetic expired record")
+            self.assertEqual(store.sweep(), 1)
+
     def test_reusing_expired_content_returns_a_readable_renewed_reference(self):
         with TemporaryDirectory() as tmp:
             store = FilesystemBlobStore(tmp, sweep_age_seconds=60)

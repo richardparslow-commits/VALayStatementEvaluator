@@ -842,8 +842,8 @@ class _AtomicJobBackend(JobBackend):
 
     def retained_blob_keys(self) -> set[str]:
         # SCAN includes keys present for the whole iteration. Payload keys remain
-        # present when claim/progress renews TTLs. The shared filesystem lock keeps
-        # new submissions from reviving aged references during this inventory.
+        # present when claim/progress renews TTLs. New admissions renew their blob
+        # mtime after cleanup's pre-inventory cutoff, so missing new keys is safe.
         cursor = "0"
         seen: set[str] = set()
         protected: set[str] = set()
@@ -861,11 +861,16 @@ class _AtomicJobBackend(JobBackend):
             for key in keys:
                 if not isinstance(key, str) or not key.startswith(prefix) or not key.endswith(":payload"):
                     raise JobQueueError("invalid retained-input key; cleanup refused")
-                raw = self._command("GET", key)
-                if raw is not None:  # Expiry between SCAN and GET is safe.
-                    blob_key = _retained_blob_key(raw)
-                    if blob_key is not None:
-                        protected.add(blob_key)
+            for start in range(0, len(keys), 16):
+                batch = keys[start:start + 16]
+                values = self._command("MGET", *batch)
+                if not isinstance(values, list) or len(values) != len(batch):
+                    raise JobQueueError("invalid retained-input batch; cleanup refused")
+                for raw in values:
+                    if raw is not None:  # Expiry between SCAN and MGET is safe.
+                        blob_key = _retained_blob_key(raw)
+                        if blob_key is not None:
+                            protected.add(blob_key)
             if next_cursor == "0":
                 return protected
             seen.add(next_cursor)

@@ -556,16 +556,25 @@ while a tier is running. Windows filesystem blob storage is unsupported. Verify
 cross-pod locking on the actual shared volume before using this backend, and roll
 all writers/cleaners to the same version before enabling cleanup.
 
+Queue inventory runs **before** taking the filesystem lock and uses batched reads.
+Cleanup keeps the cutoff captured before inventory, then checks current file ages
+under the lock. Concurrent admissions renew their files beyond that cutoff, so
+new inputs missed by inventory remain safe. Lock acquisition times out after five
+seconds, and cleanup checks a five-second work budget between filesystem entries.
+Slow filesystem calls still need the orchestrator deadline; failed or incomplete
+passes must be retried and alerted on.
+
 Writes perform a rate-limited cleanup, but idle storage needs an independent schedule:
 
 ```bash
 # Use the SAME queue URL/credentials, prefix, mount and TTL as web/workers.
-# Independent cleanup requires a reachable distributed queue (SCAN/GET access).
+# Independent cleanup requires a reachable distributed queue (SCAN/MGET access).
 VA_LSE_BLOB_STORE=filesystem python -m app.blob_cleanup --dry-run
 VA_LSE_BLOB_STORE=filesystem python -m app.blob_cleanup
 
-# Kubernetes: create va-lse-blob-cleanup-env with queue connection + prefix,
-# excluding LLM credentials; configure the tested image and matching TTL first.
+# Kubernetes: queue connection, prefix and TTL read the SAME va-lse-env keys
+# as web/workers; only those keys are injected, excluding LLM credentials.
+# Configure the tested image before applying the template.
 kubectl apply -f deploy/k8s/k8s-blob-cleanup.yaml
 kubectl create job --from=cronjob/va-lse-blob-cleanup blob-cleanup-canary -n va-lse
 kubectl logs -n va-lse job/blob-cleanup-canary

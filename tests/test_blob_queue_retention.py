@@ -88,6 +88,25 @@ class _BlobRetentionContract:
             self.store.sweep()
         self.assertEqual(self.store.get(ref), b"synthetic record to preserve")
 
+    def test_inventory_does_not_lock_writers_and_uses_its_original_cutoff(self):
+        data = b"synthetic concurrent submission"
+        ref = self.store.put(data)
+        os.utime(Path(self.tmp.name) / ref.key, (900, 900))
+        clock = [1000.0]
+
+        def inventory_then_submit():
+            snapshot = self.backend.retained_blob_keys()
+            self.store.put(data)  # Must not wait for cleanup's filesystem lock.
+            self.backend.enqueue("evaluate", json.dumps({"documents_ref": ref.to_json()}))
+            os.utime(Path(self.tmp.name) / ref.key, (1001, 1001))
+            clock[0] = 1100.0  # Inventory took longer than the 60-second file TTL.
+            return snapshot  # Does not include the concurrently submitted input.
+
+        with patch.object(blob_store.time, "time", side_effect=lambda: clock[0]):
+            self.assertEqual(self.store.sweep(retained_keys=inventory_then_submit), 0)
+        self.assertEqual(self.store.get(ref), data)
+        self.assertEqual(self.backend.depth(), 1)
+
 
 class TestInProcessBlobRetention(_BlobRetentionContract, unittest.TestCase):
     make_backend = queue_fixture.TestInProcessBackend.make_backend
@@ -102,7 +121,11 @@ class TestRedisBlobRetention(_BlobRetentionContract, unittest.TestCase):
         for index in range(220):
             self.client.set(f"t:job:inline-{index}:payload", "{}")
         self.client.set("foreign:job:other:payload", "not our data")
-        self.assertEqual(self.backend.retained_blob_keys(), {ref.key})
+        with patch.object(self.backend, "_command", wraps=self.backend._command) as commands:
+            self.assertEqual(self.backend.retained_blob_keys(), {ref.key})
+        operations = [call.args[0] for call in commands.call_args_list]
+        self.assertNotIn("GET", operations)
+        self.assertIn("MGET", operations)
         self.assertIsNotNone(self.backend.get(protected.job_id))
 
     def test_invalid_scan_replies_and_transport_failure_refuse_cleanup(self):
@@ -111,6 +134,9 @@ class TestRedisBlobRetention(_BlobRetentionContract, unittest.TestCase):
                 with self.assertRaises(job_queue.JobQueueError):
                     self.backend.retained_blob_keys()
         with patch.object(self.backend, "_command", side_effect=job_queue.JobQueueError("offline")):
+            with self.assertRaises(job_queue.JobQueueError):
+                self.backend.retained_blob_keys()
+        with patch.object(self.backend, "_command", side_effect=[["0", ["t:job:one:payload"]], None]):
             with self.assertRaises(job_queue.JobQueueError):
                 self.backend.retained_blob_keys()
 
