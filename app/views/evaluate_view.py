@@ -49,7 +49,7 @@ from ..documents import (
     EVALUATE_INTERNAL_MAX_CHARS,
     MAX_STATEMENT_CHARS,
 )
-from ..medical_review import build_timeline_data
+from ..medical_review import CITATION_MATCH_POLICY, build_timeline_data
 from ..pdf_export import detect_unconfirmed_placeholders, generate_statement_pdf
 from ..pipeline_guard import (
     PipelineTimeoutError,
@@ -1241,18 +1241,22 @@ def _render_record_coverage(eval_result: Any) -> None:
         digest.pages_in_files
         or digest.unreadable_pages
         or digest.chunks_without_facts
-        or check.get("checked")
+        or check
         or gaps
     ):
         return
 
     with st.expander(
         "🧾 Record coverage & citation check",
-        expanded=bool(digest.unreadable_pages or gaps),
+        expanded=bool(
+            digest.unreadable_pages or gaps or check.get("missing") or check.get("skipped")
+            or (check and check.get("match_policy") != CITATION_MATCH_POLICY)
+        ),
     ):
         pilot.display(
             "What the uploaded files contained, what the review actually read, and whether "
-            "each citation's quote was found on the page it names."
+            "each complete quote was found on an unambiguous cited page. A quote match "
+            "does not establish that the model interpreted it correctly."
         , container=st, method="caption")
         for line in coverage_lines(digest):
             pilot.display(line, container=st, method="markdown")

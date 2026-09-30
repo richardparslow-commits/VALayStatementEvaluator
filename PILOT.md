@@ -160,7 +160,7 @@ only after the reviewed revision, invitations, evidence and secrets are current.
 | F04: coverage/citation metadata lost | Versioned serialization preserves total pages, unreadable pages and citation units; legacy coverage marked unknown |
 | F05: repeated clinical evidence removed | Raw repeated source lines preserved |
 | F06: error/content leakage | Count-only pilot file, console, audit and diagnostic sinks; external telemetry/tracing blocked |
-| F07: factual rewrite/grounding/citations | Empty grounding refused; automatic self-review cannot change witness text; unverified citations block pilot generation; human verification still required |
+| F07: factual rewrite/grounding/citations | Empty grounding refused; automatic self-review cannot change witness text; complete contiguous quotes must match an unambiguous cited page, including their endings and punctuation; missing/short/unresolved citations block pilot generation; older prefix checks require a re-run; human verification of descriptions, dates and interpretations still required |
 | F08: parser exhaustion/fallback | Resource-limited child process, hard deadline, page/text caps, no pilot fail-open fallback |
 | F09: misleading retention/deletion | Session clearing includes registered uploads; accurate consent; queues/blobs excluded; provider retention requires review |
 | F10: deployment wiring | Runtime is default non-root image; backup scripts included; health checks use installed Python; service DNS and monitoring targets corrected |

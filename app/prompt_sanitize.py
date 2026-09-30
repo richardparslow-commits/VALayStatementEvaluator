@@ -52,10 +52,10 @@ _INVISIBLE_RE = re.compile(
 #
 # Deliberately a translation table rather than ``unicodedata.normalize("NFKC")``:
 # NFKC would also rewrite letters, digits and ligatures inside record text, and
-# every quote this app extracts is checked back against the page by token
-# (``verify_citations``). Normalizing the prompt but not the record could make an
-# echoed quote unverifiable. Only the characters that can smuggle a delimiter are
-# touched here, and those are precisely the ones the citation check ignores.
+# every quote this app extracts is checked in full against the original page
+# (``verify_citations``). Normalizing letters/digits could alter cited content.
+# Only delimiter lookalikes are touched here; an echoed quote changed by prompt
+# escaping remains unresolved rather than being accepted as a verbatim excerpt.
 _ANGLE_LOOKALIKES = str.maketrans(
     {"＜": "<", "＞": ">", "❮": "<", "❯": ">", "⟨": "<", "⟩": ">"}
 )

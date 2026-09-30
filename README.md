@@ -640,12 +640,16 @@ questions a plausible-looking report otherwise hides:
 | Skipped duplicate pages | Named, with the page each one duplicated |
 | Corroborated pages | Duplicates that arrived from a *different* file — the same page in two sources, so a statement can lean harder on it |
 | Legacy digest cap | Previously saved results retain their dropped-fact warning; regenerate them from the source records. New reviews do not cap stored evidence. |
-| Citation self-check | How many facts' quotes were found on the page they cite, with examples of any that were not |
+| Full-quote citation check | Complete quotes matched on an unambiguous cited page, out of all facts, including short or unresolved quotes; examples explain missing quotes, missing pages and ambiguous references |
 | Coverage gaps | Claims with no matching record text anywhere — reported instead of being called contradictions |
 
 The same summary is written into the report (`## Record Coverage Gaps`), so a report shared
-with a VSO carries the caveat rather than losing it. An ordinary small run with nothing to
-declare shows no panel at all.
+with a VSO carries the caveat rather than losing it. Quote checks allow differences in case
+and whitespace only: the full contiguous quote must occur on the cited page, including
+punctuation, numbers and negation. Duplicate file/page addresses cannot be verified.
+Earlier saved prefix checks require a re-run from the source records. A quote match does
+not verify the model's interpretation, generated dates or factual conclusions; human
+review remains necessary. Short, unresolved and older checks open the coverage panel.
 
 Records that arrive as a **`.zip`** (provider portals and My HealtheVet hand back
 folders) can be uploaded as they came: members are extracted like standalone uploads, and

@@ -28,6 +28,7 @@ from .prompt_sanitize import GUARD_NOTE, sanitize_digest_text, sanitize_for_prom
 
 logger = logging.getLogger("app.evaluate")
 from .medical_review import (
+    CITATION_MATCH_POLICY,
     MedicalDigest,
     ProgressCallback,
     query_has_content_words,
@@ -1716,14 +1717,29 @@ def coverage_lines(digest: MedicalDigest) -> list[str]:
             f"(corroborated): {names}{more}"
         )
     check = digest.citation_check or {}
-    if check.get("checked"):
+    if check and check.get("match_policy") != CITATION_MATCH_POLICY:
         lines.append(
-            f"- Citations self-checked: {check['checked']:,} quote(s) matched against the "
-            f"page they cite; {check.get('missing', 0):,} not found."
+            "> ⚠️ Earlier citation checks do not establish full-quote matches. "
+            "Re-run the source records before relying on their citations."
+        )
+    elif check:
+        lines.append(
+            f"- Full-quote citation check: {check.get('verified', 0):,} of "
+            f"{check.get('total', 0):,} fact(s) had a complete quote matched on an unambiguous cited page; "
+            f"{check.get('missing', 0):,} source/quote mismatch(es), "
+            f"{check.get('skipped', 0):,} too short or unresolved."
+        )
+        lines.append(
+            "- Quote matching does not verify the model's interpretation, dates or factual conclusions."
         )
         for example in (check.get("examples") or [])[:3]:
+            reason = {
+                "source_not_found": "source page unavailable",
+                "source_ambiguous": "source page ambiguous",
+                "quote_not_found": "complete quote not found",
+            }.get(example.get("reason"), "citation unresolved")
             lines.append(
-                f"  - ⚠️ quote not found on {example.get('document')} "
+                f"  - ⚠️ {reason} on {example.get('document')} "
                 f"p.{example.get('page')}: “{str(example.get('quote', ''))[:120]}”"
             )
     return lines

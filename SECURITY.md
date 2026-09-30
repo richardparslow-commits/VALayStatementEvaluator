@@ -321,10 +321,13 @@ a delimiter when a template concatenates them), fenced-code runs are broken, ang
 lookalikes (fullwidth `＜`, CJK `⟨`) are translated to ASCII first, invisible characters
 (zero-widths, bidi overrides, Unicode tag characters) are dropped, and chat-template role
 tokens and line-leading role labels (`<|im_start|>`, `<system>`, `[INST]`, `System:`) are
-neutralized so record text cannot speak in the system role. Escaping is chosen to touch only
-characters that the citation check ignores — `verify_citations` compares quotes back against
-the page by alphanumeric token, so hardening the boundary cannot make a real citation
-unverifiable.
+neutralized so record text cannot speak in the system role. `verify_citations` requires the
+complete contiguous quote to occur on an unambiguous cited page, allowing only case and
+whitespace differences. Punctuation, numbers and negation are preserved. If prompt escaping
+changes a quoted passage and the model echoes that change, the citation remains unresolved
+rather than being accepted as verbatim. Such mismatches and short or unresolved quotes
+block pilot generation. Older saved prefix checks are labeled as requiring a source re-run.
+Quote matching does not verify a generated description, date or interpretation.
 
 **What is not, and cannot be.** No instruction is filtered: a record may legitimately discuss
 instructions, and blocking phrases would corrupt analyses rather than protect them. The
