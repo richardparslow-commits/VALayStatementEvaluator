@@ -256,6 +256,7 @@ def evaluation_to_json(result: EvaluationResult) -> dict[str, Any]:
         "truncated_chars": result.truncated_chars,
         "truncation_warning": result.truncation_warning,
         "evidence_source": list(result.evidence_source),
+        "report_citations": [dict(row) for row in result.report_citations],
     }
 
     if not complete:
@@ -293,6 +294,9 @@ def evaluation_from_json(raw: Any) -> EvaluationResult:
         truncated_chars=_as_int(data.get("truncated_chars")),
         truncation_warning=_as_str(data.get("truncation_warning")),
         evidence_source=_dict_items(data.get("evidence_source")),
+        report_citations=[{"source": row["source"], "excerpt": row["excerpt"]}
+                          for row in _dict_items(data.get("report_citations"))
+                          if isinstance(row.get("source"), str) and isinstance(row.get("excerpt"), str)],
     )
 
     # Validate the raw JSON before any coercion or filtering can turn malformed

@@ -27,7 +27,7 @@ from .rubric_validation import (
 )
 from .source_validation import build_source_index, source_reference_key
 from .exporter import parse_source
-from .llm import LLMClient, LLMError, LLMParseError, LLMService
+from .llm import LLMClient, LLMError, LLMParseError, LLMService, LLMAuthError, LLMConfigurationError
 from . import tracing
 from .logging_config import PhaseTimer, get_request_id
 from .profiler import phase_timer
@@ -531,6 +531,7 @@ class EvaluationResult:
     added_facts_to_verify: list[str] = field(default_factory=list)
     digest: MedicalDigest | None = None
     report_markdown: str = ""
+    report_citations: list[dict[str, str]] = field(default_factory=list)
     # Truncation audit — set when the input exceeds EVALUATE_INTERNAL_MAX_CHARS
     input_chars: int = 0
     truncated_chars: int = 0
@@ -876,9 +877,8 @@ def _run_evaluation(
     with tracing.phase_span("report"), PhaseTimer(logger, "report", request_id=rid):
         with phase_timer("report"):
             report(0.96, "Step 8/8 — Building the report…")
-            result.report_markdown = build_report(
-                result, statement_text, citations=_citation_index_snapshot()
-            )
+            result.report_citations = _citation_index_snapshot()
+            result.report_markdown = build_report(result, statement_text)
     report(1.0, "Evaluation complete." if rubric_is_complete(result)
            else "Partial evaluation retained — scoring incomplete.")
     return result
@@ -903,6 +903,10 @@ def _score_rubric(llm: LLMService, result: EvaluationResult, statement: str) -> 
         check_pipeline_cancelled()
         try:
             data = normalize_rubric(llm.chat_json(system, prompt + retry_note, phase="rubric"))
+        except (LLMAuthError, LLMConfigurationError):
+            # Credentials/configuration cannot be repaired by resampling JSON.
+            # Preserve the existing actionable error path without another call.
+            raise
         except (RubricValidationError, LLMError):
             logger.warning(
                 "rubric response unavailable attempt=%d/%d", attempt, RUBRIC_MAX_ATTEMPTS,
@@ -935,7 +939,13 @@ def _citation_index_snapshot() -> list[dict[str, str]]:
         citations = st.session_state.get("citation_index", [])
     except Exception:  # noqa: BLE001 - session state may be unavailable
         return []
-    return citations if isinstance(citations, list) else []
+    if not isinstance(citations, list):
+        return []
+    return [
+        {"source": row["source"], "excerpt": row["excerpt"]}
+        for row in citations if isinstance(row, dict)
+        and isinstance(row.get("source"), str) and isinstance(row.get("excerpt"), str)
+    ]
 
 
 def _analyze_topics(
@@ -1282,6 +1292,19 @@ def _infer_record_type(claim_text: str) -> str:
     return DEFAULT_RECORD_TYPE
 
 
+def retained_claim_text(claims: list[dict]) -> dict[int, str]:
+    """Link only usable saved claim IDs/text, without trusting historical shape.
+
+    New pipeline claims still go through the strict extraction validator. This
+    tolerant display lookup never assigns an ID to a malformed historical row.
+    """
+    return {
+        row["id"]: row["text"] for row in claims
+        if isinstance(row, dict) and type(row.get("id")) is int
+        and row["id"] > 0 and isinstance(row.get("text"), str)
+    }
+
+
 def build_evidence_dashboard(
     verifications: list[dict[str, Any]],
     claims: list[dict[str, Any]],
@@ -1299,10 +1322,11 @@ def build_evidence_dashboard(
     produced zero extracted claims) — callers must treat that as "nothing
     to render" rather than an error.
     """
-    claim_text_by_id: dict[Any, str] = {c.get("id"): str(c.get("text", "")) for c in claims}
+    claim_text_by_id = retained_claim_text(claims)
     dashboard: dict[str, dict[str, int]] = {}
     for verification in verifications:
-        claim_text = claim_text_by_id.get(verification.get("id"), "")
+        claim_id = verification.get("id")
+        claim_text = claim_text_by_id.get(claim_id, "") if type(claim_id) is int else ""
         record_type = _infer_record_type(claim_text)
         verdict = str(verification.get("verdict") or "NOT FOUND")
         if verdict not in VERDICTS:
@@ -1858,6 +1882,8 @@ def build_report(
     record search widget (excerpt + source per entry); when non-empty, a
     "Sources" section listing every citation is appended to the report.
     """
+    if citations is None:
+        citations = result.report_citations
     lines: list[str] = []
     lines.append("# Lay Statement Evaluation Report")
     lines.append("")
@@ -1929,17 +1955,26 @@ def build_report(
             lines.append(f"- {evidence_gap.get('claim', '')}")
         lines.append("")
 
+    claim_text = retained_claim_text(result.claims)
+    unlinked = [c for c in result.claims if type(c.get("id")) is not int
+                or c.get("id", 0) <= 0 or not isinstance(c.get("text"), str)]
+    if unlinked:
+        lines.append("> Some saved claims lack usable IDs or text and cannot be linked to findings. Re-run the evaluation.")
+        for row in unlinked:
+            if isinstance(row.get("text"), str):
+                lines.append(f"> Unlinked retained claim: {row['text']}")
+        lines.append("")
     lines.append("## Claim-by-Claim Verification")
     lines.append("")
     lines.append("| # | Claim | Verdict | Record Reference | Note |")
     lines.append("|---|-------|---------|------------------|------|")
-    claim_text = {c["id"]: c.get("text", "") for c in result.claims}
     for v in result.verifications:
-        verdict = v.get("verdict", "NOT FOUND")
+        verdict = str(v.get("verdict") or "NOT FOUND")
         emoji = _VERDICT_EMOJI.get(verdict, "⚪")
-        text = claim_text.get(v.get("id"), "").replace("|", "/")[:120]
-        ref = (v.get("record_reference") or "—").replace("|", "/")[:80]
-        note = (v.get("note") or "").replace("|", "/")[:120]
+        claim_id = v.get("id")
+        text = (claim_text.get(claim_id, "") if type(claim_id) is int else "").replace("|", "/")[:120]
+        ref = str(v.get("record_reference") or "—").replace("|", "/")[:80]
+        note = str(v.get("note") or "").replace("|", "/")[:120]
         lines.append(f"| {v.get('id')} | {text} | {emoji} {verdict} | {ref} | {note} |")
     lines.append("")
     lines.append(

@@ -10,7 +10,7 @@ from tests.test_evaluate import _FakeLLM, _fake_digest, _doc
 from tests.test_views import _fake_streamlit, _patch_st
 from app.evaluate import EvaluationResult, run_evaluation, build_report, evaluation_report_markdown, compute_effectiveness_score, _score_and_recommend
 from app.job_payload import evaluation_from_json, evaluation_to_json, RunResult, encode_result, decode_result
-from app.llm import LLMParseError, LLMError
+from app.llm import LLMParseError, LLMError, LLMAuthError, LLMConfigurationError
 from app.pipeline_guard import PipelineCancelledError, PipelineTimeoutError
 from app.rubric_validation import (
     DIMENSION_LABELS, RUBRIC_POLICY, RUBRIC_MAX_ATTEMPTS, RUBRIC_INCOMPLETE_NOTICE,
@@ -202,6 +202,32 @@ class TestRubricPipeline(unittest.TestCase):
             self.assertEqual(result.overall_rating, rating)
             self.assertEqual(llm.calls.count(("chat_json", "rubric")), 1)
 
+    def test_permanent_provider_failures_stop_after_one_attempt(self):
+        for error in (LLMAuthError("Synthetic credential rejection", status_code=401),
+                      LLMConfigurationError("Synthetic configuration error")):
+            llm = _FakeLLM(overrides={"rubric": error})
+            with patch("app.evaluate.review_medical_records", return_value=_fake_digest()), patch("app.evaluate.load_knowledge", return_value="Synthetic knowledge"):
+                with self.subTest(error=type(error).__name__), self.assertRaises(type(error)):
+                    run_evaluation(llm, "Synthetic statement.", [_doc()])
+            self.assertEqual(llm.calls.count(("chat_json", "rubric")), 1)
+            self.assertNotIn(("chat_json", "topic"), llm.calls)
+            self.assertNotIn(("chat_json", "revision"), llm.calls)
+
+    def test_partial_report_preserves_independent_source_snapshot(self):
+        citations = [{"source": "synthetic.pdf p.7", "excerpt": "Synthetic source appendix excerpt."}]
+        with patch("app.evaluate.st") as st_mock:
+            st_mock.session_state.get.return_value = citations
+            result, _ = self._run(complete_rubric({key: 999 for key in DIMENSION_LABELS}))
+        citations[0]["source"] = "CHANGED_SOURCE_SENTINEL"
+        report = evaluation_report_markdown(result)
+        self.assertIn("## Sources", report)
+        self.assertIn("synthetic.pdf p.7", report)
+        self.assertIn("Synthetic source appendix excerpt.", report)
+        self.assertNotIn("CHANGED_SOURCE_SENTINEL", report)
+        restored = evaluation_from_json(evaluation_to_json(result))
+        self.assertEqual(restored.report_citations, result.report_citations)
+        self.assertIn("Synthetic source appendix excerpt.", evaluation_report_markdown(restored))
+
 
 class TestRubricSavedResults(unittest.TestCase):
     def _valid(self):
@@ -280,6 +306,28 @@ class TestRubricSavedResults(unittest.TestCase):
         self.assertEqual(outcome["scoring_status"], "incomplete")
         self.assertEqual(outcome["overall_rating"], "Not scored")
 
+    def test_malformed_historical_claims_do_not_break_safe_report_export(self):
+        result = evaluation_from_json({
+            "claims": [{"text": "Synthetic claim without ID."}, {"id": [], "text": "Synthetic bad ID."},
+                       {"id": 1, "text": {"invalid": "shape"}}],
+            "verifications": [{"id": 1, "verdict": "NOT FOUND", "record_reference": "", "note": "Synthetic note."}],
+            "report_markdown": "Excellent rating from historical cached markdown",
+            "report_citations": [{"source": "synthetic.pdf p.7", "excerpt": "Retained source excerpt."}],
+        })
+        report = evaluation_report_markdown(result)
+        self.assertIn("cannot be linked to findings", report)
+        self.assertIn("Synthetic claim without ID.", report)
+        self.assertIn("Synthetic bad ID.", report)
+        self.assertIn("Retained source excerpt.", report)
+        self.assertIn("| # | Claim | Verdict", report)
+        self.assertNotIn("Excellent", report)
+        self.assertEqual(evaluation_to_json(result)["report_markdown"], report)
+
+    def test_saved_citation_rows_require_string_source_and_excerpt(self):
+        result = evaluation_from_json({"report_citations": [None, {}, {"source": 1, "excerpt": "x"},
+                  {"source": "s", "excerpt": []}, {"source": "s", "excerpt": "Retained excerpt"}]})
+        self.assertEqual(result.report_citations, [{"source": "s", "excerpt": "Retained excerpt"}])
+
 
 class TestRubricUI(unittest.TestCase):
     def test_partial_result_has_warning_without_grades_charts_or_rewrite(self):
@@ -299,6 +347,25 @@ class TestRubricUI(unittest.TestCase):
         self.assertEqual(len(reports), 1)
         self.assertNotIn("PRIVATE_REWRITE_SENTINEL", reports[0])
         self.assertIn(RUBRIC_INCOMPLETE_NOTICE, reports[0])
+
+
+    def test_malformed_legacy_claims_render_and_download_without_scoring(self):
+        import app.views.evaluate_view as view
+        result = evaluation_from_json({"claims": [{"text": "Synthetic unlinked claim."}, {"id": []}],
+            "verifications": [{"id": 1, "verdict": "NOT FOUND"}],
+            "report_citations": [{"source": "synthetic.pdf p.1", "excerpt": "Synthetic retained excerpt."}]})
+        st_mock, _ = _fake_streamlit()
+        st_mock.columns.return_value = tuple(MagicMock() for _ in range(4))
+        with _patch_st(view, st_mock):
+            view._render_evaluation_results(result)
+        warnings = [str(c.args[0]) for c in st_mock.warning.call_args_list]
+        self.assertTrue(any("cannot be linked" in warning for warning in warnings))
+        reports = [c.kwargs["data"].decode() for c in st_mock.download_button.call_args_list
+                   if c.kwargs.get("file_name") == "lay_statement_evaluation.md"]
+        self.assertEqual(len(reports), 1)
+        self.assertIn("Synthetic unlinked claim.", reports[0])
+        self.assertIn("Synthetic retained excerpt.", reports[0])
+        st_mock.metric.assert_not_called()
 
     def test_legacy_score_badge_is_withheld(self):
         import app.views.evaluate_view as view

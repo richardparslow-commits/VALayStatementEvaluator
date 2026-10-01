@@ -43,6 +43,7 @@ from ..evaluate import (
     rubric_and_positive_sources,
     run_evaluation,
     source_reference_notice,
+    retained_claim_text,
 )
 from ..rubric_validation import rubric_is_complete, scoring_notice
 from ..exporter import export_facts, filter_facts
@@ -1436,11 +1437,15 @@ def _render_evaluation_results(eval_result: Any) -> None:
 
     with st.expander("Claim-by-claim verification table", expanded=True):
         rows = []
-        claim_text = {c["id"]: c.get("text", "") for c in eval_result.claims}
+        claim_text = retained_claim_text(eval_result.claims)
+        if any(type(c.get("id")) is not int or c.get("id", 0) <= 0
+               or not isinstance(c.get("text"), str) for c in eval_result.claims):
+            pilot.display("Some saved claims lack usable IDs or text and cannot be linked to findings. "
+                          "Re-run the evaluation.", container=st, method="warning")
         for v in eval_result.verifications:
             rows.append(
                 {
-                    "Claim": claim_text.get(v.get("id"), ""),
+                    "Claim": claim_text.get(v.get("id"), "") if type(v.get("id")) is int else "",
                     "Verdict": v.get("verdict", ""),
                     "Record reference": v.get("record_reference", ""),
                     "Note": v.get("note", ""),

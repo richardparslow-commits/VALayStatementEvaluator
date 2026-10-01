@@ -25,7 +25,9 @@ substituted to make a malformed response appear complete.
 The pipeline makes at most three rubric-phase attempts, within the existing
 provider retry, cancellation, timeout, and pilot budget controls. Correction
 instructions and scoring-boundary logs never quote the rejected output or its
-exception text. Cancellation and pipeline timeout continue to stop the run.
+exception text. Permanent authentication/configuration errors stop immediately
+through the existing actionable error path; they are not retried or relabeled
+as malformed scoring. Cancellation and pipeline timeout continue to stop the run.
 
 Only a fully valid response is committed to the result. If all attempts fail,
 `scoring_status` is `incomplete`: completed record review, extracted claims,
@@ -43,8 +45,11 @@ restored inputs. Missing, unknown, incomplete, or malformed saved scoring data
 cannot acquire a rating. Scoring output and dependent rewrites are withheld.
 Historical cached markdown is rebuilt from the retained structured review data
 for these results, so old grades and proposed rewrites cannot bypass the gate.
-Historical narrative or report-only additions are not carried into the rebuilt
-export; retain the original separately if needed, and re-run before using scoring.
+New results snapshot their source appendix as structured citations and preserve
+it across saved/queued results and report rebuilds. Malformed historical claims
+are displayed as unlinked where possible, with a re-run warning rather than
+assigning fabricated IDs. Historical narrative or report-only additions without
+structured data are not carried into the rebuilt export; retain the original separately if needed, and re-run before using scoring.
 
 Synthetic regressions cover numeric and schema rejection, boundary acceptance,
 retry recovery and exhaustion, retained partial review, cancellation/timeouts,
