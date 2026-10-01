@@ -171,6 +171,23 @@ def owns(record: Any) -> bool:
     return bool(getattr(record, "owner_id", "")) and record.owner_id == current_owner()
 
 
+def recheck_owner(owner: str) -> None:
+    """Refuse delayed work after expiry, invitation removal or identity change."""
+    if enabled() and current_owner() != owner:
+        raise PilotBlocked("Access changed while this work was running. Sign in again.")
+
+
+def require_session_access() -> None:
+    """Check the UI identity again before storing or rendering delayed results."""
+    if not enabled():
+        return
+    import streamlit as st
+    owner = st.session_state.get("_pilot_owner")
+    if not isinstance(owner, str) or not owner:
+        raise PilotBlocked("Sign in again before accessing this case.")
+    recheck_owner(owner)
+
+
 def operator_allowed() -> bool:
     if not enabled():
         return os.getenv("VA_LSE_OPERATOR_DIAGNOSTICS", "") == "1"
@@ -287,6 +304,9 @@ def action_budget(records: list[Any]) -> Iterator[None]:
     identity_token = _run_claims.set(claims)
     try:
         yield
+        # Provider checks cannot cover work after the final call, cached/fake
+        # backends or final CPU-bound processing. Reject the completed run too.
+        recheck_owner(owner)
     finally:
         _run_claims.reset(identity_token)
         with _lock:

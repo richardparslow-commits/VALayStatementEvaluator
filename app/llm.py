@@ -34,6 +34,7 @@ from .logging_config import get_request_id
 from .pipeline_guard import (
     check_pipeline_cancelled, pipeline_remaining_seconds, wait_with_cancellation,
 )
+from .pilot import PilotBlocked
 from .prompt_sanitize import validate_model_name
 from .usage import UsageTracker
 
@@ -1550,8 +1551,9 @@ class LLMClient:
         in each shape, and the caller must not guess.
         """
         from . import pilot
+        owner = ""
         if pilot.enabled():
-            pilot.current_owner()
+            owner = pilot.current_owner()
             pilot.require_destination(self._endpoint_base_url(endpoint), model)
             with self._pilot_call_lock:
                 if self._pilot_calls >= 200 or self._pilot_prompt_chars + len(system) + len(user) > 2_000_000:
@@ -1579,19 +1581,28 @@ class LLMClient:
                 request["temperature"] = temperature
             if request_timeout is not NOT_GIVEN:
                 request["timeout"] = request_timeout
-            return client.responses.create(**request), True
-        privacy_options: dict[str, Any] = {"store": False} if pilot.enabled() else {}
-        return client.chat.completions.create(
-            **privacy_options,
-            model=model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            timeout=request_timeout,
-        ), False
+            response = client.responses.create(**request)
+            responses = True
+        else:
+            privacy_options: dict[str, Any] = {"store": False} if pilot.enabled() else {}
+            response = client.chat.completions.create(
+                **privacy_options,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                timeout=request_timeout,
+            )
+            responses = False
+        if pilot.enabled():
+            # A request already sent cannot be recalled. Its response must not
+            # enter usage, pipelines or session results after access has ended.
+            pilot.recheck_owner(owner)
+            pilot.require_destination(self._endpoint_base_url(endpoint), model)
+        return response, responses
 
     def _endpoint_base_url(self, endpoint: str) -> str:
         """The base URL *endpoint* will be called with (schema is decided from it)."""
@@ -1922,7 +1933,7 @@ class LLMClient:
                     # actually waited through.
                     metrics.observe_llm_call(phase, "ok", total_ms, endpoint=endpoint)
                     return content
-                except (CircuitBreakerOpenError, QueueFullError):
+                except (CircuitBreakerOpenError, QueueFullError, PilotBlocked):
                     # Never count limiter/breaker rejections as endpoint failures.
                     raise
                 except Exception as exc:  # noqa: BLE001 - retry on any provider error

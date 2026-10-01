@@ -6,6 +6,7 @@ from typing import Any
 
 from .request_validation import MAX_OBSERVATIONS_PAYLOAD_CHARS, RequestValidationError, validate_draft_request
 from .llm import LLMConfigurationError, LLMError, LLMParseError, LLMTimeoutError, LLMUpstreamError
+from .pilot import PilotBlocked
 
 MAX_DRAFT_OBSERVATIONS_PAYLOAD_CHARS = MAX_OBSERVATIONS_PAYLOAD_CHARS
 _NO_RECORDS = object()
@@ -72,6 +73,10 @@ def validate_drafting_request(
 
 
 def map_drafting_exception(exc: Exception, *, request_id: str, phase: str) -> DraftingError:
+    if isinstance(exc, PilotBlocked):
+        # Admission refusal must reach the UI's clearing/stopping boundary.
+        # It is not a provider fault or a retryable drafting error.
+        raise exc
     if isinstance(exc, DraftingError):
         if not exc.request_id:
             exc.request_id = request_id

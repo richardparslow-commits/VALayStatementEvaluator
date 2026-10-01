@@ -315,6 +315,8 @@ def render_draft_tab() -> None:
             observations=observations,
         )
 
+    pilot.require_session_access()
+
     # A queued run outlives this browser session, so re-attach to one started
     # earlier (a reload mid-digest would otherwise look like nothing happened).
     job_runner.resume_pending_job("draft", action_label="Drafting")
@@ -563,6 +565,12 @@ def _run_draft_flow(
             claim_type,
             progress=update,
         )
+        pilot.require_session_access()
+    except pilot.PilotBlocked:
+        bar.empty()
+        _handle_draft_abort(rid, "rejected", pilot.PilotBlocked("Pilot access refused."),
+                            t0, None, None, _audit_files_d, _audit_pages_d)
+        raise
     except MemoryError as mem_exc:
         _handle_draft_abort(rid, "error", mem_exc, t0, _audit_condition_d, _audit_sources_d, _audit_files_d, _audit_pages_d)
         pilot.display(f"Draft aborted: {format_error_for_user(mem_exc, rid)}", container=st, method="error")

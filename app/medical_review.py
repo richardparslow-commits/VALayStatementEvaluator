@@ -48,6 +48,7 @@ from .llm import (
 )
 from .logging_config import PhaseTimer, get_request_id
 from .pipeline_guard import check_pipeline_cancelled, pipeline_as_completed
+from .pilot import PilotBlocked
 from .preflight import REFUSAL_STATUSES
 from .profiler import get_current_run_profiler, worker_timer
 from .prompt_sanitize import GUARD_NOTE, sanitize_for_prompt
@@ -1020,6 +1021,10 @@ def review_medical_records(
                 refused = False
                 try:
                     results[chunk.index] = future.result()
+                except PilotBlocked:
+                    # Stop scheduling/retrying a revoked run. Already-sent
+                    # calls recheck access before accepting their responses.
+                    raise
                 except Exception as exc:  # noqa: BLE001 - record and retry later
                     failed[chunk.index] = exc
                     if isinstance(exc, (CircuitBreakerOpenError, QueueFullError)):
@@ -2374,6 +2379,8 @@ def _infer_dates_once(
             max_tokens=max(2000, 60 * len(batch)),
             phase="timeline:llm_date_extraction",
         )
+    except PilotBlocked:
+        raise
     except Exception as exc:  # noqa: BLE001 - fallback pass must never break extraction
         logger.warning(
             "timeline date inference call failed error=%s",
@@ -2397,8 +2404,8 @@ def _llm_infer_undated(
 
     Returns a mapping of the input list's index to a parsed (iso_date,
     precision) tuple, or ``None`` when the model also could not infer a date.
-    Never raises — a failed call simply yields no inferences for that batch and
-    those facts stay in the 'undated' bucket.
+    Ordinary failed calls yield no inferences for that batch and those facts
+    stay undated. Admission/destination refusals stop immediately.
 
     Batched, and tolerant per row: one call over every undated fact in a large
     bundle both overflows the output budget (losing the whole batch, and with it
@@ -2495,9 +2502,9 @@ def build_timeline_data(
     cached result by the current run's request id so a stale digest from a
     previous run is never reused).
 
-    Never raises: any failure is tracked via telemetry and this returns a
-    well-formed, empty timeline so the UI can render a friendly empty state
-    instead of crashing the Evaluate tab. `feature_id` is accepted as a
+    Ordinary failures return a well-formed, empty timeline so the UI can render
+    a friendly empty state. Admission/destination refusals propagate rather than
+    masquerading as successful fallback output. `feature_id` is accepted as a
     parameter (never hardcoded here — this module is shared pipeline logic)
     so the caller controls which feature the telemetry event is attributed
     to.
@@ -2582,6 +2589,8 @@ def build_timeline_data(
                 pass
 
         return timeline_data
+    except PilotBlocked:
+        raise
     except Exception as exc:  # noqa: BLE001 - extraction must degrade gracefully, never crash
         logger.error(
             "timeline data extraction failed error=%s",

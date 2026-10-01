@@ -30,6 +30,7 @@ from . import tracing
 from .logging_config import PhaseTimer, get_request_id
 from .profiler import phase_timer
 from .pipeline_guard import check_pipeline_cancelled
+from .pilot import PilotBlocked
 from .aa_intake import care_observation_block
 from .prompt_sanitize import GUARD_NOTE, sanitize_digest_text, sanitize_for_prompt, validate_witness_field
 
@@ -775,6 +776,8 @@ def _run_draft(
                     ),
                     phase="review",
                 )
+            except PilotBlocked:
+                raise
             except Exception as exc:  # noqa: BLE001
                 # The review pass is cosmetic — grounding and the draft are
                 # already complete. A filter/retry failure here must not

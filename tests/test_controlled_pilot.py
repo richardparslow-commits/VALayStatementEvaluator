@@ -165,7 +165,7 @@ class TestAdmission(unittest.TestCase):
         docs = [document_from_text("a.txt", "Synthetic knee observation for a thread identity test.")]
         with patch.dict(os.environ, {"VA_LSE_MODE": "controlled-pilot"}), \
                 patch.object(pilot, "load_approval", return_value=data), patch.object(st, "user", claims):
-            with pilot.action_budget(docs):
+            with self.assertRaises(pilot.PilotBlocked), pilot.action_budget(docs):
                 context = contextvars.copy_context()
                 with ThreadPoolExecutor(max_workers=1) as executor:
                     self.assertEqual(executor.submit(context.run, pilot.current_owner).result(),

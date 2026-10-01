@@ -155,6 +155,12 @@ def main() -> None:
                 render_research_tab()
         with tab_about:
             render_about_tab()
+    except pilot.PilotBlocked as blocked:
+        # Access may end during extraction/provider work after initial admission.
+        # Do not keep an earlier case or fall through to shared diagnostics.
+        pilot.clear_case()
+        st.error(str(blocked))
+        st.stop()
     except Exception as exc:  # noqa: BLE001 - root error boundary
         rid = get_request_id() or st.session_state.get(REQUEST_ID_KEY, "-") or "-"
         logger.error(
