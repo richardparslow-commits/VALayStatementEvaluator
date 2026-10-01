@@ -36,7 +36,9 @@ are retained. The rating is `Not scored`; effectiveness is `None` with an
 `unavailable` band. Scoring recommendations and the proposed rewrite are skipped.
 The progress message, screen, report, saved payload, and run-log classification
 identify a partial evaluation instead of showing default zero scores or a
-colored effectiveness badge. A finished queue job can contain this explicitly
+colored effectiveness badge. Pilot diagnostics retain only recognized status
+labels (including `partial` and `scoring_status`), and the recent-run view displays
+a warning icon. Arbitrary caller strings remain excluded. A finished queue job can contain this explicitly
 partial result; queue completion means the job returned its retained result.
 
 Saved scoring data is validated before coercion or filtering. The policy and

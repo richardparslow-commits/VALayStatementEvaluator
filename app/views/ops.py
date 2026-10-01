@@ -25,6 +25,7 @@ _RUN_LOG_LIMIT = 30
 
 _STATUS_EMOJI = {
     "ok": "✅",
+    "partial": "⚠️",
     "start": "▶️",
     "error": "❌",
     "timeout": "⏱️",

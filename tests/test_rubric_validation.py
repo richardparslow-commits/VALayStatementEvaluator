@@ -376,3 +376,33 @@ class TestRubricUI(unittest.TestCase):
         st_mock.metric.assert_not_called()
         st_mock.success.assert_not_called()
         self.assertIn(RUBRIC_UNVALIDATED_NOTICE, st_mock.warning.call_args.args[0])
+
+
+class TestRubricPilotDiagnostics(unittest.TestCase):
+    def test_pilot_metadata_keeps_only_recognized_scoring_classifications(self):
+        from app import pilot
+        for classification in ("complete", "incomplete", "invalid", "unvalidated"):
+            saved = pilot.safe_metadata({"action": "evaluate", "status": "partial",
+                "scoring_status": classification, "patient": "PRIVATE_METADATA_SENTINEL"})
+            self.assertEqual(saved["status"], "partial")
+            self.assertEqual(saved["scoring_status"], classification)
+            self.assertNotIn("patient", saved)
+        self.assertEqual(pilot.safe_metadata({"status": "PRIVATE_METADATA_SENTINEL",
+                         "scoring_status": "PRIVATE_METADATA_SENTINEL"}), {})
+
+    def test_pilot_partial_status_survives_persistence_and_ops_display(self):
+        from pathlib import Path
+        import tempfile
+        from app import pilot, run_log
+        from app.views.ops import _event_row
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "runs.jsonl"
+            with patch.object(pilot, "enabled", return_value=True), patch.object(run_log, "_resolve_log_path", return_value=path):
+                run_log.run_log_event("evaluate", "partial", request_id="req_0123456789ab",
+                    scoring_status="incomplete", error="PRIVATE_METADATA_SENTINEL", patient="PRIVATE_METADATA_SENTINEL")
+            persisted = path.read_text()
+            event = json.loads(persisted)
+        self.assertNotIn("PRIVATE_METADATA_SENTINEL", persisted)
+        self.assertEqual(event["status"], "partial")
+        self.assertEqual(event["scoring_status"], "incomplete")
+        self.assertEqual(_event_row(event)["Status"], "⚠️ partial")
