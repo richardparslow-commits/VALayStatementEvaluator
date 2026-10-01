@@ -27,7 +27,7 @@ fields are split into passages with original offsets and field identity.
 Recognized headings/certification are excluded from factual coverage requirements.
 Source selection does not waive changed numbers, calendar dates, negation, approximate dates,
 uncertainty, laterality, frequency, chronology, speaker attribution, diagnosis/nexus terms or factual
-wording. Numeric occurrences also retain nearby wording and occurrence counts,
+wording. Numeric occurrences also retain nearby wording within clause boundaries and occurrence counts,
 so swapping existing years/quantities between claims is flagged. These lexical
 associations can flag legitimate rephrasing and are not semantic proof. Original
 witness passages must be preserved or linked to supported sentences. Record statements retain attribution to the records rather than

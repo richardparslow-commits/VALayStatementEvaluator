@@ -86,10 +86,17 @@ def _number_associations(text: str) -> list[str]:
     counts: dict[str, int] = {}
     starts = [start for start, _, _ in meaningful]
     ends = [end for _, end, _ in meaningful]
+    boundaries = list(re.finditer(r"[;!?]|\b(?:and|or|but)\b|(?<!\d)[,.]|[,.](?!\d)", lowered))
+    boundary_starts = [m.start() for m in boundaries]
+    boundary_ends = [m.end() for m in boundaries]
     for start, end, number in sorted(occurrences):
         prior, following = bisect_right(ends, start), bisect_left(starts, end)
-        before = [word for _, _, word in meaningful[max(0, prior - 2):prior]]
-        after = [word for _, _, word in meaningful[following:following + 2]]
+        left, right = bisect_right(boundary_ends, start), bisect_left(boundary_starts, end)
+        clause_start = boundary_ends[left - 1] if left else 0
+        clause_end = boundary_starts[right] if right < len(boundaries) else len(lowered)
+        first, last = bisect_left(starts, clause_start), bisect_right(ends, clause_end)
+        before = [word for _, _, word in meaningful[max(first, prior - 2):prior]]
+        after = [word for _, _, word in meaningful[following:min(last, following + 2)]]
         binding = fingerprint([before, number, after])
         counts[binding] = counts.get(binding, 0) + 1
         result.append(f"{binding}:{counts[binding]}")
@@ -272,8 +279,9 @@ def compare(text: str, context: dict[str, Any] | None,
             # Identity/opportunity fields supply structured meaning even when
             # their value is just "Alex", "2010" or "weekly". Permit those
             # narrow wrappers, never diagnoses, new numbers or missing content.
-            if baseline and all(s["kind"] == "witness_field" for s in baseline):
-                if name == "speaker" and fields <= {"name", "relationship", "known_since", "contact_frequency"}:
+            if fields:
+                if (name == "speaker" and all(s["kind"] == "witness_field" for s in baseline)
+                        and fields <= {"name", "relationship", "known_since", "contact_frequency"}):
                     added = set()
                 if name == "chronology" and "known_since" in fields:
                     added -= {"since"}

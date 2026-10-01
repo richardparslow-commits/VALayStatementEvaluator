@@ -157,6 +157,21 @@ class TestFactualComparison(unittest.TestCase):
         self.assertEqual(linked["status"], "blocked")
         self.assertIn("factual wording", reasons(linked))
 
+    def test_known_since_and_original_observation_can_share_a_supported_sentence(self):
+        r = result("I observed his knee pain.")
+        r.factual_inputs["witness"] = {"known_since": "2010"}
+        context = context_for_result(r)
+        text = "I have known him since 2010 and observed his knee pain."
+        row = compare(text, context)["rows"][0]
+        selected = [s["id"] for s in context["sources"] if s["kind"] in {"witness_account", "witness_field"}]
+        linked = compare(text, context, {row["id"]: selected})
+        self.assertEqual(linked["status"], "review_required", reasons(linked))
+        changed = text.replace("2010", "1995")
+        row = compare(changed, context)["rows"][0]
+        unsupported = compare(changed, context, {row["id"]: selected})
+        self.assertEqual(unsupported["status"], "blocked")
+        self.assertIn("dates/numbers", reasons(unsupported))
+
     def test_original_2020_to_1995_and_invented_frequency_are_specific(self):
         r = result(text="I observed knee pain in 1995 seven days per week.")
         review = compare(r.draft, context_for_result(r))
