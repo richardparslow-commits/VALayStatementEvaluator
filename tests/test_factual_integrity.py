@@ -94,6 +94,17 @@ class TestFactualComparison(unittest.TestCase):
         r.factual_inputs["unreadable_units"][0]["page"] = True
         self.assertIsNone(context_for_result(r))
 
+    def test_unreadable_reservations_use_the_record_limit_not_the_span_limit(self):
+        from app import config
+        r = result()
+        r.factual_inputs["unreadable_units"] = [{"filename": "scan.pdf", "kind": "page", "page": n}
+                                               for n in range(1, 4002)]
+        with patch.object(config, "MAX_RECORD_PAGES", 5000):
+            context = context_for_result(r)
+        self.assertIsNotNone(context)
+        self.assertTrue(any(s["kind"] == "record_quote" for s in context["sources"]))
+        self.assertEqual(compare(ACCOUNT, context)["status"], "review_required")
+
     def test_exact_passages_do_not_repeat_full_ledger_scans(self):
         from app import factual_integrity
         account = " ".join(f"I observed pain at event {n}." for n in range(400))
@@ -177,6 +188,34 @@ class TestFactualComparison(unittest.TestCase):
                 self.assertEqual(linked["status"], "blocked")
                 self.assertIn(category, reasons(linked))
 
+    def test_swapped_dates_and_quantities_keep_their_original_claim_associations(self):
+        cases = (
+            ("Pain began in 2020 and surgery occurred in 2021.", "Pain began in 2021 and surgery occurred in 2020."),
+            ("Pain began in 2020 and swelling began in 2021.", "Pain began in 2021 and swelling began in 2020."),
+            ("I saw two falls and three headaches.", "I saw three falls and two headaches."),
+        )
+        for original, changed in cases:
+            with self.subTest(original=original):
+                context = context_for_result(result(original))
+                row = compare(changed, context)["rows"][0]
+                sid = next(s["id"] for s in context["sources"] if s["kind"] == "witness_account")
+                linked = compare(changed, context, {row["id"]: [sid]})
+                self.assertEqual(linked["status"], "blocked")
+                self.assertIn("number-to-claim associations", reasons(linked))
+                self.assertEqual(compare(original, context)["status"], "review_required")
+
+    def test_multi_sentence_witness_details_offer_independent_original_passages(self):
+        r = result()
+        first = "I observed falls in 2021."
+        details = first + " I observed headaches in 2022."
+        r.factual_inputs["witness"] = {"aa_daily_personal_care": details}
+        context = context_for_result(r)
+        fields = [s for s in context["sources"] if s["kind"] == "witness_field"]
+        self.assertEqual(len(fields), 2)
+        for source in fields:
+            self.assertEqual(details[source["start"]:source["end"]], source["text"])
+        self.assertEqual(compare(ACCOUNT + " " + first, context)["status"], "review_required")
+
     def test_record_negation_cannot_be_removed(self):
         r = result(); context = context_for_result(r)
         sid = next(s["id"] for s in context["sources"] if s["kind"] == "record_quote")
@@ -231,6 +270,13 @@ class TestFactualComparison(unittest.TestCase):
         for text in ("# Introduction", "I certify that this statement is true and correct to the best of my knowledge and belief.",
                      "# Introduction: cancer began in 1995"):
             self.assertEqual(compare(text, context)["status"], "blocked")
+
+    def test_complete_original_statement_with_heading_and_certification_is_reviewable(self):
+        account = ("# Introduction\n" + ACCOUNT + "\n"
+                   "I certify that this statement is true and correct to the best of my knowledge and belief.")
+        review = compare(account, context_for_result(result(account)))
+        self.assertEqual(review["status"], "review_required", reasons(review))
+        self.assertEqual(len(review["rows"]), 1)
 
     def test_placeholders_block_exact_text_approval(self):
         account = "I observed pain [Confirm: frequency]."
@@ -331,6 +377,19 @@ class TestPipelineAndSavedReview(unittest.TestCase):
         r = EvaluationResult(report_markdown="APPROVED FINAL: onset 1995", **scored_result_fields(), **topic_result_fields())
         self.assertNotIn("APPROVED FINAL", evaluation_report_markdown(r))
 
+    def test_rebuilding_display_and_saved_reports_does_not_repeat_goal_events(self):
+        from app.evaluate import build_report
+        r = EvaluationResult(report_citations=[{"source": "records.txt p.1", "excerpt": QUOTE}],
+                             **scored_result_fields(), **topic_result_fields())
+        with patch("app.evaluate.track_goal") as goal:
+            build_report(r, ACCOUNT)
+            goal.assert_called_once()
+            goal.reset_mock()
+            evaluation_report_markdown(r)
+            evaluation_report_markdown(r, include_rewrite=False)
+            evaluation_to_json(r)
+            goal.assert_not_called()
+
     def test_itemized_only_edits_have_report_warnings(self):
         d = result()
         r = EvaluationResult(revision_changes=[{"revised": "Knee pain began in 1995."}],
@@ -397,6 +456,24 @@ class TestPipelineAndSavedReview(unittest.TestCase):
         payload = evaluation_to_json(r); payload["factual_review"] = {"status": "reviewed"}
         restored = evaluation_from_json(payload)
         self.assertEqual(restored.factual_review["status"], "blocked")
+
+    def test_saved_queue_results_omit_recomputable_comparison_ledgers(self):
+        from app import config
+        from app.job_payload import encode_result, decode_result, RunResult, KIND_DRAFT, KIND_EVALUATE
+        from app.usage import UsageTracker
+        d = result(); d.factual_review = {"redundant_private_ledger": "x" * 100_000}
+        e = EvaluationResult(revised_statement=ACCOUNT, factual_inputs=d.factual_inputs,
+                             digest=d.digest, evidence_source=d.evidence_source,
+                             factual_review=d.factual_review, **scored_result_fields(), **topic_result_fields())
+        for kind, candidate in ((KIND_DRAFT, d), (KIND_EVALUATE, e)):
+            with self.subTest(kind=kind), patch.object(config, "JOB_QUEUE_MAX_PAYLOAD_BYTES", 50_000):
+                encoded = encode_result(RunResult(kind=kind, result=candidate, usage=UsageTracker()))
+                payload = json.loads(encoded)["result"]
+                self.assertNotIn("factual_review", payload)
+                self.assertNotIn("redundant_private_ledger", encoded)
+                restored = decode_result(encoded).result
+                self.assertEqual(restored.factual_review["status"], "review_required")
+        self.assertNotIn(ACCOUNT, evaluation_to_json(e)["report_markdown"])
 
     def test_batch_current_and_legacy_final_have_explicit_unreviewed_comparisons(self):
         from tests.test_batch_draft import batch_draft

@@ -1149,9 +1149,9 @@ def evaluation_report_markdown(result: EvaluationResult, *, include_rewrite: boo
     if not evaluation_is_complete(result):
         # Rebuild from retained review data; a historical cached report may carry
         # invalid grades or a rewrite that predates the validation policy.
-        return build_report(result, "")
+        return build_report(result, "", emit_telemetry=False)
     original = result.factual_inputs.get("account", "")
-    report = build_report(result, original if isinstance(original, str) else "")
+    report = build_report(result, original if isinstance(original, str) else "", emit_telemetry=False)
     if (
         getattr(result, "verification_policy", "") != SOURCE_REFERENCE_POLICY
         and LEGACY_REFERENCE_NOTICE not in report
@@ -1936,6 +1936,7 @@ def build_report(
     result: EvaluationResult,
     statement_text: str,
     citations: list[dict[str, str]] | None = None,
+    *, emit_telemetry: bool = True,
 ) -> str:
     """Render the full markdown evaluation report.
 
@@ -2160,11 +2161,12 @@ def build_report(
             lines.append(f"- **{source}**: {excerpt}")
         lines.append("")
         try:
-            track_goal(
-                SEARCH_FEATURE_ID,
-                "report_sources_appended",
-                citation_count=len(citations),
-            )
+            if emit_telemetry:
+                track_goal(
+                    SEARCH_FEATURE_ID,
+                    "report_sources_appended",
+                    citation_count=len(citations),
+                )
         except Exception:  # noqa: BLE001 - telemetry must never break report generation
             pass
 

@@ -250,9 +250,6 @@ def digest_from_json(raw: Any) -> MedicalDigest | None:
 
 # ---------------------------------------------------------------- results
 def evaluation_to_json(result: EvaluationResult) -> dict[str, Any]:
-    from .factual_integrity import attach_review
-    if result.revised_statement or result.revision_changes:
-        attach_review(result, result.revised_statement)
     complete = rubric_is_complete(result)
     topics_complete = topics_are_complete(result)
     all_complete = evaluation_is_complete(result)
@@ -282,10 +279,9 @@ def evaluation_to_json(result: EvaluationResult) -> dict[str, Any]:
         "revision_changes": list(result.revision_changes),
         "revised_statement": result.revised_statement,
         "factual_inputs": dict(result.factual_inputs),
-        "factual_review": dict(result.factual_review),
         "added_facts_to_verify": list(result.added_facts_to_verify),
         "digest": digest_to_json(result.digest),
-        "report_markdown": evaluation_report_markdown(result),
+        "report_markdown": evaluation_report_markdown(result, include_rewrite=False),
         "input_chars": result.input_chars,
         "truncated_chars": result.truncated_chars,
         "truncation_warning": result.truncation_warning,
@@ -380,11 +376,8 @@ def evaluation_from_json(raw: Any) -> EvaluationResult:
 
 
 def draft_to_json(result: DraftResult) -> dict[str, Any]:
-    from .factual_integrity import attach_review
-    attach_review(result, result.output_statement)
     return {
         "factual_inputs": dict(result.factual_inputs),
-        "factual_review": dict(result.factual_review),
         "grounding": dict(result.grounding) if isinstance(result.grounding, dict) else {},
         "grounding_policy": result.grounding_policy,
         "draft": result.draft,

@@ -9,11 +9,13 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from bisect import bisect_left, bisect_right
 from itertools import islice
 from collections.abc import Iterator
 from typing import Any
 
 from .documents import DocumentPage, ExtractedDocument
+from . import config
 from .grounding_sources import grounding_catalog
 from .medical_review import MedicalDigest
 
@@ -71,6 +73,29 @@ def _spans(text: str) -> Iterator[dict[str, Any]]:
             yield {"start": start, "end": start + len(clean), "text": clean}
 
 
+def _number_associations(text: str) -> list[str]:
+    """Bind each occurrence to nearby factual wording, not just a number set."""
+    lowered = text.casefold().replace("’", "'")
+    tokens = list(_WORDS.finditer(lowered))
+    meaningful = [(m.start(), m.end(), _content_word(m.group())) for m in tokens
+                  if m.group() not in _GRAMMAR | {"known", "know", "name"}
+                  and m.group() not in _NUMBER_WORDS and not m.group().isdecimal()]
+    occurrences = [(m.start(), m.end(), m.group()) for m in _NUMBERS.finditer(lowered)]
+    occurrences += [(m.start(), m.end(), _NUMBER_WORDS[m.group()]) for m in tokens if m.group() in _NUMBER_WORDS]
+    result = []
+    counts: dict[str, int] = {}
+    starts = [start for start, _, _ in meaningful]
+    ends = [end for _, end, _ in meaningful]
+    for start, end, number in sorted(occurrences):
+        prior, following = bisect_right(ends, start), bisect_left(starts, end)
+        before = [word for _, _, word in meaningful[max(0, prior - 2):prior]]
+        after = [word for _, _, word in meaningful[following:following + 2]]
+        binding = fingerprint([before, number, after])
+        counts[binding] = counts.get(binding, 0) + 1
+        result.append(f"{binding}:{counts[binding]}")
+    return sorted(result)
+
+
 def features(text: str) -> dict[str, list[str]]:
     words = set(_WORDS.findall(text.casefold().replace("’", "'")))
     numbers = set(_NUMBERS.findall(text)) | {_NUMBER_WORDS[w] for w in words if w in _NUMBER_WORDS}
@@ -82,6 +107,7 @@ def features(text: str) -> dict[str, list[str]]:
         "factual wording": sorted({_content_word(w) for w in words - _GRAMMAR
                                    if w not in _NUMBER_WORDS and not w.isdecimal()}),
         "dates/numbers": sorted(numbers),
+        "number-to-claim associations": _number_associations(text),
         "calendar dates": sorted(words & {"january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"}),
         "chronology": sorted(words & {"before", "after", "since", "during", "until", "earlier", "later", "prior", "following"}),
         "speaker": sorted((({"first person"} if words & {"i", "me", "my", "we", "our", "us"} else set()) |
@@ -108,7 +134,9 @@ def build_context(account: str, witness: dict[str, str], digest: MedicalDigest |
             # Retain them in the context fingerprint but never offer them as
             # support, including in a selection mixed with witness passages.
             if name not in {"Claimed condition", "Claim type"} and value.strip():
-                yield {"kind": "witness_field", "field": name, "label": _FIELD_LABELS.get(name, name), "text": value}
+                for index, span in enumerate(_spans(value), 1):
+                    yield {**span, "kind": "witness_field", "field": name,
+                           "label": f"{_FIELD_LABELS.get(name, name)} — passage {index}"}
         if digest:
             catalog, _ = grounding_catalog(digest, records, "", max_facts=len(digest.facts), budget_chars=4_000_000)
             for entry in catalog.values():
@@ -148,7 +176,7 @@ def context_for_result(result: Any) -> dict[str, Any] | None:
     if (not isinstance(account, str) or not account.strip() or len(account) > MAX_OUTPUT_CHARS
             or not isinstance(witness, dict) or len(witness) > 66
             or any(not isinstance(k, str) or not isinstance(v, str) or len(v) > 4000 for k, v in witness.items())
-            or not isinstance(unreadable, list) or len(unreadable) > MAX_SPANS
+            or not isinstance(unreadable, list) or len(unreadable) > config.MAX_RECORD_PAGES
             or not isinstance(evidence, list) or not evidence):
         return None
     records = []
@@ -269,7 +297,8 @@ def compare(text: str, context: dict[str, Any] | None,
         result["rows"].append({**span, "id": row_id, "sources": chosen, "candidates": candidates,
                                "features": actual, "issues": reasons})
     for index, (sid, source) in enumerate(sources.items(), 1):
-        if require_account_coverage and source["kind"] == "witness_account" and sid not in used:
+        if (require_account_coverage and source["kind"] == "witness_account"
+                and not _structural(source["text"]) and sid not in used):
             result["issues"].append(f"Original witness passage {index} is not preserved or linked to a supported sentence.")
     if not result["rows"]:
         result["issues"].append("No factual sentences are available for source and witness review.")

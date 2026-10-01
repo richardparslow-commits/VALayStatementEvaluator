@@ -22,11 +22,15 @@ missing these reservations require a re-run.
 Every non-structural output sentence has offsets, a text fingerprint, selected
 source IDs, candidate passages and unresolved comparison items. Exact original
 matches receive a source link; lexical candidates alone never receive one.
-Other sentences need explicit human source selection. Source selection does
-not waive changed numbers, calendar dates, negation, approximate dates,
+Other sentences need explicit human source selection. Prose-valued witness
+fields are split into passages with original offsets and field identity.
+Recognized headings/certification are excluded from factual coverage requirements.
+Source selection does not waive changed numbers, calendar dates, negation, approximate dates,
 uncertainty, laterality, frequency, chronology, speaker attribution, diagnosis/nexus terms or factual
-wording. Original witness passages must be preserved or linked to supported
-sentences. Record statements retain attribution to the records rather than
+wording. Numeric occurrences also retain nearby wording and occurrence counts,
+so swapping existing years/quantities between claims is flagged. These lexical
+associations can flag legitimate rephrasing and are not semantic proof. Original
+witness passages must be preserved or linked to supported sentences. Record statements retain attribution to the records rather than
 becoming firsthand observations, including when combined with witness sources.
 Unresolved placeholders block approval.
 Structured name, relationship, known-since and observation-frequency fields permit
@@ -53,7 +57,10 @@ case approval or signatures. Pilot download exclusion still applies.
 
 Saved payloads retain the original inputs but cannot grant approval by storing a
 `reviewed` flag. Comparisons are rebuilt from original account/metadata, retained
-facts and complete source pages. Missing or malformed legacy provenance stays
+facts and complete source pages. Durable app result payloads omit recomputable
+comparison ledgers; evaluation payloads also omit rewrites from cached report
+prose while retaining the structured rewrite for fresh review. Report rebuilds
+do not emit duplicate source-appendix goal events. Missing or malformed legacy provenance stays
 unreviewed and requires a re-run with original inputs. Cached rewrite reports are
 rebuilt so historical final/approved claims cannot bypass current annotations.
 Evaluation report downloads omit generated rewrites and proposed edits; the
