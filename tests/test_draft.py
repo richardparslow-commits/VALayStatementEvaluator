@@ -433,7 +433,8 @@ class TestRunDraftEdgeCases(unittest.TestCase):
         mock_review.side_effect = ValueError("No records")
         with self.assertRaises(DraftingError) as ctx:
             run_draft(_FakeLLM(), [], WITNESS, "obs", "cond", "Service connection")
-        self.assertIn("unexpected drafting error", ctx.exception.format_for_user().lower())
+        self.assertEqual(ctx.exception.error_kind, "payload_invalid")
+        mock_review.assert_not_called()
 
     @patch("app.draft.review_medical_records")
     @patch("app.draft.load_knowledge", return_value="k")
@@ -460,10 +461,9 @@ class TestRunDraftEdgeCases(unittest.TestCase):
     @patch("app.draft.load_knowledge", return_value="k")
     def test_empty_observations(self, _mk, mock_review):
         mock_review.return_value = _fake_digest()
-        result = run_draft(_FakeLLM(), [_doc()], WITNESS, "", "knee pain", "Service connection")
-        self.assertEqual(result.input_chars, 0)
-        # pipeline still completes (grounding/draft/review called)
-        self.assertTrue(result.draft)
+        with self.assertRaises(DraftingPayloadError):
+            run_draft(_FakeLLM(), [_doc()], WITNESS, "", "knee pain", "Service connection")
+        mock_review.assert_not_called()
 
     @patch("app.draft.review_medical_records")
     @patch("app.draft.load_knowledge", return_value="k")

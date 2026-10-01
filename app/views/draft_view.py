@@ -294,8 +294,6 @@ def render_draft_tab() -> None:
         # Mint the correlation id BEFORE validation so every rejection carries a
         # reference the run log can resolve (see app/run_log.py).
         rid = new_run_request_id()
-        if not _validate_draft_inputs(records, observations, condition, rid):
-            return
         _run_draft_flow(
             rid=rid,
             records=records,
@@ -419,29 +417,36 @@ def _render_observations_length_guidance(observations: str) -> None:
         , container=st, method="caption")
 
 
-def _validate_draft_inputs(records: list, observations: str, condition: str, rid: str) -> bool:
+_NO_WITNESS = object()
+
+
+def _validate_draft_inputs(records: list, observations: str, condition: str, rid: str,
+                           *, claim_type: str = "Service connection", witness: Any = _NO_WITNESS,
+                           validate_record_set: bool = True, confirm_oversize: bool = True,
+                           original_text: str | None = None) -> bool:
     """Pre-run validation; shows the specific error and returns False when invalid.
 
     Every rejection is recorded in the persistent run log so the reference shown
     in future error messages is always correlatable, even for pre-pipeline
     failures that never reach the audit log.
     """
-    if not records:
-        msg = "Upload at least one medical record file first."
-        run_log_event("draft", "rejected", request_id=rid, error=msg, reason="no_records")
-        # Shown with the id the run log recorded, so a rejection the user quotes
-        # is findable even though it never reached the audit log.
-        pilot.display(f"{msg}{reference_suffix(rid)}", container=st, method="error")
+    from ..request_validation import RequestValidationError, validate_draft_request, validate_records, validate_follow_up_prompt_budget
+    try:
+        if validate_record_set:
+            validate_records(records)
+        validate_draft_request(observations=observations, condition=condition, claim_type=claim_type,
+                               witness={} if witness is _NO_WITNESS else witness, validate_record_set=False)
+        if original_text is not None:
+            validate_follow_up_prompt_budget(original_text, observations, field="observations",
+                                             label="The observations", limit=DRAFT_INTERNAL_MAX_CHARS)
+    except RequestValidationError as exc:
+        reason = ({"records": "no_records", "observations": "missing_observations", "condition": "missing_condition",
+                   "claim_type": "missing_claim_type"}.get(exc.field, exc.reason)
+                  if exc.reason == "payload_missing" else exc.reason)
+        run_log_event("draft", "rejected", request_id=rid, error=str(exc), reason=reason)
+        pilot.display(f"{exc}{reference_suffix(rid)}", container=st, method="error")
         return False
-    if not observations.strip() or not condition.strip():
-        msg = "Enter the condition and the witness's observations."
-        run_log_event(
-            "draft", "rejected", request_id=rid, error=msg,
-            reason="missing_observations" if not observations.strip() else "missing_condition",
-        )
-        pilot.display(f"{msg}{reference_suffix(rid)}", container=st, method="error")
-        return False
-    if len(observations) > MAX_OBSERVATIONS_CHARS and not st.session_state.get(
+    if confirm_oversize and len(observations) > MAX_OBSERVATIONS_CHARS and not st.session_state.get(
         "draft_confirm_oversize"
     ):
         over = len(observations) - MAX_OBSERVATIONS_CHARS
@@ -473,12 +478,20 @@ def _run_draft_flow(
     observations: str,
 ) -> None:
     """Run the pipeline with the pre-minted run id; persist the result."""
+    if not _validate_draft_inputs(records, observations, condition, rid, claim_type=claim_type, witness=witness):
+        return
+    queued = job_runner.queue_mode_active()
+    submitted_observations = observations if queued else append_follow_up_answers(observations.strip(), slot="draft")
+    if not _validate_draft_inputs(records, submitted_observations, condition, rid, claim_type=claim_type, witness=witness,
+                                  validate_record_set=False, confirm_oversize=False,
+                                  original_text=None if queued else observations.strip()):
+        return
     # Before anything is spent: a configuration whose every call is rejected is
     # detectable in one request. Covers the queued path too — this is the only
     # entry point, and the worker never re-checks inside its own session-less run.
     if not check_endpoint_gate("draft", log_action="draft", request_id=rid):
         return
-    if job_runner.queue_mode_active():
+    if queued:
         _run_draft_queued(
             rid=rid,
             records=records,
@@ -544,7 +557,7 @@ def _run_draft_flow(
             llm,
             records,
             witness,
-            append_follow_up_answers(observations.strip(), slot="draft"),
+            submitted_observations,
             condition.strip(),
             claim_type,
             progress=update,

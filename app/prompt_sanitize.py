@@ -45,6 +45,16 @@ _INVISIBLE_RE = re.compile(
     "\U000e0000-\U000e007f]"
 )
 
+# Detect useful text without allocating a sanitized copy of a full record page.
+# Derive the same invisible-character class used by prompt sanitization.
+_VISIBLE_TEXT_RE = re.compile(r"[^\s\x00-\x1f\x7f-\x9f" + _INVISIBLE_RE.pattern[1:-1] + "]")
+
+
+def has_prompt_text(value: str) -> bool:
+    """True when at least one printable, non-whitespace, non-invisible character exists."""
+    return any(match.group().isprintable() for match in _VISIBLE_TEXT_RE.finditer(value))
+
+
 # Angle brackets that *look* like ``<``/``>`` once rendered: fullwidth (CJK input
 # methods produce these), CJK double angle brackets, and the mathematical angle
 # brackets. Translated to ASCII before the escaping pass so a lookalike cannot

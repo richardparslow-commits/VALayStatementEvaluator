@@ -516,7 +516,7 @@ class TestDraftingSourceGate(unittest.TestCase):
 
     def test_unknown_legacy_fact_sources_produce_explicit_coverage_warning(self):
         from tests.test_batch_draft import TestFinalPhaseSemantics
-        result = TestFinalPhaseSemantics()._run_final("ok")
+        result = TestFinalPhaseSemantics()._run_final("ok", legacy_unknown_sources=True)
         self.assertEqual(result["legacy_source_facts_unresolved"], 1)
         self.assertIn("Legacy source coverage", result["grounding_markdown"])
 

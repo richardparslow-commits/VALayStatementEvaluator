@@ -610,6 +610,8 @@ def run_evaluation(
     care-coverage gaps. ``None`` keeps every prompt byte-identical to the
     pre-intake pipeline.
     """
+    from .request_validation import validate_evaluation_request
+    validate_evaluation_request(statement_text=statement_text, records=records, witness=witness)
     rid = get_request_id() or "-"
     t0 = time.perf_counter()
     pages = sum(len(d.pages) for d in records)

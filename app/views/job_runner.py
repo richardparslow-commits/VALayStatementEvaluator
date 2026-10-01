@@ -38,6 +38,7 @@ from ..job_payload import (
     PayloadError,
     RunResult,
     decode_result,
+    decode_job,
     documents_bundle,
     encode_job,
     encode_job_with_blob,
@@ -342,6 +343,7 @@ def submit_job(
                 if pending["owner_id"] != owner or pending["kind"] != kind:
                     raise PayloadError("The previous submission belongs to another session.")
                 payload = pending["payload"]
+                decode_job(kind, payload, blob_store=get_blob_store())
                 request_id = pending["request_id"]
                 files, pages = pending["files"], pending["pages"]
                 condition, sources = pending["condition"], pending["sources"]

@@ -20,6 +20,7 @@ from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests
 from tests.rubric_fixtures import scored_result_fields
 from tests.topic_fixtures import topic_result_fields
 
+from app.documents import document_from_text
 from app.preflight import BLOCKED, OK, UNVERIFIED, Verdict  # noqa: E402
 from app.usage import UsageTracker  # noqa: E402
 
@@ -1475,7 +1476,7 @@ class TestEvaluateRunBookkeeping(unittest.TestCase):
             side_effect=lambda action, status, **kw: events.append((action, status, kw)),
         ), patch.object(evaluate_view, "audit_log"):
             try:
-                evaluate_view._run_evaluation_flow("I watched the veteran limp.", [MagicMock()])
+                evaluate_view._run_evaluation_flow("I watched the veteran limp.", [document_from_text("synthetic.txt", "Knee pain noted.")])
             except BaseException as raised:  # noqa: BLE001 - control flow is re-raised
                 return events, raised
         return events, None
