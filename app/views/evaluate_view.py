@@ -211,6 +211,8 @@ def render_evaluate_tab() -> None:
     if run:
         _run_evaluation_flow(statement_text, records, collect_aa_answers("eval"))
 
+    pilot.require_session_access()
+
     # A queued run outlives this browser session, so re-attach to one started
     # earlier (a reload mid-digest would otherwise look like nothing happened).
     job_runner.resume_pending_job("eval", action_label="Evaluation")
@@ -387,6 +389,9 @@ def _run_evaluation_flow(statement_text: str, records: list, witness: dict[str, 
             progress=update,
             witness=witness or {},
         )
+        pilot.require_session_access()
+    except pilot.PilotBlocked:
+        raise
     except MemoryError as mem_exc:
         bar.empty()
         duration_ms = int((time.perf_counter() - t0) * 1000)

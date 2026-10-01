@@ -48,6 +48,7 @@ from .llm import (
 )
 from .logging_config import PhaseTimer, get_request_id
 from .pipeline_guard import check_pipeline_cancelled, pipeline_as_completed
+from .pilot import PilotBlocked
 from .preflight import REFUSAL_STATUSES
 from .profiler import get_current_run_profiler, worker_timer
 from .prompt_sanitize import GUARD_NOTE, sanitize_for_prompt
@@ -1020,6 +1021,10 @@ def review_medical_records(
                 refused = False
                 try:
                     results[chunk.index] = future.result()
+                except PilotBlocked:
+                    # Stop scheduling/retrying a revoked run. Already-sent
+                    # calls recheck access before accepting their responses.
+                    raise
                 except Exception as exc:  # noqa: BLE001 - record and retry later
                     failed[chunk.index] = exc
                     if isinstance(exc, (CircuitBreakerOpenError, QueueFullError)):

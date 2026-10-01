@@ -159,6 +159,19 @@ upload caps, parser timeout/resource limits, real provider error paths, logs and
 egress restrictions. Verify that no case download URL is created and that
 `/health`, `/ready`, and `/metrics` are unavailable through the pilot proxy.
 
+Use [the R07 host acceptance procedure](deploy/PILOT_ACCEPTANCE.md) to record the
+actual image IDs, identity/MFA, two-participant isolation, network restrictions,
+revocation during work, parser probes and single-instance upgrade results. Blank
+templates and CI results are not completed deployment evidence. The pilot Compose
+file does not itself enforce an outbound destination allowlist; the operator must
+demonstrate the actual host/network policy before real-information admission.
+
+Access is rechecked after provider responses, at successful pipeline completion,
+and before delayed results enter session state. An expired token or removed
+invitation discards that response/run; admission refusals bypass retries and
+ordinary drafting errors. The UI clears the working case and stops rendering.
+Requests already sent and content already displayed cannot be recalled.
+
 The local test suite exercises the code paths with synthetic identities and
 providers. It **does not prove live OIDC integration, TLS configuration, provider
 terms, container limits, backup restoration, or output accuracy**. Record those
