@@ -130,6 +130,10 @@ def worker_config_error() -> str:
 def _hydrate(slot: str, run: RunResult) -> None:
     """Store a decoded result under the keys the tab's results renderer reads."""
     result_key, usage_key, rid_key = _RESULT_KEYS[slot]
+    if slot == "eval":
+        # Recovery cannot bind new questions to the current form inputs. Keep
+        # earlier answers and their own binding, but block collection into it.
+        st.session_state["eval_follow_up_questions_bound"] = False
     st.session_state[result_key] = run.result
     st.session_state[usage_key] = run.usage
     st.session_state[rid_key] = run.request_id or st.session_state.get(rid_key, "")

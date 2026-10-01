@@ -70,7 +70,7 @@ def _valid_input_key(value: Any) -> bool:
     return isinstance(value, str) and re.fullmatch(r"[a-f0-9]{64}", value) is not None
 
 
-def remember_evaluation_inputs(input_key: str) -> None:
+def remember_evaluation_inputs(input_key: str, *, source_id: str = "") -> None:
     """Bind questions from a returned direct result; discard prior-case state."""
     previous = st.session_state.get(_key("eval", "input_key"), "")
     if not _valid_input_key(input_key) or previous != input_key:
@@ -79,12 +79,15 @@ def remember_evaluation_inputs(input_key: str) -> None:
         st.session_state[_key("eval", "index")] = 0
         st.session_state[_key("eval", "notice")] = ""
     st.session_state[_key("eval", "input_key")] = input_key if _valid_input_key(input_key) else ""
+    st.session_state[_key("eval", "input_source_id")] = source_id
+    st.session_state[_key("eval", "questions_bound")] = _valid_input_key(input_key) and bool(source_id)
 
 
 def append_follow_up_answers(text: str, *, slot: str, input_key: str | None = None) -> str:
     """Append accepted answers; evaluation reuse requires matching exact inputs."""
     if slot == "eval" and (not _valid_input_key(input_key)
-            or st.session_state.get(_key(slot, "input_key"), "") != input_key):
+            or st.session_state.get(_key(slot, "input_key"), "") != input_key
+            or not st.session_state.get(_key(slot, "input_source_id"))):
         if _saved_answers(slot):
             pilot.display("Saved follow-up answers belong to different or unrecognized inputs "
                           "and were not included. Review the statement and collect new answers "
@@ -123,6 +126,16 @@ def render_follow_up_questions(
 ) -> None:
     """Render one follow-up question at a time with accept/skip controls."""
     _ensure_state(slot, source_id)
+    if slot == "eval" and questions and (
+            not _valid_input_key(st.session_state.get(_key(slot, "input_key")))
+            or st.session_state.get(_key(slot, "input_source_id")) != source_id
+            or st.session_state.get(_key(slot, "questions_bound")) is not True):
+        questions = []
+        empty_message = (
+            "New follow-up questions are unavailable for this saved or queued result. "
+            "Run a direct evaluation to bind new answers to its inputs. Earlier saved "
+            "answers remain available and can be reused only with their matching inputs."
+        )
     questions = _filter_handled_questions(slot, questions)
     saved = _saved_answers(slot)
     skipped = _saved_skips(slot)
@@ -142,7 +155,7 @@ def render_follow_up_questions(
         if saved:
             pilot.display(
                 (f"{len(saved)} accepted answer(s) will be included only when the statement, "
-                 "records and witness inputs match this evaluation."
+                 "records and witness inputs match their source evaluation."
                  if slot == "eval" and _valid_input_key(st.session_state.get(_key(slot, "input_key")))
                  else "These saved answers are unbound and will not be included in another evaluation. "
                  "Clear them and collect new answers." if slot == "eval"

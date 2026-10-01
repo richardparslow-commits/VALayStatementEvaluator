@@ -292,6 +292,8 @@ class TestTopicUI(unittest.TestCase):
                     session["eval_request_id"] = "req_new"
                     binding = follow_up.evaluation_input_key("Same synthetic statement.", [_doc()], {})
                     session["eval_follow_up_input_key"] = binding
+                    session["eval_follow_up_input_source_id"] = "req_new"
+                    session["eval_follow_up_questions_bound"] = True
                     session["eval_follow_up_saved"] = [{"topic": "A", "question": "What happened?", "answer": "Synthetic pending answer."}]
                     if old_source is not None: session["eval_follow_up_source_id"] = old_source
                     st_mock.button.side_effect = lambda label, **kw: clear if kw.get("key") == "eval_follow_up_clear" else False
@@ -315,6 +317,9 @@ class TestTopicUI(unittest.TestCase):
         question = follow_up.evaluate_follow_up_questions(result)[0]
         st_mock, session = _fake_streamlit()
         session["eval_follow_up_source_id"] = "req_current"
+        session["eval_follow_up_input_key"] = "a" * 64
+        session["eval_follow_up_input_source_id"] = "req_current"
+        session["eval_follow_up_questions_bound"] = True
         session["eval_follow_up_saved"] = [{**question, "answer": "Synthetic accepted answer."}]
         st_mock.button.return_value = False
         with _patch_st(follow_up, st_mock):
@@ -370,6 +375,7 @@ class TestTopicUI(unittest.TestCase):
         st_mock, session = _fake_streamlit()
         key = follow_up.evaluation_input_key("Synthetic case A.", [_doc()], {})
         session["eval_follow_up_input_key"] = key
+        session["eval_follow_up_input_source_id"] = "req_case_a"
         session["eval_follow_up_saved"] = [{"topic": "A", "answer": "CASE_A_ANSWER_SENTINEL"}]
         with _patch_st(follow_up, st_mock):
             for other_key in (None, "", "future", follow_up.evaluation_input_key("Synthetic case B.", [_doc()], {})):
@@ -385,6 +391,7 @@ class TestTopicUI(unittest.TestCase):
         key = follow_up.evaluation_input_key("Synthetic case A.", [_doc()], {})
         other = follow_up.evaluation_input_key("Synthetic case B.", [_doc()], {})
         session["eval_follow_up_input_key"] = key
+        session["eval_follow_up_input_source_id"] = "req_case_a"
         for suffix in ("saved", "skipped", "applied_saved", "applied_skipped"):
             session[f"eval_follow_up_{suffix}"] = [{"topic": "A", "answer": "CASE_A_ANSWER_SENTINEL"}]
         with _patch_st(follow_up, st_mock): follow_up.remember_evaluation_inputs(other)
@@ -401,6 +408,7 @@ class TestTopicUI(unittest.TestCase):
             records = [_doc()]; statement = "Synthetic case A." if matching else "Synthetic case B."
             key = follow_up.evaluation_input_key("Synthetic case A.", records, {})
             session["eval_follow_up_input_key"] = key
+            session["eval_follow_up_input_source_id"] = "req_case_a"
             session["eval_follow_up_saved"] = [{"topic": "A", "answer": "CASE_A_ANSWER_SENTINEL"}]
             llm = MagicMock(); llm.usage.totals.return_value = type("Totals", (), {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0})()
             with _patch_st(view, st_mock), _patch_st(follow_up, st_mock), patch.object(view, "get_llm", return_value=llm), patch.object(view, "check_endpoint_gate", return_value=True), patch.object(view, "check_shutdown_gate", return_value=True), patch.object(view, "enter_run", return_value=True), patch.object(view, "exit_run"), patch.object(view, "progress_widgets", return_value=(MagicMock(), lambda *a, **kw: None)), patch.object(view, "check_memory_before_run"), patch.object(view, "get_profiler", return_value=None), patch.object(view, "audit_record_meta", return_value=(["Upload"], 1, 1)), patch.object(view, "audit_condition_for_slot", return_value=""), patch.object(view, "record_watchdog_run"), patch.object(view, "audit_log"), patch.object(view, "run_log_event"), patch.object(view, "run_with_timeout", return_value=result) as run:
@@ -412,6 +420,49 @@ class TestTopicUI(unittest.TestCase):
             else:
                 self.assertNotIn("CASE_A_ANSWER_SENTINEL", submitted)
                 self.assertEqual(session["eval_follow_up_saved"], [])
+
+    def test_queued_recovery_preserves_answers_without_binding_new_questions(self):
+        from app.views import job_runner, follow_up
+        for partial in (False, True):
+            for returned_reference in ("req_queued", ""):
+                with self.subTest(partial=partial, reference=returned_reference):
+                    st_mock, session = _fake_streamlit()
+                    key = follow_up.evaluation_input_key("Synthetic original case.", [_doc()], {})
+                    session["eval_follow_up_input_key"] = key
+                    session["eval_follow_up_input_source_id"] = "req_original"
+                    session["eval_follow_up_questions_bound"] = True
+                    session["eval_request_id"] = "req_original"
+                    session["eval_follow_up_saved"] = [{"topic": "A", "answer": "PENDING_ANSWER_SENTINEL"}]
+                    result = valid_result()
+                    if partial: result.topic_status = "incomplete"
+                    run = RunResult(kind="evaluate", result=result, usage=UsageTracker(), request_id=returned_reference)
+                    st_mock.button.return_value = False
+                    with _patch_st(job_runner, st_mock), _patch_st(follow_up, st_mock), patch("app.views.usage.record_watchdog_run"):
+                        job_runner._hydrate("eval", run)
+                        follow_up.render_follow_up_questions(slot="eval", source_id=session["eval_request_id"],
+                            questions=follow_up.evaluate_follow_up_questions(result),
+                            empty_message="Topic analysis unavailable.", next_run_label="evaluation")
+                        reused = follow_up.append_follow_up_answers("Synthetic original case.", slot="eval", input_key=key)
+                    self.assertEqual(session["eval_follow_up_input_key"], key)
+                    self.assertEqual(len(session["eval_follow_up_saved"]), 1)
+                    self.assertIs(session["eval_follow_up_questions_bound"], False)
+                    self.assertIn("PENDING_ANSWER_SENTINEL", reused)
+                    st_mock.form.assert_not_called()
+                    st_mock.button.assert_called_once_with("Clear saved follow-up answers and skipped questions", key="eval_follow_up_clear")
+
+    def test_queued_completion_does_not_consume_unused_saved_answers(self):
+        from app.views import evaluate_view as view, job_runner
+        st_mock, session = _fake_streamlit()
+        result = valid_result(); result.topic_status = "incomplete"
+        session["eval_result"] = result
+        session["eval_follow_up_saved"] = [{"topic": "A", "answer": "PENDING_ANSWER_SENTINEL"}]
+        session["eval_follow_up_input_key"] = "a" * 64
+        outcome = job_runner.QueueOutcome(ok=True, request_id="req_queued")
+        with _patch_st(view, st_mock), patch.object(view, "check_shutdown_gate", return_value=True), patch.object(job_runner, "worker_config_error", return_value=""), patch.object(view, "audit_record_meta", return_value=(["Upload"], 1, 1)), patch.object(view, "audit_condition_for_slot", return_value=""), patch.object(job_runner, "submit_job", return_value=outcome) as submit:
+            view._run_evaluation_queued("Synthetic statement.", [_doc()], {})
+        self.assertNotIn("PENDING_ANSWER_SENTINEL", submit.call_args.kwargs["job"].statement_text)
+        self.assertEqual(len(session["eval_follow_up_saved"]), 1)
+        self.assertEqual(session["eval_follow_up_input_key"], "a" * 64)
 
     def test_result_derived_currency_topics_require_validation(self):
         from app.views import evaluate_view as view

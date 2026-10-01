@@ -108,6 +108,9 @@ class TestFollowUpStateAndRendering(unittest.TestCase):
         import app.views.follow_up as follow_up
 
         st_mock, session = _fake_streamlit()
+        session["eval_follow_up_input_key"] = "a" * 64
+        session["eval_follow_up_input_source_id"] = "req_1"
+        session["eval_follow_up_questions_bound"] = True
         st_mock.text_area.side_effect = ["Edited question?", "Edited answer."]
         st_mock.form_submit_button.side_effect = [True, False]
         with patch.object(follow_up, "st", st_mock):
@@ -219,6 +222,7 @@ class TestFollowUpRunIntegration(unittest.TestCase):
         from app.documents import document_from_text
         records = [document_from_text("synthetic.txt", "Synthetic record.")]
         session["eval_follow_up_input_key"] = follow_up.evaluation_input_key("Original statement.", records, {})
+        session["eval_follow_up_input_source_id"] = "req_previous"
         llm = MagicMock()
         llm.usage.totals.return_value = type("Totals", (), {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0})()
         with (

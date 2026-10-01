@@ -61,9 +61,13 @@ Direct reuse requires a session-only SHA-256 binding over the exact statement,
 record content and metadata, and witness inputs. Different or unrecognized inputs
 do not receive pending answers. A returned result for different inputs clears
 prior pending/applied answers and skipped questions before binding its new
-questions. Legacy/unbound state is not automatically reused. Recovered queued
-results invalidate direct answer bindings because they can represent earlier
-submission inputs. The binding is not logged or persisted to a provider.
+questions. Legacy/unbound state is not automatically reused. Queued/recovered results
+preserve earlier pending answers and their original direct-input binding, since
+queue jobs do not include them. They cannot collect new answers under that older
+binding: hydration explicitly marks their questions unbound, even for a legacy
+result with no reference. A direct evaluation can reuse the preserved answers
+only when its exact inputs match their original binding. The binding is not
+logged or persisted to a provider.
 
 The follow-up panel displays validated gaps. An empty filtered question list
 never claims every applicable topic is covered: questions may have already been
