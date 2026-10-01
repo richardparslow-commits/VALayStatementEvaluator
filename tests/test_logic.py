@@ -6,6 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 
+from app.rubric_validation import DIMENSION_LABELS  # noqa: E402
 from app.config import Settings  # noqa: E402
 from app.config import load_knowledge  # noqa: E402
 from app.documents import extract_document  # noqa: E402
@@ -77,10 +78,11 @@ class TestRelevanceSearch(unittest.TestCase):
 class TestEvaluationResult(unittest.TestCase):
     def _sample(self):
         return EvaluationResult(
+            scoring_policy="complete_rubric_v1", scoring_status="complete",
             scores={"factual_accuracy": 9, "specificity_detail": 6, "lay_competence": 8,
                     "condition_connection": 7, "continuity_timeline": 5, "functional_impact": 6,
                     "credibility_consistency": 8, "form_completeness": 4},
-            rationales={"factual_accuracy": "All checkable facts matched."},
+            rationales={key: "Synthetic rationale: all checkable facts matched." for key in DIMENSION_LABELS},
             claims=[{"id": 1, "text": "Injured back lifting pallet in 2014."}],
             verifications=[
                 {"id": 1, "verdict": "SUPPORTED", "record_reference": "records p.1 2014-09",
