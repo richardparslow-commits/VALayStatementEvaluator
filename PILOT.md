@@ -16,9 +16,10 @@ expired and incomplete. Do not replace evidence references with a general
   per hour. These process-local counters reset on restart. The operator must also
   enforce an account spending limit and ingress limits.
 - Uploads only: at most 500 source pages per case, 50 MB per file, 200 MB total.
-  A parser runs in a separate, killable process with a 60-second deadline, 30 CPU
-  seconds, a 32 MB output limit, and a 1 GB address-space limit on Linux. There is
-  no fallback to parsing the file in the web process.
+  Each parse runs in a fresh non-root Linux container with no network access or
+  application mounts. A 60-second child deadline (70-second supervisor deadline),
+  30 CPU seconds per process, 32 MB output, 1 GB memory/no swap, 32 processes and 128 MB
+  temporary filesystem bound each parse. There is no web-process fallback.
 - One operator-configured HTTPS analysis provider and approved model list. The
   pilot HTTP client refuses redirects and environment proxies. Each run is
   limited to 200 actual provider attempts, two million submitted prompt
@@ -35,11 +36,24 @@ expired and incomplete. Do not replace evidence references with a general
   their authorized session to an approved destination. Re-enabling file exports
   requires an authenticated, owner-authorized download service.
 
-The parser process is a resource boundary, **not an operating-system security
-sandbox**. Use the non-root runtime container, restricted capabilities, read-only
-filesystem, private ingress, and tested network policy. Mac/Windows desktop
-execution is not the reviewed production pilot environment; Linux container
-limits and deployment controls must be exercised before admission is approved.
+The private parser launcher accepts only a file label, size, hash, random request
+identifier and bounded bytes. It fixes the image, command, user, network, mounts
+and resource limits. Only the launcher has Docker daemon access; neither the web
+application nor the parser receives the daemon socket. The launcher must be
+treated as a trusted host administrator because Docker access is powerful. It
+receives no provider/OIDC secrets, approvals, logs or case storage. It serves one
+request at a time over a private Unix socket and keeps no case files or content
+logs. Parser temporary files disappear with the per-file container.
+
+The mandatory [AppArmor policy](deploy/parser.apparmor) denies all sockets,
+capabilities, mounts and process tracing in addition to Docker's default seccomp
+policy. Host filesystem/process/network namespaces exclude application secrets
+and other cases. Unsupported hosts, missing images/profile, parser failures,
+timeouts and malformed or mismatched replies fail closed. This is a container
+boundary, not a guarantee against a host-kernel or Docker vulnerability. Linux CI
+uses synthetic fixtures; repeat the acceptance probes on the actual reviewed
+host before admitting real information. Mac/Windows desktop execution is not a
+supported controlled-pilot environment.
 
 ## Operator evidence and sign-in setup
 
@@ -95,6 +109,8 @@ limits and deployment controls must be exercised before admission is approved.
    | Variable | Operator-supplied value |
    |---|---|
    | `VA_LSE_BUILD_SHA` | Reviewed immutable revision |
+   | `VA_LSE_PARSER_IMAGE` | Local parser image ID (`sha256:` plus 64 hex digits), built from that revision |
+   | `VA_LSE_DOCKER_GID` | Linux Docker socket group ID; added only to the trusted launcher |
    | `VA_LSE_PILOT_ENV_FILE` | Protected provider environment file |
    | `VA_LSE_PILOT_APPROVAL_HOST_FILE` | Absolute path to actual approval JSON |
    | `VA_LSE_OIDC_SECRETS_FILE` | Absolute path to OIDC secrets |
@@ -102,6 +118,12 @@ limits and deployment controls must be exercised before admission is approved.
    | `VA_LSE_TLS_CERT`, `VA_LSE_TLS_KEY` | TLS certificate and private-key files |
 
    ```sh
+   # On the reviewed Linux Docker host with AppArmor and default seccomp enabled:
+   sudo apparmor_parser -r deploy/parser.apparmor
+   docker build -f deploy/parser.Dockerfile --build-arg VA_LSE_BUILD_SHA="$VA_LSE_BUILD_SHA" -t va-lse-parser:reviewed .
+   export VA_LSE_PARSER_IMAGE="$(docker image inspect va-lse-parser:reviewed --format '{{.Id}}')"
+   export VA_LSE_DOCKER_GID="$(stat -c '%g' /var/run/docker.sock)"
+   VA_LSE_TEST_PARSER_IMAGE="$VA_LSE_PARSER_IMAGE" VA_LSE_TEST_PARSER_REVISION="$VA_LSE_BUILD_SHA" python -m unittest tests.test_parser_container_live -v
    docker compose -f docker-compose.pilot.yml config --quiet
    docker compose -f docker-compose.pilot.yml up --build -d
    ```
@@ -161,7 +183,7 @@ only after the reviewed revision, invitations, evidence and secrets are current.
 | F05: repeated clinical evidence removed | Raw repeated source lines preserved |
 | F06: error/content leakage | Count-only pilot file, console, audit and diagnostic sinks; external telemetry/tracing blocked |
 | F07: factual rewrite/grounding/citations | Grounding requires every analysis section, meaningful typed rows, JSON boolean coverage flags and all checklist topics A–O; omitted witness analysis or malformed responses stop drafting; older incomplete results remain inspectable with a re-run warning. Automatic self-review cannot change witness text; complete contiguous quotes must match an unambiguous cited page, including their endings and punctuation; missing/short/unresolved citations block pilot generation; older prefix checks require a re-run; human verification of descriptions, dates and interpretations still required |
-| F08: parser exhaustion/fallback | Resource-limited child process, hard deadline, page/text caps, no pilot fail-open fallback |
+| F08: parser exhaustion/fallback | Dedicated container, no application mounts, no sockets, AppArmor/default seccomp, bounded resources and replies, no pilot fallback |
 | F09: misleading retention/deletion | Session clearing includes registered uploads; accurate consent; queues/blobs excluded; provider retention requires review |
 | F10: deployment wiring | Runtime is default non-root image; backup scripts included; health checks use installed Python; service DNS and monitoring targets corrected |
 | F11: hosted access/action controls | Verified invited OIDC identities, operator role, TLS/private pilot proxy, quotas, no media exports; monitoring ports local and anonymous dashboards disabled |

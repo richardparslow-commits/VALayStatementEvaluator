@@ -1,0 +1,15 @@
+# Load on the actual Linux Docker host before starting the pilot launcher.
+#include <tunables/global>
+profile va-lse-parser flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+  file,
+  deny network,
+  deny capability,
+  deny mount,
+  deny ptrace,
+  deny /proc/**/mem rw,
+  deny /proc/**/environ r,
+  deny /proc/kcore r,
+  signal (receive) peer=unconfined,
+  signal (send, receive) peer=va-lse-parser,
+}

@@ -521,6 +521,31 @@ jobs:
           assert pathlib.Path('scripts/restore_audit_logs.py').is_file();
           subprocess.run(['python', 'scripts/backup_audit_logs.py', '--status'], check=True)"
 
+  parser-isolation:
+    name: Linux parser isolation (synthetic probes)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test runtime
+        run: pip install --require-hashes -r requirements.lock
+      - name: Load the mandatory parser AppArmor profile
+        run: sudo apparmor_parser -r deploy/parser.apparmor
+      - name: Build parser and trusted launcher images
+        run: |
+          docker build -f deploy/parser.Dockerfile --build-arg VA_LSE_BUILD_SHA=${{ github.sha }} -t va-lse-parser:ci .
+          docker build -f deploy/parser-launcher.Dockerfile -t va-lse-parser-launcher:ci .
+          echo "VA_LSE_TEST_PARSER_IMAGE=$(docker image inspect va-lse-parser:ci --format '{{.Id}}')" >> "$GITHUB_ENV"
+      - name: Probe actual filesystem, network, process and resource boundaries
+        env:
+          VA_LSE_TEST_PARSER_REVISION: ${{ github.sha }}
+        run: python -m unittest tests.test_parser_container_live -v
+
   sandbox-image:
     name: Build the sandbox image stage
     runs-on: ubuntu-latest
