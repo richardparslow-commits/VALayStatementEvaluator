@@ -33,7 +33,8 @@ from . import config
 from .blob_store import BlobRef, BlobStore, BlobStoreError, dumps_documents, loads_documents
 from .documents import DocumentPage, ExtractedDocument
 from .draft import DraftResult
-from .evaluate import EvaluationResult
+from .evaluate import EvaluationResult, compute_effectiveness_score, evaluation_report_markdown
+from .rubric_validation import RUBRIC_POLICY, RubricValidationError, normalize_rubric, rubric_is_complete
 from .medical_review import MedicalDigest, MedicalFact
 from .config import PRIMARY_ENDPOINT
 from .usage import UsageEntry, UsageTracker
@@ -224,12 +225,17 @@ def digest_from_json(raw: Any) -> MedicalDigest | None:
 
 # ---------------------------------------------------------------- results
 def evaluation_to_json(result: EvaluationResult) -> dict[str, Any]:
-    return {
+    complete = rubric_is_complete(result)
+    payload = {
         "claimed_condition": result.claimed_condition,
         "writer_role": result.writer_role,
         "claims": list(result.claims),
         "verifications": list(result.verifications),
         "verification_policy": result.verification_policy,
+        "scoring_policy": result.scoring_policy,
+        "scoring_status": result.scoring_status if complete or result.scoring_status == "incomplete" else "unvalidated",
+        "effectiveness_score": compute_effectiveness_score(result) if complete else None,
+        "recommendations": list(result.recommendations) if complete else [],
         "scores": dict(result.scores),
         "rationales": dict(result.rationales),
         "improvements": list(result.improvements),
@@ -245,28 +251,34 @@ def evaluation_to_json(result: EvaluationResult) -> dict[str, Any]:
         "revised_statement": result.revised_statement,
         "added_facts_to_verify": list(result.added_facts_to_verify),
         "digest": digest_to_json(result.digest),
-        "report_markdown": result.report_markdown,
+        "report_markdown": result.report_markdown if complete else evaluation_report_markdown(result),
         "input_chars": result.input_chars,
         "truncated_chars": result.truncated_chars,
         "truncation_warning": result.truncation_warning,
         "evidence_source": list(result.evidence_source),
     }
 
+    if not complete:
+        for key in ("scores", "rationales"):
+            payload[key] = {}
+        for key in ("improvements", "omitted_record_facts", "revision_changes", "added_facts_to_verify"):
+            payload[key] = []
+        for key in ("executive_summary", "revision_notes", "revised_statement"):
+            payload[key] = ""
+    return payload
+
 
 def evaluation_from_json(raw: Any) -> EvaluationResult:
     data = _as_dict(raw)
-    return EvaluationResult(
+    result = EvaluationResult(
         claimed_condition=_as_str(data.get("claimed_condition")),
         writer_role=_as_str(data.get("writer_role")),
         claims=_dict_items(data.get("claims")),
         verifications=_dict_items(data.get("verifications")),
         verification_policy=_as_str(data.get("verification_policy")),
-        scores=_float_map(data.get("scores")),
-        rationales=_str_map(data.get("rationales")),
-        improvements=_dict_items(data.get("improvements")),
-        omitted_record_facts=_dict_items(data.get("omitted_record_facts")),
+        scoring_policy=_as_str(data.get("scoring_policy")),
+        scoring_status=_as_str(data.get("scoring_status")),
         evidence_gaps=_dict_items(data.get("evidence_gaps")),
-        executive_summary=_as_str(data.get("executive_summary")),
         topic_focus=_as_str(data.get("topic_focus")),
         topic_rows=_dict_items(data.get("topic_rows")),
         topic_critical_gaps=_str_items(data.get("topic_critical_gaps")),
@@ -282,6 +294,27 @@ def evaluation_from_json(raw: Any) -> EvaluationResult:
         truncation_warning=_as_str(data.get("truncation_warning")),
         evidence_source=_dict_items(data.get("evidence_source")),
     )
+
+    # Validate the raw JSON before any coercion or filtering can turn malformed
+    # data (e.g. true or "9") into apparently valid numeric scoring fields.
+    if result.scoring_policy == RUBRIC_POLICY and result.scoring_status == "complete":
+        try:
+            rubric = normalize_rubric({key: data.get(key) for key in (
+                "scores", "rationales", "improvements", "omitted_record_facts", "executive_summary"
+            )})
+        except RubricValidationError:
+            result.scoring_status = "invalid"
+        else:
+            for key, value in rubric.items():
+                setattr(result, key, value)
+            result.effectiveness_score = compute_effectiveness_score(result)
+            result.recommendations = _dict_items(data.get("recommendations"))
+    if not rubric_is_complete(result):
+        result.revision_notes = ""
+        result.revision_changes = []
+        result.revised_statement = ""
+        result.added_facts_to_verify = []
+    return result
 
 
 def draft_to_json(result: DraftResult) -> dict[str, Any]:

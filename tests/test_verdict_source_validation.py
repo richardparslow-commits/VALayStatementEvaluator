@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from tests import hermetic  # noqa: F401
+from tests.rubric_fixtures import scored_result_fields
 from tests.test_evaluate import _FakeLLM, _fake_digest
 from tests.test_views import _fake_streamlit, _patch_st
 from app.documents import BLOCK, DocumentPage, ExtractedDocument, document_from_text
@@ -209,17 +210,18 @@ class TestSavedVerdictSourcePolicy(unittest.TestCase):
                 self.assertIn(LEGACY_REFERENCE_NOTICE, build_report(result, "Synthetic statement."))
                 self.assertNotIn(SOURCE_REFERENCE_NOTICE, build_report(result, "Synthetic statement."))
 
-    def test_legacy_report_download_keeps_body_and_adds_warning_once(self):
+    def test_legacy_report_download_rebuilds_review_and_adds_warning_once(self):
         result = evaluation_from_json({"report_markdown": "# Historical report\nSynthetic finding."})
         report = evaluation_report_markdown(result)
-        self.assertIn(result.report_markdown, report)
+        self.assertNotIn("# Historical report", report)
+        self.assertIn("Scoring unavailable", report)
         self.assertEqual(report.count(LEGACY_REFERENCE_NOTICE), 1)
         self.assertEqual(result.report_markdown, "# Historical report\nSynthetic finding.")
         result.report_markdown = report
         self.assertEqual(evaluation_report_markdown(result), report)
 
     def test_current_report_download_preserves_original_report(self):
-        result = EvaluationResult(verification_policy=SOURCE_REFERENCE_POLICY, report_markdown="# Synthetic report")
+        result = EvaluationResult(**scored_result_fields(), verification_policy=SOURCE_REFERENCE_POLICY, report_markdown="# Synthetic report")
         self.assertEqual(evaluation_report_markdown(result), result.report_markdown)
 
     def test_ui_warns_on_legacy_results_and_the_download_contains_the_warning(self):

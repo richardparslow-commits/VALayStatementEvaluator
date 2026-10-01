@@ -21,6 +21,10 @@ from .documents import (
     MAX_STATEMENT_CHARS,
     PAGE,
 )
+from .rubric_validation import (
+    DIMENSION_LABELS, RUBRIC_POLICY, RUBRIC_MAX_ATTEMPTS, RubricValidationError,
+    normalize_rubric, rubric_is_complete, scoring_notice, validate_scores,
+)
 from .source_validation import build_source_index, source_reference_key
 from .exporter import parse_source
 from .llm import LLMClient, LLMError, LLMParseError, LLMService
@@ -532,7 +536,7 @@ class EvaluationResult:
     truncated_chars: int = 0
     truncation_warning: str = ""
     # Statement Effectiveness Score & Improvement Recommendations (F4)
-    effectiveness_score: int = 0
+    effectiveness_score: int | None = None
     recommendations: list[dict] = field(default_factory=list)
     # Claims whose batch retrieved no matching record text. These are coverage
     # gaps, not findings: the statement is silent *and* the records supplied
@@ -546,6 +550,8 @@ class EvaluationResult:
     evidence_source: list[dict] = field(default_factory=list)
     # Missing/unknown policies on saved results must never imply current validation.
     verification_policy: str = ""
+    scoring_policy: str = ""
+    scoring_status: str = ""
 
     @property
     def contradiction_count(self) -> int:
@@ -555,7 +561,7 @@ class EvaluationResult:
 
     @property
     def overall_rating(self) -> str:
-        if not self.scores:
+        if not rubric_is_complete(self):
             return "Not scored"
         weighted = dict(self.scores)
         weighted["factual_accuracy"] = weighted.get("factual_accuracy", 0) * 1.5
@@ -571,19 +577,11 @@ class EvaluationResult:
     @property
     def score_band(self) -> str:
         """Color band for ``effectiveness_score`` (green >75, yellow 50-75, red <50)."""
+        if (not rubric_is_complete(self) or type(self.effectiveness_score) is not int
+                or not 0 <= self.effectiveness_score <= 100):
+            return "unavailable"
         return compute_score_band(self.effectiveness_score)
 
-
-DIMENSION_LABELS = {
-    "factual_accuracy": "Factual Accuracy vs. Records",
-    "specificity_detail": "Specificity & Detail",
-    "lay_competence": "Lay Competence Boundaries",
-    "condition_connection": "Connection to Claimed Condition",
-    "continuity_timeline": "Continuity & Timeline",
-    "functional_impact": "Functional Impact",
-    "credibility_consistency": "Credibility & Consistency",
-    "form_completeness": "Form & Completeness",
-}
 
 
 def run_evaluation(
@@ -628,7 +626,7 @@ def run_evaluation(
                 extra={
                     "request_id": rid,
                     "phase": "evaluate",
-                    "status": "ok",
+                    "status": "ok" if rubric_is_complete(result) else "partial",
                     "duration_ms": duration_ms,
                 },
             )
@@ -855,41 +853,25 @@ def _run_evaluation(
     with tracing.phase_span("rubric"), PhaseTimer(logger, "rubric", request_id=rid):
         with phase_timer("rubric"):
             report(0.78, "Step 4/7 — Scoring against the lay-evidence rubric…")
-            rubric_data = llm.chat_json(
-                RUBRIC_SYSTEM_TEMPLATE.format(
-                    rubric=load_knowledge("evaluation_rubric.md"),
-                    legal=load_knowledge("legal_framework.md"),
-                ),
-                RUBRIC_USER.format(
-                    statement=sanitize_for_prompt(prompt_statement, max_chars=EVALUATE_INTERNAL_MAX_CHARS),
-                    verifications=sanitize_for_prompt(_verifications_text(result), max_chars=20_000),
-                    digest_summary=sanitize_digest_text((result.digest.summary if result.digest else "") or "(no summary)", max_chars=20_000),
-                    guard_note=GUARD_NOTE,
-                ),
-                phase="rubric",
-            )
-            result.scores = {k: float(v) for k, v in rubric_data.get("scores", {}).items()}
-            result.rationales = rubric_data.get("rationales", {})
-            result.improvements = rubric_data.get("improvements", [])
-            result.omitted_record_facts = rubric_data.get("omitted_record_facts", [])
-            result.executive_summary = rubric_data.get("executive_summary", "")
+            _score_rubric(llm, result, prompt_statement)
 
     with tracing.phase_span("topic"), PhaseTimer(logger, "topic", request_id=rid):
         with phase_timer("topic"):
             report(0.79, "Step 5/7 — Auditing topic coverage (hazards, care, family, progression)…")
             _analyze_topics(llm, result, statement_text, report)
 
-    with tracing.phase_span("revision"), PhaseTimer(logger, "revision", request_id=rid):
-        with phase_timer("revision"):
-            report(0.86, "Step 6/8 — Drafting improvement suggestions and a revised statement…")
-            _draft_revision(llm, result, statement_text, report)
+    if rubric_is_complete(result):
+        with tracing.phase_span("revision"), PhaseTimer(logger, "revision", request_id=rid):
+            with phase_timer("revision"):
+                report(0.86, "Step 6/8 — Drafting improvement suggestions and a revised statement…")
+                _draft_revision(llm, result, statement_text, report)
 
-    # The score/recommendations pass is LLM-backed like every other phase, so it
-    # gets the same phase span treatment as its neighbours.
-    with tracing.phase_span("score"), PhaseTimer(logger, "score", request_id=rid):
-        with phase_timer("score"):
-            report(0.92, "Step 7/8 — Computing effectiveness score and recommendations…")
-            _score_and_recommend(llm, result, report, witness)
+        # The score/recommendations pass is LLM-backed like every other phase, so it
+        # gets the same phase span treatment as its neighbours.
+        with tracing.phase_span("score"), PhaseTimer(logger, "score", request_id=rid):
+            with phase_timer("score"):
+                report(0.92, "Step 7/8 — Computing effectiveness score and recommendations…")
+                _score_and_recommend(llm, result, report, witness)
 
     with tracing.phase_span("report"), PhaseTimer(logger, "report", request_id=rid):
         with phase_timer("report"):
@@ -897,8 +879,49 @@ def _run_evaluation(
             result.report_markdown = build_report(
                 result, statement_text, citations=_citation_index_snapshot()
             )
-    report(1.0, "Evaluation complete.")
+    report(1.0, "Evaluation complete." if rubric_is_complete(result)
+           else "Partial evaluation retained — scoring incomplete.")
     return result
+
+
+def _score_rubric(llm: LLMService, result: EvaluationResult, statement: str) -> None:
+    """Commit scoring fields together only after a complete validated response."""
+    result.scoring_policy = RUBRIC_POLICY
+    result.scoring_status = "incomplete"
+    system = RUBRIC_SYSTEM_TEMPLATE.format(
+        rubric=load_knowledge("evaluation_rubric.md"), legal=load_knowledge("legal_framework.md")
+    )
+    prompt = RUBRIC_USER.format(
+        statement=sanitize_for_prompt(statement, max_chars=EVALUATE_INTERNAL_MAX_CHARS),
+        verifications=sanitize_for_prompt(_verifications_text(result), max_chars=20_000),
+        digest_summary=sanitize_digest_text(
+            (result.digest.summary if result.digest else "") or "(no summary)", max_chars=20_000
+        ), guard_note=GUARD_NOTE,
+    )
+    retry_note = ""
+    for attempt in range(1, RUBRIC_MAX_ATTEMPTS + 1):
+        check_pipeline_cancelled()
+        try:
+            data = normalize_rubric(llm.chat_json(system, prompt + retry_note, phase="rubric"))
+        except (RubricValidationError, LLMError):
+            logger.warning(
+                "rubric response unavailable attempt=%d/%d", attempt, RUBRIC_MAX_ATTEMPTS,
+                extra={"phase": "rubric", "status": "incomplete"},
+            )
+            retry_note = (
+                "\n\nReturn a fresh complete JSON object in the required schema. Scores must "
+                "be finite JSON numbers from 0 to 10, with exactly the eight dimension keys "
+                "in both scores and rationales and a nonempty rationale for each. Include "
+                "all improvement and omitted-fact row fields and a nonempty executive summary."
+            )
+            continue
+        result.scores = data["scores"]
+        result.rationales = data["rationales"]
+        result.improvements = data["improvements"]
+        result.omitted_record_facts = data["omitted_record_facts"]
+        result.executive_summary = data["executive_summary"]
+        result.scoring_status = "complete"
+        return
 
 
 def _citation_index_snapshot() -> list[dict[str, str]]:
@@ -1056,6 +1079,10 @@ def source_reference_notice(result: EvaluationResult) -> str:
 
 def evaluation_report_markdown(result: EvaluationResult) -> str:
     """Keep saved report content, adding the missing-policy notice to exports."""
+    if not rubric_is_complete(result):
+        # Rebuild from retained review data; a historical cached report may carry
+        # invalid grades or a rewrite that predates the validation policy.
+        return build_report(result, "")
     report = result.report_markdown
     if (
         getattr(result, "verification_policy", "") != SOURCE_REFERENCE_POLICY
@@ -1342,7 +1369,7 @@ def _rubric_component(result: "EvaluationResult") -> float:
     """0-100 rubric component: mean of the 8 dimension scores (each 0-10)."""
     if not result.scores:
         return 0.0
-    values = list(result.scores.values())
+    values = list(validate_scores(result.scores).values())
     avg = sum(values) / len(values)
     return max(0.0, min(100.0, avg * 10.0))
 
@@ -1399,7 +1426,9 @@ def compute_effectiveness_score(result: "EvaluationResult") -> int:
     verdict distribution 30%, evidence density 20%, statement length/
     complexity 10%. Always returns an integer in [0, 100], including when
     *result* carries zero claims (verdict/density components fall back to
-    defined neutrals instead of raising ``ZeroDivisionError``).
+    defined neutrals instead of raising ``ZeroDivisionError``). Nonempty rubric
+    scores must have exactly eight finite numeric dimensions in range; invalid
+    values raise ``RubricValidationError`` instead of being clamped to success.
     """
     weighted = (
         _rubric_component(result) * _RUBRIC_WEIGHT
@@ -1635,9 +1664,13 @@ def _score_and_recommend(
     Recommendations feature (feature id EFFECTIVENESS_FEATURE_ID) live here,
     at the compute/generate boundary: a ``goal`` event on completion carrying
     scoreValue/scoreBand/recommendationCount, and a ``feature.error`` event
-    if recommendation generation fails (score computation itself never
-    raises). A failure here must not discard the completed evaluation.
+    if recommendation generation fails. Invalid or incomplete rubric data
+    is gated before score computation. A failure here must not discard the completed evaluation.
     """
+    if not rubric_is_complete(result):
+        result.effectiveness_score = None
+        result.recommendations = []
+        return
     result.effectiveness_score = compute_effectiveness_score(result)
     try:
         result.recommendations = generate_improvement_recommendations(result, llm, witness)
@@ -1833,11 +1866,17 @@ def build_report(
     if result.truncation_warning:
         lines.append(f"> ⚠️ **Truncated input:** {result.truncation_warning}")
         lines.append("")
+    scoring_complete = rubric_is_complete(result)
+    lines.append(f"> **Rubric validation:** {scoring_notice(result)}")
+    lines.append("")
     lines.append(f"**Overall rating: {result.overall_rating}**")
-    lines.append(
-        f"**Effectiveness score: {result.effectiveness_score}/100 "
-        f"({result.score_band.upper()})**"
-    )
+    if scoring_complete and result.score_band != "unavailable":
+        lines.append(
+            f"**Effectiveness score: {result.effectiveness_score}/100 "
+            f"({result.score_band.upper()})**"
+        )
+    else:
+        lines.append("**Effectiveness score: unavailable**")
     claimed: str = result.claimed_condition  # narrow type for mypy
     if claimed:
         lines.append(f"**Appears to support claim for:** {claimed}")
@@ -1854,7 +1893,7 @@ def build_report(
     lines.append("")
 
     lines.append("## Executive Summary")
-    lines.append(result.executive_summary or "(none)")
+    lines.append((result.executive_summary or "(none)") if scoring_complete else scoring_notice(result))
     lines.append("")
 
     if result.contradiction_count:
@@ -1913,17 +1952,18 @@ def build_report(
     )
     lines.append("")
 
-    lines.append("## Rubric Scores")
-    lines.append("")
-    lines.append("| Dimension | Score | Rationale |")
-    lines.append("|-----------|-------|-----------|")
-    for key, label in DIMENSION_LABELS.items():
-        score = result.scores.get(key, 0)
-        rationale = (result.rationales.get(key) or "").replace("|", "/")[:200]
-        lines.append(f"| {label} | {score:.1f}/10 | {rationale} |")
-    lines.append("")
+    if scoring_complete:
+        lines.append("## Rubric Scores")
+        lines.append("")
+        lines.append("| Dimension | Score | Rationale |")
+        lines.append("|-----------|-------|-----------|")
+        for key, label in DIMENSION_LABELS.items():
+            score = result.scores.get(key, 0)
+            rationale = (result.rationales.get(key) or "").replace("|", "/")[:200]
+            lines.append(f"| {label} | {score:.1f}/10 | {rationale} |")
+        lines.append("")
 
-    if result.recommendations:
+    if scoring_complete and result.recommendations:
         lines.append("## Improvement Recommendations (ranked by estimated impact)")
         lines.append("")
         for index, rec in enumerate(result.recommendations, start=1):
@@ -1931,7 +1971,7 @@ def build_report(
             lines.append(f"   - {rec.get('explanation', '')}")
         lines.append("")
 
-    if result.improvements:
+    if scoring_complete and result.improvements:
         lines.append("## Top Improvements (in priority order)")
         lines.append("")
         for imp in result.improvements:
@@ -1964,14 +2004,14 @@ def build_report(
             lines.append(f"_{result.topic_notes}_")
             lines.append("")
 
-    if result.omitted_record_facts:
+    if scoring_complete and result.omitted_record_facts:
         lines.append("## Facts in the Records You Could Add (verify from personal knowledge first)")
         lines.append("")
         for fact in result.omitted_record_facts:
             lines.append(f"- {fact.get('fact', '')} _(source: {fact.get('source', 'records')})_")
         lines.append("")
 
-    if result.revised_statement or result.revision_changes:
+    if scoring_complete and (result.revised_statement or result.revision_changes):
         lines.append("## Suggested Improvements — Proposed Rewrite")
         lines.append("")
         if result.revision_notes:

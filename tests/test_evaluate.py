@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
+from tests.rubric_fixtures import scored_result_fields
 from tests.grounding_fixtures import complete_grounding  # noqa: E402
 
 from app.documents import (  # noqa: E402
@@ -220,13 +221,13 @@ class TestEvaluationResultProperties(unittest.TestCase):
         self.assertEqual(EvaluationResult(scores={}).overall_rating, "Not scored")
         # weighted avg: factual_accuracy *1.5
         high = {k: 9 for k in DIMENSION_LABELS}
-        self.assertEqual(EvaluationResult(scores=high).overall_rating, "Excellent")
+        self.assertEqual(EvaluationResult(**scored_result_fields(high)).overall_rating, "Excellent")
         mid = {k: 7 for k in DIMENSION_LABELS}
-        self.assertEqual(EvaluationResult(scores=mid).overall_rating, "Strong")
+        self.assertEqual(EvaluationResult(**scored_result_fields(mid)).overall_rating, "Strong")
         low_mid = {k: 5 for k in DIMENSION_LABELS}
-        self.assertEqual(EvaluationResult(scores=low_mid).overall_rating, "Adequate")
+        self.assertEqual(EvaluationResult(**scored_result_fields(low_mid)).overall_rating, "Adequate")
         low = {k: 2 for k in DIMENSION_LABELS}
-        self.assertEqual(EvaluationResult(scores=low).overall_rating, "Needs Substantial Work")
+        self.assertEqual(EvaluationResult(**scored_result_fields(low)).overall_rating, "Needs Substantial Work")
 
     def test_factual_accuracy_weighted(self):
         # factual_accuracy low should drag rating down
@@ -260,6 +261,7 @@ class TestVerificationsText(unittest.TestCase):
 class TestBuildReport(unittest.TestCase):
     def _sample(self, **overrides):
         base = dict(
+            scoring_policy="complete_rubric_v1", scoring_status="complete",
             scores={k: 6.0 for k in DIMENSION_LABELS},
             rationales={k: "Reason." for k in DIMENSION_LABELS},
             claims=[{"id": 1, "text": "Injured back lifting pallet 2014."}],
@@ -316,7 +318,7 @@ class TestBuildReport(unittest.TestCase):
         self.assertIn("⚪ NOT FOUND", report)
 
     def test_overall_rating_in_report(self):
-        r = EvaluationResult(scores={k: 9 for k in DIMENSION_LABELS})
+        r = EvaluationResult(**scored_result_fields({k: 9 for k in DIMENSION_LABELS}))
         self.assertIn("Excellent", build_report(r, "s"))
 
     def test_sources_section_appended_when_citations_present(self):
@@ -947,7 +949,7 @@ class TestRunEvaluationHappyPath(unittest.TestCase):
         llm = _FakeLLM(overrides={
             "rubric": {
                 "scores": {"factual_accuracy": 9, "specificity_detail": 3, "lay_competence": 8, "condition_connection": 7, "continuity_timeline": 6, "functional_impact": 4, "credibility_consistency": 8, "form_completeness": 5},
-                "rationales": {"factual_accuracy": "High accuracy."},
+                "rationales": {k: "High accuracy." for k in DIMENSION_LABELS},
                 "improvements": [{"priority": 1, "problem": "Low specificity", "suggestion": "Add dates.", "example_rewrite": "In 2014..."}],
                 "omitted_record_facts": [{"fact": "MRI 2020", "source": "a.txt p.1"}],
                 "executive_summary": "Strong factual accuracy, weak specificity.",
