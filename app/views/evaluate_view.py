@@ -1509,17 +1509,19 @@ def _render_evaluation_results(eval_result: Any) -> None:
             if eval_result.topic_notes:
                 pilot.display(eval_result.topic_notes, container=st, method="caption")
 
-    if _topics_complete:
-        render_follow_up_questions(
-            slot="eval",
-            source_id=_result_reference(),
-            questions=evaluate_follow_up_questions(eval_result),
-            empty_message=(
-                "No remaining questions are shown for this validated topic analysis. "
-                "Review its coverage and any saved or skipped questions."
-            ),
-            next_run_label="evaluation",
-        )
+    render_follow_up_questions(
+        slot="eval",
+        source_id=_result_reference(),
+        questions=evaluate_follow_up_questions(eval_result),
+        empty_message=(
+            "No remaining questions are shown for this validated topic analysis. "
+            "Review its coverage and any saved or skipped questions."
+            if _topics_complete else
+            "New topic questions are unavailable because this analysis is incomplete or "
+            "unvalidated. Review or clear any saved answers before another evaluation."
+        ),
+        next_run_label="evaluation",
+    )
 
     if rubric_is_complete(eval_result):
         with st.expander("Improvements & record facts to add", expanded=True):

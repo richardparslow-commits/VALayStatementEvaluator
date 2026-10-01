@@ -270,7 +270,9 @@ class TestTopicUI(unittest.TestCase):
             view._render_evaluation_results(result)
         columns[3].metric.assert_called_once_with("Topics covered", "—")
         self.assertIn(TOPIC_UNVALIDATED_NOTICE, [c.args[0] for c in st_mock.warning.call_args_list])
-        followups.assert_not_called()
+        followups.assert_called_once()
+        self.assertEqual(followups.call_args.kwargs["questions"], [])
+        self.assertIn("unavailable", followups.call_args.kwargs["empty_message"])
         st_mock.text_area.assert_not_called()
         self.assertFalse(any("Topic coverage" in str(c) for c in st_mock.expander.call_args_list))
         rendered = str(st_mock.mock_calls)
@@ -278,6 +280,47 @@ class TestTopicUI(unittest.TestCase):
         reports = [c.kwargs["data"].decode() for c in st_mock.download_button.call_args_list if c.kwargs.get("file_name") == "lay_statement_evaluation.md"]
         self.assertIn(TOPIC_UNVALIDATED_NOTICE, reports[0])
         self.assertNotIn("PRIVATE_REWRITE_SENTINEL", reports[0])
+
+    def test_pending_answers_survive_partial_reference_changes_and_remain_clearable(self):
+        from app.views import evaluate_view as view, follow_up
+        for old_source in (None, "req_old"):
+            for clear in (False, True):
+                with self.subTest(old_source=old_source, clear=clear):
+                    result = valid_result(); result.topic_rows.pop()
+                    st_mock, session = _fake_streamlit()
+                    st_mock.columns.return_value = tuple(MagicMock() for _ in range(4))
+                    session["eval_request_id"] = "req_new"
+                    session["eval_follow_up_saved"] = [{"topic": "A", "question": "What happened?", "answer": "Synthetic pending answer."}]
+                    if old_source is not None: session["eval_follow_up_source_id"] = old_source
+                    st_mock.button.side_effect = lambda label, **kw: clear if kw.get("key") == "eval_follow_up_clear" else False
+                    with _patch_st(view, st_mock), _patch_st(follow_up, st_mock):
+                        view._render_evaluation_results(result)
+                        next_input = follow_up.append_follow_up_answers("Changed synthetic statement.", slot="eval")
+                    st_mock.button.assert_any_call("Clear saved follow-up answers and skipped questions", key="eval_follow_up_clear")
+                    self.assertTrue(any("Synthetic pending answer." in str(c) for c in st_mock.write.call_args_list))
+                    st_mock.form.assert_not_called()
+                    if clear:
+                        self.assertEqual(session["eval_follow_up_saved"], [])
+                        self.assertNotIn("Synthetic pending answer.", next_input)
+                        st_mock.rerun.assert_called_once()
+                    else:
+                        self.assertIn("Synthetic pending answer.", next_input)
+                        self.assertEqual(len(session["eval_follow_up_saved"]), 1)
+
+    def test_all_handled_questions_still_show_pending_answers_and_clear_control(self):
+        from app.views import follow_up
+        result = valid_result()
+        question = follow_up.evaluate_follow_up_questions(result)[0]
+        st_mock, session = _fake_streamlit()
+        session["eval_follow_up_source_id"] = "req_current"
+        session["eval_follow_up_saved"] = [{**question, "answer": "Synthetic accepted answer."}]
+        st_mock.button.return_value = False
+        with _patch_st(follow_up, st_mock):
+            follow_up.render_follow_up_questions(slot="eval", source_id="req_current",
+                questions=[question], empty_message="No remaining questions.", next_run_label="evaluation")
+        st_mock.button.assert_called_once_with("Clear saved follow-up answers and skipped questions", key="eval_follow_up_clear")
+        self.assertTrue(any("Synthetic accepted answer." in str(c) for c in st_mock.write.call_args_list))
+        st_mock.form.assert_not_called()
 
     def test_validated_empty_followups_never_claim_all_topics_covered(self):
         from app.views import evaluate_view as view

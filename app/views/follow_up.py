@@ -90,14 +90,11 @@ def render_follow_up_questions(
         index = len(questions)
         st.session_state[_key(slot, "index")] = index
 
-    with st.expander("🤖 Automated follow-up question generator", expanded=bool(questions)):
+    with st.expander("🤖 Automated follow-up question generator",
+                     expanded=bool(questions or saved or skipped or applied_saved or applied_skipped)):
         notice = _clean_text(st.session_state.get(_key(slot, "notice"), ""))
         if notice:
             pilot.display(notice, container=st, method="success")
-
-        if not questions:
-            pilot.display(empty_message, container=st, method="info")
-            return
 
         if saved:
             pilot.display(
@@ -131,6 +128,10 @@ def render_follow_up_questions(
                 st.session_state[_key(slot, "index")] = 0
                 st.session_state[_key(slot, "notice")] = "Cleared the saved follow-up state for this tab."
                 st.rerun()
+
+        if not questions:
+            pilot.display(empty_message, container=st, method="info")
+            return
 
         if index >= len(questions):
             if skipped:
@@ -288,17 +289,15 @@ def _ensure_state(slot: str, source_id: str) -> None:
     if source_key not in st.session_state:
         st.session_state[_key(slot, "source_id")] = source_id
         st.session_state[_key(slot, "index")] = 0
-        st.session_state[_key(slot, "saved")] = []
-        st.session_state[_key(slot, "skipped")] = []
-        st.session_state[_key(slot, "applied_saved")] = []
-        st.session_state[_key(slot, "applied_skipped")] = []
+        for suffix in ("saved", "skipped", "applied_saved", "applied_skipped"):
+            st.session_state.setdefault(_key(slot, suffix), [])
         st.session_state[_key(slot, "notice")] = ""
         return
     if st.session_state.get(source_key) != source_id:
         st.session_state[source_key] = source_id
         st.session_state[_key(slot, "index")] = 0
-        st.session_state[_key(slot, "saved")] = []
-        st.session_state[_key(slot, "skipped")] = []
+        # Saved answers are still pending until explicit consumption or clearing.
+        # A partial rerun changes the reference without consuming them.
         st.session_state[_key(slot, "notice")] = ""
 
 

@@ -53,7 +53,10 @@ serialization and restoration. Historical cached reports are rebuilt from
 retained structured findings and citations whenever rubric or topic validation
 is incomplete. A re-run is needed to restore trusted topic coverage. Accepted
 follow-up answers stay pending when a direct run remains partial, allowing a
-subsequent complete evaluation to consume them.
+subsequent complete evaluation to consume them. Saved answers and their clear
+control remain accessible when coverage fails or all generated questions have
+already been handled. Changing the run reference does not discard pending
+answers; explicit consumption or clearing removes them.
 
 The follow-up panel displays validated gaps. An empty filtered question list
 never claims every applicable topic is covered: questions may have already been

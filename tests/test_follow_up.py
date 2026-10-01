@@ -170,10 +170,10 @@ class TestFollowUpStateAndRendering(unittest.TestCase):
 
         st_mock, session = _fake_streamlit()
         session["eval_follow_up_source_id"] = "req_old"
-        session["eval_follow_up_saved"] = [
+        session["eval_follow_up_saved"] = []
+        session["eval_follow_up_applied_saved"] = [
             {"topic": "A. Hazards", "question": "Q?", "answer": "A."}
         ]
-        session["eval_follow_up_pending_apply"] = False
         with patch.object(follow_up, "st", st_mock):
             follow_up.render_follow_up_questions(
                 slot="eval",
