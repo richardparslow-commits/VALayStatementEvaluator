@@ -300,6 +300,7 @@ def render_draft_tab() -> None:
             condition=condition,
             claim_type=claim_type,
             witness={
+                "veteran_name": veteran_name,
                 **_witness_details(
                     witness_name=witness_name,
                     relationship=relationship,
@@ -831,7 +832,9 @@ def _render_draft_results(draft_result: Any) -> None:
     edited = st.text_area(
         "Statement", value=draft_result.output_statement, height=460, key="draft_edited"
     )
-    export_confirmed = pilot.confirm_export(edited)
+    from .factual_review import render_factual_review
+    factual_confirmed = render_factual_review(draft_result, edited, slot="draft")
+    export_confirmed = factual_confirmed and pilot.confirm_export(edited)
     col_a, col_b = st.columns(2)
     pilot.file_download(
         "⬇️ Download statement (.txt)",

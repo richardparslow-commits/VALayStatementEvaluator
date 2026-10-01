@@ -35,6 +35,7 @@ from .prompt_sanitize import GUARD_NOTE, sanitize_digest_text, sanitize_for_prom
 
 logger = logging.getLogger("app.draft")
 from .medical_review import MedicalDigest, ProgressCallback, review_medical_records
+from .factual_integrity import attach_review, retained_inputs
 
 # Feature: Condition-Specific Templates
 FEATURE_ID = "02f0935a-ee5e-4083-88a2-10e11753ccc9"  # condition-specific-templates
@@ -377,6 +378,8 @@ class DraftResult:
     # Each dict holds {"filename": str, "kind": "page"|"block", "page": int,
     # "text": str} — the raw record pages that fed the digest extraction.
     evidence_source: list[dict] = field(default_factory=list)
+    factual_inputs: dict[str, Any] = field(default_factory=dict)
+    factual_review: dict[str, Any] = field(default_factory=dict)
 
     @property
     def output_statement(self) -> str:
@@ -623,7 +626,8 @@ def _run_draft(
     claim_type: str,
     progress: ProgressCallback | None,
 ) -> DraftResult:
-    result = DraftResult()
+    result = DraftResult(factual_inputs=retained_inputs(observations,
+                         {**witness, "Claimed condition": condition, "Claim type": claim_type}, records))
     result.input_chars = len(observations)
     # Preserve complete source evidence — the raw record pages that
     # produced every digest fact. This store lives independently of
@@ -742,6 +746,9 @@ def _run_draft(
             except Exception as exc:  # noqa: BLE001
                 raise map_drafting_exception(exc, request_id=rid, phase="draft") from exc
 
+    if not isinstance(result.draft, str) or not result.draft.strip():
+        raise LLMParseError("Draft output must contain a complete text statement before factual review.")
+    attach_review(result, result.draft)
     with tracing.phase_span("review"), PhaseTimer(logger, "review", request_id=rid):
         with phase_timer("review"):
             report(0.85, "Step 4/4 — Self-review and improvement pass…")
@@ -797,7 +804,8 @@ def _run_draft(
     else:
         result.final_statement = improved.strip()
 
-    report(1.0, "Draft complete.")
+    attach_review(result, result.output_statement)
+    report(1.0, "Review draft complete; source and witness approval required.")
     return result
 
 

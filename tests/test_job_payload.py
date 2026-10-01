@@ -201,7 +201,9 @@ class TestResultRoundtrip(unittest.TestCase):
         self.assertEqual(restored.verifications, original.verifications)
         self.assertEqual(restored.scores, original.scores)
         self.assertEqual(restored.revised_statement, original.revised_statement)
-        self.assertEqual(restored.report_markdown, original.report_markdown)
+        from app.evaluate import evaluation_report_markdown
+        self.assertEqual(restored.report_markdown, evaluation_report_markdown(original, include_rewrite=False))
+        self.assertIn("Factual comparison", evaluation_report_markdown(restored))
         self.assertEqual(restored.added_facts_to_verify, original.added_facts_to_verify)
         self.assertEqual(restored.topic_critical_gaps, original.topic_critical_gaps)
         # Derived properties must recompute identically from restored data.

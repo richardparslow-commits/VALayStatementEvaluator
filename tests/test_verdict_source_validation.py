@@ -221,9 +221,13 @@ class TestSavedVerdictSourcePolicy(unittest.TestCase):
         result.report_markdown = report
         self.assertEqual(evaluation_report_markdown(result), report)
 
-    def test_current_report_download_preserves_original_report(self):
+    def test_current_source_policy_survives_rebuilt_report(self):
         result = EvaluationResult(**scored_result_fields(), **topic_result_fields(), verification_policy=SOURCE_REFERENCE_POLICY, report_markdown="# Synthetic report")
-        self.assertEqual(evaluation_report_markdown(result), result.report_markdown)
+        report = evaluation_report_markdown(result)
+        self.assertIn(SOURCE_REFERENCE_NOTICE, report)
+        self.assertNotIn(LEGACY_REFERENCE_NOTICE, report)
+        self.assertNotIn("# Synthetic report", report)
+        self.assertEqual(result.verification_policy, SOURCE_REFERENCE_POLICY)
 
     def test_ui_warns_on_legacy_results_and_the_download_contains_the_warning(self):
         import app.views.evaluate_view as view
