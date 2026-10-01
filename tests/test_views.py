@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 from tests.rubric_fixtures import scored_result_fields
+from tests.topic_fixtures import topic_result_fields
 
 from app.preflight import BLOCKED, OK, UNVERIFIED, Verdict  # noqa: E402
 from app.usage import UsageTracker  # noqa: E402
@@ -1507,7 +1508,7 @@ class TestEvaluateRunBookkeeping(unittest.TestCase):
         from app.evaluate import EvaluationResult
 
         events, _ = self._drive(
-            result=EvaluationResult(**scored_result_fields(), claims=[{"id": 1, "text": "Knee pain."}])
+            result=EvaluationResult(**scored_result_fields(), **topic_result_fields(), claims=[{"id": 1, "text": "Knee pain."}])
         )
         statuses = [status for _, status, _ in events]
         self.assertIn("ok", statuses)
@@ -2749,7 +2750,7 @@ class TestRenderEffectivenessScore(unittest.TestCase):
         from app.evaluate import EvaluationResult
 
         return EvaluationResult(
-            **scored_result_fields(),
+            **scored_result_fields(), **topic_result_fields(),
             effectiveness_score=score,
             recommendations=recommendations
             if recommendations is not None

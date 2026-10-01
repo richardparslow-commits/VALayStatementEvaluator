@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from .. import pilot
+from ..evaluation_topics import topics_are_complete
 
 from typing import Any
 
@@ -18,6 +19,8 @@ def draft_follow_up_questions(result: Any) -> list[dict[str, str]]:
 
 def evaluate_follow_up_questions(result: Any) -> list[dict[str, str]]:
     """Return uncovered checklist-topic questions from an evaluation result."""
+    if not topics_are_complete(result):
+        return []
     claim_focus = getattr(result, "topic_focus", "")
     return _evaluation_topic_questions(getattr(result, "topic_rows", []), claim_focus=claim_focus)
 
@@ -208,7 +211,7 @@ def _evaluation_topic_questions(topic_rows: Any, *, claim_focus: Any) -> list[di
         return questions
     focus = _clean_text(claim_focus)
     for row in topic_rows:
-        if not isinstance(row, dict) or not row.get("applicable"):
+        if not isinstance(row, dict) or row.get("applicable") is not True:
             continue
         coverage = _clean_text(row.get("coverage")).lower()
         if coverage == "covered":

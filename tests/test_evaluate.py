@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
+from tests.topic_fixtures import complete_topics, topic_result_fields
 from tests.rubric_fixtures import scored_result_fields
 from tests.grounding_fixtures import complete_grounding  # noqa: E402
 
@@ -134,15 +135,7 @@ class _FakeLLM:
                 "executive_summary": "Adequate statement with minor gaps.",
             }
         if phase == "topic":
-            return {
-                "claim_focus": "knee condition - increased rating",
-                "topics": [
-                    {"topic": "A. Hazards and Dangers", "applicable": True, "coverage": "partial", "evidence": "Lifts at work.", "gap_note": "Describe near-miss."},
-                    {"topic": "B. Caregiver Burden", "applicable": False, "coverage": "not applicable", "evidence": "", "gap_note": ""},
-                ],
-                "critical_gaps": ["A. Hazards and Dangers — needs incident detail"],
-                "notes": "Good base.",
-            }
+            return complete_topics()
         if phase == "revision":
             return {
                 "revision_notes": "Aligned timeline with records.",
@@ -276,10 +269,7 @@ class TestBuildReport(unittest.TestCase):
             revision_changes=[{"category": "contradiction_fix", "original": "2009", "revised": "2010 [Confirm: date]", "reason": "Record shows 2010."}],
             revised_statement="Revised [Confirm: date].",
             added_facts_to_verify=["Brace 2010"],
-            topic_focus="knee - increased rating",
-            topic_rows=[{"topic": "A. Hazards", "applicable": True, "coverage": "partial", "evidence": "Stove.", "gap_note": "Add incident."}],
-            topic_critical_gaps=["A. Hazards — missing incident"],
-            topic_notes="Note.",
+            **topic_result_fields(),
         )
         base.update(overrides)
         return EvaluationResult(**base)
@@ -982,7 +972,10 @@ class TestRunEvaluationEdgeCases(unittest.TestCase):
         llm = _FakeLLM(overrides={"topic": LLMError("model down")})
         result = run_evaluation(llm, "stmt", [_doc()])
         self.assertIn("unavailable", result.topic_notes)
-        # pipeline still completed rubric + revision + report
+        # Record and rubric findings remain available; dependent phases are withheld.
+        self.assertEqual(llm.calls.count(("chat_json", "topic")), 3)
+        self.assertNotIn(("chat_json", "revision"), llm.calls)
+        self.assertNotIn(("chat_json", "recommendations"), llm.calls)
         self.assertTrue(result.report_markdown)
 
     @patch("app.evaluate.review_medical_records")

@@ -23,6 +23,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # tests/ — log_isolation
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
+from tests.topic_fixtures import complete_topics, topic_result_fields
+from tests.rubric_fixtures import scored_result_fields
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -54,27 +56,13 @@ def _eval_result():
     """A completed evaluation whose applicable topics include the stale one."""
     from app.evaluate import EvaluationResult
 
-    return EvaluationResult(
-        claimed_condition="post-traumatic stress disorder",
-        executive_summary="Summary.",
-        topic_rows=[
-            {
-                "topic": "A",
-                "applicable": True,
-                "coverage": "absent",
-                "evidence": "",
-                "gap_note": "Describe the stove incident.",
-            },
-            {
-                "topic": "G",
-                "applicable": True,
-                "coverage": "partial",
-                "evidence": "before and after",
-                "gap_note": "Add dates.",
-            },
-        ],
-        topic_focus="PTSD, need for regular assistance",
-    )
+    raw = complete_topics()
+    raw["claim_focus"] = "PTSD, need for regular assistance"
+    raw["topics"][0].update(coverage="absent", evidence="", gap_note="Describe the stove incident.")
+    raw["topics"][6].update(applicable=True, coverage="partial", evidence="before and after", gap_note="Add dates.")
+    return EvaluationResult(**scored_result_fields(), **topic_result_fields(raw),
+                            claimed_condition="post-traumatic stress disorder")
+
 
 
 class TestFrameworkCurrencyInTheApp(unittest.TestCase):

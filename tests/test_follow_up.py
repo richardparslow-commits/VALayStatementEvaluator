@@ -9,6 +9,8 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
+from tests.topic_fixtures import complete_topics, topic_result_fields
+from tests.rubric_fixtures import scored_result_fields
 
 from app.draft import DraftResult  # noqa: E402
 from app.evaluate import EvaluationResult  # noqa: E402
@@ -53,21 +55,20 @@ class TestFollowUpQuestionExtraction(unittest.TestCase):
     def test_evaluate_extracts_partial_and_absent_topics(self) -> None:
         from app.views.follow_up import evaluate_follow_up_questions
 
-        result = EvaluationResult(
-            topic_focus="PTSD caregiver support",
-            topic_rows=[
-                {"topic": "A. Hazards", "applicable": True, "coverage": "covered", "gap_note": "ignored"},
-                {"topic": "B. Caregiver Burden", "applicable": True, "coverage": "partial", "gap_note": "Describe what happens if you are away for a day"},
-                {"topic": "C. Personal Care", "applicable": True, "coverage": "absent", "gap_note": ""},
-                {"topic": "D. Other", "applicable": False, "coverage": "absent", "gap_note": "ignored"},
-            ],
-        )
+        raw = complete_topics()
+        raw["claim_focus"] = "PTSD caregiver support"
+        raw["topics"][0].update(coverage="covered", gap_note="")
+        raw["topics"][1].update(applicable=True, coverage="partial", evidence="Caregiver helps daily.",
+                                 gap_note="Describe what happens if you are away for a day")
+        raw["topics"][2].update(applicable=True, coverage="absent", gap_note="Describe personally observed care needs.")
+        raw["critical_gaps"] = []
+        result = EvaluationResult(**topic_result_fields(raw))
         questions = evaluate_follow_up_questions(result)
         self.assertEqual(len(questions), 2)
-        self.assertEqual(questions[0]["topic"], "B. Caregiver Burden")
+        self.assertEqual(questions[0]["topic"], "B. Caregiver Burden And Necessity Of Care")
         self.assertIn("PTSD caregiver support", questions[0]["question"])
-        self.assertEqual(questions[1]["topic"], "C. Personal Care")
-        self.assertIn("What has the witness personally observed", questions[1]["question"])
+        self.assertEqual(questions[1]["topic"], "C. Basic Personal Care And Hygiene")
+        self.assertIn("Describe personally observed care needs", questions[1]["question"])
 
     def test_malformed_topic_data_is_ignored_safely(self) -> None:
         from app.views.follow_up import draft_follow_up_questions, evaluate_follow_up_questions
@@ -85,7 +86,7 @@ class TestFollowUpQuestionExtraction(unittest.TestCase):
         )
         self.assertEqual(
             evaluate_follow_up_questions(eval_result),
-            [{"topic": "A", "question": "What has the witness personally observed about A that should be added if true?"}],
+            [],
         )
 
 
@@ -233,7 +234,7 @@ class TestFollowUpRunIntegration(unittest.TestCase):
             patch.object(
                 evaluate_view,
                 "run_with_timeout",
-                return_value=EvaluationResult(claims=[{"id": 1}], scores={"factual_accuracy": 7.0}),
+                return_value=EvaluationResult(**scored_result_fields(), **topic_result_fields(), claims=[{"id": 1, "text": "Synthetic observation."}]),
             ) as run_with_timeout,
             patch.object(evaluate_view, "get_profiler", return_value=None),
             patch.object(evaluate_view, "audit_record_meta", return_value=(["Upload"], 1, 1)),

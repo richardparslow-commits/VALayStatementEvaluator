@@ -19,6 +19,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # tests/ — log_isolation
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
+from tests.topic_fixtures import complete_topics
+from tests.rubric_fixtures import complete_rubric
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -58,12 +60,9 @@ class _FakeLLM:
         if phase == "claims":
             return {"claimed_condition": "", "writer_role": "", "claims": []}
         if phase == "rubric":
-            return {
-                "scores": {}, "rationales": {}, "improvements": [],
-                "omitted_record_facts": [], "executive_summary": "",
-            }
+            return complete_rubric()
         if phase == "topic":
-            return {"claim_focus": "", "topics": [], "critical_gaps": [], "notes": ""}
+            return complete_topics()
         if phase == "revision":
             return {
                 "revision_notes": "", "changes": [], "revised_statement": "",

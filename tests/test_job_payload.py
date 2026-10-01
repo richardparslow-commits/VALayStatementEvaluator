@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
+from tests.topic_fixtures import topic_result_fields
 
 from app import config  # noqa: E402
 from app.documents import document_from_text  # noqa: E402
@@ -83,10 +84,7 @@ def _evaluation() -> EvaluationResult:
         improvements=[{"priority": 1, "problem": "Vague", "suggestion": "Add dates.", "example_rewrite": ""}],
         omitted_record_facts=[{"fact": "Brace prescribed.", "source": "a.txt p.1"}],
         executive_summary="Adequate with gaps.",
-        topic_focus="knee - increased rating",
-        topic_rows=[{"topic": "A. Hazards", "applicable": True, "coverage": "partial"}],
-        topic_critical_gaps=["A. Hazards needs detail"],
-        topic_notes="Good base.",
+        **topic_result_fields(),
         revision_notes="Aligned timeline.",
         revision_changes=[{"category": "specificity", "original": "hurt", "revised": "hurt daily"}],
         revised_statement="I confirm daily knee pain.",

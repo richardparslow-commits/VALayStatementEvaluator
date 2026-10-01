@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 from tests import hermetic  # noqa: F401
 from tests.rubric_fixtures import scored_result_fields
+from tests.topic_fixtures import topic_result_fields
 from tests.test_evaluate import _FakeLLM, _fake_digest
 from tests.test_views import _fake_streamlit, _patch_st
 from app.documents import BLOCK, DocumentPage, ExtractedDocument, document_from_text
@@ -221,7 +222,7 @@ class TestSavedVerdictSourcePolicy(unittest.TestCase):
         self.assertEqual(evaluation_report_markdown(result), report)
 
     def test_current_report_download_preserves_original_report(self):
-        result = EvaluationResult(**scored_result_fields(), verification_policy=SOURCE_REFERENCE_POLICY, report_markdown="# Synthetic report")
+        result = EvaluationResult(**scored_result_fields(), **topic_result_fields(), verification_policy=SOURCE_REFERENCE_POLICY, report_markdown="# Synthetic report")
         self.assertEqual(evaluation_report_markdown(result), result.report_markdown)
 
     def test_ui_warns_on_legacy_results_and_the_download_contains_the_warning(self):
