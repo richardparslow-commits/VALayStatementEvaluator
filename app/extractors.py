@@ -596,7 +596,7 @@ def build_extractor() -> RecordExtractor | None:
     if pilot.enabled() or mode == "isolated":
         from .isolated_extract import IsolatedExtractor
         if mode not in ("isolated", "in-process"):
-            raise pilot.PilotBlocked("The pilot requires the isolated local parser; fallback is disabled.")
+            raise pilot.PilotBlocked("The pilot requires the protected parser service; fallback is disabled.")
         record_configuration(mode="isolated", timeout_seconds=60)
         return IsolatedExtractor()
     if mode in ("", "in-process", "inprocess", "local"):

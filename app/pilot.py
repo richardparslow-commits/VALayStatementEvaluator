@@ -101,13 +101,18 @@ def validate_configuration() -> dict[str, Any]:
     if (not 0 < config.MAX_RECORD_PAGES <= 500 or config.MAX_UPLOAD_BYTES > 50 * 1024 * 1024
             or config.MAX_TOTAL_UPLOAD_BYTES > 200 * 1024 * 1024):
         raise PilotBlocked("Pilot input limits require at most 500 pages, 50 MB per file, and 200 MB total.")
+    from .isolated_extract import parser_health
+    try:
+        parser_health()
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        raise PilotBlocked("The reviewed protected parser service must be available before pilot admission.") from exc
     # This first pilot deliberately has no durable case storage or remote tools.
     # The disabled services need a separate privacy/ownership release review.
     if (config.JOB_QUEUE_ENABLED or config.BLOB_STORE_MODE != "none"
             or config.TRACING_ENABLED or config.SHARED_CACHE_URL or config.SHARED_CACHE_TOKEN
             or config.EXTRACTOR_MODE not in ("isolated", "in-process")):
         raise PilotBlocked("Pilot configuration requires no queue, no blob storage, "
-                           "no tracing, and the isolated local extractor.")
+                           "no tracing, and the protected parser service.")
     if any(os.getenv(key, "").strip() for key in (
         "INSPECT_API_KEY", "AGILOOP_API_KEY", "INSPECT_TELEMETRY_URL",
         "AGILOOP_TELEMETRY_URL", "OTEL_EXPORTER_OTLP_ENDPOINT",

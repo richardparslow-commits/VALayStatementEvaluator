@@ -179,7 +179,7 @@ COPY scripts/ ./scripts/
 COPY deploy/ ./deploy/
 COPY nginx/ ./nginx/
 COPY examples/ ./examples/
-COPY requirements*.txt ./
+COPY requirements*.txt requirements-parser.lock ./
 
 # A baseline commit, so `git status` in the sandbox shows the agent's own edits
 # instead of the whole tree, and the suite's git-grounded test has a repository

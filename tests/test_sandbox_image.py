@@ -141,6 +141,7 @@ class TestSandboxCarriesWhatTheSuiteReads(SandboxImageTestCase):
         "run_app.py",
         ".streamlit/config.toml",
         "requirements.lock",
+        "requirements-parser.lock",
         # this stage's reason to exist
         "tests",
         "scripts",

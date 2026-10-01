@@ -34,6 +34,10 @@ def approval() -> dict:
 
 
 class TestAdmission(unittest.TestCase):
+    def setUp(self):
+        from app import documents
+        self.addCleanup(documents.set_active_extractor, documents._ACTIVE_EXTRACTOR)
+
     def test_operator_manifest_is_required_current_and_revision_specific(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "approval.json"
@@ -125,7 +129,8 @@ class TestAdmission(unittest.TestCase):
                 patch.object(config, "load_settings", return_value=settings), patch.object(st, "user", user), \
                 patch.object(config, "MAX_RECORD_PAGES", 500), patch.object(config, "BLOB_STORE_MODE", "none"), \
                 patch.object(config, "SHARED_CACHE_URL", ""), patch.object(config, "SHARED_CACHE_TOKEN", ""), \
-                patch("sys.platform", "linux"), patch("os.geteuid", return_value=1000):
+                patch("sys.platform", "linux"), patch("os.geteuid", return_value=1000), \
+                patch("app.isolated_extract.parser_health"):
             at = AppTest.from_file(str(root / "run_app.py"))
             at.secrets["auth"] = auth
             at.run()
@@ -373,20 +378,28 @@ class TestEvidenceRegressions(unittest.TestCase):
         provider.assert_not_called()
         self.assertIsNone(build.call_args.args[1])
 
-    def test_isolated_parser_preserves_archive_members_and_erases_scratch_files(self):
-        from app.isolated_extract import IsolatedExtractor
+    def test_protected_parser_preserves_archive_member_citations(self):
+        from app.isolated_extract import _documents
+        from app.documents import InProcessExtractor
+        from app.job_payload import documents_to_json
         payload = io.BytesIO()
         with zipfile.ZipFile(payload, "w") as archive:
             archive.writestr("one.txt", "First synthetic observation of knee pain.")
             archive.writestr("two.txt", "Second synthetic observation of limited walking.")
-        docs, skipped = IsolatedExtractor().extract("records.zip", payload.getvalue())
+        # Synthetic schema fixture only; actual OS boundary runs in Linux CI.
+        docs, skipped = InProcessExtractor().extract("records.zip", payload.getvalue())
+        request = {"version": 1, "label": "records.zip", "sha256": "a" * 64, "nonce": "b" * 32}
+        reply = {**request, "image": "sha256:" + "c" * 64, "documents": documents_to_json(docs), "skipped": skipped}
+        docs, skipped = _documents(reply, request, reply["image"])
         self.assertEqual(len(docs), 2)
         self.assertFalse(skipped)
         self.assertTrue(all(doc.coverage_known for doc in docs))
 
     def test_parser_timeout_is_fail_closed_without_parent_fallback(self):
         from app.isolated_extract import IsolatedExtractor
-        with patch("app.isolated_extract.subprocess.run", side_effect=subprocess.TimeoutExpired("parser", 1)), patch("app.documents.InProcessExtractor.extract") as fallback:
+        with patch.dict(os.environ, {"VA_LSE_PARSER_IMAGE": "sha256:" + "a" * 64}), \
+                patch("app.isolated_extract.socket.socket") as constructor, patch("app.documents.InProcessExtractor.extract") as fallback:
+            constructor.return_value.__enter__.return_value.connect.side_effect = TimeoutError("synthetic timeout")
             with self.assertRaises(ExtractionError):
                 IsolatedExtractor(timeout=1).extract("record.txt", b"synthetic record")
         fallback.assert_not_called()
