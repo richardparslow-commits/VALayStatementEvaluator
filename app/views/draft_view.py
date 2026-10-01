@@ -422,19 +422,23 @@ _NO_WITNESS = object()
 
 def _validate_draft_inputs(records: list, observations: str, condition: str, rid: str,
                            *, claim_type: str = "Service connection", witness: Any = _NO_WITNESS,
-                           validate_record_set: bool = True, confirm_oversize: bool = True) -> bool:
+                           validate_record_set: bool = True, confirm_oversize: bool = True,
+                           original_text: str | None = None) -> bool:
     """Pre-run validation; shows the specific error and returns False when invalid.
 
     Every rejection is recorded in the persistent run log so the reference shown
     in future error messages is always correlatable, even for pre-pipeline
     failures that never reach the audit log.
     """
-    from ..request_validation import RequestValidationError, validate_draft_request, validate_records
+    from ..request_validation import RequestValidationError, validate_draft_request, validate_records, validate_follow_up_prompt_budget
     try:
         if validate_record_set:
             validate_records(records)
         validate_draft_request(observations=observations, condition=condition, claim_type=claim_type,
                                witness={} if witness is _NO_WITNESS else witness, validate_record_set=False)
+        if original_text is not None:
+            validate_follow_up_prompt_budget(original_text, observations, field="observations",
+                                             label="The observations", limit=DRAFT_INTERNAL_MAX_CHARS)
     except RequestValidationError as exc:
         reason = ({"records": "no_records", "observations": "missing_observations", "condition": "missing_condition",
                    "claim_type": "missing_claim_type"}.get(exc.field, exc.reason)
@@ -479,7 +483,8 @@ def _run_draft_flow(
     queued = job_runner.queue_mode_active()
     submitted_observations = observations if queued else append_follow_up_answers(observations.strip(), slot="draft")
     if not _validate_draft_inputs(records, submitted_observations, condition, rid, claim_type=claim_type, witness=witness,
-                                  validate_record_set=False, confirm_oversize=False):
+                                  validate_record_set=False, confirm_oversize=False,
+                                  original_text=None if queued else observations.strip()):
         return
     # Before anything is spent: a configuration whose every call is rejected is
     # detectable in one request. Covers the queued path too — this is the only

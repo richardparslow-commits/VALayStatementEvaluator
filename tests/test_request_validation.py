@@ -234,6 +234,64 @@ class TestQueuedBoundaries(unittest.TestCase):
 
 
 class TestUIBoundaries(unittest.TestCase):
+    def test_saved_answers_fit_prompt_or_stop_without_consumption(self):
+        from app.views import draft_view, evaluate_view, follow_up
+        for view, slot in ((draft_view, "draft"), (evaluate_view, "eval")):
+            for total in (60_001, 80_000, 80_001):
+                for confirmed in (False, True):
+                    st_mock, session = _fake_streamlit()
+                    original = "x" * 60_000
+                    request = ({**draft_request(), "observations": original} if slot == "draft" else
+                               {**evaluation_request(), "statement_text": original})
+                    answer = {"topic": "Impact", "question": "What changed?", "answer": "a"}
+                    session[f"{slot}_follow_up_saved"] = [answer]
+                    session[f"{slot}_confirm_oversize"] = confirmed
+                    session["eval_follow_up_input_key"] = follow_up.evaluation_input_key(original, request["records"], {})
+                    session["eval_follow_up_input_source_id"] = "synthetic-result"
+                    with patch.object(follow_up, "st", st_mock):
+                        overhead = len(follow_up.compose_follow_up_appendix(slot)) - 1
+                        # Keep the original under the recommended limit; accepted
+                        # answers alone cross the thresholds under test.
+                        base_length = min(60_000, total - overhead - 3)
+                        original = original[:base_length]
+                        request["observations" if slot == "draft" else "statement_text"] = original
+                        session["eval_follow_up_input_key"] = follow_up.evaluation_input_key(original, request["records"], {})
+                        answer["answer"] = "a" * (total - base_length - 2 - overhead)
+                        with self.subTest(slot=slot, total=total, confirmed=confirmed), \
+                                patch.object(view, "st", st_mock), patch.object(view, "run_log_event") as log, \
+                                patch.object(view, "check_endpoint_gate", return_value=False) as gate, \
+                                patch.object(view, "get_llm") as client, \
+                                patch.object(view.job_runner, "queue_mode_active", return_value=False):
+                            if slot == "draft":
+                                view._run_draft_flow(rid="synthetic", **request)
+                            else:
+                                with patch.object(view, "ensure_request_id", return_value="synthetic"):
+                                    view._run_evaluation_flow(**request)
+                            if total <= 80_000:
+                                gate.assert_called_once()
+                            else:
+                                gate.assert_not_called()
+                                self.assertEqual(log.call_args.kwargs["reason"], "payload_too_large")
+                                self.assertIn("Shorten", log.call_args.kwargs["error"])
+                            client.assert_not_called()
+                            self.assertEqual(session[f"{slot}_follow_up_saved"], [answer])
+
+    def test_original_long_text_confirmation_still_works_without_saved_answers(self):
+        from app.views import draft_view, evaluate_view, follow_up
+        for view, slot in ((draft_view, "draft"), (evaluate_view, "eval")):
+            st_mock, session = _fake_streamlit()
+            session[f"{slot}_confirm_oversize"] = True
+            with patch.object(view, "st", st_mock), patch.object(follow_up, "st", st_mock), \
+                    patch.object(view, "run_log_event"), \
+                    patch.object(view.job_runner, "queue_mode_active", return_value=False), \
+                    patch.object(view, "check_endpoint_gate", return_value=False) as gate:
+                if slot == "draft":
+                    view._run_draft_flow(rid="synthetic", **{**draft_request(), "observations": "x" * 80_001})
+                else:
+                    with patch.object(view, "ensure_request_id", return_value="synthetic"):
+                        view._run_evaluation_flow(**{**evaluation_request(), "statement_text": "x" * 80_001})
+            gate.assert_called_once()
+
     def test_saved_answers_can_cross_recommended_limit_without_missing_checkbox(self):
         from app.views import draft_view, evaluate_view
         for view in (draft_view, evaluate_view):

@@ -17,10 +17,13 @@ The payload ceiling for statements and observations is 120,000 characters. This
 preserves drafting's existing ceiling and gives both paths bounded room for
 follow-up answers. It is distinct from the existing 60,000-character recommended
 limit and 80,000-character prompt budget: those still carry their confirmation
-and truncation warnings. The post-append check applies the hard ceiling so saved
-answers cannot require a confirmation checkbox that the original-input UI never
-rendered. Passing input validation does not mean every character
-will reach every prompt.
+and truncation warnings for the original input. After appending saved answers,
+the combined text must fit the 80,000-character prompt budget. Otherwise the UI
+stops before the endpoint gate and asks the user to shorten the original text;
+saved answers remain pending. The original-input confirmation cannot waive this
+check. Crossing only the 60,000-character recommended limit after appending answers
+does not require an unrendered checkbox. Passing payload validation alone does
+not mean every character will reach every prompt.
 
 Condition, claim type, filenames and ordinary witness values are bounded at 500
 characters. Optional `aa_*` intake answers allow 4,000 characters; their existing

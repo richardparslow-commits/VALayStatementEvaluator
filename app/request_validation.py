@@ -59,6 +59,18 @@ def validate_witness(witness: Any, *, optional: bool = False) -> None:
             raise RequestValidationError("Witness details are malformed. " + message, field="witness")
 
 
+def validate_follow_up_prompt_budget(original: str, submitted: str, *, field: str,
+                                    label: str, limit: int) -> None:
+    """Saved answers must fit; an earlier base-text waiver cannot discard them."""
+    if submitted != original and len(submitted) > limit:
+        raise RequestValidationError(
+            f"{label} with saved follow-up answers exceeds the {limit:,}-character model limit. "
+            f"Shorten {label.lower()} so all saved answers fit before trying again. "
+            "Your saved answers have been kept.",
+            field=field, reason="payload_too_large",
+        )
+
+
 def validate_records(records: Any) -> tuple[int, int]:
     if not isinstance(records, list):
         raise RequestValidationError("Medical records must be a list of extracted documents.", field="records")

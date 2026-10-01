@@ -265,15 +265,19 @@ def _render_statement_length_guidance(statement_text: str) -> None:
 
 
 def _validate_evaluate_inputs(statement_text: str, records: list, witness: dict[str, str] | None = None,
-                              *, validate_record_set: bool = True, confirm_oversize: bool = True) -> bool:
+                              *, validate_record_set: bool = True, confirm_oversize: bool = True,
+                              original_text: str | None = None) -> bool:
     """Pre-run validation; shows the specific error and returns False when invalid."""
     # Minted rather than defaulted to "-": each rejection below is written to the
     # run log under this id, and an id the user cannot see is not a reference.
     rid = ensure_request_id()
-    from ..request_validation import RequestValidationError, validate_evaluation_request
+    from ..request_validation import RequestValidationError, validate_evaluation_request, validate_follow_up_prompt_budget
     try:
         validate_evaluation_request(statement_text=statement_text, records=records, witness=witness,
                                     validate_record_set=validate_record_set)
+        if original_text is not None:
+            validate_follow_up_prompt_budget(original_text, statement_text, field="statement_text",
+                                             label="The statement", limit=EVALUATE_INTERNAL_MAX_CHARS)
     except RequestValidationError as exc:
         reason = ({"statement_text": "no_statement", "records": "no_records"}.get(exc.field, exc.reason)
                   if exc.reason == "payload_missing" else exc.reason)
@@ -316,7 +320,8 @@ def _run_evaluation_flow(statement_text: str, records: list, witness: dict[str, 
     _input_key = "" if queued else evaluation_input_key(statement_text, records, witness or {})
     submitted_statement = (statement_text if queued else
                            append_follow_up_answers(statement_text.strip(), slot="eval", input_key=_input_key))
-    if not _validate_evaluate_inputs(submitted_statement, records, witness, validate_record_set=False, confirm_oversize=False):
+    if not _validate_evaluate_inputs(submitted_statement, records, witness, validate_record_set=False,
+                                     confirm_oversize=False, original_text=None if queued else statement_text.strip()):
         return
     # Before anything is spent: a configuration whose every call is rejected is
     # detectable in one request. This is the only entry point into the pipeline, so
