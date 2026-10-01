@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
+from tests.rubric_fixtures import scored_result_fields
 
 from app.preflight import BLOCKED, OK, UNVERIFIED, Verdict  # noqa: E402
 from app.usage import UsageTracker  # noqa: E402
@@ -1140,7 +1141,7 @@ class TestEmptyAnalysisResults(unittest.TestCase):
         error_messages = [str(call.args[0]) for call in st_mock.error.call_args_list]
         self.assertFalse([m for m in error_messages if "no usable analysis" in m])
 
-    def test_blank_result_renders_the_score_band_banner_alongside_the_guard(self) -> None:
+    def test_blank_result_withholds_score_band_alongside_the_guard(self) -> None:
         """The empty-analysis guard and the RED score band both use st.error.
 
         Merge regression guard: the effectiveness-score panel renders its RED
@@ -1162,7 +1163,7 @@ class TestEmptyAnalysisResults(unittest.TestCase):
         band_banners = [m for m in error_messages if "(RED band)" in m]
         self.assertEqual(len(guards), 1)
         self.assertIn("req_84ab42a65e24", guards[0])
-        self.assertEqual(len(band_banners), 1)
+        self.assertEqual(len(band_banners), 0)
 
     def test_panel_renders_the_timeline_and_the_score_panels_exactly_once_each(self) -> None:
         """Merge regression guard for the timeline + effectiveness-score panels.
@@ -1184,8 +1185,7 @@ class TestEmptyAnalysisResults(unittest.TestCase):
         result = EvaluationResult(
             claims=[{"id": 1, "text": "Knee pain since 2014."}],
             verifications=[{"id": 1, "verdict": "SUPPORTED"}],
-            scores={"factual_accuracy": 7.0},
-            executive_summary="Strong statement.",
+            **scored_result_fields(),
             effectiveness_score=90,
             recommendations=[
                 {"title": "Add dates", "impact": "+4 points", "explanation": "x"}
@@ -1507,11 +1507,25 @@ class TestEvaluateRunBookkeeping(unittest.TestCase):
         from app.evaluate import EvaluationResult
 
         events, _ = self._drive(
-            result=EvaluationResult(claims=[{"id": 1, "text": "Knee pain."}], scores={"a": 5.0})
+            result=EvaluationResult(**scored_result_fields(), claims=[{"id": 1, "text": "Knee pain."}])
         )
         statuses = [status for _, status, _ in events]
         self.assertIn("ok", statuses)
         self.assertNotIn("empty", statuses)
+
+    def test_partial_analysis_logs_partial_without_success_status(self) -> None:
+        from app.evaluate import EvaluationResult
+        events, raised = self._drive(result=EvaluationResult(
+            scoring_policy="complete_rubric_v1", scoring_status="incomplete",
+            claims=[{"id": 1, "text": "Synthetic claim."}],
+        ))
+        self.assertIsNone(raised)
+        statuses = [status for _, status, _ in events]
+        self.assertIn("partial", statuses)
+        self.assertNotIn("ok", statuses)
+        partial = next(details for _, status, details in events if status == "partial")
+        self.assertEqual(partial["scoring_status"], "incomplete")
+
 
 
 # ------------------------------------------------- sidebar settings guards
@@ -2735,6 +2749,7 @@ class TestRenderEffectivenessScore(unittest.TestCase):
         from app.evaluate import EvaluationResult
 
         return EvaluationResult(
+            **scored_result_fields(),
             effectiveness_score=score,
             recommendations=recommendations
             if recommendations is not None

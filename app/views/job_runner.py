@@ -450,7 +450,7 @@ def _render_uncertain_submission(slot: str) -> None:
             wait_for_result=False,
         )
         if outcome is not None and outcome.ok:
-            pilot.display(f"Run complete — reference `{outcome.request_id}`.", container=st, method="success")
+            pilot.display(f"Run result available — reference `{outcome.request_id}`.", container=st, method="info")
         return
     discard_allowed = st.checkbox(
         "I understand the earlier job may still run; I want to start a separate run.",

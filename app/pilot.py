@@ -299,7 +299,8 @@ def safe_metadata(data: Mapping[str, Any]) -> dict[str, Any]:
     if re.fullmatch(r"(?:req_[a-f0-9]{12}|[a-f0-9-]{32,36})", reference):
         result["request_id"] = reference
     for key, choices in {"action": {"app", "evaluate", "draft"},
-                         "status": {"start", "ok", "error", "timeout", "rejected", "queued", "done"}}.items():
+                         "status": {"start", "ok", "partial", "error", "timeout", "rejected", "queued", "done"},
+                         "scoring_status": {"complete", "incomplete", "invalid", "unvalidated"}}.items():
         if isinstance(data.get(key), str) and data[key] in choices:
             result[key] = data[key]
     return result

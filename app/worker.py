@@ -42,6 +42,7 @@ from . import shutdown
 from . import tracing
 from .blob_store import BlobStoreError, get_blob_store
 from .draft import DraftResult
+from .rubric_validation import rubric_is_complete
 from .evaluate import EvaluationResult
 from .job_payload import (
     KIND_DRAFT,
@@ -190,6 +191,7 @@ def _outcome_for(kind: str, result: EvaluationResult | DraftResult) -> dict[str,
                 "claims": len(result.claims),
                 "contradictions": result.contradiction_count,
                 "overall_rating": result.overall_rating,
+                "scoring_status": "complete" if rubric_is_complete(result) else "incomplete",
             }
         if isinstance(result, DraftResult):
             return {
@@ -385,6 +387,7 @@ def execute_job(
     # run served by the backup provider survives to the audit log and the run log.
     endpoints = run.usage.endpoints_used()
     outcome = _outcome_for(kind, run.result)
+    completion_status = "partial" if outcome.get("scoring_status") == "incomplete" else "ok"
     logger.info(
         "worker job done job_id=%s kind=%s duration_ms=%d calls=%d",
         record.job_id,
@@ -394,14 +397,14 @@ def execute_job(
         extra={
             "request_id": request_id,
             "phase": kind,
-            "status": "ok",
+            "status": completion_status,
             "duration_ms": duration_ms,
             "calls": totals.calls,
         },
     )
     run_log_event(
         kind,
-        "ok",
+        completion_status,
         request_id=request_id,
         duration_ms=duration_ms,
         endpoints=",".join(endpoints),

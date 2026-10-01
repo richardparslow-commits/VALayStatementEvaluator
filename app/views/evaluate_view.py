@@ -43,7 +43,9 @@ from ..evaluate import (
     rubric_and_positive_sources,
     run_evaluation,
     source_reference_notice,
+    retained_claim_text,
 )
+from ..rubric_validation import rubric_is_complete, scoring_notice
 from ..exporter import export_facts, filter_facts
 from ..job_payload import EvaluateJob
 from ..config import Settings, load_settings
@@ -501,7 +503,7 @@ def _run_evaluation_flow(statement_text: str, records: list, witness: dict[str, 
         extra={
             "request_id": rid,
             "phase": "evaluate",
-            "status": "ok",
+            "status": "ok" if rubric_is_complete(result) else "partial",
             "duration_ms": duration_ms,
             "calls": total.calls,
             "prompt_tokens": total.prompt_tokens,
@@ -514,6 +516,7 @@ def _run_evaluation_flow(statement_text: str, records: list, witness: dict[str, 
             "claims": len(getattr(result, "claims", []) or []),
             "contradictions": int(getattr(result, "contradiction_count", 0) or 0),
             "overall_rating": str(getattr(result, "overall_rating", "") or ""),
+            "scoring_status": "complete" if rubric_is_complete(result) else "incomplete",
         }
     except Exception:  # noqa: BLE001
         _outcome = {}
@@ -529,7 +532,7 @@ def _run_evaluation_flow(statement_text: str, records: list, witness: dict[str, 
     )
     run_log_event(
         "evaluate",
-        "ok",
+        "ok" if rubric_is_complete(result) else "partial",
         request_id=rid,
         duration_ms=duration_ms,
         endpoints=",".join(_endpoints),
@@ -611,7 +614,12 @@ def _run_evaluation_queued(
         action_label="Evaluation",
     )
     if outcome is not None and outcome.ok:
-        pilot.display(f"Evaluation complete — reference `{outcome.request_id}`.", container=st, method="success")
+        result = st.session_state.get("eval_result")
+        if rubric_is_complete(result):
+            pilot.display(f"Evaluation complete — reference `{outcome.request_id}`.", container=st, method="success")
+        else:
+            pilot.display(f"Partial evaluation retained — reference `{outcome.request_id}`. "
+                          + scoring_notice(result), container=st, method="warning")
 
 
 def _result_reference() -> str:
@@ -1166,7 +1174,10 @@ def _render_effectiveness_score(eval_result: Any) -> None:
     `app/evaluate.py::_score_and_recommend` — not here — since it must fire
     exactly once per computation, not once per render.
     """
-    score = int(getattr(eval_result, "effectiveness_score", 0) or 0)
+    if not rubric_is_complete(eval_result) or getattr(eval_result, "score_band", "unavailable") == "unavailable":
+        pilot.display(scoring_notice(eval_result), container=st, method="warning")
+        return
+    score = int(eval_result.effectiveness_score)
     band = getattr(eval_result, "score_band", "") or compute_score_band(score)
     rid = _result_reference() or "no-ref"
 
@@ -1420,16 +1431,21 @@ def _render_evaluation_results(eval_result: Any) -> None:
         "Topics covered", f"{len(_covered)}/{len(_applicable)}" if _applicable else "—"
     )
 
-    with st.expander("Executive summary", expanded=True):
-        pilot.display(eval_result.executive_summary, container=st, method="write")
+    if rubric_is_complete(eval_result):
+        with st.expander("Executive summary", expanded=True):
+            pilot.display(eval_result.executive_summary, container=st, method="write")
 
     with st.expander("Claim-by-claim verification table", expanded=True):
         rows = []
-        claim_text = {c["id"]: c.get("text", "") for c in eval_result.claims}
+        claim_text = retained_claim_text(eval_result.claims)
+        if any(type(c.get("id")) is not int or c.get("id", 0) <= 0
+               or not isinstance(c.get("text"), str) for c in eval_result.claims):
+            pilot.display("Some saved claims lack usable IDs or text and cannot be linked to findings. "
+                          "Re-run the evaluation.", container=st, method="warning")
         for v in eval_result.verifications:
             rows.append(
                 {
-                    "Claim": claim_text.get(v.get("id"), ""),
+                    "Claim": claim_text.get(v.get("id"), "") if type(v.get("id")) is int else "",
                     "Verdict": v.get("verdict", ""),
                     "Record reference": v.get("record_reference", ""),
                     "Note": v.get("note", ""),
@@ -1439,20 +1455,21 @@ def _render_evaluation_results(eval_result: Any) -> None:
 
     _render_evidence_dashboard(eval_result)
 
-    with st.expander("Rubric scores", expanded=True):
-        score_rows = [
-            {
-                "Dimension": DIMENSION_LABELS.get(k, k),
-                "Score": eval_result.scores.get(k, 0),
-                "Rationale": eval_result.rationales.get(k, ""),
-            }
-            for k in DIMENSION_LABELS
-        ]
-        st.dataframe(score_rows, width="stretch", hide_index=True)
-        st.bar_chart(
-            {DIMENSION_LABELS[k]: eval_result.scores.get(k, 0) for k in DIMENSION_LABELS},
-            horizontal=True,
-        )
+    if rubric_is_complete(eval_result):
+        with st.expander("Rubric scores", expanded=True):
+            score_rows = [
+                {
+                    "Dimension": DIMENSION_LABELS.get(k, k),
+                    "Score": eval_result.scores.get(k, 0),
+                    "Rationale": eval_result.rationales.get(k, ""),
+                }
+                for k in DIMENSION_LABELS
+            ]
+            st.dataframe(score_rows, width="stretch", hide_index=True)
+            st.bar_chart(
+                {DIMENSION_LABELS[k]: eval_result.scores.get(k, 0) for k in DIMENSION_LABELS},
+                horizontal=True,
+            )
 
     if eval_result.topic_rows:
         with st.expander(
@@ -1495,69 +1512,70 @@ def _render_evaluation_results(eval_result: Any) -> None:
         next_run_label="evaluation",
     )
 
-    with st.expander("Improvements & record facts to add", expanded=True):
-        for imp in eval_result.improvements:
-            pilot.display(f"**{imp.get('priority', '?')}. {imp.get('problem', '')}**", container=st, method="markdown")
-            pilot.display(imp.get("suggestion", ""), container=st, method="write")
-            if imp.get("example_rewrite"):
-                pilot.display(f"Example: “{imp.get('example_rewrite')}”", container=st, method="caption")
-        if eval_result.omitted_record_facts:
-            pilot.display("**Facts from the records you could add (verify first):**", container=st, method="markdown")
-            for fact_dict in eval_result.omitted_record_facts:
-                pilot.display(
-                    f"- {fact_dict.get('fact', '')} _(source: {fact_dict.get('source', '')})_"
-                , container=st, method="write")
+    if rubric_is_complete(eval_result):
+        with st.expander("Improvements & record facts to add", expanded=True):
+            for imp in eval_result.improvements:
+                pilot.display(f"**{imp.get('priority', '?')}. {imp.get('problem', '')}**", container=st, method="markdown")
+                pilot.display(imp.get("suggestion", ""), container=st, method="write")
+                if imp.get("example_rewrite"):
+                    pilot.display(f"Example: “{imp.get('example_rewrite')}”", container=st, method="caption")
+            if eval_result.omitted_record_facts:
+                pilot.display("**Facts from the records you could add (verify first):**", container=st, method="markdown")
+                for fact_dict in eval_result.omitted_record_facts:
+                    pilot.display(
+                        f"- {fact_dict.get('fact', '')} _(source: {fact_dict.get('source', '')})_"
+                    , container=st, method="write")
 
-    if eval_result.revised_statement or eval_result.revision_changes:
-        with st.expander("📝 Suggested improvements — proposed rewrite", expanded=True):
-            if eval_result.revision_notes:
-                pilot.display(eval_result.revision_notes, container=st, method="info")
-            if eval_result.revision_changes:
-                change_rows = [
-                    {
-                        "Category": c.get("category", ""),
-                        "Original": c.get("original", "") or "(addition)",
-                        "Suggested": c.get("revised", ""),
-                        "Why": c.get("reason", ""),
-                    }
-                    for c in eval_result.revision_changes
-                ]
-                st.dataframe(change_rows, width="stretch", hide_index=True)
-            if eval_result.added_facts_to_verify:
+        if eval_result.revised_statement or eval_result.revision_changes:
+            with st.expander("📝 Suggested improvements — proposed rewrite", expanded=True):
+                if eval_result.revision_notes:
+                    pilot.display(eval_result.revision_notes, container=st, method="info")
+                if eval_result.revision_changes:
+                    change_rows = [
+                        {
+                            "Category": c.get("category", ""),
+                            "Original": c.get("original", "") or "(addition)",
+                            "Suggested": c.get("revised", ""),
+                            "Why": c.get("reason", ""),
+                        }
+                        for c in eval_result.revision_changes
+                    ]
+                    st.dataframe(change_rows, width="stretch", hide_index=True)
+                if eval_result.added_facts_to_verify:
+                    pilot.display(
+                        "**Record-sourced facts added — the witness must confirm each before signing:**"
+                    , container=st, method="markdown")
+                    for fact_str in eval_result.added_facts_to_verify:
+                        pilot.display(f"- {fact_str}", container=st, method="write")
+                pilot.display("#### Revised statement", container=st, method="markdown")
                 pilot.display(
-                    "**Record-sourced facts added — the witness must confirm each before signing:**"
-                , container=st, method="markdown")
-                for fact_str in eval_result.added_facts_to_verify:
-                    pilot.display(f"- {fact_str}", container=st, method="write")
-            pilot.display("#### Revised statement", container=st, method="markdown")
-            pilot.display(
-                "AI revisions require source and witness review. Resolve every "
-                "[Confirm: ...] placeholder with the witness before signing."
-            , container=st, method="caption")
-            revised = st.text_area(
-                "Revised statement (editable)",
-                value=eval_result.revised_statement,
-                height=420,
-                key="eval_revised_statement",
-            )
-            export_confirmed = pilot.confirm_export(revised)
-            col_a, col_b = st.columns(2)
-            pilot.file_download(
-                "⬇️ Download revised statement (.txt)",
-                data=revised.encode("utf-8"),
-                disabled=not export_confirmed,
-                file_name="lay_statement_revised.txt",
-                mime="text/plain",
-             container=col_a)
-            pilot.file_download(
-                "⬇️ Download revised statement (.md)",
-                data=revised.encode("utf-8"),
-                disabled=not export_confirmed,
-                file_name="lay_statement_revised.md",
-                mime="text/markdown",
-             container=col_b)
-            if export_confirmed:
-                _render_pdf_export(revised, entry_point="evaluate")
+                    "AI revisions require source and witness review. Resolve every "
+                    "[Confirm: ...] placeholder with the witness before signing."
+                , container=st, method="caption")
+                revised = st.text_area(
+                    "Revised statement (editable)",
+                    value=eval_result.revised_statement,
+                    height=420,
+                    key="eval_revised_statement",
+                )
+                export_confirmed = pilot.confirm_export(revised)
+                col_a, col_b = st.columns(2)
+                pilot.file_download(
+                    "⬇️ Download revised statement (.txt)",
+                    data=revised.encode("utf-8"),
+                    disabled=not export_confirmed,
+                    file_name="lay_statement_revised.txt",
+                    mime="text/plain",
+                 container=col_a)
+                pilot.file_download(
+                    "⬇️ Download revised statement (.md)",
+                    data=revised.encode("utf-8"),
+                    disabled=not export_confirmed,
+                    file_name="lay_statement_revised.md",
+                    mime="text/markdown",
+                 container=col_b)
+                if export_confirmed:
+                    _render_pdf_export(revised, entry_point="evaluate")
 
     _render_fact_export_section(eval_result)
     _render_medical_timeline(eval_result, request_reference=_result_reference())

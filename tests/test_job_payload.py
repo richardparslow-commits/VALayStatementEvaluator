@@ -17,6 +17,7 @@ from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests
 from app import config  # noqa: E402
 from app.documents import document_from_text  # noqa: E402
 from app.draft import DraftResult  # noqa: E402
+from tests.rubric_fixtures import scored_result_fields
 from app.evaluate import DIMENSION_LABELS, EvaluationResult  # noqa: E402
 from app.job_payload import (  # noqa: E402
     KIND_DRAFT,
@@ -70,6 +71,7 @@ def _digest() -> MedicalDigest:
 
 def _evaluation() -> EvaluationResult:
     return EvaluationResult(
+        scoring_policy="complete_rubric_v1", scoring_status="complete",
         claimed_condition="knee condition",
         writer_role="spouse",
         claims=[{"id": 1, "text": "Injured knee lifting pallet.", "type": "in_service_event"}],
@@ -78,7 +80,7 @@ def _evaluation() -> EvaluationResult:
         ],
         scores={k: 6.0 for k in DIMENSION_LABELS},
         rationales={k: "Because " + k for k in DIMENSION_LABELS},
-        improvements=[{"priority": 1, "problem": "Vague", "suggestion": "Add dates."}],
+        improvements=[{"priority": 1, "problem": "Vague", "suggestion": "Add dates.", "example_rewrite": ""}],
         omitted_record_facts=[{"fact": "Brace prescribed.", "source": "a.txt p.1"}],
         executive_summary="Adequate with gaps.",
         topic_focus="knee - increased rating",
@@ -239,8 +241,8 @@ class TestResultRoundtrip(unittest.TestCase):
         self.assertEqual(usage_from_json({"entries": "nope"}).totals().calls, 0)
 
     def test_int_scores_are_coerced_to_float(self):
-        restored = evaluation_from_json({"scores": {"factual_accuracy": 7}})
-        self.assertEqual(restored.scores, {"factual_accuracy": 7.0})
+        restored = evaluation_from_json(scored_result_fields({k: 7 for k in DIMENSION_LABELS}))
+        self.assertEqual(restored.scores, {k: 7.0 for k in DIMENSION_LABELS})
 
 
 class TestJobEnvelope(unittest.TestCase):
