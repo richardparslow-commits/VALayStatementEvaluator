@@ -6,18 +6,21 @@ case mounts. The parser gets stdin bytes, a fresh tmpfs, and no bind mounts.
 from __future__ import annotations
 
 import os
+import json
 import re
 import selectors
 import socket
 import subprocess
+import threading
 import time
 import uuid
 from pathlib import Path
 from typing import Any
+from concurrent.futures import ThreadPoolExecutor
 
 from .parser_protocol import (DEADLINE, MAX_HEADER, MAX_INPUT, MAX_OUTPUT, SOCKET_PATH,
                               ParserRefused, bind_input, decode, encode, frame,
-                              recv_exact, recv_frame, validate_request)
+                              recv_exact, recv_frame, validate_request, validate_json_structure)
 
 PROFILE = "va-lse-parser"
 
@@ -27,6 +30,7 @@ class DockerParser:
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", image) or not revision:
             raise ParserRefused("An immutable reviewed parser image is required.")
         self.image, self.revision, self.docker = image, revision, docker
+        self.parse_lock = threading.Lock()
         self.env = {"PATH": os.defpath, "HOME": "/nonexistent", "DOCKER_HOST": "unix:///var/run/docker.sock"}
 
     def _command(self, args: list[str]) -> Any:
@@ -34,7 +38,8 @@ class DockerParser:
                                 timeout=10, check=True)
         if len(result.stdout) > 65536:
             raise ParserRefused("Invalid parser runtime metadata.")
-        return decode(result.stdout)
+        # Daemon metadata is trusted and separately bounded to 64 KB.
+        return json.loads(result.stdout)
 
     def ready(self) -> dict[str, Any]:
         info = self._command(["info", "--format", "{{json .}}"])
@@ -49,7 +54,7 @@ class DockerParser:
         return {"ready": True, "image": self.image, "revision": self.revision}
 
     def command(self, name: str) -> list[str]:
-        return [self.docker, "run", "--pull=never", "--name", name, "--interactive",
+        return [self.docker, "run", "--rm", "--pull=never", "--name", name, "--interactive",
                 "--network=none", "--ipc=none", "--read-only", "--user=65534:65534",
                 "--cap-drop=ALL", "--security-opt=no-new-privileges:true",
                 f"--security-opt=apparmor={PROFILE}", "--memory=1g", "--memory-swap=1g",
@@ -99,36 +104,47 @@ class DockerParser:
                                 raise ParserRefused("Parser output exceeds its limit.")
             if process.wait(timeout=max(0.1, deadline - time.monotonic())) != 0:
                 raise ParserRefused("Parser refused the document.")
-            reply = decode(bytes(output))
-            if not isinstance(reply, dict):
-                raise ParserRefused("Invalid parser response.")
-            reply["image"] = self.image
-            encoded = encode(reply)
+            # The Docker-authorized launcher never builds an object graph from
+            # document output. Bound lexical structure and pass opaque bytes in
+            # an image-bound envelope; the web client validates the full schema.
+            validate_json_structure(bytes(output))
+            encoded = b'{"image":' + encode(self.image) + b',"response":' + bytes(output) + b'}'
             if len(encoded) > MAX_OUTPUT:
                 raise ParserRefused("Parser output exceeds its limit.")
             return encoded
         finally:
-            if process.poll() is None:
-                process.kill()
-            process.wait(timeout=5)
-            for pipe in (process.stdin, process.stdout):
-                if pipe is not None:
-                    pipe.close()
-            # Always remove the container, including a detached CLI/timeout.
-            # PID 1 also has its own deadline: launcher loss cannot leave a parse running.
-            subprocess.run([self.docker, "rm", "--force", name], env=self.env,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           timeout=10, check=True)
+            try:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=5)
+            finally:
+                try:
+                    for pipe in (process.stdin, process.stdout):
+                        if pipe is not None:
+                            pipe.close()
+                finally:
+                    # Removal must still run after kill, reap or pipe-close failure.
+                    subprocess.run([self.docker, "rm", "--force", name], env=self.env,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   # Auto-remove may have already removed an exited container.
+                                   timeout=10, check=False)
 
 
 def handle(connection: socket.socket, runner: DockerParser) -> None:
     connection.settimeout(10)
+    locked = False
     try:
         header = decode(recv_frame(connection, MAX_HEADER, time.monotonic() + 10))
         if header == {"operation": "health"}:
             reply = encode(runner.ready())
         else:
             request = validate_request(header)
+            locked = runner.parse_lock.acquire(blocking=False)
+            if not locked:
+                connection.sendall(frame(encode({"busy": True})))
+                return
+            # Explicit admission before bytes: a busy caller does not upload or queue.
+            connection.sendall(frame(encode({"accepted": True})))
             # A monotonic overall upload deadline also bounds slow partial senders.
             deadline = time.monotonic() + 15
             data = bytearray()
@@ -147,6 +163,17 @@ def handle(connection: socket.socket, runner: DockerParser) -> None:
             connection.sendall(frame(encode({"error": "Parser refused this file; no fallback was used."})))
         except OSError:
             pass
+    finally:
+        if locked:
+            runner.parse_lock.release()
+
+
+def _handle_owned(connection: socket.socket, runner: DockerParser, slots: threading.Semaphore) -> None:
+    try:
+        with connection:
+            handle(connection, runner)
+    finally:
+        slots.release()
 
 
 def serve() -> None:
@@ -158,14 +185,19 @@ def serve() -> None:
                 "sha256": hashlib.sha256(data).hexdigest(), "nonce": uuid.uuid4().hex}, data)
     path = Path(SOCKET_PATH)
     path.unlink(missing_ok=True)
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+    slots = threading.Semaphore(4)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener, ThreadPoolExecutor(max_workers=4) as executor:
         listener.bind(str(path))
         path.chmod(0o600)
-        listener.listen(1)
+        listener.listen(4)
         while True:
-            connection, _ = listener.accept()
-            with connection:
-                handle(connection, runner)
+            slots.acquire()
+            try:
+                connection, _ = listener.accept()
+                executor.submit(_handle_owned, connection, runner, slots)
+            except BaseException:
+                slots.release()
+                raise
 
 
 if __name__ == "__main__":

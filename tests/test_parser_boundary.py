@@ -5,6 +5,8 @@ import hashlib
 import io
 import os
 import socket
+import subprocess
+import time
 import struct
 import threading
 import unittest
@@ -33,6 +35,55 @@ def response():
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_json_graph_depth_and_alternative_encoding_are_refused_before_decode(self):
+        values = [b'[' + b'{},' * 70000 + b'{}]', b'[' * 17 + b'0' + b']' * 17,
+                  '{"x":1}'.encode('utf-16-le'), b'{"x":"\xc3\xa9"}']
+        for value in values:
+            with self.subTest(size=len(value)), patch('app.parser_protocol.json.loads') as parse, self.assertRaises(wire.ParserRefused):
+                wire.decode(value)
+            parse.assert_not_called()
+
+    def test_json_string_punctuation_and_escaped_unicode_remain_valid(self):
+        value = {'text': 'Observation \" quoted \\ path [ {},: ] \U0001f600' * 20000}
+        self.assertEqual(wire.decode(wire.encode(value)), value)
+
+    def test_synthetic_page_limit_is_preserved_while_pilot_limit_is_enforced(self):
+        from app import config
+        value, req = response(), request()
+        value['label'] = req['label'] = 'records.zip'
+        original = value['documents'][0]
+        value['documents'] = [{**original, 'filename': f'records/{n}.txt', 'total_pages': 3,
+                               'pages': [{'page': p, 'kind': 'block', 'text': 'Synthetic observation'} for p in (1,2,3)]}
+                              for n in range(200)]
+        with patch.object(config, 'MAX_RECORD_PAGES', 5000):
+            self.assertEqual(len(_documents(value, req, IMAGE)[0]), 200)
+        with patch.object(config, 'MAX_RECORD_PAGES', 500), self.assertRaises(wire.ParserRefused):
+            _documents(value, req, IMAGE)
+
+    def test_refused_empty_upload_is_skipped_and_other_files_continue(self):
+        from app import documents
+        good = documents.document_from_text('good.txt', DATA.decode())
+        selected = MagicMock()
+        protected = IsolatedExtractor()
+        selected.extract.side_effect = lambda label, data: protected.extract(label, data) if not data else ([good], [])
+        empty, valid = MagicMock(name='empty'), MagicMock(name='valid')
+        empty.name, valid.name = 'empty.txt', 'good.txt'
+        empty.getvalue.return_value, valid.getvalue.return_value = b'', DATA
+        with patch.dict(os.environ, {'VA_LSE_PARSER_IMAGE': IMAGE}), patch.object(documents, '_ACTIVE_EXTRACTOR', selected), \
+                patch('app.documents.InProcessExtractor.extract') as fallback:
+            docs, skipped = documents.extract_uploaded_documents([empty, valid])
+        self.assertEqual(docs, [good])
+        self.assertEqual(len(skipped), 1)
+        self.assertIn('empty.txt', skipped[0])
+        self.assertEqual(selected.extract.call_count, 2)
+        fallback.assert_not_called()
+
+    def test_busy_client_refusal_occurs_before_file_bytes_are_sent(self):
+        with patch.dict(os.environ, {'VA_LSE_PARSER_IMAGE': IMAGE}), patch('app.isolated_extract.socket.socket') as constructor, \
+                patch('app.isolated_extract.recv_frame', return_value=wire.encode({'busy': True})), self.assertRaisesRegex(ExtractionError, 'busy'):
+            IsolatedExtractor().extract('record.txt', DATA)
+        self.assertEqual(constructor.return_value.__enter__.return_value.sendall.call_count, 1)
+
     def test_trickled_socket_bytes_cannot_reset_absolute_deadline(self):
         connection = MagicMock()
         connection.recv.return_value = b'x'
@@ -108,7 +159,9 @@ class ProtocolTests(unittest.TestCase):
         value['label'] = req['label'] = 'records.zip'
         value['documents'][0]['filename'] = 'records/folder/one.txt'
         self.assertEqual(_documents(value, req, IMAGE)[0][0].filename, 'records/folder/one.txt')
-        for name in ('other/one.txt', 'records/../case.txt', 'records//absolute.txt'):
+        value['documents'][0]['filename'] = 'records/sub/../record.txt'
+        self.assertEqual(_documents(value, req, IMAGE)[0][0].filename, 'records/sub/../record.txt')
+        for name in ('other/one.txt', 'records//absolute.txt'):
             value['documents'][0]['filename'] = name
             with self.subTest(name=name), self.assertRaises(wire.ParserRefused):
                 _documents(value, req, IMAGE)
@@ -139,6 +192,64 @@ class ProtocolTests(unittest.TestCase):
 
 
 class LauncherTests(unittest.TestCase):
+    def test_busy_admission_is_prompt_and_health_remains_responsive(self):
+        runner = MagicMock()
+        runner.parse_lock = threading.Lock()
+        runner.ready.return_value = {'ready': True}
+        started, release = threading.Event(), threading.Event()
+        def run(*args):
+            started.set()
+            self.assertTrue(release.wait(3))
+            return wire.encode(response())
+        runner.run.side_effect = run
+        pairs = [socket.socketpair() for _ in range(3)]
+        threads = []
+        try:
+            for left, _ in pairs:
+                thread = threading.Thread(target=handle, args=(left, runner))
+                threads.append(thread)
+                thread.start()
+            first, second, health = [right for _, right in pairs]
+            for connection in (first, second, health): connection.settimeout(2)
+            first.sendall(wire.frame(wire.encode(request())))
+            self.assertEqual(wire.decode(wire.recv_frame(first, wire.MAX_HEADER)), {'accepted': True})
+            first.sendall(DATA)
+            self.assertTrue(started.wait(1))
+            second.sendall(wire.frame(wire.encode(request())))
+            self.assertEqual(wire.decode(wire.recv_frame(second, wire.MAX_HEADER)), {'busy': True})
+            health.sendall(wire.frame(wire.encode({'operation': 'health'})))
+            self.assertEqual(wire.decode(wire.recv_frame(health, wire.MAX_HEADER)), {'ready': True})
+            self.assertEqual(runner.run.call_count, 1)
+            release.set()
+            self.assertEqual(wire.decode(wire.recv_frame(first, wire.MAX_OUTPUT)), response())
+        finally:
+            release.set()
+            for left, right in pairs: left.close(); right.close()
+            for thread in threads: thread.join(3)
+        self.assertFalse(any(t.is_alive() for t in threads))
+
+    def test_reap_failure_still_attempts_container_removal(self):
+        runner = DockerParser(IMAGE, 'reviewed')
+        process = subprocess.Popen([os.sys.executable, '-c', "import sys; sys.stdin.buffer.read(); print('{}')"],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
+        try:
+            with patch('app.parser_service.subprocess.Popen', return_value=process), \
+                    patch.object(process, 'wait', side_effect=[0, subprocess.TimeoutExpired('synthetic', 5)]), \
+                    patch('app.parser_service.subprocess.run') as remove, self.assertRaises(subprocess.TimeoutExpired):
+                runner.run(request(), DATA)
+            self.assertEqual(remove.call_args.args[0][1:3], ['rm', '--force'])
+        finally:
+            process.wait(timeout=5)
+
+    def test_narrow_parser_dependency_hashes_match_application_lock(self):
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[1]
+        full = (root / 'requirements.lock').read_text()
+        narrow = (root / 'requirements-parser.lock').read_text()
+        lines = [line for line in narrow.splitlines() if line and not line.startswith('#')]
+        self.assertEqual([line.split('==')[0] for line in lines if '==' in line], ['pypdf', 'python-dotenv'])
+        self.assertTrue(all(line in full for line in lines))
+
     def test_pilot_mounts_keep_credentials_and_daemon_in_different_services(self):
         from pathlib import Path
         import yaml
@@ -196,7 +307,9 @@ class LauncherTests(unittest.TestCase):
             thread = threading.Thread(target=lambda: handle(left, runner))
             thread.start()
             right.settimeout(3)
-            right.sendall(wire.frame(wire.encode(request())) + DATA)
+            right.sendall(wire.frame(wire.encode(request())))
+            self.assertEqual(wire.decode(wire.recv_frame(right, wire.MAX_HEADER)), {'accepted': True})
+            right.sendall(DATA)
             self.assertEqual(wire.decode(wire.recv_frame(right, wire.MAX_OUTPUT)), response())
             thread.join(3)
             self.assertFalse(thread.is_alive())

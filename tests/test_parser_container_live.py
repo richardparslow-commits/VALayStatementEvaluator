@@ -23,7 +23,7 @@ from unittest.mock import patch
 from tests import hermetic  # noqa: F401
 from app import parser_protocol as wire
 from app.parser_service import DockerParser
-from app.isolated_extract import _documents
+from app.isolated_extract import _documents, _unpack_reply
 
 IMAGE = os.environ.get('VA_LSE_TEST_PARSER_IMAGE', '')
 REVISION = os.environ.get('VA_LSE_TEST_PARSER_REVISION', '')
@@ -43,10 +43,10 @@ class ParserContainerTests(unittest.TestCase):
         def argv(name):
             return command(name)[:-2] + ['-c', code]
         with patch.object(self.runner, 'command', side_effect=argv):
-            return wire.decode(self.runner.run(self.request, self.data))
+            return wire.decode(self.runner.run(self.request, self.data))['response']
 
     def test_normal_file_and_archive_parse_without_local_fallback(self):
-        docs, skipped = _documents(wire.decode(self.runner.run(self.request, self.data)), self.request, IMAGE)
+        docs, skipped = _documents(_unpack_reply(wire.decode(self.runner.run(self.request, self.data)), IMAGE), self.request, IMAGE)
         self.assertEqual(docs[0].pages[0].text, self.data.decode())
         self.assertFalse(skipped)
         archive = io.BytesIO()
@@ -55,7 +55,7 @@ class ParserContainerTests(unittest.TestCase):
             output.writestr('folder/two.txt', b'Second synthetic observation.')
         data = archive.getvalue()
         req = {**self.request, 'label': 'records.zip', 'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
-        docs, skipped = _documents(wire.decode(self.runner.run(req, data)), req, IMAGE)
+        docs, skipped = _documents(_unpack_reply(wire.decode(self.runner.run(req, data)), IMAGE), req, IMAGE)
         self.assertEqual([d.filename for d in docs], ['records/one.txt', 'records/folder/two.txt'])
         # Input staging must allow >32 MB even though returned output is capped at 32 MB.
         # The large unsupported member is synthetic padding and is never extracted.
@@ -65,7 +65,7 @@ class ParserContainerTests(unittest.TestCase):
             output.writestr('padding.bin', b'0' * (36 * 1024 ** 2))
         data = archive.getvalue()
         req = {**req, 'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
-        docs, skipped = _documents(wire.decode(self.runner.run(req, data)), req, IMAGE)
+        docs, skipped = _documents(_unpack_reply(wire.decode(self.runner.run(req, data)), IMAGE), req, IMAGE)
         self.assertEqual(docs[0].pages[0].text, self.data.decode())
         self.assertEqual(len(skipped), 1)
 
@@ -138,7 +138,7 @@ print(json.dumps(result))''')
     def test_memory_exhaustion_refuses_document_and_launcher_survives(self):
         with self.assertRaises(wire.ParserRefused):
             self.probe("import sys; sys.stdin.buffer.read(); bytearray(2 * 1024**3)")
-        _documents(wire.decode(self.runner.run(self.request, self.data)), self.request, IMAGE)
+        _documents(_unpack_reply(wire.decode(self.runner.run(self.request, self.data)), IMAGE), self.request, IMAGE)
 
     def test_pid_exhaustion_is_bounded_and_descendants_are_removed(self):
         result = self.probe('''import sys, os, time, json
@@ -162,7 +162,7 @@ print(json.dumps({'count':len(children), 'bounded':len(children)<32}), flush=Tru
             self.probe("import sys; sys.stdin.buffer.read(); sys.stdout.buffer.write(b'x' * (34*1024**2)); sys.stdout.flush()")
         with patch('app.parser_service.DEADLINE', -8), self.assertRaises(wire.ParserRefused):
             self.probe("import sys,time; sys.stdin.buffer.read(); time.sleep(120)")
-        _documents(wire.decode(self.runner.run(self.request, self.data)), self.request, IMAGE)
+        _documents(_unpack_reply(wire.decode(self.runner.run(self.request, self.data)), IMAGE), self.request, IMAGE)
 
     def test_private_launcher_image_and_channel_work_end_to_end(self):
         name = 'va-parser-launcher-ci-' + uuid.uuid4().hex
@@ -175,7 +175,7 @@ print(json.dumps({'count':len(children), 'bounded':len(children)<32}), flush=Tru
         try:
             call(['run', '--detach', '--name', name, '--network=none', '--read-only',
                   '--cap-drop=ALL', '--security-opt=no-new-privileges:true', '--group-add', group,
-                  '--memory=512m', '--cpus=1', '--pids-limit=32',
+                  '--memory=512m', '--cpus=1', '--pids-limit=64',
                   '--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777',
                   '--volume=/var/run/docker.sock:/var/run/docker.sock',
                   '--volume=' + volume + ':/run/parser',
@@ -184,6 +184,7 @@ print(json.dumps({'count':len(children), 'bounded':len(children)<32}), flush=Tru
             code = ("import time,socket; from app.parser_protocol import *; "
                     "s=socket.socket(socket.AF_UNIX); s.settimeout(90); "
                     "s.connect(SOCKET_PATH); s.sendall(frame(encode(" + repr(self.request) + "))); "
+                    "assert decode(recv_frame(s, MAX_HEADER))=={'accepted':True}; "
                     "s.sendall(" + repr(self.data) + "); "
                     "print(encode(decode(recv_frame(s, MAX_OUTPUT))).decode())")
             # Wait for readiness using the launcher user's real channel, not host access.
@@ -199,7 +200,7 @@ print(json.dumps({'count':len(children), 'bounded':len(children)<32}), flush=Tru
                 time.sleep(.5)
             result = call(['run', '--rm', '--network=none', '--read-only', '--user=65534:65534',
                            '--volume=' + volume + ':/run/parser:ro', '--entrypoint=python', IMAGE, '-c', code])
-            docs, skipped = _documents(wire.decode(result.stdout), self.request, IMAGE)
+            docs, skipped = _documents(_unpack_reply(wire.decode(result.stdout), IMAGE), self.request, IMAGE)
             self.assertEqual(docs[0].pages[0].text, self.data.decode())
             self.assertFalse(skipped)
         finally:

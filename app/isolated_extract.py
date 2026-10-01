@@ -11,11 +11,19 @@ from pathlib import Path
 from typing import Any
 
 from .documents import DocumentPage, ExtractedDocument, ExtractionError
-from .parser_protocol import (DEADLINE, MAX_HEADER, MAX_INPUT, MAX_OUTPUT, MAX_TEXT,
+from .parser_protocol import (DEADLINE, MAX_HEADER, MAX_INPUT, MAX_OUTPUT, MAX_TEXT, MAX_PAGES,
                               SOCKET_PATH, ParserRefused, decode, encode, frame,
                               recv_frame, validate_request)
 
 MAX_OUTPUT_BYTES = MAX_OUTPUT
+
+
+def _unpack_reply(value: Any, image: str) -> dict[str, Any]:
+    if (not isinstance(value, dict) or set(value) != {"image", "response"}
+            or value["image"] != image or not isinstance(value["response"], dict)
+            or "image" in value["response"]):
+        raise ParserRefused("Invalid parser response envelope.")
+    return {**value["response"], "image": image}
 
 
 def parser_image() -> str:
@@ -37,6 +45,8 @@ def parser_health() -> None:
 
 
 def _documents(reply: Any, request: dict[str, Any], image: str) -> tuple[list[ExtractedDocument], list[str]]:
+    from . import config
+    limit = max(1, min(MAX_PAGES, config.MAX_RECORD_PAGES))
     if (not isinstance(reply, dict)
             or set(reply) != {"version", "nonce", "sha256", "label", "documents", "skipped", "image"}
             or type(reply["version"]) is not int or reply["version"] != 1
@@ -45,7 +55,7 @@ def _documents(reply: Any, request: dict[str, Any], image: str) -> tuple[list[Ex
         raise ParserRefused("Parser response integrity check failed.")
     raw = reply["documents"]
     skipped = reply["skipped"]
-    if (not isinstance(raw, list) or len(raw) > 500 or not isinstance(skipped, list)
+    if (not isinstance(raw, list) or len(raw) > limit or not isinstance(skipped, list)
             or len(skipped) > 1000 or any(not isinstance(x, str) or len(x) > 4096 for x in skipped)):
         raise ParserRefused("Invalid parser document list.")
     documents: list[ExtractedDocument] = []
@@ -62,18 +72,18 @@ def _documents(reply: Any, request: dict[str, Any], image: str) -> tuple[list[Ex
         member = name[len(prefix):] if isinstance(name, str) and name.startswith(prefix) else ""
         if (not isinstance(name, str) or not 0 < len(name) <= 2048 or name in names
                 or not (name == label or (label.lower().endswith(".zip") and member
-                    and not member.startswith("/") and ".." not in member.replace("\\", "/").split("/")))
+                    and not member.startswith("/")))
                 or any(ord(c) < 32 or ord(c) == 127 for c in name)
                 or type(item["schema_version"]) is not int or item["schema_version"] != 2
                 or item["coverage_known"] is not True
                 or item["pagination"] not in ("page", "block")
-                or type(item["total_pages"]) is not int or not 0 < item["total_pages"] <= 500):
+                or type(item["total_pages"]) is not int or not 0 < item["total_pages"] <= limit):
             raise ParserRefused("Invalid parser document identity or coverage.")
         names.add(name)
         total += item["total_pages"]
         pages, unreadable = item["pages"], item["unreadable_pages"]
-        if (not isinstance(pages, list) or len(pages) > 500 or not isinstance(unreadable, list)
-                or len(unreadable) > 500 or any(type(n) is not int or not 1 <= n <= item["total_pages"] for n in unreadable)
+        if (not isinstance(pages, list) or len(pages) > limit or not isinstance(unreadable, list)
+                or len(unreadable) > limit or any(type(n) is not int or not 1 <= n <= item["total_pages"] for n in unreadable)
                 or len(set(unreadable)) != len(unreadable)):
             raise ParserRefused("Invalid parser page coverage.")
         decoded: list[DocumentPage] = []
@@ -87,7 +97,7 @@ def _documents(reply: Any, request: dict[str, Any], image: str) -> tuple[list[Ex
             seen.add(page["page"])
             chars += len(page["text"])
             decoded.append(DocumentPage(name, page["page"], page["text"], page["kind"]))
-        if len(seen) != item["total_pages"] or total > 500 or chars > MAX_TEXT:
+        if len(seen) != item["total_pages"] or total > limit or chars > MAX_TEXT:
             raise ParserRefused("Parser response exceeds coverage or output bounds.")
         if [p.page for p in decoded] != sorted(p.page for p in decoded):
             raise ParserRefused("Parser pages are out of order.")
@@ -113,9 +123,14 @@ class IsolatedExtractor:
                 connection.settimeout(self.timeout)
                 connection.connect(SOCKET_PATH)
                 connection.sendall(frame(encode(request)))
+                admission = decode(recv_frame(connection, MAX_HEADER, deadline))
+                if admission == {"busy": True}:
+                    raise ExtractionError("The protected parser is busy. Try this file again after the current upload finishes.")
+                if admission != {"accepted": True}:
+                    raise ParserRefused("Parser admission was refused.")
                 connection.settimeout(max(0.001, deadline - time.monotonic()))
                 connection.sendall(data)
-                reply = decode(recv_frame(connection, MAX_OUTPUT, deadline))
+                reply = _unpack_reply(decode(recv_frame(connection, MAX_OUTPUT, deadline)), image)
             return _documents(reply, request, image)
         except (OSError, ValueError, KeyError, TypeError, RecursionError) as exc:
             raise ExtractionError("The protected parser refused this file. No local fallback was used.") from exc

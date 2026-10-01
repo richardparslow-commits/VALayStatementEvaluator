@@ -707,7 +707,12 @@ def _expand_and_extract(
     label: str, data: bytes, extractor: RecordExtractor | None = None
 ) -> tuple[list[ExtractedDocument], list[str]]:
     """Extract one file through the active extractor (or *extractor* when given)."""
-    return (extractor or _ACTIVE_EXTRACTOR).extract(label, data)
+    try:
+        return (extractor or _ACTIVE_EXTRACTOR).extract(label, data)
+    except ExtractionError:
+        # Per-file rejection is visible and does not abort other uploads. This
+        # never substitutes an in-process parser for a refused protected parse.
+        return [], [f"✖️ {label}: protected parsing was refused or is busy. Try this file again or ask the operator."]
 
 
 def extract_uploaded_documents(

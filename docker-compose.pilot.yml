@@ -61,7 +61,7 @@ services:
     security_opt: [no-new-privileges:true]
     mem_limit: 512m
     cpus: 1
-    pids_limit: 16
+    pids_limit: 64
     tmpfs:
       - /tmp:size=16M,mode=1777
     healthcheck:

@@ -13,6 +13,9 @@ MAX_INPUT = 50 * 1024 * 1024
 MAX_OUTPUT = 32 * 1024 * 1024
 MAX_HEADER = 4096
 MAX_TEXT = 20 * 1024 * 1024
+MAX_PAGES = 5000
+MAX_JSON_STRUCTURE = 200000
+MAX_JSON_DEPTH = 16
 SOCKET_PATH = "/run/parser/parser.sock"
 DEADLINE = 60
 
@@ -25,7 +28,43 @@ def encode(value: Any) -> bytes:
     return json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
 
 
+def validate_json_structure(data: bytes) -> None:
+    # Our encoder always escapes non-ASCII characters. Refusing alternative
+    # encodings prevents both scanner ambiguity and a 4x widened string allocation.
+    if not data or not data.isascii() or b"\x00" in data:
+        raise ParserRefused("Invalid parser JSON encoding.")
+    # Bound allocations before json.loads builds a graph in the trusted process.
+    # Punctuation inside record strings is data, not structure; escaped quotes
+    # and backslashes must not let a hostile string evade this scan.
+    depth = structure = 0
+    quoted = escaped = False
+    for value in data:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif value == 92:
+                escaped = True
+            elif value == 34:
+                quoted = False
+            continue
+        if value == 34:
+            quoted = True
+        elif value in (123, 91):
+            depth += 1
+            structure += 1
+            if depth > MAX_JSON_DEPTH:
+                raise ParserRefused("Parser JSON nesting exceeds its limit.")
+        elif value in (125, 93):
+            depth -= 1
+            structure += 1
+        elif value in (44, 58):
+            structure += 1
+        if structure > MAX_JSON_STRUCTURE:
+            raise ParserRefused("Parser JSON structure exceeds its limit.")
+
+
 def decode(data: bytes) -> Any:
+    validate_json_structure(data)
     def unique(items: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for key, value in items:
@@ -33,7 +72,7 @@ def decode(data: bytes) -> Any:
                 raise ParserRefused("Duplicate parser fields.")
             result[key] = value
         return result
-    return json.loads(data, object_pairs_hook=unique)
+    return json.loads(data.decode("ascii"), object_pairs_hook=unique)
 
 
 def validate_request(value: Any) -> dict[str, Any]:

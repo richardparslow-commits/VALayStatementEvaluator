@@ -51,7 +51,7 @@ def supervise() -> None:
         (root / "input").write_bytes(data)
         subprocess.run([sys.executable, "-m", "app.parser_worker", "--child", directory],
                        env={"PATH": os.defpath, "PYTHONPATH": "/app", "PYTHONDONTWRITEBYTECODE": "1",
-                            "VA_LSE_MAX_RECORD_PAGES": "500"},
+                            "VA_LSE_MAX_RECORD_PAGES": "5000"},
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                        timeout=DEADLINE, check=True)
         output = root / "output"

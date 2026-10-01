@@ -42,8 +42,20 @@ and resource limits. Only the launcher has Docker daemon access; neither the web
 application nor the parser receives the daemon socket. The launcher must be
 treated as a trusted host administrator because Docker access is powerful. It
 receives no provider/OIDC secrets, approvals, logs or case storage. It serves one
-request at a time over a private Unix socket and keeps no case files or content
-logs. Parser temporary files disappear with the per-file container.
+parse at a time over a private Unix socket and keeps no case files or content
+logs. Health checks remain responsive during parsing. Another parse receives a
+prompt busy refusal before file bytes are accepted, rather than queuing past its
+deadline. Parser temporary files disappear with the per-file container, which
+also has daemon-managed automatic removal if its launcher disappears.
+
+The parser installs only the hash-pinned `pypdf` and `python-dotenv` versions from
+[requirements-parser.lock](requirements-parser.lock), copied from the application
+lock. The launcher relays bounded output without building a document object
+graph. Both sides limit JSON nesting/structure before decoding. The web client
+applies the configured page cap (at most 500 in pilot; at most 5,000 for synthetic
+isolated use). ZIP member names are citation labels only, never host paths. A
+refused or empty file produces a per-file warning and other files continue;
+there is no fallback or implicit acceptance of the refused file.
 
 The mandatory [AppArmor policy](deploy/parser.apparmor) denies all sockets,
 capabilities, mounts and process tracing in addition to Docker's default seccomp
