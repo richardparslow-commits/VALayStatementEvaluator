@@ -567,6 +567,9 @@ def _run_draft_flow(
         )
         pilot.require_session_access()
     except pilot.PilotBlocked:
+        bar.empty()
+        _handle_draft_abort(rid, "rejected", pilot.PilotBlocked("Pilot access refused."),
+                            t0, None, None, _audit_files_d, _audit_pages_d)
         raise
     except MemoryError as mem_exc:
         _handle_draft_abort(rid, "error", mem_exc, t0, _audit_condition_d, _audit_sources_d, _audit_files_d, _audit_pages_d)

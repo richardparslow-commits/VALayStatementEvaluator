@@ -32,6 +32,7 @@ from .evaluation_topics import (
 from .source_validation import build_source_index, source_reference_key
 from .exporter import parse_source
 from .llm import LLMClient, LLMError, LLMParseError, LLMService, LLMAuthError, LLMConfigurationError
+from .pilot import PilotBlocked
 from . import tracing
 from .logging_config import PhaseTimer, get_request_id
 from .profiler import phase_timer
@@ -1747,7 +1748,8 @@ def _score_and_recommend(
     at the compute/generate boundary: a ``goal`` event on completion carrying
     scoreValue/scoreBand/recommendationCount, and a ``feature.error`` event
     if recommendation generation fails. Invalid or incomplete rubric data
-    is gated before score computation. A failure here must not discard the completed evaluation.
+    is gated before score computation. Ordinary provider failures preserve the
+    completed evaluation; admission/destination refusals stop the run.
     """
     if not rubric_is_complete(result):
         result.effectiveness_score = None
@@ -1759,6 +1761,8 @@ def _score_and_recommend(
         return
     try:
         result.recommendations = generate_improvement_recommendations(result, llm, witness)
+    except PilotBlocked:
+        raise
     except Exception as exc:  # noqa: BLE001 - feature-error boundary
         logger.warning(
             "recommendation generation unavailable error=%s",

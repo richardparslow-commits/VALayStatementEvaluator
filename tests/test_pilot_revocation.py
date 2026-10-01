@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import threading
 import unittest
+from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
 from tests import hermetic  # noqa: F401
@@ -225,3 +226,97 @@ class TestRevocationDuringWork(unittest.TestCase):
         self.assertIs(caught.exception, refusal)
         self.assertEqual(service.chat_json.call_count, 2)
         self.assertEqual(pilot._active, 0)
+
+    def test_recommendations_cannot_fall_back_after_destination_refusal(self):
+        from app import evaluate
+        result = evaluate.EvaluationResult()
+        refusal = pilot.PilotBlocked("Destination no longer approved.")
+        with patch.object(evaluate, "rubric_is_complete", return_value=True), \
+                patch.object(evaluate, "topics_are_complete", return_value=True), \
+                patch.object(evaluate, "compute_effectiveness_score", return_value=70), \
+                patch.object(evaluate, "generate_improvement_recommendations", side_effect=refusal), \
+                patch.object(evaluate, "_fallback_recommendations") as fallback, \
+                self.assertRaises(pilot.PilotBlocked) as caught:
+            evaluate._score_and_recommend(self.client, result, MagicMock())
+        self.assertIs(caught.exception, refusal)
+        fallback.assert_not_called()
+
+    def test_date_inference_cannot_retry_an_admission_refusal(self):
+        from app import medical_review
+        service = MagicMock()
+        service.chat_json.side_effect = pilot.PilotBlocked("Destination no longer approved.")
+        facts = [medical_review.MedicalFact("", "symptom", "Synthetic knee pain", "record.txt b.1")]
+        with self.assertRaises(pilot.PilotBlocked):
+            medical_review._llm_infer_undated(service, facts)
+        service.chat_json.assert_called_once()
+
+    def test_timeline_builder_does_not_mask_an_admission_refusal(self):
+        from app import medical_review
+        service = MagicMock()
+        refusal = pilot.PilotBlocked("Destination no longer approved.")
+        service.chat_json.side_effect = refusal
+        digest = medical_review.MedicalDigest(facts=[
+            medical_review.MedicalFact("", "symptom", "Synthetic knee pain", "record.txt b.1")])
+        with self.assertRaises(pilot.PilotBlocked) as caught:
+            medical_review.build_timeline_data(digest, service)
+        self.assertIs(caught.exception, refusal)
+        service.chat_json.assert_called_once()
+
+    def _assert_refused_flow_has_terminal_events(self, kind, phase):
+        from app.views import draft_view, evaluate_view
+        view = draft_view if kind == "draft" else evaluate_view
+        refusal = pilot.PilotBlocked("PRIVATE_REFUSAL_CANARY")
+        streamlit = MagicMock()
+        streamlit.session_state = {}
+        bar = MagicMock()
+        rid = "req_aaaaaaaaaaaa"
+        with ExitStack() as stack:
+            def patched(target, name, **kwargs):
+                return stack.enter_context(patch.object(target, name, **kwargs))
+            patched(view, "st", new=streamlit)
+            patched(view, "_validate_draft_inputs" if kind == "draft" else "_validate_evaluate_inputs", return_value=True)
+            patched(view.job_runner, "queue_mode_active", return_value=False)
+            patched(view, "append_follow_up_answers", return_value="Synthetic account.")
+            patched(view, "check_endpoint_gate", return_value=True)
+            patched(view, "get_llm", return_value=self.client)
+            patched(view, "check_shutdown_gate", return_value=True)
+            patched(view, "enter_run", return_value=True)
+            exit_run = patched(view, "exit_run")
+            patched(view, "audit_record_meta", return_value=([], 1, 1))
+            patched(view, "audit_condition_for_slot", return_value=None)
+            patched(view, "progress_widgets", return_value=(bar, MagicMock()))
+            patched(view, "get_profiler", return_value=None)
+            patched(view, "check_memory_before_run")
+            patched(view, "run_with_timeout", **({"side_effect": refusal} if phase == "pipeline" else {"return_value": MagicMock()}))
+            patched(pilot, "require_session_access", side_effect=refusal)
+            start = patched(view.audit_log, "audit_" + kind + "_start")
+            audit = patched(view.audit_log, "audit_" + kind + "_error")
+            log = patched(view, "run_log_event")
+            if kind == "evaluate":
+                patched(view, "new_run_request_id", return_value=rid)
+            with self.assertRaises(pilot.PilotBlocked) as caught:
+                if kind == "draft":
+                    view._run_draft_flow(rid=rid, records=self.docs, condition="Knee pain", claim_type="Original claim",
+                                         witness={}, observations="Synthetic account.")
+                else:
+                    view._run_evaluation_flow("Synthetic account.", self.docs)
+        self.assertIs(caught.exception, refusal)
+        start.assert_called_once()
+        audit.assert_called_once()
+        self.assertEqual(audit.call_args.kwargs["request_id"], rid)
+        self.assertEqual(str(audit.call_args.kwargs["error"]), "Pilot access refused.")
+        self.assertTrue(any(call.args[:2] == (kind, "rejected") for call in log.call_args_list))
+        self.assertNotIn("PRIVATE_REFUSAL_CANARY", repr(audit.call_args_list) + repr(log.call_args_list))
+        self.assertNotIn("draft_result" if kind == "draft" else "eval_result", streamlit.session_state)
+        exit_run.assert_called_once()
+        bar.empty.assert_called_once()
+
+    def test_refused_evaluation_records_terminal_count_only_events(self):
+        for phase in ("pipeline", "pre_storage"):
+            with self.subTest(phase=phase):
+                self._assert_refused_flow_has_terminal_events("evaluate", phase)
+
+    def test_refused_draft_records_terminal_count_only_events(self):
+        for phase in ("pipeline", "pre_storage"):
+            with self.subTest(phase=phase):
+                self._assert_refused_flow_has_terminal_events("draft", phase)
