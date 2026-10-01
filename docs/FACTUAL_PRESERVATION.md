@@ -27,7 +27,8 @@ fields are split into passages with original offsets and field identity.
 Recognized headings/certification are excluded from factual coverage requirements.
 Source selection does not waive changed numbers, calendar dates, negation, approximate dates,
 uncertainty, laterality, frequency, chronology, speaker attribution, diagnosis/nexus terms or factual
-wording. Numeric occurrences also retain nearby wording within clause boundaries and occurrence counts,
+wording. Numeric occurrences bind to the complete ordered factual wording of
+their clause, their order/position and occurrence counts,
 so swapping existing years/quantities between claims is flagged. These lexical
 associations can flag legitimate rephrasing and are not semantic proof. Original
 witness passages must be preserved or linked to supported sentences. Record statements retain attribution to the records rather than
@@ -37,7 +38,9 @@ Structured name, relationship, known-since and observation-frequency fields perm
 narrow identity/opportunity phrasing; a claimed condition does not supply a
 firsthand account or diagnosis. Claim condition/type labels stay in the context
 fingerprint but cannot be selected as supporting evidence. These wrappers do not
-permit new factual details.
+permit new factual details. An observation wrapper is available only for standalone
+frequency-only opportunity fields, so adding such a field to reported symptoms
+cannot turn those symptoms into firsthand observations.
 
 The lexical screen is deliberately conservative. It can flag legitimate
 paraphrases, abbreviations or template wording. Correct the output against the

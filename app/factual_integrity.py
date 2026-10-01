@@ -74,7 +74,7 @@ def _spans(text: str) -> Iterator[dict[str, Any]]:
 
 
 def _number_associations(text: str) -> list[str]:
-    """Bind each occurrence to nearby factual wording, not just a number set."""
+    """Bind numbers to complete clause wording, occurrence order and position."""
     lowered = text.casefold().replace("’", "'")
     tokens = list(_WORDS.finditer(lowered))
     meaningful = [(m.start(), m.end(), _content_word(m.group())) for m in tokens
@@ -89,15 +89,20 @@ def _number_associations(text: str) -> list[str]:
     boundaries = list(re.finditer(r"[;!?]|\b(?:and|or|but)\b|(?<!\d)[,.]|[,.](?!\d)", lowered))
     boundary_starts = [m.start() for m in boundaries]
     boundary_ends = [m.end() for m in boundaries]
+    clauses: dict[tuple[int, int], str] = {}
+    ordinals: dict[tuple[int, int], int] = {}
     for start, end, number in sorted(occurrences):
-        prior, following = bisect_right(ends, start), bisect_left(starts, end)
+        prior = bisect_right(ends, start)
         left, right = bisect_right(boundary_ends, start), bisect_left(boundary_starts, end)
         clause_start = boundary_ends[left - 1] if left else 0
         clause_end = boundary_starts[right] if right < len(boundaries) else len(lowered)
         first, last = bisect_left(starts, clause_start), bisect_right(ends, clause_end)
-        before = [word for _, _, word in meaningful[max(first, prior - 2):prior]]
-        after = [word for _, _, word in meaningful[following:min(last, following + 2)]]
-        binding = fingerprint([before, number, after])
+        clause = (clause_start, clause_end)
+        if clause not in clauses:
+            # Hash the complete clause once, avoiding a full copy per number.
+            clauses[clause] = fingerprint([word for _, _, word in meaningful[first:last]])
+        ordinals[clause] = ordinals.get(clause, 0) + 1
+        binding = fingerprint([clauses[clause], ordinals[clause], prior - first, number])
         counts[binding] = counts.get(binding, 0) + 1
         result.append(f"{binding}:{counts[binding]}")
     return sorted(result)
@@ -276,6 +281,12 @@ def compare(text: str, context: dict[str, Any] | None,
             missing = expected - set(values)
             added = set(values) - expected
             fields = {s.get("field") for s in baseline if s["kind"] == "witness_field"}
+            opportunity_words = {"daily", "weekly", "monthly", "hourly", "occasionally", "sometime",
+                                 "constant", "always", "every", "day", "days", "week", "month",
+                                 "year", "hour", "time", "often", "rarely", "regularly"}
+            opportunity_wrapper = (fields == {"contact_frequency"}
+                                   and all(s["kind"] == "witness_field" for s in baseline)
+                                   and all(set(s["features"]["factual wording"]) <= opportunity_words for s in baseline))
             # Identity/opportunity fields supply structured meaning even when
             # their value is just "Alex", "2010" or "weekly". Permit those
             # narrow wrappers, never diagnoses, new numbers or missing content.
@@ -285,14 +296,14 @@ def compare(text: str, context: dict[str, Any] | None,
                     added = set()
                 if name == "chronology" and "known_since" in fields:
                     added -= {"since"}
-                if name == "attribution" and "contact_frequency" in fields:
+                if name == "attribution" and opportunity_wrapper:
                     added -= {"observed"}
                 if name == "factual wording":
                     if "name" in fields:
                         added -= {"name"}
                     if "known_since" in fields:
                         added -= {"know", "known"}
-                    if "contact_frequency" in fields:
+                    if opportunity_wrapper:
                         added -= {"observe"}
             if added or missing:
                 reasons.append(f"Changed or unsupported {name}; compare with the original passage.")

@@ -219,6 +219,35 @@ class TestFactualComparison(unittest.TestCase):
                 self.assertIn("number-to-claim associations", reasons(linked))
                 self.assertEqual(compare(original, context)["status"], "review_required")
 
+    def test_repeated_local_wording_does_not_hide_swapped_years(self):
+        original = "In 2020 I observed severe right knee pain and in 2021 I observed severe left knee pain."
+        changed = "In 2021 I observed severe right knee pain and in 2020 I observed severe left knee pain."
+        context = context_for_result(result(original))
+        row = compare(changed, context)["rows"][0]
+        sid = next(s["id"] for s in context["sources"] if s["kind"] == "witness_account")
+        linked = compare(changed, context, {row["id"]: [sid]})
+        self.assertEqual(linked["status"], "blocked")
+        self.assertIn("number-to-claim associations", reasons(linked))
+        self.assertEqual(compare(original, context)["status"], "review_required")
+
+    def test_opportunity_fields_cannot_promote_reported_symptoms_to_firsthand_observation(self):
+        for kind in ("account", "prose_field", "opportunity_field"):
+            with self.subTest(kind=kind):
+                r = result("I reported knee pain.")
+                r.factual_inputs["witness"] = {"contact_frequency": "weekly"}
+                if kind == "prose_field":
+                    r.factual_inputs["witness"]["aa_details"] = "I reported knee pain."
+                elif kind == "opportunity_field":
+                    r.factual_inputs["witness"]["contact_frequency"] = "I reported knee pain weekly."
+                context = context_for_result(r)
+                text = "I reported and observed knee pain weekly."
+                row = compare(text, context, require_account_coverage=False)["rows"][0]
+                selected = [s["id"] for s in context["sources"]
+                            if (s["kind"] == "witness_account" and kind == "account") or s["kind"] == "witness_field"]
+                linked = compare(text, context, {row["id"]: selected}, require_account_coverage=False)
+                self.assertEqual(linked["status"], "blocked")
+                self.assertIn("attribution", reasons(linked))
+
     def test_multi_sentence_witness_details_offer_independent_original_passages(self):
         r = result()
         first = "I observed falls in 2021."
