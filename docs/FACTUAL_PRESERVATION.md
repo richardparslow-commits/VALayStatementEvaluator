@@ -14,7 +14,10 @@ is evidence. A quotation can be split into comparison passages while retaining
 its complete quote fingerprint, fact ID and typed source address; the complete
 quote remains in the retained digest. It is not duplicated per sentence or
 proposed edit. Ambiguous, missing or
-fabricated quotes cannot become supporting passages.
+fabricated quotes cannot become supporting passages. Original unreadable source
+addresses are retained and reconstructed too, so another upload with the same
+filename/page cannot make an ambiguous quotation selectable. Legacy inputs
+missing these reservations require a re-run.
 
 Every non-structural output sentence has offsets, a text fingerprint, selected
 source IDs, candidate passages and unresolved comparison items. Exact original
@@ -24,10 +27,13 @@ not waive changed numbers, calendar dates, negation, approximate dates,
 uncertainty, laterality, frequency, chronology, speaker attribution, diagnosis/nexus terms or factual
 wording. Original witness passages must be preserved or linked to supported
 sentences. Record statements retain attribution to the records rather than
-becoming firsthand observations. Unresolved placeholders block approval.
+becoming firsthand observations, including when combined with witness sources.
+Unresolved placeholders block approval.
 Structured name, relationship, known-since and observation-frequency fields permit
 narrow identity/opportunity phrasing; a claimed condition does not supply a
-firsthand account or diagnosis. These wrappers do not permit new factual details.
+firsthand account or diagnosis. Claim condition/type labels stay in the context
+fingerprint but cannot be selected as supporting evidence. These wrappers do not
+permit new factual details.
 
 The lexical screen is deliberately conservative. It can flag legitimate
 paraphrases, abbreviations or template wording. Correct the output against the
@@ -50,6 +56,8 @@ Saved payloads retain the original inputs but cannot grant approval by storing a
 facts and complete source pages. Missing or malformed legacy provenance stays
 unreviewed and requires a re-run with original inputs. Cached rewrite reports are
 rebuilt so historical final/approved claims cannot bypass current annotations.
+Evaluation report downloads omit generated rewrites and proposed edits; the
+dedicated statement exports require review of the exact edited text.
 
 The batch path uses the same original-input comparison. Current and resumed
 outputs are explicitly unreviewed and produce `factual_review.md`. Legacy finals
@@ -61,7 +69,9 @@ output spans. Excess spans explicitly block approval instead of silently
 dropping evidence. The record catalogue uses a 4,000,000-character presentation
 budget and omits unusable or excess quotation entries; omitted record quotations
 cannot be selected as support. Full uploaded sources remain available separately.
-Displayed report excerpts are shortened explicitly; comparison uses the complete
+Exact passages use an indexed lookup; substring checks use token intersections,
+and an unchanged source selection reuses the first comparison. Displayed report
+excerpts are shortened explicitly; comparison uses the complete
 retained passage. No new model calls or external services are introduced.
 
 `tests/test_factual_integrity.py` covers the original 2020→1995/invented-frequency

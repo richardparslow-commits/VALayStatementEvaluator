@@ -1619,7 +1619,7 @@ def _render_evaluation_results(eval_result: Any) -> None:
         pilot.display(evaluation_report_markdown(eval_result), container=st, method="markdown")
     pilot.file_download(
         "⬇️ Download evaluation report (.md)",
-        data=evaluation_report_markdown(eval_result).encode("utf-8"),
+        data=evaluation_report_markdown(eval_result, include_rewrite=False).encode("utf-8"),
         file_name="lay_statement_evaluation.md",
         mime="text/markdown",
      container=st)

@@ -35,7 +35,7 @@ from .prompt_sanitize import GUARD_NOTE, sanitize_digest_text, sanitize_for_prom
 
 logger = logging.getLogger("app.draft")
 from .medical_review import MedicalDigest, ProgressCallback, review_medical_records
-from .factual_integrity import FACTUAL_POLICY, attach_review
+from .factual_integrity import attach_review, retained_inputs
 
 # Feature: Condition-Specific Templates
 FEATURE_ID = "02f0935a-ee5e-4083-88a2-10e11753ccc9"  # condition-specific-templates
@@ -626,8 +626,8 @@ def _run_draft(
     claim_type: str,
     progress: ProgressCallback | None,
 ) -> DraftResult:
-    result = DraftResult(factual_inputs={"policy": FACTUAL_POLICY, "account": observations,
-                                       "witness": {**witness, "Claimed condition": condition, "Claim type": claim_type}})
+    result = DraftResult(factual_inputs=retained_inputs(observations,
+                         {**witness, "Claimed condition": condition, "Claim type": claim_type}, records))
     result.input_chars = len(observations)
     # Preserve complete source evidence — the raw record pages that
     # produced every digest fact. This store lives independently of

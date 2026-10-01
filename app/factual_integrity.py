@@ -104,7 +104,10 @@ def build_context(account: str, witness: dict[str, str], digest: MedicalDigest |
         for index, span in enumerate(_spans(account), 1):
             yield {**span, "kind": "witness_account", "label": f"Original witness account — passage {index}"}
         for name, value in sorted(witness.items()):
-            if value.strip():
+            # Claim labels describe the requested work, not observed evidence.
+            # Retain them in the context fingerprint but never offer them as
+            # support, including in a selection mixed with witness passages.
+            if name not in {"Claimed condition", "Claim type"} and value.strip():
                 yield {"kind": "witness_field", "field": name, "label": _FIELD_LABELS.get(name, name), "text": value}
         if digest:
             catalog, _ = grounding_catalog(digest, records, "", max_facts=len(digest.facts), budget_chars=4_000_000)
@@ -120,9 +123,18 @@ def build_context(account: str, witness: dict[str, str], digest: MedicalDigest |
     for source in sources:
         source["id"] = "source-" + fingerprint(source)
         source["features"] = features(source["text"])
-    pages = [[doc.filename, doc.pagination, [[p.page, p.kind, p.text] for p in doc.pages]] for doc in records]
+    pages = [[doc.filename, doc.pagination, doc.unreadable_pages,
+              [[p.page, p.kind, p.text] for p in doc.pages]] for doc in records]
     return {"policy": FACTUAL_POLICY, "sources": sources, "complete": complete,
             "hash": fingerprint([account, witness, pages, sources, complete])}
+
+
+def retained_inputs(account: str, witness: dict[str, str], records: list[ExtractedDocument]) -> dict[str, Any]:
+    """Preserve unavailable source addresses as well as readable page text."""
+    unavailable = [{"filename": doc.filename, "kind": doc.pagination, "page": number}
+                   for doc in records for number in doc.unreadable_pages]
+    return {"policy": FACTUAL_POLICY, "account": account, "witness": dict(witness),
+            "unreadable_units": unavailable}
 
 
 def context_for_result(result: Any) -> dict[str, Any] | None:
@@ -131,10 +143,12 @@ def context_for_result(result: Any) -> dict[str, Any] | None:
     if not isinstance(raw, dict) or raw.get("policy") != FACTUAL_POLICY:
         return None
     account, witness = raw.get("account"), raw.get("witness")
+    unreadable = raw.get("unreadable_units")
     evidence = getattr(result, "evidence_source", None)
     if (not isinstance(account, str) or not account.strip() or len(account) > MAX_OUTPUT_CHARS
             or not isinstance(witness, dict) or len(witness) > 66
             or any(not isinstance(k, str) or not isinstance(v, str) or len(v) > 4000 for k, v in witness.items())
+            or not isinstance(unreadable, list) or len(unreadable) > MAX_SPANS
             or not isinstance(evidence, list) or not evidence):
         return None
     records = []
@@ -146,6 +160,12 @@ def context_for_result(result: Any) -> dict[str, Any] | None:
         # Recombine pages by filename so the shared source index detects
         # ambiguous addresses instead of giving a fabricated quote a binding.
         records.append(ExtractedDocument(page["filename"], [DocumentPage(page["filename"], page["page"], page["text"], page["kind"])], pagination=page["kind"]))
+    for unit in unreadable:
+        if (not isinstance(unit, dict) or not isinstance(unit.get("filename"), str)
+                or unit.get("kind") not in ("page", "block") or type(unit.get("page")) is not int
+                or unit["page"] < 1):
+            return None
+        records.append(ExtractedDocument(unit["filename"], unreadable_pages=[unit["page"]], pagination=unit["kind"]))
     context = build_context(account, witness, getattr(result, "digest", None), records)
     # Hash complete source snapshots, including unresolved facts, so changing
     # digest evidence cannot leave an old session approval applicable.
@@ -174,8 +194,10 @@ def compare(text: str, context: dict[str, Any] | None,
         return result
     sources = {s["id"]: s for s in context["sources"]}
     source_keys = {sid: _key(s["text"]) for sid, s in sources.items()}
+    exact_index: dict[str, list[str]] = {}
     inverted: dict[str, set[str]] = {}
     for sid, key in source_keys.items():
+        exact_index.setdefault(key, []).append(sid)
         for word in set(key.split()):
             inverted.setdefault(word, set()).add(sid)
     used: set[str] = set()
@@ -187,13 +209,21 @@ def compare(text: str, context: dict[str, Any] | None,
         if _structural(sentence):
             continue
         row_id = fingerprint([span["start"], span["end"], sentence])
-        exact = [sid for sid, source_key in source_keys.items() if key and (key == source_key or
-                 (len(key.split()) >= 4 and key in source_key))]
-        scores: dict[str, int] = {}
-        for word in set(key.split()):
-            for sid in inverted.get(word, ()):
-                scores[sid] = scores.get(sid, 0) + 1
-        candidates = sorted(scores, key=lambda sid: (-scores[sid], sid))[:3]
+        exact = exact_index.get(key, [])
+        if not exact and len(key.split()) >= 4:
+            # Every word must be present before testing contiguous containment.
+            # Exact matches use a direct lookup and never scan the whole ledger.
+            matches = [inverted.get(word, set()) for word in set(key.split())]
+            possible = set.intersection(*matches) if matches else set()
+            exact = [sid for sid in sorted(possible) if " " + key + " " in " " + source_keys[sid] + " "]
+        if exact:
+            candidates = exact[:3]
+        else:
+            scores: dict[str, int] = {}
+            for word in set(key.split()):
+                for sid in inverted.get(word, ()):
+                    scores[sid] = scores.get(sid, 0) + 1
+            candidates = sorted(scores, key=lambda sid: (-scores[sid], sid))[:3]
         default_source = next((sid for sid in exact if sid not in used), exact[0] if exact else None)
         chosen = (links or {}).get(row_id, [default_source] if default_source else [])
         reasons = []
@@ -230,7 +260,7 @@ def compare(text: str, context: dict[str, Any] | None,
                         added -= {"observe"}
             if added or missing:
                 reasons.append(f"Changed or unsupported {name}; compare with the original passage.")
-        if selected and all(s["kind"] == "record_quote" for s in selected) and not _RECORD_ATTRIBUTION.search(sentence):
+        if any(s["kind"] == "record_quote" for s in selected) and not _RECORD_ATTRIBUTION.search(sentence):
             reasons.append("Record evidence must remain attributed to the records; it cannot become a firsthand witness account.")
         if re.search(r"\[[^\[\]]+\]", sentence):
             reasons.append("Resolve the placeholder with the witness before review approval.")

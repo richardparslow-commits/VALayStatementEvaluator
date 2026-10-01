@@ -947,12 +947,12 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
                 f"> ⚠️ Legacy source coverage: {legacy_unresolved_facts} fact(s) have no recoverable source filename; "
                 "re-run record review before relying on those facts.\n\n"
             )
-        from app.factual_integrity import FACTUAL_POLICY, attach_review
+        from app.factual_integrity import attach_review, retained_inputs
         from app.job_payload import digest_to_json
         from app.draft import _pages_to_source
         factual_result = DraftResult(draft=final, digest=combined, evidence_source=_pages_to_source(source_docs),
-                                     factual_inputs={"policy": FACTUAL_POLICY, "account": cfg.observations,
-                                                     "witness": {**cfg.witness, "Claimed condition": cfg.condition, "Claim type": cfg.claim_type}})
+                                     factual_inputs=retained_inputs(cfg.observations,
+                                                     {**cfg.witness, "Claimed condition": cfg.condition, "Claim type": cfg.claim_type}, source_docs))
         attach_review(factual_result, final)
         return {
             "statement": final,

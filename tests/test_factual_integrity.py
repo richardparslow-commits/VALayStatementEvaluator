@@ -8,10 +8,11 @@ from unittest.mock import MagicMock, patch
 
 from tests import hermetic  # noqa: F401
 from app.documents import document_from_text
+from app.documents import ExtractedDocument
 from app.draft import DraftResult, _pages_to_source, run_draft
 from app.evaluate import EvaluationResult, _draft_revision, evaluation_report_markdown, run_evaluation
 from app.factual_integrity import (FACTUAL_POLICY, MAX_SPANS, attach_review, build_context,
-                                   compare, context_for_result, fingerprint, review_markdown)
+                                   compare, context_for_result, fingerprint, retained_inputs, review_markdown)
 from app.job_payload import draft_from_json, draft_to_json, evaluation_from_json, evaluation_to_json
 from app.medical_review import MedicalDigest, MedicalFact
 from tests.test_views import _fake_streamlit
@@ -29,7 +30,7 @@ def result(account=ACCOUNT, text=None):
                        document="records.txt", page=1)
     return DraftResult(draft=account if text is None else text, digest=MedicalDigest(facts=[fact]),
                        evidence_source=_pages_to_source([doc]),
-                       factual_inputs={"policy": FACTUAL_POLICY, "account": account, "witness": {}})
+                       factual_inputs=retained_inputs(account, {}, [doc]))
 
 
 def reasons(review):
@@ -74,6 +75,41 @@ class TestFactualComparison(unittest.TestCase):
                 r.digest.facts[0].quote = "Fabricated quote"
             self.assertFalse(any(s["kind"] == "record_quote" for s in context_for_result(r)["sources"]))
 
+    def test_unreadable_duplicate_address_remains_unusable_after_save(self):
+        r = result()
+        docs = [ExtractedDocument("records.txt", unreadable_pages=[1]), document_from_text("records.txt", QUOTE)]
+        r.factual_inputs = retained_inputs(ACCOUNT, {}, docs)
+        r.evidence_source = _pages_to_source(docs)
+        for checked in (r, draft_from_json(draft_to_json(r))):
+            self.assertFalse(any(s["kind"] == "record_quote" for s in context_for_result(checked)["sources"]))
+        legacy = deepcopy(r); legacy.factual_inputs.pop("unreadable_units")
+        self.assertIsNone(context_for_result(legacy))
+
+    def test_unreadable_source_context_changes_invalidate_its_fingerprint(self):
+        r = result()
+        r.factual_inputs["unreadable_units"] = [{"filename": "scan.pdf", "kind": "page", "page": 1}]
+        before = context_for_result(r)["hash"]
+        r.factual_inputs["unreadable_units"][0]["page"] = 2
+        self.assertNotEqual(before, context_for_result(r)["hash"])
+        r.factual_inputs["unreadable_units"][0]["page"] = True
+        self.assertIsNone(context_for_result(r))
+
+    def test_exact_passages_do_not_repeat_full_ledger_scans(self):
+        from app import factual_integrity
+        account = " ".join(f"I observed pain at event {n}." for n in range(400))
+        context = context_for_result(result(account))
+        calls = 0
+        class CountedKey(str):
+            def split(self, *args, **kwargs):
+                nonlocal calls
+                calls += 1
+                return super().split(*args, **kwargs)
+        original_key = factual_integrity._key
+        with patch.object(factual_integrity, "_key", side_effect=lambda text: CountedKey(original_key(text))):
+            review = compare(account, context)
+        self.assertEqual(review["status"], "review_required")
+        self.assertLess(calls, 3 * 400)
+
     def test_unchanged_uncertain_lay_account_is_eligible_only_for_human_review(self):
         r = result()
         review = compare(r.draft, context_for_result(r))
@@ -94,10 +130,21 @@ class TestFactualComparison(unittest.TestCase):
         # A claimed condition is not firsthand evidence or a diagnosis.
         r.factual_inputs["witness"]["Claimed condition"] = "cancer"
         context = context_for_result(r)
-        row = compare("I have cancer.", context, require_account_coverage=False)["rows"][0]
-        sid = next(s["id"] for s in context["sources"] if s.get("field") == "Claimed condition")
-        linked = compare(row["text"], context, {row["id"]: [sid]}, require_account_coverage=False)
+        self.assertFalse(any(s.get("field") == "Claimed condition" for s in context["sources"]))
+        linked = compare("I have cancer.", context, require_account_coverage=False)
         self.assertEqual(linked["status"], "blocked")
+
+    def test_claim_labels_cannot_add_facts_to_a_witness_passage(self):
+        r = result("I observed pain.")
+        r.factual_inputs["witness"] = {"Claimed condition": "cancer", "Claim type": "service connected"}
+        context = context_for_result(r)
+        self.assertFalse(any(s.get("field") in r.factual_inputs["witness"] for s in context["sources"]))
+        text = "I observed pain and cancer."
+        row = compare(text, context)["rows"][0]
+        witness = next(s["id"] for s in context["sources"] if s["kind"] == "witness_account")
+        linked = compare(text, context, {row["id"]: [witness]})
+        self.assertEqual(linked["status"], "blocked")
+        self.assertIn("factual wording", reasons(linked))
 
     def test_original_2020_to_1995_and_invented_frequency_are_specific(self):
         r = result(text="I observed knee pain in 1995 seven days per week.")
@@ -144,6 +191,19 @@ class TestFactualComparison(unittest.TestCase):
         sid = next(s["id"] for s in context["sources"] if s["kind"] == "record_quote")
         review = compare(QUOTE, context, require_account_coverage=False)
         linked = compare(QUOTE, context, {review["rows"][0]["id"]: [sid]}, require_account_coverage=False)
+        self.assertIn("firsthand", reasons(linked))
+
+    def test_mixed_witness_and_record_sources_still_require_record_attribution(self):
+        r = result("I observed knee pain.")
+        quote = "Knee pain and swelling."
+        r.digest.facts[0].quote = quote
+        r.evidence_source[0]["text"] = quote
+        context = context_for_result(r)
+        selected = [s["id"] for s in context["sources"]]
+        text = "I observed knee pain and knee swelling."
+        row = compare(text, context)["rows"][0]
+        linked = compare(text, context, {row["id"]: selected})
+        self.assertEqual(linked["status"], "blocked")
         self.assertIn("firsthand", reasons(linked))
 
     def test_attributed_record_text_can_be_manually_linked(self):
@@ -295,6 +355,40 @@ class TestPipelineAndSavedReview(unittest.TestCase):
         self.assertTrue(all(c.kwargs["disabled"] for c in download.call_args_list))
         pdf.assert_not_called()
 
+    def test_evaluation_report_download_omits_unapproved_rewrite_and_edits(self):
+        from app.views import evaluate_view, factual_review
+        d = result(text="I observed knee pain in 1995.")
+        r = EvaluationResult(revised_statement=d.draft, revision_changes=[{"revised": "NEW-EDIT-SENTINEL"}],
+                             factual_inputs=d.factual_inputs, digest=d.digest, evidence_source=d.evidence_source,
+                             **scored_result_fields(), **topic_result_fields())
+        safe_report = evaluation_report_markdown(r, include_rewrite=False)
+        self.assertNotIn(d.draft, safe_report)
+        self.assertNotIn("NEW-EDIT-SENTINEL", safe_report)
+        self.assertIn("omitted", safe_report)
+        self.assertEqual(r.revised_statement, d.draft)
+        st, _ = _fake_streamlit(); st.columns.side_effect = lambda n: [MagicMock() for _ in range(n)]
+        st.text_area.return_value = d.draft
+        st.multiselect.side_effect = lambda label, options, **kw: kw["default"]
+        from contextlib import ExitStack
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(evaluate_view, "st", st))
+            stack.enter_context(patch.object(factual_review, "st", st))
+            for name in ("render_usage_summary", "render_follow_up_questions", "_render_record_coverage",
+                         "_render_effectiveness_score", "_render_evidence_dashboard", "_render_framework_currency_flags",
+                         "_render_fact_export_section", "_render_medical_timeline"):
+                stack.enter_context(patch.object(evaluate_view, name))
+            stack.enter_context(patch.object(evaluate_view, "_result_reference", return_value=""))
+            download = stack.enter_context(patch.object(evaluate_view.pilot, "file_download"))
+            pdf = stack.enter_context(patch.object(evaluate_view, "_render_pdf_export"))
+            evaluate_view._render_evaluation_results(r)
+        statement_calls = [c for c in download.call_args_list if "revised statement" in c.args[0]]
+        self.assertEqual(len(statement_calls), 2)
+        self.assertTrue(all(c.kwargs["disabled"] for c in statement_calls))
+        report_call = next(c for c in download.call_args_list if "evaluation report" in c.args[0])
+        self.assertNotIn(d.draft.encode(), report_call.kwargs["data"])
+        self.assertNotIn(b"NEW-EDIT-SENTINEL", report_call.kwargs["data"])
+        pdf.assert_not_called()
+
     def test_saved_evaluation_factual_review_is_recomputed(self):
         d = result(text="I observed knee pain in 1995.")
         r = EvaluationResult(revised_statement=d.draft, factual_inputs=d.factual_inputs,
@@ -338,6 +432,11 @@ class TestExactHumanReview(unittest.TestCase):
         receipt = self.session["factual_draft_receipt"]
         self.assertEqual(receipt["text_hash"], compare(r.draft, context_for_result(r))["text_hash"])
         self.assertNotIn("text", receipt)
+
+    def test_unchanged_source_choices_reuse_the_same_comparison(self):
+        with patch.object(self.view, "compare", wraps=compare) as checked:
+            self.assertFalse(self.view.render_factual_review(result(), ACCOUNT, slot="draft"))
+        self.assertEqual(checked.call_count, 1)
 
     def test_critical_factual_change_cannot_be_approved(self):
         r = result(text="I observed knee pain in 1995.")

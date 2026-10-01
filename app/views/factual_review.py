@@ -32,7 +32,8 @@ def render_factual_review(result: Any, text: str, *, slot: str) -> bool:
                 key=prefix + "_" + row["id"],
             )
             links[row["id"]] = selected if isinstance(selected, list) else []
-        checked = compare(text, context, links)
+        checked = (initial if all(links[row["id"]] == row["sources"] for row in initial["rows"])
+                   else compare(text, context, links))
         for row in checked["rows"]:
             for issue in row["issues"]:
                 pilot.display(f"Characters {row['start']}–{row['end']}: {issue}", container=st, method="warning")

@@ -2,7 +2,7 @@
 and score it against the VA lay-evidence rubric."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import logging
 import re
@@ -47,7 +47,7 @@ from .medical_review import (
     retrieve_evidence,
     review_medical_records,
 )
-from .factual_integrity import FACTUAL_POLICY, attach_review, review_markdown
+from .factual_integrity import attach_review, retained_inputs, review_markdown
 from .aa_intake import care_gaps_text
 
 # Feature: Condition-Specific Templates
@@ -783,7 +783,7 @@ def _run_evaluation(
     progress: ProgressCallback | None,
     witness: dict[str, str],
 ) -> EvaluationResult:
-    result = EvaluationResult(factual_inputs={"policy": FACTUAL_POLICY, "account": statement_text, "witness": dict(witness)})
+    result = EvaluationResult(factual_inputs=retained_inputs(statement_text, witness, records))
     result.input_chars = len(statement_text)
     # Preserve complete source evidence — the raw record pages that
     # produced every digest fact and verification. This store lives
@@ -1136,8 +1136,16 @@ def source_reference_notice(result: EvaluationResult) -> str:
     return LEGACY_REFERENCE_NOTICE
 
 
-def evaluation_report_markdown(result: EvaluationResult) -> str:
+def evaluation_report_markdown(result: EvaluationResult, *, include_rewrite: bool = True) -> str:
     """Rebuild from retained fields; cached prose cannot grant factual approval."""
+    if not include_rewrite and (result.revised_statement or result.revision_changes):
+        # A report download is independent of exact edited-statement approval.
+        # Do not use it to export the original, possibly unapproved model text.
+        review_only = replace(result, revised_statement="", revision_changes=[], revision_notes="",
+                              added_facts_to_verify=[], factual_review={})
+        return ("> Generated rewrites and proposed edits are omitted from this report download. "
+                "Review them against the original sources in the statement panel.\n\n"
+                + evaluation_report_markdown(review_only))
     if not evaluation_is_complete(result):
         # Rebuild from retained review data; a historical cached report may carry
         # invalid grades or a rewrite that predates the validation policy.
