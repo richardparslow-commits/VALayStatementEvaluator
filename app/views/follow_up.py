@@ -4,6 +4,9 @@ from __future__ import annotations
 from .. import pilot
 from ..evaluation_topics import topics_are_complete
 
+import hashlib
+import json
+import re
 from typing import Any
 
 import streamlit as st
@@ -45,8 +48,48 @@ def compose_follow_up_appendix(slot: str) -> str:
     return "\n".join(lines) if len(lines) > 1 else ""
 
 
-def append_follow_up_answers(text: str, *, slot: str) -> str:
-    """Append accepted follow-up answers to the next prompt input, if any."""
+def evaluation_input_key(statement: str, records: Any, witness: Any) -> str:
+    """Session-only binding to exact raw inputs; malformed/legacy inputs fail closed."""
+    from ..documents import ExtractedDocument
+    from ..job_payload import documents_to_json
+
+    if (not isinstance(statement, str) or not isinstance(records, list)
+            or not all(isinstance(doc, ExtractedDocument) for doc in records)
+            or not isinstance(witness, dict)):
+        return ""
+    try:
+        payload = {"statement": statement.strip(), "records": documents_to_json(records),
+                   "witness": witness}
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError, AttributeError):
+        return ""
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _valid_input_key(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[a-f0-9]{64}", value) is not None
+
+
+def remember_evaluation_inputs(input_key: str) -> None:
+    """Bind questions from a returned direct result; discard prior-case state."""
+    previous = st.session_state.get(_key("eval", "input_key"), "")
+    if not _valid_input_key(input_key) or previous != input_key:
+        for suffix in ("saved", "skipped", "applied_saved", "applied_skipped"):
+            st.session_state[_key("eval", suffix)] = []
+        st.session_state[_key("eval", "index")] = 0
+        st.session_state[_key("eval", "notice")] = ""
+    st.session_state[_key("eval", "input_key")] = input_key if _valid_input_key(input_key) else ""
+
+
+def append_follow_up_answers(text: str, *, slot: str, input_key: str | None = None) -> str:
+    """Append accepted answers; evaluation reuse requires matching exact inputs."""
+    if slot == "eval" and (not _valid_input_key(input_key)
+            or st.session_state.get(_key(slot, "input_key"), "") != input_key):
+        if _saved_answers(slot):
+            pilot.display("Saved follow-up answers belong to different or unrecognized inputs "
+                          "and were not included. Review the statement and collect new answers "
+                          "from its evaluation.", container=st, method="warning")
+        return text
     appendix = compose_follow_up_appendix(slot)
     if not appendix:
         return text
@@ -98,8 +141,13 @@ def render_follow_up_questions(
 
         if saved:
             pilot.display(
-                f"{len(saved)} accepted answer(s) will be included automatically in the next "
-                f"{next_run_label} run."
+                (f"{len(saved)} accepted answer(s) will be included only when the statement, "
+                 "records and witness inputs match this evaluation."
+                 if slot == "eval" and _valid_input_key(st.session_state.get(_key(slot, "input_key")))
+                 else "These saved answers are unbound and will not be included in another evaluation. "
+                 "Clear them and collect new answers." if slot == "eval"
+                 else f"{len(saved)} accepted answer(s) will be included automatically in the next "
+                 f"{next_run_label} run.")
             , container=st, method="caption")
             for item in saved:
                 topic = _clean_text(item.get("topic")) or "Follow-up"
@@ -297,7 +345,7 @@ def _ensure_state(slot: str, source_id: str) -> None:
         st.session_state[source_key] = source_id
         st.session_state[_key(slot, "index")] = 0
         # Saved answers are still pending until explicit consumption or clearing.
-        # A partial rerun changes the reference without consuming them.
+        # Direct evaluation reuse also requires the matching input binding.
         st.session_state[_key(slot, "notice")] = ""
 
 

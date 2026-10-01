@@ -67,6 +67,8 @@ from ..run_log import run_log_event
 from ..shutdown import enter_run, exit_run
 from .follow_up import (
     append_follow_up_answers,
+    evaluation_input_key,
+    remember_evaluation_inputs,
     evaluate_follow_up_questions,
     mark_follow_up_answers_consumed,
     render_follow_up_questions,
@@ -365,10 +367,11 @@ def _run_evaluation_flow(statement_text: str, records: list, witness: dict[str, 
     t0 = time.perf_counter()
     try:
         check_memory_before_run()
+        _input_key = evaluation_input_key(statement_text, records, witness or {})
         result = run_with_timeout(
             run_evaluation,
             llm,
-            append_follow_up_answers(statement_text.strip(), slot="eval"),
+            append_follow_up_answers(statement_text.strip(), slot="eval", input_key=_input_key),
             records,
             progress=update,
             witness=witness or {},
@@ -565,6 +568,7 @@ def _run_evaluation_flow(statement_text: str, records: list, witness: dict[str, 
         _profiler_run.run_end_mono = time.monotonic()
         _profiler_run.emit()
         get_profiler().record_run(_profiler_run)
+    remember_evaluation_inputs(_input_key)
     st.session_state.eval_result = result
     st.session_state.eval_usage = llm.usage
     st.session_state.eval_request_id = rid
@@ -617,6 +621,9 @@ def _run_evaluation_queued(
         action_label="Evaluation",
     )
     if outcome is not None and outcome.ok:
+        # A recovered queue result may belong to earlier saved submission inputs.
+        # Keep evaluation answer reuse fail-closed until a direct run binds them.
+        remember_evaluation_inputs("")
         result = st.session_state.get("eval_result")
         if evaluation_is_complete(result):
             pilot.display(f"Evaluation complete — reference `{outcome.request_id}`.", container=st, method="success")

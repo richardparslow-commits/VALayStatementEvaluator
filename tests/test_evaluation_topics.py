@@ -290,12 +290,14 @@ class TestTopicUI(unittest.TestCase):
                     st_mock, session = _fake_streamlit()
                     st_mock.columns.return_value = tuple(MagicMock() for _ in range(4))
                     session["eval_request_id"] = "req_new"
+                    binding = follow_up.evaluation_input_key("Same synthetic statement.", [_doc()], {})
+                    session["eval_follow_up_input_key"] = binding
                     session["eval_follow_up_saved"] = [{"topic": "A", "question": "What happened?", "answer": "Synthetic pending answer."}]
                     if old_source is not None: session["eval_follow_up_source_id"] = old_source
                     st_mock.button.side_effect = lambda label, **kw: clear if kw.get("key") == "eval_follow_up_clear" else False
                     with _patch_st(view, st_mock), _patch_st(follow_up, st_mock):
                         view._render_evaluation_results(result)
-                        next_input = follow_up.append_follow_up_answers("Changed synthetic statement.", slot="eval")
+                        next_input = follow_up.append_follow_up_answers("Same synthetic statement.", slot="eval", input_key=binding)
                     st_mock.button.assert_any_call("Clear saved follow-up answers and skipped questions", key="eval_follow_up_clear")
                     self.assertTrue(any("Synthetic pending answer." in str(c) for c in st_mock.write.call_args_list))
                     st_mock.form.assert_not_called()
@@ -351,6 +353,65 @@ class TestTopicUI(unittest.TestCase):
         self.assertEqual(partial["topic_status"], "incomplete")
         self.assertNotIn("ok", [status for _, status, _ in events])
         consume.assert_not_called()
+
+    def test_input_binding_changes_with_statement_record_content_and_witness(self):
+        from app.views import follow_up
+        from app.documents import document_from_text
+        base = follow_up.evaluation_input_key("Synthetic case A.", [document_from_text("same.txt", "Record A.")], {"role": "spouse"})
+        for statement, text, witness in (("Synthetic case B.", "Record A.", {"role": "spouse"}),
+            ("Synthetic case A.", "Record B.", {"role": "spouse"}),
+            ("Synthetic case A.", "Record A.", {"role": "veteran"})):
+            self.assertNotEqual(base, follow_up.evaluation_input_key(statement, [document_from_text("same.txt", text)], witness))
+        self.assertEqual(base, follow_up.evaluation_input_key("Synthetic case A.", [document_from_text("same.txt", "Record A.")], {"role": "spouse"}))
+        self.assertEqual(follow_up.evaluation_input_key("Synthetic case A.", [MagicMock()], {}), "")
+
+    def test_other_or_legacy_inputs_cannot_receive_saved_answers(self):
+        from app.views import follow_up
+        st_mock, session = _fake_streamlit()
+        key = follow_up.evaluation_input_key("Synthetic case A.", [_doc()], {})
+        session["eval_follow_up_input_key"] = key
+        session["eval_follow_up_saved"] = [{"topic": "A", "answer": "CASE_A_ANSWER_SENTINEL"}]
+        with _patch_st(follow_up, st_mock):
+            for other_key in (None, "", "future", follow_up.evaluation_input_key("Synthetic case B.", [_doc()], {})):
+                self.assertEqual(follow_up.append_follow_up_answers("Synthetic case B.", slot="eval", input_key=other_key), "Synthetic case B.")
+            session.pop("eval_follow_up_input_key")
+            self.assertEqual(follow_up.append_follow_up_answers("Synthetic case A.", slot="eval", input_key=key), "Synthetic case A.")
+        self.assertTrue(st_mock.warning.called)
+        self.assertNotIn("CASE_A_ANSWER_SENTINEL", str(st_mock.warning.call_args_list))
+
+    def test_new_result_binding_discards_old_case_answers_and_skips(self):
+        from app.views import follow_up
+        st_mock, session = _fake_streamlit()
+        key = follow_up.evaluation_input_key("Synthetic case A.", [_doc()], {})
+        other = follow_up.evaluation_input_key("Synthetic case B.", [_doc()], {})
+        session["eval_follow_up_input_key"] = key
+        for suffix in ("saved", "skipped", "applied_saved", "applied_skipped"):
+            session[f"eval_follow_up_{suffix}"] = [{"topic": "A", "answer": "CASE_A_ANSWER_SENTINEL"}]
+        with _patch_st(follow_up, st_mock): follow_up.remember_evaluation_inputs(other)
+        self.assertEqual(session["eval_follow_up_input_key"], other)
+        for suffix in ("saved", "skipped", "applied_saved", "applied_skipped"):
+            self.assertEqual(session[f"eval_follow_up_{suffix}"], [])
+
+    def test_direct_partial_retry_uses_answers_only_for_same_inputs(self):
+        from app.views import evaluate_view as view, follow_up
+        result = valid_result(); result.topic_rows.pop()
+        # Exercise the actual direct-run orchestration with its input-binding helper.
+        for matching in (True, False):
+            st_mock, session = _fake_streamlit()
+            records = [_doc()]; statement = "Synthetic case A." if matching else "Synthetic case B."
+            key = follow_up.evaluation_input_key("Synthetic case A.", records, {})
+            session["eval_follow_up_input_key"] = key
+            session["eval_follow_up_saved"] = [{"topic": "A", "answer": "CASE_A_ANSWER_SENTINEL"}]
+            llm = MagicMock(); llm.usage.totals.return_value = type("Totals", (), {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0})()
+            with _patch_st(view, st_mock), _patch_st(follow_up, st_mock), patch.object(view, "get_llm", return_value=llm), patch.object(view, "check_endpoint_gate", return_value=True), patch.object(view, "check_shutdown_gate", return_value=True), patch.object(view, "enter_run", return_value=True), patch.object(view, "exit_run"), patch.object(view, "progress_widgets", return_value=(MagicMock(), lambda *a, **kw: None)), patch.object(view, "check_memory_before_run"), patch.object(view, "get_profiler", return_value=None), patch.object(view, "audit_record_meta", return_value=(["Upload"], 1, 1)), patch.object(view, "audit_condition_for_slot", return_value=""), patch.object(view, "record_watchdog_run"), patch.object(view, "audit_log"), patch.object(view, "run_log_event"), patch.object(view, "run_with_timeout", return_value=result) as run:
+                view._run_evaluation_flow(statement, records)
+            submitted = run.call_args.args[2]
+            if matching:
+                self.assertIn("CASE_A_ANSWER_SENTINEL", submitted)
+                self.assertEqual(len(session["eval_follow_up_saved"]), 1)
+            else:
+                self.assertNotIn("CASE_A_ANSWER_SENTINEL", submitted)
+                self.assertEqual(session["eval_follow_up_saved"], [])
 
     def test_result_derived_currency_topics_require_validation(self):
         from app.views import evaluate_view as view

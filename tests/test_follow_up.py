@@ -216,6 +216,9 @@ class TestFollowUpRunIntegration(unittest.TestCase):
         session["eval_follow_up_saved"] = [
             {"topic": "A. Hazards", "question": "What happened near the stove?", "answer": "He left the burner on twice last month."}
         ]
+        from app.documents import document_from_text
+        records = [document_from_text("synthetic.txt", "Synthetic record.")]
+        session["eval_follow_up_input_key"] = follow_up.evaluation_input_key("Original statement.", records, {})
         llm = MagicMock()
         llm.usage.totals.return_value = type("Totals", (), {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0})()
         with (
@@ -243,7 +246,7 @@ class TestFollowUpRunIntegration(unittest.TestCase):
             patch.object(evaluate_view, "audit_log"),
             patch.object(evaluate_view, "run_log_event"),
         ):
-            evaluate_view._run_evaluation_flow("Original statement.", [MagicMock(pages=["p1"])])
+            evaluate_view._run_evaluation_flow("Original statement.", records)
 
         appended_statement = run_with_timeout.call_args.args[2]
         self.assertIn("Original statement.", appended_statement)

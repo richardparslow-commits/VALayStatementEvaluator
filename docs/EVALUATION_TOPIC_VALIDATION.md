@@ -56,7 +56,14 @@ follow-up answers stay pending when a direct run remains partial, allowing a
 subsequent complete evaluation to consume them. Saved answers and their clear
 control remain accessible when coverage fails or all generated questions have
 already been handled. Changing the run reference does not discard pending
-answers; explicit consumption or clearing removes them.
+answers for the same inputs; explicit consumption or clearing removes them.
+Direct reuse requires a session-only SHA-256 binding over the exact statement,
+record content and metadata, and witness inputs. Different or unrecognized inputs
+do not receive pending answers. A returned result for different inputs clears
+prior pending/applied answers and skipped questions before binding its new
+questions. Legacy/unbound state is not automatically reused. Recovered queued
+results invalidate direct answer bindings because they can represent earlier
+submission inputs. The binding is not logged or persisted to a provider.
 
 The follow-up panel displays validated gaps. An empty filtered question list
 never claims every applicable topic is covered: questions may have already been
