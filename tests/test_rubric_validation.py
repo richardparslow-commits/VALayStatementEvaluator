@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 from tests import hermetic  # noqa: F401
 from tests.rubric_fixtures import complete_rubric, scored_result_fields
+from tests.topic_fixtures import topic_result_fields
 from tests.test_evaluate import _FakeLLM, _fake_digest, _doc
 from tests.test_views import _fake_streamlit, _patch_st
 from app.evaluate import EvaluationResult, run_evaluation, build_report, evaluation_report_markdown, compute_effectiveness_score, _score_and_recommend
@@ -231,7 +232,7 @@ class TestRubricPipeline(unittest.TestCase):
 
 class TestRubricSavedResults(unittest.TestCase):
     def _valid(self):
-        return EvaluationResult(**scored_result_fields(), claims=[{"id": 1, "text": "Synthetic claim."}], verifications=[{"id": 1, "verdict": "NOT FOUND"}], revised_statement="Synthetic reviewed rewrite.")
+        return EvaluationResult(**scored_result_fields(), **topic_result_fields(), claims=[{"id": 1, "text": "Synthetic claim."}], verifications=[{"id": 1, "verdict": "NOT FOUND"}], revised_statement="Synthetic reviewed rewrite.")
 
     def test_complete_json_roundtrip_retains_status_and_effectiveness(self):
         result = self._valid()

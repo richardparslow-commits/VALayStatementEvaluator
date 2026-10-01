@@ -5,6 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
+from tests.topic_fixtures import topic_result_fields
 
 from app.rubric_validation import DIMENSION_LABELS  # noqa: E402
 from app.config import Settings  # noqa: E402
@@ -105,25 +106,7 @@ class TestEvaluationResult(unittest.TestCase):
             ],
             revised_statement="I was treated in 2010. [Confirm: exact date]",
             added_facts_to_verify=["2010 cortisone injection"],
-            topic_focus="PTSD with need for regular assistance (spouse statement)",
-            topic_rows=[
-                {
-                    "topic": "A. Hazards and Dangers",
-                    "applicable": True,
-                    "coverage": "partial",
-                    "evidence": "He sometimes forgets the stove.",
-                    "gap_note": "Describe a specific near-miss incident.",
-                },
-                {
-                    "topic": "J. Physical Side Effects",
-                    "applicable": False,
-                    "coverage": "not applicable",
-                    "evidence": "",
-                    "gap_note": "",
-                },
-            ],
-            topic_critical_gaps=["B. Caregiver Burden — not addressed"],
-            topic_notes="Good base, but hazards need concrete incidents.",
+            **topic_result_fields(),
         )
 
     def test_contradiction_count(self):
@@ -145,11 +128,11 @@ class TestEvaluationResult(unittest.TestCase):
         report = build_report(self._sample(), "statement body")
         self.assertIn("A. Hazards and Dangers", report)
         self.assertIn("partial", report)
-        self.assertIn("He sometimes forgets the stove.", report)
+        self.assertIn("Stove left on.", report)
         self.assertIn("Describe a specific near-miss incident.", report)
         self.assertIn("Critical gaps", report)
-        self.assertIn("B. Caregiver Burden — not addressed", report)
-        self.assertIn("PTSD with need for regular assistance", report)
+        self.assertIn("A. Hazards and Dangers — needs incident detail", report)
+        self.assertIn("knee condition - increased rating", report)
 
     def test_report_topic_coverage_optional(self):
         result = self._sample()

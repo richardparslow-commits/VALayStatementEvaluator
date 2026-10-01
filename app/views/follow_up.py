@@ -2,7 +2,11 @@
 from __future__ import annotations
 
 from .. import pilot
+from ..evaluation_topics import topics_are_complete
 
+import hashlib
+import json
+import re
 from typing import Any
 
 import streamlit as st
@@ -18,6 +22,8 @@ def draft_follow_up_questions(result: Any) -> list[dict[str, str]]:
 
 def evaluate_follow_up_questions(result: Any) -> list[dict[str, str]]:
     """Return uncovered checklist-topic questions from an evaluation result."""
+    if not topics_are_complete(result):
+        return []
     claim_focus = getattr(result, "topic_focus", "")
     return _evaluation_topic_questions(getattr(result, "topic_rows", []), claim_focus=claim_focus)
 
@@ -42,8 +48,51 @@ def compose_follow_up_appendix(slot: str) -> str:
     return "\n".join(lines) if len(lines) > 1 else ""
 
 
-def append_follow_up_answers(text: str, *, slot: str) -> str:
-    """Append accepted follow-up answers to the next prompt input, if any."""
+def evaluation_input_key(statement: str, records: Any, witness: Any) -> str:
+    """Session-only binding to exact raw inputs; malformed/legacy inputs fail closed."""
+    from ..documents import ExtractedDocument
+    from ..job_payload import documents_to_json
+
+    if (not isinstance(statement, str) or not isinstance(records, list)
+            or not all(isinstance(doc, ExtractedDocument) for doc in records)
+            or not isinstance(witness, dict)):
+        return ""
+    try:
+        payload = {"statement": statement.strip(), "records": documents_to_json(records),
+                   "witness": witness}
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError, AttributeError):
+        return ""
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _valid_input_key(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[a-f0-9]{64}", value) is not None
+
+
+def remember_evaluation_inputs(input_key: str, *, source_id: str = "") -> None:
+    """Bind questions from a returned direct result; discard prior-case state."""
+    previous = st.session_state.get(_key("eval", "input_key"), "")
+    if not _valid_input_key(input_key) or previous != input_key:
+        for suffix in ("saved", "skipped", "applied_saved", "applied_skipped"):
+            st.session_state[_key("eval", suffix)] = []
+        st.session_state[_key("eval", "index")] = 0
+        st.session_state[_key("eval", "notice")] = ""
+    st.session_state[_key("eval", "input_key")] = input_key if _valid_input_key(input_key) else ""
+    st.session_state[_key("eval", "input_source_id")] = source_id
+    st.session_state[_key("eval", "questions_bound")] = _valid_input_key(input_key) and bool(source_id)
+
+
+def append_follow_up_answers(text: str, *, slot: str, input_key: str | None = None) -> str:
+    """Append accepted answers; evaluation reuse requires matching exact inputs."""
+    if slot == "eval" and (not _valid_input_key(input_key)
+            or st.session_state.get(_key(slot, "input_key"), "") != input_key
+            or not st.session_state.get(_key(slot, "input_source_id"))):
+        if _saved_answers(slot):
+            pilot.display("Saved follow-up answers belong to different or unrecognized inputs "
+                          "and were not included. Review the statement and collect new answers "
+                          "from its evaluation.", container=st, method="warning")
+        return text
     appendix = compose_follow_up_appendix(slot)
     if not appendix:
         return text
@@ -77,6 +126,16 @@ def render_follow_up_questions(
 ) -> None:
     """Render one follow-up question at a time with accept/skip controls."""
     _ensure_state(slot, source_id)
+    if slot == "eval" and questions and (
+            not _valid_input_key(st.session_state.get(_key(slot, "input_key")))
+            or st.session_state.get(_key(slot, "input_source_id")) != source_id
+            or st.session_state.get(_key(slot, "questions_bound")) is not True):
+        questions = []
+        empty_message = (
+            "New follow-up questions are unavailable for this saved or queued result. "
+            "Run a direct evaluation to bind new answers to its inputs. Earlier saved "
+            "answers remain available and can be reused only with their matching inputs."
+        )
     questions = _filter_handled_questions(slot, questions)
     saved = _saved_answers(slot)
     skipped = _saved_skips(slot)
@@ -87,19 +146,21 @@ def render_follow_up_questions(
         index = len(questions)
         st.session_state[_key(slot, "index")] = index
 
-    with st.expander("🤖 Automated follow-up question generator", expanded=bool(questions)):
+    with st.expander("🤖 Automated follow-up question generator",
+                     expanded=bool(questions or saved or skipped or applied_saved or applied_skipped)):
         notice = _clean_text(st.session_state.get(_key(slot, "notice"), ""))
         if notice:
             pilot.display(notice, container=st, method="success")
 
-        if not questions:
-            pilot.display(empty_message, container=st, method="info")
-            return
-
         if saved:
             pilot.display(
-                f"{len(saved)} accepted answer(s) will be included automatically in the next "
-                f"{next_run_label} run."
+                (f"{len(saved)} accepted answer(s) will be included only when the statement, "
+                 "records and witness inputs match their source evaluation."
+                 if slot == "eval" and _valid_input_key(st.session_state.get(_key(slot, "input_key")))
+                 else "These saved answers are unbound and will not be included in another evaluation. "
+                 "Clear them and collect new answers." if slot == "eval"
+                 else f"{len(saved)} accepted answer(s) will be included automatically in the next "
+                 f"{next_run_label} run.")
             , container=st, method="caption")
             for item in saved:
                 topic = _clean_text(item.get("topic")) or "Follow-up"
@@ -128,6 +189,10 @@ def render_follow_up_questions(
                 st.session_state[_key(slot, "index")] = 0
                 st.session_state[_key(slot, "notice")] = "Cleared the saved follow-up state for this tab."
                 st.rerun()
+
+        if not questions:
+            pilot.display(empty_message, container=st, method="info")
+            return
 
         if index >= len(questions):
             if skipped:
@@ -208,7 +273,7 @@ def _evaluation_topic_questions(topic_rows: Any, *, claim_focus: Any) -> list[di
         return questions
     focus = _clean_text(claim_focus)
     for row in topic_rows:
-        if not isinstance(row, dict) or not row.get("applicable"):
+        if not isinstance(row, dict) or row.get("applicable") is not True:
             continue
         coverage = _clean_text(row.get("coverage")).lower()
         if coverage == "covered":
@@ -285,17 +350,15 @@ def _ensure_state(slot: str, source_id: str) -> None:
     if source_key not in st.session_state:
         st.session_state[_key(slot, "source_id")] = source_id
         st.session_state[_key(slot, "index")] = 0
-        st.session_state[_key(slot, "saved")] = []
-        st.session_state[_key(slot, "skipped")] = []
-        st.session_state[_key(slot, "applied_saved")] = []
-        st.session_state[_key(slot, "applied_skipped")] = []
+        for suffix in ("saved", "skipped", "applied_saved", "applied_skipped"):
+            st.session_state.setdefault(_key(slot, suffix), [])
         st.session_state[_key(slot, "notice")] = ""
         return
     if st.session_state.get(source_key) != source_id:
         st.session_state[source_key] = source_id
         st.session_state[_key(slot, "index")] = 0
-        st.session_state[_key(slot, "saved")] = []
-        st.session_state[_key(slot, "skipped")] = []
+        # Saved answers are still pending until explicit consumption or clearing.
+        # Direct evaluation reuse also requires the matching input binding.
         st.session_state[_key(slot, "notice")] = ""
 
 

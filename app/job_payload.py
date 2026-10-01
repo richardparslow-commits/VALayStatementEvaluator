@@ -34,6 +34,7 @@ from .blob_store import BlobRef, BlobStore, BlobStoreError, dumps_documents, loa
 from .documents import DocumentPage, ExtractedDocument
 from .draft import DraftResult
 from .evaluate import EvaluationResult, compute_effectiveness_score, evaluation_report_markdown
+from .evaluation_topics import TOPIC_POLICY, TopicValidationError, normalize_topics, topics_are_complete, evaluation_is_complete, topic_notice
 from .rubric_validation import RUBRIC_POLICY, RubricValidationError, normalize_rubric, rubric_is_complete
 from .medical_review import MedicalDigest, MedicalFact
 from .config import PRIMARY_ENDPOINT
@@ -226,6 +227,8 @@ def digest_from_json(raw: Any) -> MedicalDigest | None:
 # ---------------------------------------------------------------- results
 def evaluation_to_json(result: EvaluationResult) -> dict[str, Any]:
     complete = rubric_is_complete(result)
+    topics_complete = topics_are_complete(result)
+    all_complete = evaluation_is_complete(result)
     payload = {
         "claimed_condition": result.claimed_condition,
         "writer_role": result.writer_role,
@@ -235,23 +238,25 @@ def evaluation_to_json(result: EvaluationResult) -> dict[str, Any]:
         "scoring_policy": result.scoring_policy,
         "scoring_status": result.scoring_status if complete or result.scoring_status == "incomplete" else "unvalidated",
         "effectiveness_score": compute_effectiveness_score(result) if complete else None,
-        "recommendations": list(result.recommendations) if complete else [],
+        "recommendations": list(result.recommendations) if all_complete else [],
         "scores": dict(result.scores),
         "rationales": dict(result.rationales),
         "improvements": list(result.improvements),
         "omitted_record_facts": list(result.omitted_record_facts),
         "evidence_gaps": list(result.evidence_gaps),
         "executive_summary": result.executive_summary,
-        "topic_focus": result.topic_focus,
-        "topic_rows": list(result.topic_rows),
-        "topic_critical_gaps": list(result.topic_critical_gaps),
-        "topic_notes": result.topic_notes,
+        "topic_policy": result.topic_policy,
+        "topic_status": result.topic_status if topics_complete or result.topic_status == "incomplete" else "unvalidated",
+        "topic_focus": result.topic_focus if topics_complete else "",
+        "topic_rows": list(result.topic_rows) if topics_complete else [],
+        "topic_critical_gaps": list(result.topic_critical_gaps) if topics_complete else [],
+        "topic_notes": result.topic_notes if topics_complete else topic_notice(result),
         "revision_notes": result.revision_notes,
         "revision_changes": list(result.revision_changes),
         "revised_statement": result.revised_statement,
         "added_facts_to_verify": list(result.added_facts_to_verify),
         "digest": digest_to_json(result.digest),
-        "report_markdown": result.report_markdown if complete else evaluation_report_markdown(result),
+        "report_markdown": result.report_markdown if all_complete else evaluation_report_markdown(result),
         "input_chars": result.input_chars,
         "truncated_chars": result.truncated_chars,
         "truncation_warning": result.truncation_warning,
@@ -265,6 +270,11 @@ def evaluation_to_json(result: EvaluationResult) -> dict[str, Any]:
         for key in ("improvements", "omitted_record_facts", "revision_changes", "added_facts_to_verify"):
             payload[key] = []
         for key in ("executive_summary", "revision_notes", "revised_statement"):
+            payload[key] = ""
+    if not all_complete:
+        for key in ("revision_changes", "added_facts_to_verify"):
+            payload[key] = []
+        for key in ("revision_notes", "revised_statement"):
             payload[key] = ""
     return payload
 
@@ -280,10 +290,8 @@ def evaluation_from_json(raw: Any) -> EvaluationResult:
         scoring_policy=_as_str(data.get("scoring_policy")),
         scoring_status=_as_str(data.get("scoring_status")),
         evidence_gaps=_dict_items(data.get("evidence_gaps")),
-        topic_focus=_as_str(data.get("topic_focus")),
-        topic_rows=_dict_items(data.get("topic_rows")),
-        topic_critical_gaps=_str_items(data.get("topic_critical_gaps")),
-        topic_notes=_as_str(data.get("topic_notes")),
+        topic_policy=_as_str(data.get("topic_policy")),
+        topic_status=_as_str(data.get("topic_status")),
         revision_notes=_as_str(data.get("revision_notes")),
         revision_changes=_dict_items(data.get("revision_changes")),
         revised_statement=_as_str(data.get("revised_statement")),
@@ -312,8 +320,25 @@ def evaluation_from_json(raw: Any) -> EvaluationResult:
             for key, value in rubric.items():
                 setattr(result, key, value)
             result.effectiveness_score = compute_effectiveness_score(result)
-            result.recommendations = _dict_items(data.get("recommendations"))
-    if not rubric_is_complete(result):
+    # Validate raw topic fields before coercion/filtering can conceal bad rows.
+    if result.topic_policy == TOPIC_POLICY and result.topic_status == "complete":
+        try:
+            topics = normalize_topics({"claim_focus": data.get("topic_focus"),
+                                       "topics": data.get("topic_rows"),
+                                       "critical_gaps": data.get("topic_critical_gaps"),
+                                       "notes": data.get("topic_notes")})
+        except TopicValidationError:
+            result.topic_status = "invalid"
+        else:
+            result.topic_focus = topics["claim_focus"]
+            result.topic_rows = topics["topics"]
+            result.topic_critical_gaps = topics["critical_gaps"]
+            result.topic_notes = topics["notes"]
+    if not topics_are_complete(result):
+        result.topic_notes = topic_notice(result)
+    if evaluation_is_complete(result):
+        result.recommendations = _dict_items(data.get("recommendations"))
+    else:
         result.revision_notes = ""
         result.revision_changes = []
         result.revised_statement = ""

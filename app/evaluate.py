@@ -25,6 +25,10 @@ from .rubric_validation import (
     DIMENSION_LABELS, RUBRIC_POLICY, RUBRIC_MAX_ATTEMPTS, RubricValidationError,
     normalize_rubric, rubric_is_complete, scoring_notice, validate_scores,
 )
+from .evaluation_topics import (
+    TOPIC_POLICY, TOPIC_MAX_ATTEMPTS, TopicValidationError, normalize_topics,
+    topics_are_complete, evaluation_is_complete, topic_notice,
+)
 from .source_validation import build_source_index, source_reference_key
 from .exporter import parse_source
 from .llm import LLMClient, LLMError, LLMParseError, LLMService, LLMAuthError, LLMConfigurationError
@@ -491,6 +495,10 @@ Return JSON:
   "notes": "1-2 sentence overall coverage assessment"
 }}
 Return one topics entry per checklist topic (A through O), in checklist order.
+Use the exact topic letter (A, B, ..., O) in topic. Critical gap strings must begin
+with their topic letter and identify a partial/absent applicable topic. Covered
+or partial rows need evidence; absent and inapplicable rows have empty evidence.
+Only partial/absent applicable rows have nonempty gap_note. No other row has a gap_note.
 
 STATEMENT UNDER REVIEW:
 <<<
@@ -525,6 +533,8 @@ class EvaluationResult:
     topic_rows: list[dict] = field(default_factory=list)
     topic_critical_gaps: list[str] = field(default_factory=list)
     topic_notes: str = ""
+    topic_policy: str = ""
+    topic_status: str = ""
     revision_notes: str = ""
     revision_changes: list[dict] = field(default_factory=list)
     revised_statement: str = ""
@@ -627,7 +637,7 @@ def run_evaluation(
                 extra={
                     "request_id": rid,
                     "phase": "evaluate",
-                    "status": "ok" if rubric_is_complete(result) else "partial",
+                    "status": "ok" if evaluation_is_complete(result) else "partial",
                     "duration_ms": duration_ms,
                 },
             )
@@ -861,17 +871,19 @@ def _run_evaluation(
             report(0.79, "Step 5/7 — Auditing topic coverage (hazards, care, family, progression)…")
             _analyze_topics(llm, result, statement_text, report)
 
-    if rubric_is_complete(result):
+    if evaluation_is_complete(result):
         with tracing.phase_span("revision"), PhaseTimer(logger, "revision", request_id=rid):
             with phase_timer("revision"):
                 report(0.86, "Step 6/8 — Drafting improvement suggestions and a revised statement…")
                 _draft_revision(llm, result, statement_text, report)
 
+    if rubric_is_complete(result):
         # The score/recommendations pass is LLM-backed like every other phase, so it
         # gets the same phase span treatment as its neighbours.
         with tracing.phase_span("score"), PhaseTimer(logger, "score", request_id=rid):
             with phase_timer("score"):
-                report(0.92, "Step 7/8 — Computing effectiveness score and recommendations…")
+                report(0.92, "Step 7/8 — Computing effectiveness score and recommendations…"
+                       if topics_are_complete(result) else "Computing effectiveness from validated rubric; topic recommendations withheld.")
                 _score_and_recommend(llm, result, report, witness)
 
     with tracing.phase_span("report"), PhaseTimer(logger, "report", request_id=rid):
@@ -879,8 +891,8 @@ def _run_evaluation(
             report(0.96, "Step 8/8 — Building the report…")
             result.report_citations = _citation_index_snapshot()
             result.report_markdown = build_report(result, statement_text)
-    report(1.0, "Evaluation complete." if rubric_is_complete(result)
-           else "Partial evaluation retained — scoring incomplete.")
+    report(1.0, "Evaluation complete." if evaluation_is_complete(result)
+           else "Partial evaluation retained — scoring or topic analysis incomplete.")
     return result
 
 
@@ -954,39 +966,50 @@ def _analyze_topics(
     statement_text: str,
     report: ProgressCallback,
 ) -> None:
-    """Audit the statement against the topic checklist (A–O).
-
-    Like the revision step, a failure here must not discard the completed
-    evaluation, so errors are swallowed and the fields stay empty.
-    """
+    """Commit only a complete validated topic response, or retain earlier review."""
+    result.topic_policy = TOPIC_POLICY
+    result.topic_status = "incomplete"
+    result.topic_focus = ""
+    result.topic_rows = []
+    result.topic_critical_gaps = []
+    result.topic_notes = ""
     truncated_statement, _ = _truncate_for_prompt(statement_text, EVALUATE_INTERNAL_MAX_CHARS)
-    try:
-        topic_data = llm.chat_json(
-            TOPIC_SYSTEM_TEMPLATE.format(
-                checklist=load_knowledge("topic_checklist.md"),
-                legal=load_knowledge("legal_framework.md"),
-            ),
-            TOPIC_USER.format(
-                statement=sanitize_for_prompt(truncated_statement, max_chars=EVALUATE_INTERNAL_MAX_CHARS),
-                verifications=sanitize_for_prompt(_verifications_text(result), max_chars=20_000),
-                digest_summary=sanitize_digest_text(((result.digest.summary if result.digest else "") or "(no summary)")[:12000], max_chars=20_000),
-                guard_note=GUARD_NOTE,
-            ),
-            phase="topic",
-        )
-    except LLMError as exc:
-        logger.warning(
-            "topic coverage unavailable error=%s",
-            f"{type(exc).__name__}: {exc}",
-            extra={"request_id": get_request_id() or "-", "phase": "topic", "status": "error", "error_class": type(exc).__name__},
-        )
-        result.topic_notes = "Topic coverage analysis unavailable — the model call failed."
+    system = TOPIC_SYSTEM_TEMPLATE.format(
+        checklist=load_knowledge("topic_checklist.md"), legal=load_knowledge("legal_framework.md")
+    )
+    prompt = TOPIC_USER.format(
+        statement=sanitize_for_prompt(truncated_statement, max_chars=EVALUATE_INTERNAL_MAX_CHARS),
+        verifications=sanitize_for_prompt(_verifications_text(result), max_chars=20_000),
+        digest_summary=sanitize_digest_text(
+            ((result.digest.summary if result.digest else "") or "(no summary)")[:12000], max_chars=20_000
+        ), guard_note=GUARD_NOTE,
+    )
+    retry_note = ""
+    for attempt in range(1, TOPIC_MAX_ATTEMPTS + 1):
+        check_pipeline_cancelled()
+        try:
+            data = normalize_topics(llm.chat_json(system, prompt + retry_note, phase="topic"))
+        except (LLMAuthError, LLMConfigurationError):
+            raise
+        except (TopicValidationError, LLMError):
+            logger.warning("topic response unavailable attempt=%d/%d", attempt, TOPIC_MAX_ATTEMPTS,
+                           extra={"phase": "topic", "status": "incomplete"})
+            retry_note = (
+                "\n\nReturn a fresh complete JSON object with all required fields and one row "
+                "per topic A through O. Use the exact letter as topic, JSON booleans for "
+                "applicable and the documented coverage vocabulary. Covered/partial topics "
+                "need evidence; partial/absent applicable topics need concrete gap wording. "
+                "Inapplicable topics use not applicable with empty evidence/gap fields. "
+                "Critical gaps must refer only to weak applicable topic letters."
+            )
+            continue
+        result.topic_focus = data["claim_focus"]
+        result.topic_rows = data["topics"]
+        result.topic_critical_gaps = data["critical_gaps"]
+        result.topic_notes = data["notes"]
+        result.topic_status = "complete"
         return
-    result.topic_focus = topic_data.get("claim_focus", "")
-    result.topic_rows = topic_data.get("topics", [])
-    result.topic_critical_gaps = [str(g) for g in topic_data.get("critical_gaps", []) if str(g).strip()]
-    result.topic_notes = topic_data.get("notes", "")
-    report(0.85, "Topic coverage audited.")
+    result.topic_notes = topic_notice(result)
 
 
 def _draft_revision(
@@ -1000,6 +1023,12 @@ def _draft_revision(
     A failure here should not lose the completed evaluation, so errors are
     swallowed and the revision fields simply stay empty.
     """
+    if not evaluation_is_complete(result):
+        result.revision_notes = ""
+        result.revision_changes = []
+        result.revised_statement = ""
+        result.added_facts_to_verify = []
+        return
     import json as _json
 
     if result.topic_rows:
@@ -1089,7 +1118,7 @@ def source_reference_notice(result: EvaluationResult) -> str:
 
 def evaluation_report_markdown(result: EvaluationResult) -> str:
     """Keep saved report content, adding the missing-policy notice to exports."""
-    if not rubric_is_complete(result):
+    if not evaluation_is_complete(result):
         # Rebuild from retained review data; a historical cached report may carry
         # invalid grades or a rewrite that predates the validation policy.
         return build_report(result, "")
@@ -1554,7 +1583,7 @@ def _fallback_recommendations(result: "EvaluationResult", minimum: int) -> list[
                 "claim_id": None,
             }
         )
-    for gap in result.topic_critical_gaps:
+    for gap in (result.topic_critical_gaps if topics_are_complete(result) else []):
         candidates.append(
             {
                 "title": f"Address gap: {gap}"[:160],
@@ -1651,7 +1680,7 @@ def generate_improvement_recommendations(
     """
     import json as _json
 
-    topic_gaps = "\n".join(f"- {g}" for g in result.topic_critical_gaps) or "(none identified)"
+    topic_gaps = ("\n".join(f"- {g}" for g in result.topic_critical_gaps) or "(none identified)") if topics_are_complete(result) else "Topic coverage is unavailable; do not infer complete coverage or absence of gaps."
     improvements_text = (
         _json.dumps(result.improvements[:6], indent=1) if result.improvements else "(none)"
     )
@@ -1696,6 +1725,9 @@ def _score_and_recommend(
         result.recommendations = []
         return
     result.effectiveness_score = compute_effectiveness_score(result)
+    if not topics_are_complete(result):
+        result.recommendations = []
+        return
     try:
         result.recommendations = generate_improvement_recommendations(result, llm, witness)
     except Exception as exc:  # noqa: BLE001 - feature-error boundary
@@ -1894,6 +1926,7 @@ def build_report(
         lines.append("")
     scoring_complete = rubric_is_complete(result)
     lines.append(f"> **Rubric validation:** {scoring_notice(result)}")
+    lines.append(f"> **Topic validation:** {topic_notice(result)}")
     lines.append("")
     lines.append(f"**Overall rating: {result.overall_rating}**")
     if scoring_complete and result.score_band != "unavailable":
@@ -1998,7 +2031,7 @@ def build_report(
             lines.append(f"| {label} | {score:.1f}/10 | {rationale} |")
         lines.append("")
 
-    if scoring_complete and result.recommendations:
+    if evaluation_is_complete(result) and result.recommendations:
         lines.append("## Improvement Recommendations (ranked by estimated impact)")
         lines.append("")
         for index, rec in enumerate(result.recommendations, start=1):
@@ -2016,7 +2049,7 @@ def build_report(
                 lines.append(f"   - Example: “{imp.get('example_rewrite')}”")
             lines.append("")
 
-    if result.topic_rows:
+    if topics_are_complete(result):
         lines.append("## Topic Coverage — What the Statement Does and Does Not Address")
         lines.append("")
         if result.topic_focus:
@@ -2046,7 +2079,7 @@ def build_report(
             lines.append(f"- {fact.get('fact', '')} _(source: {fact.get('source', 'records')})_")
         lines.append("")
 
-    if scoring_complete and (result.revised_statement or result.revision_changes):
+    if evaluation_is_complete(result) and (result.revised_statement or result.revision_changes):
         lines.append("## Suggested Improvements — Proposed Rewrite")
         lines.append("")
         if result.revision_notes:

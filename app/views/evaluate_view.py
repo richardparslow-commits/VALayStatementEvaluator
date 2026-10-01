@@ -45,6 +45,7 @@ from ..evaluate import (
     source_reference_notice,
     retained_claim_text,
 )
+from ..evaluation_topics import topics_are_complete, evaluation_is_complete, topic_notice
 from ..rubric_validation import rubric_is_complete, scoring_notice
 from ..exporter import export_facts, filter_facts
 from ..job_payload import EvaluateJob
@@ -66,6 +67,8 @@ from ..run_log import run_log_event
 from ..shutdown import enter_run, exit_run
 from .follow_up import (
     append_follow_up_answers,
+    evaluation_input_key,
+    remember_evaluation_inputs,
     evaluate_follow_up_questions,
     mark_follow_up_answers_consumed,
     render_follow_up_questions,
@@ -364,10 +367,11 @@ def _run_evaluation_flow(statement_text: str, records: list, witness: dict[str, 
     t0 = time.perf_counter()
     try:
         check_memory_before_run()
+        _input_key = evaluation_input_key(statement_text, records, witness or {})
         result = run_with_timeout(
             run_evaluation,
             llm,
-            append_follow_up_answers(statement_text.strip(), slot="eval"),
+            append_follow_up_answers(statement_text.strip(), slot="eval", input_key=_input_key),
             records,
             progress=update,
             witness=witness or {},
@@ -503,7 +507,7 @@ def _run_evaluation_flow(statement_text: str, records: list, witness: dict[str, 
         extra={
             "request_id": rid,
             "phase": "evaluate",
-            "status": "ok" if rubric_is_complete(result) else "partial",
+            "status": "ok" if evaluation_is_complete(result) else "partial",
             "duration_ms": duration_ms,
             "calls": total.calls,
             "prompt_tokens": total.prompt_tokens,
@@ -517,6 +521,7 @@ def _run_evaluation_flow(statement_text: str, records: list, witness: dict[str, 
             "contradictions": int(getattr(result, "contradiction_count", 0) or 0),
             "overall_rating": str(getattr(result, "overall_rating", "") or ""),
             "scoring_status": "complete" if rubric_is_complete(result) else "incomplete",
+            "topic_status": "complete" if topics_are_complete(result) else "incomplete",
         }
     except Exception:  # noqa: BLE001
         _outcome = {}
@@ -532,7 +537,7 @@ def _run_evaluation_flow(statement_text: str, records: list, witness: dict[str, 
     )
     run_log_event(
         "evaluate",
-        "ok" if rubric_is_complete(result) else "partial",
+        "ok" if evaluation_is_complete(result) else "partial",
         request_id=rid,
         duration_ms=duration_ms,
         endpoints=",".join(_endpoints),
@@ -563,10 +568,12 @@ def _run_evaluation_flow(statement_text: str, records: list, witness: dict[str, 
         _profiler_run.run_end_mono = time.monotonic()
         _profiler_run.emit()
         get_profiler().record_run(_profiler_run)
+    remember_evaluation_inputs(_input_key, source_id=rid)
     st.session_state.eval_result = result
     st.session_state.eval_usage = llm.usage
     st.session_state.eval_request_id = rid
-    mark_follow_up_answers_consumed("eval")
+    if evaluation_is_complete(result):
+        mark_follow_up_answers_consumed("eval")
     record_watchdog_run(llm.usage)
 
 
@@ -615,11 +622,11 @@ def _run_evaluation_queued(
     )
     if outcome is not None and outcome.ok:
         result = st.session_state.get("eval_result")
-        if rubric_is_complete(result):
+        if evaluation_is_complete(result):
             pilot.display(f"Evaluation complete — reference `{outcome.request_id}`.", container=st, method="success")
         else:
             pilot.display(f"Partial evaluation retained — reference `{outcome.request_id}`. "
-                          + scoring_notice(result), container=st, method="warning")
+                          + scoring_notice(result) + " " + topic_notice(result), container=st, method="warning")
 
 
 def _result_reference() -> str:
@@ -1195,7 +1202,7 @@ def _render_effectiveness_score(eval_result: Any) -> None:
     banner = {"green": st.success, "yellow": st.warning, "red": st.error}.get(band, st.error)
     banner(f"{emoji} {label} ({band.upper()} band)")
 
-    recommendations = getattr(eval_result, "recommendations", None) or []
+    recommendations = (getattr(eval_result, "recommendations", None) or []) if evaluation_is_complete(eval_result) else []
     if not recommendations:
         return
 
@@ -1309,6 +1316,8 @@ def _case_topic_letters(eval_result: Any) -> list[str]:
         if known:
             return sorted(set(known))
 
+    if not topics_are_complete(eval_result):
+        return []
     derived: set[str] = set()
     for row in getattr(eval_result, "topic_rows", []) or []:
         if not row.get("applicable"):
@@ -1425,7 +1434,8 @@ def _render_evaluation_results(eval_result: Any) -> None:
     col1.metric("Overall rating", eval_result.overall_rating)
     col2.metric("Claims verified", len(eval_result.verifications))
     col3.metric("Contradictions", eval_result.contradiction_count)
-    _applicable = [t for t in eval_result.topic_rows if t.get("applicable")]
+    _topics_complete = topics_are_complete(eval_result)
+    _applicable = [t for t in eval_result.topic_rows if t["applicable"] is True] if _topics_complete else []
     _covered = [t for t in _applicable if t.get("coverage") == "covered"]
     col4.metric(
         "Topics covered", f"{len(_covered)}/{len(_applicable)}" if _applicable else "—"
@@ -1471,7 +1481,9 @@ def _render_evaluation_results(eval_result: Any) -> None:
                 horizontal=True,
             )
 
-    if eval_result.topic_rows:
+    pilot.display(topic_notice(eval_result), container=st,
+                  method="caption" if _topics_complete else "warning")
+    if _topics_complete:
         with st.expander(
             "🧭 Topic coverage — what the statement does and does not address", expanded=True
         ):
@@ -1506,8 +1518,11 @@ def _render_evaluation_results(eval_result: Any) -> None:
         source_id=_result_reference(),
         questions=evaluate_follow_up_questions(eval_result),
         empty_message=(
-            "No follow-up questions are needed — every applicable checklist topic is already "
-            "covered well enough for this run."
+            "No remaining questions are shown for this validated topic analysis. "
+            "Review its coverage and any saved or skipped questions."
+            if _topics_complete else
+            "New topic questions are unavailable because this analysis is incomplete or "
+            "unvalidated. Review or clear any saved answers before another evaluation."
         ),
         next_run_label="evaluation",
     )
@@ -1526,7 +1541,7 @@ def _render_evaluation_results(eval_result: Any) -> None:
                         f"- {fact_dict.get('fact', '')} _(source: {fact_dict.get('source', '')})_"
                     , container=st, method="write")
 
-        if eval_result.revised_statement or eval_result.revision_changes:
+        if evaluation_is_complete(eval_result) and (eval_result.revised_statement or eval_result.revision_changes):
             with st.expander("📝 Suggested improvements — proposed rewrite", expanded=True):
                 if eval_result.revision_notes:
                     pilot.display(eval_result.revision_notes, container=st, method="info")

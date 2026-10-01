@@ -300,7 +300,8 @@ def safe_metadata(data: Mapping[str, Any]) -> dict[str, Any]:
         result["request_id"] = reference
     for key, choices in {"action": {"app", "evaluate", "draft"},
                          "status": {"start", "ok", "partial", "error", "timeout", "rejected", "queued", "done"},
-                         "scoring_status": {"complete", "incomplete", "invalid", "unvalidated"}}.items():
+                         "scoring_status": {"complete", "incomplete", "invalid", "unvalidated"},
+                         "topic_status": {"complete", "incomplete", "invalid", "unvalidated"}}.items():
         if isinstance(data.get(key), str) and data[key] in choices:
             result[key] = data[key]
     return result
