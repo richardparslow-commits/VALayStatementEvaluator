@@ -36,7 +36,7 @@ class ParserContainerTests(unittest.TestCase):
         self.runner.ready()
         self.data = b'Synthetic observation of knee pain.'
         self.request = {'version': 1, 'label': 'record.txt', 'size': len(self.data),
-                        'sha256': hashlib.sha256(self.data).hexdigest(), 'nonce': uuid.uuid4().hex}
+                        'sha256': hashlib.sha256(self.data).hexdigest(), 'nonce': uuid.uuid4().hex, 'page_limit': 500}
 
     def probe(self, code):
         command = self.runner.command
@@ -68,6 +68,21 @@ class ParserContainerTests(unittest.TestCase):
         docs, skipped = _documents(_unpack_reply(wire.decode(self.runner.run(req, data)), IMAGE), req, IMAGE)
         self.assertEqual(docs[0].pages[0].text, self.data.decode())
         self.assertEqual(len(skipped), 1)
+
+    def test_pdf_page_limit_is_applied_before_any_text_extraction(self):
+        from pypdf import PdfWriter
+        output = io.BytesIO()
+        writer = PdfWriter()
+        writer.add_blank_page(width=100, height=100)
+        writer.add_blank_page(width=100, height=100)
+        writer.write(output)
+        data = output.getvalue()
+        req = {**self.request, 'label': 'two-pages.pdf', 'size': len(data),
+               'sha256': hashlib.sha256(data).hexdigest(), 'page_limit': 1}
+        docs, skipped = _documents(_unpack_reply(wire.decode(self.runner.run(req, data)), IMAGE), req, IMAGE)
+        self.assertFalse(docs)
+        self.assertEqual(len(skipped), 1)
+        self.assertIn('physical page limit before text extraction', skipped[0])
 
     def test_linux_uid_capabilities_seccomp_apparmor_and_limits_are_active(self):
         result = self.probe('''import sys, os, json, resource

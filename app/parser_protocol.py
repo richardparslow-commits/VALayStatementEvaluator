@@ -76,10 +76,11 @@ def decode(data: bytes) -> Any:
 
 
 def validate_request(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict) or set(value) != {"version", "label", "size", "sha256", "nonce"}:
+    if not isinstance(value, dict) or set(value) != {"version", "label", "size", "sha256", "nonce", "page_limit"}:
         raise ParserRefused("Invalid parser request.")
     if (type(value["version"]) is not int or value["version"] != 1
             or type(value["size"]) is not int or not 0 < value["size"] <= MAX_INPUT
+            or type(value["page_limit"]) is not int or not 0 < value["page_limit"] <= MAX_PAGES
             or not isinstance(value["label"], str) or not 0 < len(value["label"]) <= 1024
             or any(ord(c) < 32 or ord(c) == 127 for c in value["label"])
             or not isinstance(value["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", value["sha256"])

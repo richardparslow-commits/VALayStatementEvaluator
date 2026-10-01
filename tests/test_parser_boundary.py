@@ -24,17 +24,25 @@ DATA = b'Synthetic observation of knee pain.'
 
 def request():
     return {'version': 1, 'label': 'record.txt', 'size': len(DATA),
-            'sha256': hashlib.sha256(DATA).hexdigest(), 'nonce': 'b' * 32}
+            'sha256': hashlib.sha256(DATA).hexdigest(), 'nonce': 'b' * 32, 'page_limit': 500}
 
 
 def response():
-    return {**{k: v for k, v in request().items() if k != 'size'}, 'image': IMAGE,
+    return {**{k: v for k, v in request().items() if k not in ('size', 'page_limit')}, 'image': IMAGE,
             'documents': [{'filename': 'record.txt', 'schema_version': 2, 'total_pages': 1,
                            'unreadable_pages': [], 'pagination': 'block', 'coverage_known': True,
                            'pages': [{'page': 1, 'kind': 'block', 'text': DATA.decode()}]}], 'skipped': []}
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_worker_uses_lower_request_and_deployment_page_limit(self):
+        from app.parser_worker import extraction_page_limit
+        for requested, deployed, expected in ((5000, 500, 500), (500, 5000, 500), (5000, 5000, 5000)):
+            with patch.dict(os.environ, {'VA_LSE_PARSER_MAX_PAGES': str(deployed)}):
+                self.assertEqual(extraction_page_limit({'page_limit': requested}), expected)
+        with patch.dict(os.environ, {'VA_LSE_PARSER_MAX_PAGES': '0'}), self.assertRaises(ValueError):
+            extraction_page_limit({'page_limit': 500})
+
     def test_json_graph_depth_and_alternative_encoding_are_refused_before_decode(self):
         values = [b'[' + b'{},' * 70000 + b'{}]', b'[' * 17 + b'0' + b']' * 17,
                   '{"x":1}'.encode('utf-16-le'), b'{"x":"\xc3\xa9"}']
@@ -51,6 +59,7 @@ class ProtocolTests(unittest.TestCase):
         from app import config
         value, req = response(), request()
         value['label'] = req['label'] = 'records.zip'
+        req['page_limit'] = 5000
         original = value['documents'][0]
         value['documents'] = [{**original, 'filename': f'records/{n}.txt', 'total_pages': 3,
                                'pages': [{'page': p, 'kind': 'block', 'text': 'Synthetic observation'} for p in (1,2,3)]}
@@ -100,7 +109,7 @@ class ProtocolTests(unittest.TestCase):
                 wire.read_request(io.BytesIO(wire.frame(wire.encode(request())) + data))
 
     def test_request_schema_limits_and_duplicate_keys(self):
-        for key, value in (('size', True), ('size', wire.MAX_INPUT + 1), ('label', 'a\n.txt'),
+        for key, value in (('size', True), ('page_limit', True), ('page_limit', 0), ('page_limit', 5001), ('size', wire.MAX_INPUT + 1), ('label', 'a\n.txt'),
                            ('label', ''), ('nonce', '../path'), ('version', True), ('sha256', 'x')):
             with self.subTest(key=key), self.assertRaises(wire.ParserRefused):
                 wire.validate_request({**request(), key: value})
@@ -189,6 +198,12 @@ class ProtocolTests(unittest.TestCase):
                 patch('app.isolated_extract.socket.socket'), patch('app.isolated_extract.recv_frame', return_value=wire.encode(
                     {'ready': True, 'image': IMAGE, 'revision': 'old'})), self.assertRaises(wire.ParserRefused):
             parser_health()
+        from app import config
+        with patch.dict(os.environ, {'VA_LSE_PARSER_IMAGE': IMAGE, 'VA_LSE_BUILD_SHA': 'reviewed'}), \
+                patch.object(config, 'MAX_RECORD_PAGES', 500), patch('app.isolated_extract.socket.socket'), \
+                patch('app.isolated_extract.recv_frame', return_value=wire.encode(
+                    {'ready': True, 'image': IMAGE, 'revision': 'reviewed', 'max_pages': 500})):
+            parser_health()
 
 
 class LauncherTests(unittest.TestCase):
@@ -259,7 +274,7 @@ class LauncherTests(unittest.TestCase):
         self.assertFalse(any('docker.sock' in x for x in web['volumes']))
         self.assertNotIn('env_file', launcher)
         self.assertEqual(launcher['network_mode'], 'none')
-        self.assertEqual(set(launcher['environment']), {'VA_LSE_PARSER_IMAGE', 'VA_LSE_BUILD_SHA'})
+        self.assertEqual(set(launcher['environment']), {'VA_LSE_PARSER_IMAGE', 'VA_LSE_BUILD_SHA', 'VA_LSE_PARSER_MAX_PAGES'})
         self.assertEqual(launcher['volumes'], ['/var/run/docker.sock:/var/run/docker.sock', 'parser-channel:/run/parser'])
         self.assertIn('parser-channel:/run/parser:ro', web['volumes'])
         parser = (root / 'deploy/parser.Dockerfile').read_text()

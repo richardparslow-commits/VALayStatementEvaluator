@@ -37,7 +37,7 @@ expired and incomplete. Do not replace evidence references with a general
   requires an authenticated, owner-authorized download service.
 
 The private parser launcher accepts only a file label, size, hash, random request
-identifier and bounded bytes. It fixes the image, command, user, network, mounts
+identifier, bounded extraction page limit and bounded bytes. It fixes the image, command, user, network, mounts
 and resource limits. Only the launcher has Docker daemon access; neither the web
 application nor the parser receives the daemon socket. The launcher must be
 treated as a trusted host administrator because Docker access is powerful. It
@@ -52,8 +52,11 @@ The parser installs only the hash-pinned `pypdf` and `python-dotenv` versions fr
 [requirements-parser.lock](requirements-parser.lock), copied from the application
 lock. The launcher relays bounded output without building a document object
 graph. Both sides limit JSON nesting/structure before decoding. The web client
-applies the configured page cap (at most 500 in pilot; at most 5,000 for synthetic
-isolated use). ZIP member names are citation labels only, never host paths. A
+and worker apply the lower of the request and launcher page caps before PDF text
+extraction (at most 500 in pilot; at most 5,000 for synthetic isolated use). The
+pilot Compose launcher fixes `VA_LSE_PARSER_MAX_PAGES=500`. A separate synthetic
+launcher can set this to 5,000 to match its application's configured limit.
+ZIP member names are citation labels only, never host paths. A
 refused or empty file produces a per-file warning and other files continue;
 there is no fallback or implicit acceptance of the refused file.
 

@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 from concurrent.futures import ThreadPoolExecutor
 
-from .parser_protocol import (DEADLINE, MAX_HEADER, MAX_INPUT, MAX_OUTPUT, SOCKET_PATH,
+from .parser_protocol import (DEADLINE, MAX_HEADER, MAX_INPUT, MAX_OUTPUT, MAX_PAGES, SOCKET_PATH,
                               ParserRefused, bind_input, decode, encode, frame,
                               recv_exact, recv_frame, validate_request, validate_json_structure)
 
@@ -26,10 +26,13 @@ PROFILE = "va-lse-parser"
 
 
 class DockerParser:
-    def __init__(self, image: str, revision: str, docker: str = "/usr/local/bin/docker") -> None:
+    def __init__(self, image: str, revision: str, docker: str = "/usr/local/bin/docker", max_pages: int = 500) -> None:
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", image) or not revision:
             raise ParserRefused("An immutable reviewed parser image is required.")
         self.image, self.revision, self.docker = image, revision, docker
+        if type(max_pages) is not int or not 0 < max_pages <= MAX_PAGES:
+            raise ParserRefused("Invalid parser deployment page limit.")
+        self.max_pages = max_pages
         self.parse_lock = threading.Lock()
         self.env = {"PATH": os.defpath, "HOME": "/nonexistent", "DOCKER_HOST": "unix:///var/run/docker.sock"}
 
@@ -51,7 +54,7 @@ class DockerParser:
         if (not isinstance(images, list) or len(images) != 1 or images[0].get("Id") != self.image
                 or f"VA_LSE_BUILD_SHA={self.revision}" not in images[0].get("Config", {}).get("Env", [])):
             raise ParserRefused("The parser image does not match the reviewed revision.")
-        return {"ready": True, "image": self.image, "revision": self.revision}
+        return {"ready": True, "image": self.image, "revision": self.revision, "max_pages": self.max_pages}
 
     def command(self, name: str) -> list[str]:
         return [self.docker, "run", "--rm", "--pull=never", "--name", name, "--interactive",
@@ -62,7 +65,8 @@ class DockerParser:
                 # PID 1 stages up to 50 MB input; the parsing child lowers this to 32 MB.
                 f"--ulimit=fsize={MAX_INPUT}:{MAX_INPUT}", "--log-driver=none",
                 "--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=128m,mode=1777",
-                "--workdir=/tmp", "--env=PYTHONPATH=/app", "--entrypoint=/usr/local/bin/python", self.image,
+                "--workdir=/tmp", "--env=PYTHONPATH=/app", f"--env=VA_LSE_PARSER_MAX_PAGES={self.max_pages}",
+                "--entrypoint=/usr/local/bin/python", self.image,
                 "-m", "app.parser_worker"]
 
     def run(self, request: dict[str, Any], data: bytes) -> bytes:
@@ -177,12 +181,13 @@ def _handle_owned(connection: socket.socket, runner: DockerParser, slots: thread
 
 
 def serve() -> None:
-    runner = DockerParser(os.environ.get("VA_LSE_PARSER_IMAGE", ""), os.environ.get("VA_LSE_BUILD_SHA", ""))
+    runner = DockerParser(os.environ.get("VA_LSE_PARSER_IMAGE", ""), os.environ.get("VA_LSE_BUILD_SHA", ""),
+                          max_pages=int(os.environ.get("VA_LSE_PARSER_MAX_PAGES", "500")))
     runner.ready()
     import hashlib
     data = b"Synthetic parser readiness fixture."
     runner.run({"version": 1, "label": "readiness.txt", "size": len(data),
-                "sha256": hashlib.sha256(data).hexdigest(), "nonce": uuid.uuid4().hex}, data)
+                "sha256": hashlib.sha256(data).hexdigest(), "nonce": uuid.uuid4().hex, "page_limit": runner.max_pages}, data)
     path = Path(SOCKET_PATH)
     path.unlink(missing_ok=True)
     slots = threading.Semaphore(4)

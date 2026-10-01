@@ -8,7 +8,14 @@ import sys
 import tempfile
 from pathlib import Path
 
-from .parser_protocol import DEADLINE, MAX_OUTPUT, MAX_TEXT, encode, read_request
+from .parser_protocol import DEADLINE, MAX_OUTPUT, MAX_TEXT, MAX_PAGES, encode, read_request
+
+
+def extraction_page_limit(request: dict[str, int]) -> int:
+    maximum = int(os.environ.get("VA_LSE_PARSER_MAX_PAGES", "500"))
+    if not 0 < maximum <= MAX_PAGES:
+        raise ValueError("Invalid parser deployment page limit.")
+    return min(maximum, request["page_limit"])
 
 
 def child(root: Path) -> None:
@@ -51,7 +58,7 @@ def supervise() -> None:
         (root / "input").write_bytes(data)
         subprocess.run([sys.executable, "-m", "app.parser_worker", "--child", directory],
                        env={"PATH": os.defpath, "PYTHONPATH": "/app", "PYTHONDONTWRITEBYTECODE": "1",
-                            "VA_LSE_MAX_RECORD_PAGES": "5000"},
+                            "VA_LSE_MAX_RECORD_PAGES": str(extraction_page_limit(request))},
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                        timeout=DEADLINE, check=True)
         output = root / "output"

@@ -50,6 +50,7 @@ services:
     environment:
       VA_LSE_PARSER_IMAGE: ${VA_LSE_PARSER_IMAGE:?Set the reviewed parser image ID sha256}
       VA_LSE_BUILD_SHA: ${VA_LSE_BUILD_SHA:?Set the reviewed immutable revision}
+      VA_LSE_PARSER_MAX_PAGES: "500"
     group_add:
       - ${VA_LSE_DOCKER_GID:?Set the Linux daemon socket group ID}
     volumes:

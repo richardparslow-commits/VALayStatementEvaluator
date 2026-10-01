@@ -34,19 +34,24 @@ def parser_image() -> str:
 
 
 def parser_health() -> None:
+    from . import config
     image = parser_image()
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
         connection.settimeout(12)
         connection.connect(SOCKET_PATH)
         connection.sendall(frame(encode({"operation": "health"})))
         reply = decode(recv_frame(connection, MAX_HEADER, time.monotonic() + 12))
-    if reply != {"ready": True, "image": image, "revision": os.environ.get("VA_LSE_BUILD_SHA", "")}:
+    if (not isinstance(reply, dict) or set(reply) != {"ready", "image", "revision", "max_pages"}
+            or reply["ready"] is not True or reply["image"] != image
+            or reply["revision"] != os.environ.get("VA_LSE_BUILD_SHA", "")
+            or type(reply["max_pages"]) is not int
+            or not max(1, min(config.MAX_RECORD_PAGES, MAX_PAGES)) <= reply["max_pages"] <= MAX_PAGES):
         raise ParserRefused("The reviewed parser service is unavailable.")
 
 
 def _documents(reply: Any, request: dict[str, Any], image: str) -> tuple[list[ExtractedDocument], list[str]]:
     from . import config
-    limit = max(1, min(MAX_PAGES, config.MAX_RECORD_PAGES))
+    limit = max(1, min(MAX_PAGES, config.MAX_RECORD_PAGES, request.get("page_limit", MAX_PAGES)))
     if (not isinstance(reply, dict)
             or set(reply) != {"version", "nonce", "sha256", "label", "documents", "skipped", "image"}
             or type(reply["version"]) is not int or reply["version"] != 1
@@ -117,7 +122,8 @@ class IsolatedExtractor:
             if len(data) > min(MAX_INPUT, config.MAX_UPLOAD_BYTES):
                 raise ParserRefused("Upload exceeds the parser input limit.")
             request = validate_request({"version": 1, "label": label, "size": len(data),
-                                        "sha256": hashlib.sha256(data).hexdigest(), "nonce": uuid.uuid4().hex})
+                                        "sha256": hashlib.sha256(data).hexdigest(), "nonce": uuid.uuid4().hex,
+                                        "page_limit": max(1, min(MAX_PAGES, config.MAX_RECORD_PAGES))})
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
                 deadline = time.monotonic() + self.timeout
                 connection.settimeout(self.timeout)
