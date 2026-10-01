@@ -768,14 +768,17 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
         if selected_names - {path.name for path in part_files}:
             raise ValueError("A successful batch source file is unavailable.")
         source_docs = []
+        # Legacy facts with no filenames stay unresolved. If no original member
+        # can be recovered, current readable parts can satisfy the input contract
+        # without pretending to restore a source binding for those old facts.
+        legacy_unbound_inputs = not selected_names and legacy_unresolved_facts > 0
         for path in part_files:
-            if path.name in selected_names:
+            if path.name in selected_names or (legacy_unbound_inputs and path.name not in quarantined):
                 try:
                     docs, _ = records_from_local_path(str(path))
-                except ExtractionError as exc:
-                    # Membership now comes from successful source metadata or
-                    # retained fact provenance. An original skip is not selected;
-                    # failure of a selected source is a new loss of evidence.
+                except (ExtractionError, OSError) as exc:
+                    if legacy_unbound_inputs:
+                        continue
                     raise ValueError(
                         "A retained batch source input could not be re-extracted; restore it or re-run record review."
                     ) from exc
@@ -1064,20 +1067,31 @@ def main(argv: list[str] | None = None) -> int:
     from app.documents import ExtractionError, records_from_local_path
     from app.request_validation import validate_records
     from app import config
-    input_pages = input_bytes = 0
+    input_pages = input_bytes = unreadable_parts = 0
     try:
         for path in part_files:
-            source_docs, _ = records_from_local_path(str(path))
-            validate_records(source_docs)
-            input_pages += sum(max(doc.source_page_count, len(doc.pages)) for doc in source_docs)
-            input_bytes += sum(len(page.text.encode("utf-8")) for doc in source_docs for page in doc.pages)
+            try:
+                source_docs, _ = records_from_local_path(str(path))
+            except (ExtractionError, OSError):
+                unreadable_parts += 1
+                continue
+            if not source_docs:
+                unreadable_parts += 1
+                continue
+            part_pages, part_bytes = validate_records(source_docs)
+            input_pages += part_pages
+            input_bytes += part_bytes
             if input_pages > config.MAX_RECORD_PAGES or input_bytes > config.MAX_TOTAL_UPLOAD_BYTES:
                 raise RequestValidationError("Batch records exceed the configured total input limits. Split the record set.",
                                              field="records", reason="payload_too_large")
             del source_docs
-    except (RequestValidationError, ExtractionError, OSError):
+        if not input_pages:
+            raise RequestValidationError("Batch records need usable extracted text.", field="records")
+    except RequestValidationError:
         log("FATAL: batch records need usable extracted text within the configured input limits.")
         return 2
+    if unreadable_parts:
+        log(f"WARNING: {unreadable_parts} source part(s) have no usable text; existing batch skip/coverage handling still applies.")
 
     batches = plan_batches(part_files, cfg.parts_per_batch)
     log(f"{len(part_files)} parts -> {len(batches)} batches of ≤{cfg.parts_per_batch}")

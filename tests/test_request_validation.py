@@ -87,6 +87,18 @@ class TestInputContract(unittest.TestCase):
         with self.assertRaises(RequestValidationError):
             validate_evaluation_request(**{**evaluation_request(), "statement_text": "\ud800"})
 
+    def test_record_admission_counts_utf8_once_per_page(self):
+        class CountedText(str):
+            encodes = 0
+            def encode(self, *args, **kwargs):
+                self.encodes += 1
+                return super().encode(*args, **kwargs)
+        text = CountedText("é" * 100_000)
+        record = ExtractedDocument("synthetic.txt", [DocumentPage("synthetic.txt", 1, text)])
+        with patch("app.prompt_sanitize.sanitize_for_prompt", side_effect=AssertionError("Full page sanitized")):
+            self.assertEqual(validate_records([record]), (1, 200_000))
+        self.assertEqual(text.encodes, 1)
+
 
 class TestDirectBoundaries(unittest.TestCase):
     def test_invalid_statement_never_reserves_quota_or_calls_model(self):
@@ -209,6 +221,22 @@ class TestQueuedBoundaries(unittest.TestCase):
 
 
 class TestUIBoundaries(unittest.TestCase):
+    def test_each_flow_checks_record_text_once_before_endpoint_gate(self):
+        from app.views import draft_view, evaluate_view
+        for view in (draft_view, evaluate_view):
+            st_mock, _ = _fake_streamlit()
+            with patch.object(view, "st", st_mock), patch.object(view, "run_log_event"), \
+                    patch.object(view, "check_endpoint_gate", return_value=False), \
+                    patch.object(view.job_runner, "queue_mode_active", return_value=False), \
+                    patch("app.request_validation.validate_records", wraps=validate_records) as check, \
+                    patch.object(view, "append_follow_up_answers", side_effect=lambda text, **kw: text):
+                if view is draft_view:
+                    view._run_draft_flow(rid="synthetic", **draft_request())
+                else:
+                    with patch.object(view, "ensure_request_id", return_value="synthetic"):
+                        view._run_evaluation_flow(**evaluation_request())
+            check.assert_called_once()
+
     def test_invalid_evaluation_flow_stops_before_preflight_or_queue(self):
         from app.views import evaluate_view as view
         for fields in ({"statement_text": " "}, {"statement_text": 42}, {"statement_text": "x" * (MAX_STATEMENT_PAYLOAD_CHARS + 1)},
@@ -242,6 +270,38 @@ class TestUIBoundaries(unittest.TestCase):
 
 
 class TestBatchBoundaries(unittest.TestCase):
+    def test_mixed_readable_and_blank_parts_keep_readable_batch_review(self):
+        from tests.test_batch_draft import batch_draft, _main_argv
+        from app.llm import ChatProbe
+        from app.medical_review import MedicalDigest
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); arguments = _main_argv(root)
+            (root / "records" / "Part2.txt").write_text(" \n ")
+            with patch("app.config.load_settings", return_value=MagicMock()), \
+                    patch("app.llm.probe_chat", return_value=ChatProbe(200, "", "OK")) as probe, \
+                    patch("app.llm.LLMClient"), patch.object(batch_draft, "log"), \
+                    patch("app.medical_review.review_medical_records", return_value=MedicalDigest(pages_reviewed=1)) as review:
+                self.assertEqual(batch_draft.main(arguments), 0)
+            probe.assert_called_once(); review.assert_called_once()
+            self.assertEqual([d.filename for d in review.call_args.args[1]], ["Part1.txt"])
+
+    def test_legacy_unbound_facts_can_finalize_with_current_usable_inputs(self):
+        from tests.test_batch_draft import TestFinalPhaseSemantics
+        result = TestFinalPhaseSemantics()._run_final("ok", legacy_unknown_only=True)
+        self.assertEqual(result["legacy_source_facts_unresolved"], 1)
+        self.assertIn("Legacy source coverage", result["grounding_markdown"])
+        self.assertTrue(result["statement"])
+
+    def test_legacy_unbound_facts_without_usable_inputs_never_call_model(self):
+        from tests.test_batch_draft import batch_draft, _make_cfg
+        from app.medical_review import MedicalDigest, MedicalFact
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _make_cfg(Path(tmp)); llm = MagicMock()
+            state = batch_draft.digest_to_state(MedicalDigest(facts=[MedicalFact("2023", "symptom", "Legacy fact", "p. 1")]))
+            with self.assertRaises(RequestValidationError):
+                batch_draft.final_phase(llm, cfg, {"legacy": state})
+            llm.chat.assert_not_called(); llm.chat_json.assert_not_called()
+
     def test_invalid_batch_config_stops_both_programmatic_paths(self):
         from tests.test_batch_draft import batch_draft, _make_cfg
         with tempfile.TemporaryDirectory() as tmp:

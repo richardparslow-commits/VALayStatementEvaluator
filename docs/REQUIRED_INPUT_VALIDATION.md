@@ -9,8 +9,8 @@ client. Saved submission retries validate their retained payload before enqueue.
 
 Evaluation requires a nonblank text statement and extracted medical records.
 Drafting requires nonblank text observations, condition, claim type, and extracted
-medical records. Required text must still contain something after prompt
-sanitization removes invisible characters. Numbers, booleans, containers and null
+medical records. Required text must contain a visible, non-whitespace character. This check uses
+the sanitizer’s invisible-character set without copying/sanitizing whole pages. Numbers, booleans, containers and null
 values are rejected rather than converted into strings or empty defaults.
 
 The payload ceiling for statements and observations is 120,000 characters. This
@@ -35,10 +35,15 @@ through the tolerant saved-result deserializer. Inline and externalized records
 have the same request contract. Result decoding keeps its legacy compatibility.
 
 The batch script validates its configuration and selected source records before
-its credential probe, checks
-extracted groups before medical review, and validates restored final-phase
-sources before merge/summarization calls. It preserves raw witness-JSON types so
-an invalid number or null cannot become invented witness text.
+its credential probe, checks extracted groups before medical review, and validates
+final-phase inputs before merge/summarization calls. Mixed readable/unreadable
+parts retain the existing batch skip and coverage behavior when usable text
+remains; no usable records stops the run before any provider call. If legacy
+facts have no recoverable source filenames, current readable parts may satisfy
+the input requirement, but those facts retain their unresolved provenance warning.
+Those current parts do not establish bindings for old facts. The script preserves
+raw witness-JSON types so an invalid number or null cannot become invented witness
+text.
 
 Errors contain labels, policy limits and error kinds, without repeating submitted
 values. Drafting preserves its `DraftingPayloadError` API; queue boundaries wrap

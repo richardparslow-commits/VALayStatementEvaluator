@@ -489,7 +489,7 @@ class TestFinalPhaseSemantics(unittest.TestCase):
     ) + DRAFT
 
     def _run_final(self, review_behavior: str, *,
-                   bad_grounding_once: bool = False, grounding_override=None, legacy_unknown_sources=False) -> dict:
+                   bad_grounding_once: bool = False, grounding_override=None, legacy_unknown_sources=False, legacy_unknown_only=False) -> dict:
         from app.medical_review import MedicalDigest, MedicalFact
 
         cfg = _make_cfg(Path(tempfile.mkdtemp()))
@@ -534,6 +534,8 @@ class TestFinalPhaseSemantics(unittest.TestCase):
                     return ["not", "an", "object"]
                 return complete_grounding() if grounding_override is None else grounding_override
 
+        if legacy_unknown_only:
+            batch_state.pop("source_files")
         states = {"batch_01": batch_state}
         if legacy_unknown_sources:
             states["batch_legacy"] = batch_draft.digest_to_state(MedicalDigest(

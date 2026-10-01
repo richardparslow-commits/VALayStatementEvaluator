@@ -209,8 +209,6 @@ def render_evaluate_tab() -> None:
 
     run = st.button("🔍 Run exhaustive evaluation", type="primary", key="eval_run")
     if run:
-        if not _validate_evaluate_inputs(statement_text, records):
-            return
         _run_evaluation_flow(statement_text, records, collect_aa_answers("eval"))
 
     # A queued run outlives this browser session, so re-attach to one started
@@ -266,14 +264,16 @@ def _render_statement_length_guidance(statement_text: str) -> None:
         , container=st, method="caption")
 
 
-def _validate_evaluate_inputs(statement_text: str, records: list, witness: dict[str, str] | None = None) -> bool:
+def _validate_evaluate_inputs(statement_text: str, records: list, witness: dict[str, str] | None = None,
+                              *, validate_record_set: bool = True) -> bool:
     """Pre-run validation; shows the specific error and returns False when invalid."""
     # Minted rather than defaulted to "-": each rejection below is written to the
     # run log under this id, and an id the user cannot see is not a reference.
     rid = ensure_request_id()
     from ..request_validation import RequestValidationError, validate_evaluation_request
     try:
-        validate_evaluation_request(statement_text=statement_text, records=records, witness=witness)
+        validate_evaluation_request(statement_text=statement_text, records=records, witness=witness,
+                                    validate_record_set=validate_record_set)
     except RequestValidationError as exc:
         reason = {"statement_text": "no_statement", "records": "no_records"}.get(exc.field, exc.reason)
         run_log_event("evaluate", "rejected", request_id=rid, error=str(exc), reason=reason)
@@ -312,10 +312,10 @@ def _run_evaluation_flow(statement_text: str, records: list, witness: dict[str, 
     if not _validate_evaluate_inputs(statement_text, records, witness):
         return
     queued = job_runner.queue_mode_active()
-    _input_key = evaluation_input_key(statement_text, records, witness or {})
+    _input_key = "" if queued else evaluation_input_key(statement_text, records, witness or {})
     submitted_statement = (statement_text if queued else
                            append_follow_up_answers(statement_text.strip(), slot="eval", input_key=_input_key))
-    if not _validate_evaluate_inputs(submitted_statement, records, witness):
+    if not _validate_evaluate_inputs(submitted_statement, records, witness, validate_record_set=False):
         return
     # Before anything is spent: a configuration whose every call is rejected is
     # detectable in one request. This is the only entry point into the pipeline, so

@@ -9,7 +9,7 @@ from typing import Any
 
 from . import config
 from .documents import DRAFT_INTERNAL_MAX_CHARS, EVALUATE_INTERNAL_MAX_CHARS, DocumentPage, ExtractedDocument
-from .prompt_sanitize import sanitize_for_prompt, validate_witness_field
+from .prompt_sanitize import has_prompt_text, validate_witness_field
 
 MAX_STATEMENT_PAYLOAD_CHARS = EVALUATE_INTERNAL_MAX_CHARS + 40_000
 MAX_OBSERVATIONS_PAYLOAD_CHARS = DRAFT_INTERNAL_MAX_CHARS + 40_000
@@ -27,7 +27,7 @@ class RequestValidationError(ValueError):
         self.reason = reason
 
 
-def validate_text(value: Any, *, field: str, label: str, limit: int, required: bool = True) -> None:
+def validate_text(value: Any, *, field: str, label: str, limit: int, required: bool = True) -> int:
     if not isinstance(value, str):
         raise RequestValidationError(f"{label} must be plain text.", field=field)
     if len(value) > limit:
@@ -35,10 +35,10 @@ def validate_text(value: Any, *, field: str, label: str, limit: int, required: b
             f"{label} is too large to send safely. Shorten or split it to at most {limit:,} characters.",
             field=field, reason="payload_too_large",
         )
-    if required and (not value.strip() or not sanitize_for_prompt(value, max_chars=limit).strip()):
+    if required and not has_prompt_text(value):
         raise RequestValidationError(f"Provide {label.lower()} before starting the run.", field=field)
     try:
-        value.encode("utf-8")
+        return len(value.encode("utf-8"))
     except UnicodeEncodeError as exc:
         raise RequestValidationError(f"{label} contains invalid text encoding.", field=field) from exc
 
@@ -59,7 +59,7 @@ def validate_witness(witness: Any, *, optional: bool = False) -> None:
             raise RequestValidationError("Witness details are malformed. " + message, field="witness")
 
 
-def validate_records(records: Any) -> None:
+def validate_records(records: Any) -> tuple[int, int]:
     if not isinstance(records, list) or not records:
         raise RequestValidationError("Upload at least one medical record file with extractable text.", field="records")
     source_pages = text_bytes = 0
@@ -75,8 +75,7 @@ def validate_records(records: Any) -> None:
             if (not isinstance(page, DocumentPage) or page.filename != doc.filename
                     or type(page.page) is not int or page.page < 1 or page.kind not in ("page", "block")):
                 raise RequestValidationError("Medical record page addresses are invalid.", field="records")
-            validate_text(page.text, field="records", label="Record page text", limit=config.MAX_TOTAL_UPLOAD_BYTES)
-            text_bytes += len(page.text.encode("utf-8"))
+            text_bytes += validate_text(page.text, field="records", label="Record page text", limit=config.MAX_TOTAL_UPLOAD_BYTES)
         source_pages += max(doc.source_page_count, len(doc.pages))
     if source_pages > config.MAX_RECORD_PAGES:
         raise RequestValidationError("Medical records exceed the configured page limit. Split the record set.",
@@ -85,10 +84,14 @@ def validate_records(records: Any) -> None:
         raise RequestValidationError("Medical record text exceeds the configured total input limit. Split the record set.",
                                      field="records", reason="payload_too_large")
 
+    return source_pages, text_bytes
 
-def validate_evaluation_request(*, statement_text: Any, records: Any, witness: Any = None) -> None:
+
+def validate_evaluation_request(*, statement_text: Any, records: Any, witness: Any = None,
+                                validate_record_set: bool = True) -> None:
     validate_text(statement_text, field="statement_text", label="The lay statement", limit=MAX_STATEMENT_PAYLOAD_CHARS)
-    validate_records(records)
+    if validate_record_set:
+        validate_records(records)
     validate_witness(witness, optional=True)
 
 
