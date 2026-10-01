@@ -148,6 +148,8 @@ def request_documents_from_json(raw: Any) -> list[ExtractedDocument]:
     for entry in raw:
         if not isinstance(entry, dict) or not isinstance(entry.get("filename"), str):
             raise PayloadError("Medical record filenames must be text.")
+        if "pagination" in entry and entry["pagination"] not in ("page", "block"):
+            raise PayloadError("Medical record pagination must be a page or block citation unit.")
         pages = entry.get("pages")
         if not isinstance(pages, list) or not pages:
             raise PayloadError("Each medical record needs extractable page text.")
@@ -155,6 +157,8 @@ def request_documents_from_json(raw: Any) -> list[ExtractedDocument]:
             if (not isinstance(page, dict) or not isinstance(page.get("text"), str)
                     or not page["text"].strip() or type(page.get("page")) is not int or page["page"] < 1):
                 raise PayloadError("Medical record pages must contain text and valid page addresses.")
+            if "kind" in page and page["kind"] not in ("page", "block"):
+                raise PayloadError("Medical record citation units must be page or block.")
     records = documents_from_json(raw)
     if len(records) != len(raw):
         raise PayloadError("Medical record inputs could not be decoded completely.")

@@ -35,7 +35,7 @@ def draft_request():
 
 
 def invalid_values(limit):
-    return ("", " \t\n\u2003", "\u200b\ufeff", None, 7, True, [], {}, "x" * (limit + 1))
+    return ("", " \t\n\u2003", "\u200b\ufeff", "\x00\x01\x7f\x80", "\u061c", None, 7, True, [], {}, "x" * (limit + 1))
 
 
 class TestInputContract(unittest.TestCase):
@@ -172,6 +172,19 @@ class TestQueuedBoundaries(unittest.TestCase):
             raw = dict(body); raw.pop(field)
             with self.subTest(field=field), self.assertRaises(PayloadError): decode_job("draft", json.dumps(raw))
 
+    def test_malformed_citation_units_cannot_be_coerced_to_page(self):
+        body = json.loads(encode_job("evaluate", EvaluateJob("statement", docs())))
+        for value in (None, 7, False, {}, [], "", "chapter"):
+            for field in ("kind", "pagination"):
+                raw = deepcopy(body); record = raw["documents"][0]
+                (record["pages"][0] if field == "kind" else record)[field] = value
+                with self.subTest(field=field, value_type=type(value).__name__), self.assertRaises(PayloadError):
+                    decode_job("evaluate", json.dumps(raw))
+        # Older requests omitted citation units; their existing page default remains.
+        legacy = deepcopy(body); record = legacy["documents"][0]
+        record.pop("pagination"); record["pages"][0].pop("kind")
+        self.assertEqual(decode_job("evaluate", json.dumps(legacy)).records[0].pages[0].kind, "page")
+
     def test_wrong_witness_types_cannot_be_coerced_to_optional_empty_fields(self):
         for kind, job in (("evaluate", EvaluateJob("statement", docs())), ("draft", DraftJob(**draft_request()))):
             body = json.loads(encode_job(kind, job))
@@ -221,6 +234,53 @@ class TestQueuedBoundaries(unittest.TestCase):
 
 
 class TestUIBoundaries(unittest.TestCase):
+    def test_saved_answers_can_cross_recommended_limit_without_missing_checkbox(self):
+        from app.views import draft_view, evaluate_view
+        for view in (draft_view, evaluate_view):
+            st_mock, session = _fake_streamlit()
+            with patch.object(view, "st", st_mock), patch.object(view, "run_log_event"), \
+                    patch.object(view, "check_endpoint_gate", return_value=False) as gate, \
+                    patch.object(view.job_runner, "queue_mode_active", return_value=False), \
+                    patch.object(view, "append_follow_up_answers", return_value="x" * 60_001):
+                if view is draft_view:
+                    view._run_draft_flow(rid="synthetic", **draft_request())
+                else:
+                    with patch.object(view, "ensure_request_id", return_value="synthetic"):
+                        view._run_evaluation_flow(**evaluation_request())
+            self.assertNotIn("draft_confirm_oversize" if view is draft_view else "eval_confirm_oversize", session)
+            gate.assert_called_once()
+
+    def test_rejection_logs_preserve_capacity_invalid_and_missing_reasons(self):
+        from app.views import draft_view, evaluate_view
+        cases = ((evaluate_view, {"statement_text": "x" * (MAX_STATEMENT_PAYLOAD_CHARS + 1)}, "payload_too_large"),
+                 (evaluate_view, {"statement_text": 7}, "payload_invalid"),
+                 (evaluate_view, {"statement_text": " "}, "no_statement"),
+                 (draft_view, {"observations": "x" * (MAX_OBSERVATIONS_PAYLOAD_CHARS + 1)}, "payload_too_large"),
+                 (draft_view, {"condition": "x" * 501}, "payload_too_large"),
+                 (draft_view, {"observations": 7}, "payload_invalid"),
+                 (draft_view, {"observations": " "}, "missing_observations"))
+        for view, fields, reason in cases:
+            st_mock, _ = _fake_streamlit()
+            with self.subTest(reason=reason, fields=list(fields)), patch.object(view, "st", st_mock), \
+                    patch.object(view, "run_log_event") as log:
+                if view is draft_view:
+                    request = {**draft_request(), **fields}
+                    self.assertFalse(view._validate_draft_inputs(request["records"], request["observations"], request["condition"],
+                                                                "synthetic", claim_type=request["claim_type"], witness=request["witness"]))
+                else:
+                    with patch.object(view, "ensure_request_id", return_value="synthetic"):
+                        self.assertFalse(view._validate_evaluate_inputs(**{**evaluation_request(), **fields}))
+            self.assertEqual(log.call_args.kwargs["reason"], reason)
+        for view in (draft_view, evaluate_view):
+            st_mock, _ = _fake_streamlit()
+            with patch.object(view, "st", st_mock), patch.object(view, "run_log_event") as log, patch.object(config, "MAX_RECORD_PAGES", 0):
+                if view is draft_view:
+                    self.assertFalse(view._validate_draft_inputs(docs(), "obs", "cond", "synthetic"))
+                else:
+                    with patch.object(view, "ensure_request_id", return_value="synthetic"):
+                        self.assertFalse(view._validate_evaluate_inputs("statement", docs()))
+            self.assertEqual(log.call_args.kwargs["reason"], "payload_too_large")
+
     def test_each_flow_checks_record_text_once_before_endpoint_gate(self):
         from app.views import draft_view, evaluate_view
         for view in (draft_view, evaluate_view):

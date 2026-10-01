@@ -36,7 +36,7 @@ def validate_text(value: Any, *, field: str, label: str, limit: int, required: b
             field=field, reason="payload_too_large",
         )
     if required and not has_prompt_text(value):
-        raise RequestValidationError(f"Provide {label.lower()} before starting the run.", field=field)
+        raise RequestValidationError(f"Provide {label.lower()} before starting the run.", field=field, reason="payload_missing")
     try:
         return len(value.encode("utf-8"))
     except UnicodeEncodeError as exc:
@@ -60,8 +60,11 @@ def validate_witness(witness: Any, *, optional: bool = False) -> None:
 
 
 def validate_records(records: Any) -> tuple[int, int]:
-    if not isinstance(records, list) or not records:
-        raise RequestValidationError("Upload at least one medical record file with extractable text.", field="records")
+    if not isinstance(records, list):
+        raise RequestValidationError("Medical records must be a list of extracted documents.", field="records")
+    if not records:
+        raise RequestValidationError("Upload at least one medical record file with extractable text.",
+                                     field="records", reason="payload_missing")
     source_pages = text_bytes = 0
     for doc in records:
         if not isinstance(doc, ExtractedDocument):

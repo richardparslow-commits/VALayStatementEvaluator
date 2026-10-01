@@ -422,7 +422,7 @@ _NO_WITNESS = object()
 
 def _validate_draft_inputs(records: list, observations: str, condition: str, rid: str,
                            *, claim_type: str = "Service connection", witness: Any = _NO_WITNESS,
-                           validate_record_set: bool = True) -> bool:
+                           validate_record_set: bool = True, confirm_oversize: bool = True) -> bool:
     """Pre-run validation; shows the specific error and returns False when invalid.
 
     Every rejection is recorded in the persistent run log so the reference shown
@@ -436,11 +436,13 @@ def _validate_draft_inputs(records: list, observations: str, condition: str, rid
         validate_draft_request(observations=observations, condition=condition, claim_type=claim_type,
                                witness={} if witness is _NO_WITNESS else witness, validate_record_set=False)
     except RequestValidationError as exc:
-        reason = {"records": "no_records", "observations": "missing_observations", "condition": "missing_condition"}.get(exc.field, exc.reason)
+        reason = ({"records": "no_records", "observations": "missing_observations", "condition": "missing_condition",
+                   "claim_type": "missing_claim_type"}.get(exc.field, exc.reason)
+                  if exc.reason == "payload_missing" else exc.reason)
         run_log_event("draft", "rejected", request_id=rid, error=str(exc), reason=reason)
         pilot.display(f"{exc}{reference_suffix(rid)}", container=st, method="error")
         return False
-    if len(observations) > MAX_OBSERVATIONS_CHARS and not st.session_state.get(
+    if confirm_oversize and len(observations) > MAX_OBSERVATIONS_CHARS and not st.session_state.get(
         "draft_confirm_oversize"
     ):
         over = len(observations) - MAX_OBSERVATIONS_CHARS
@@ -477,7 +479,7 @@ def _run_draft_flow(
     queued = job_runner.queue_mode_active()
     submitted_observations = observations if queued else append_follow_up_answers(observations.strip(), slot="draft")
     if not _validate_draft_inputs(records, submitted_observations, condition, rid, claim_type=claim_type, witness=witness,
-                                  validate_record_set=False):
+                                  validate_record_set=False, confirm_oversize=False):
         return
     # Before anything is spent: a configuration whose every call is rejected is
     # detectable in one request. Covers the queued path too — this is the only

@@ -67,7 +67,7 @@ def validate_drafting_request(
             witness=witness, records=records, validate_record_set=records is not _NO_RECORDS,
         )
     except RequestValidationError as exc:
-        raise DraftingPayloadError(str(exc), error_kind=exc.reason,
+        raise DraftingPayloadError(str(exc), error_kind="payload_invalid" if exc.reason == "payload_missing" else exc.reason,
                                    diagnostics=f"invalid input field={exc.field} reason={exc.reason}") from exc
 
 

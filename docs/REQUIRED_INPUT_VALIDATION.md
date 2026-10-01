@@ -9,7 +9,7 @@ client. Saved submission retries validate their retained payload before enqueue.
 
 Evaluation requires a nonblank text statement and extracted medical records.
 Drafting requires nonblank text observations, condition, claim type, and extracted
-medical records. Required text must contain a visible, non-whitespace character. This check uses
+medical records. Required text must contain a printable, visible, non-whitespace character. This check uses
 the sanitizer’s invisible-character set without copying/sanitizing whole pages. Numbers, booleans, containers and null
 values are rejected rather than converted into strings or empty defaults.
 
@@ -17,7 +17,9 @@ The payload ceiling for statements and observations is 120,000 characters. This
 preserves drafting's existing ceiling and gives both paths bounded room for
 follow-up answers. It is distinct from the existing 60,000-character recommended
 limit and 80,000-character prompt budget: those still carry their confirmation
-and truncation warnings. Passing input validation does not mean every character
+and truncation warnings. The post-append check applies the hard ceiling so saved
+answers cannot require a confirmation checkbox that the original-input UI never
+rendered. Passing input validation does not mean every character
 will reach every prompt.
 
 Condition, claim type, filenames and ordinary witness values are bounded at 500
@@ -45,6 +47,7 @@ Those current parts do not establish bindings for old facts. The script preserve
 raw witness-JSON types so an invalid number or null cannot become invented witness
 text.
 
+Rejection logs distinguish missing fields, invalid payloads and capacity limits.
 Errors contain labels, policy limits and error kinds, without repeating submitted
 values. Drafting preserves its `DraftingPayloadError` API; queue boundaries wrap
 contract failures in `PayloadError`; evaluation exposes `RequestValidationError`.
