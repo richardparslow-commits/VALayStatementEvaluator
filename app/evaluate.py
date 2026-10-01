@@ -47,6 +47,7 @@ from .medical_review import (
     retrieve_evidence,
     review_medical_records,
 )
+from .factual_integrity import FACTUAL_POLICY, attach_review, review_markdown
 from .aa_intake import care_gaps_text
 
 # Feature: Condition-Specific Templates
@@ -563,6 +564,8 @@ class EvaluationResult:
     verification_policy: str = ""
     scoring_policy: str = ""
     scoring_status: str = ""
+    factual_inputs: dict[str, Any] = field(default_factory=dict)
+    factual_review: dict[str, Any] = field(default_factory=dict)
 
     @property
     def contradiction_count(self) -> int:
@@ -780,7 +783,7 @@ def _run_evaluation(
     progress: ProgressCallback | None,
     witness: dict[str, str],
 ) -> EvaluationResult:
-    result = EvaluationResult()
+    result = EvaluationResult(factual_inputs={"policy": FACTUAL_POLICY, "account": statement_text, "witness": dict(witness)})
     result.input_chars = len(statement_text)
     # Preserve complete source evidence — the raw record pages that
     # produced every digest fact and verification. This store lives
@@ -1025,6 +1028,11 @@ def _draft_revision(
     A failure here should not lose the completed evaluation, so errors are
     swallowed and the revision fields simply stay empty.
     """
+    result.revision_notes = ""
+    result.revision_changes = []
+    result.revised_statement = ""
+    result.added_facts_to_verify = []
+    result.factual_review = {}
     if not evaluation_is_complete(result):
         result.revision_notes = ""
         result.revision_changes = []
@@ -1069,12 +1077,22 @@ def _draft_revision(
         )
         result.revision_notes = "Revision draft unavailable — the model call failed."
         return
+    if (not isinstance(revise_data, dict) or not isinstance(revise_data.get("revised_statement"), str)
+            or not isinstance(revise_data.get("revision_notes", ""), str)
+            or not isinstance(revise_data.get("changes", []), list)
+            or any(not isinstance(row, dict) or any(not isinstance(v, str) for v in row.values())
+                   for row in revise_data.get("changes", []))
+            or not isinstance(revise_data.get("added_facts_to_verify", []), list)
+            or any(not isinstance(value, str) for value in revise_data.get("added_facts_to_verify", []))):
+        result.revision_notes = "Revision unavailable: malformed output cannot enter factual review."
+        return
     result.revision_notes = revise_data.get("revision_notes", "")
     result.revision_changes = revise_data.get("changes", [])
     result.revised_statement = revise_data.get("revised_statement", "")
     result.added_facts_to_verify = [
-        str(f) for f in revise_data.get("added_facts_to_verify", []) if str(f).strip()
+        f for f in revise_data.get("added_facts_to_verify", []) if f.strip()
     ]
+    attach_review(result, result.revised_statement)
     report(0.94, "Improvement suggestions drafted.")
 
 
@@ -1119,12 +1137,13 @@ def source_reference_notice(result: EvaluationResult) -> str:
 
 
 def evaluation_report_markdown(result: EvaluationResult) -> str:
-    """Keep saved report content, adding the missing-policy notice to exports."""
+    """Rebuild from retained fields; cached prose cannot grant factual approval."""
     if not evaluation_is_complete(result):
         # Rebuild from retained review data; a historical cached report may carry
         # invalid grades or a rewrite that predates the validation policy.
         return build_report(result, "")
-    report = result.report_markdown
+    original = result.factual_inputs.get("account", "")
+    report = build_report(result, original if isinstance(original, str) else "")
     if (
         getattr(result, "verification_policy", "") != SOURCE_REFERENCE_POLICY
         and LEGACY_REFERENCE_NOTICE not in report
@@ -2109,6 +2128,13 @@ def build_report(
             lines.append("```text")
             lines.append(result.revised_statement)
             lines.append("```")
+            lines.append("")
+            attach_review(result, result.revised_statement)
+            lines.append(review_markdown(result.factual_review))
+            lines.append("")
+        elif result.revision_changes:
+            attach_review(result, "")
+            lines.append(review_markdown(result.factual_review))
             lines.append("")
 
     if result.digest and result.digest.summary:

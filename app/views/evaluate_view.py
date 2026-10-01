@@ -1567,6 +1567,13 @@ def _render_evaluation_results(eval_result: Any) -> None:
                         for c in eval_result.revision_changes
                     ]
                     st.dataframe(change_rows, width="stretch", hide_index=True)
+                    from ..factual_integrity import attach_review, review_markdown
+                    attach_review(eval_result, eval_result.revised_statement)
+                    with st.expander("Factual checks for proposed edits"):
+                        for edit in eval_result.factual_review.get("proposed_edits", []):
+                            # Plain text: model changes and witness excerpts cannot render controls.
+                            comparison = {**edit["comparison"], "ledger": eval_result.factual_review.get("ledger", [])}
+                            st.text(f"Proposed edit {edit['index']}\n" + review_markdown(comparison))
                 if eval_result.added_facts_to_verify:
                     pilot.display(
                         "**Record-sourced facts added — the witness must confirm each before signing:**"
@@ -1584,7 +1591,9 @@ def _render_evaluation_results(eval_result: Any) -> None:
                     height=420,
                     key="eval_revised_statement",
                 )
-                export_confirmed = pilot.confirm_export(revised)
+                from .factual_review import render_factual_review
+                factual_confirmed = render_factual_review(eval_result, revised, slot="eval")
+                export_confirmed = factual_confirmed and pilot.confirm_export(revised)
                 col_a, col_b = st.columns(2)
                 pilot.file_download(
                     "⬇️ Download revised statement (.txt)",

@@ -123,6 +123,15 @@ def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def saved_factual_review(final: dict) -> dict:
+    """Recompute resumed output; saved review flags never grant approval."""
+    from app.job_payload import draft_from_json
+    return draft_from_json({"draft": final.get("statement", ""),
+                            "factual_inputs": final.get("factual_inputs"),
+                            "digest": final.get("factual_digest"),
+                            "evidence_source": final.get("factual_evidence_source")}).factual_review
+
+
 def _format_with(template: str, **kwargs: str) -> str:
     """Format *template* with only the placeholders it actually declares.
 
@@ -938,8 +947,20 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
                 f"> ⚠️ Legacy source coverage: {legacy_unresolved_facts} fact(s) have no recoverable source filename; "
                 "re-run record review before relying on those facts.\n\n"
             )
+        from app.factual_integrity import FACTUAL_POLICY, attach_review
+        from app.job_payload import digest_to_json
+        from app.draft import _pages_to_source
+        factual_result = DraftResult(draft=final, digest=combined, evidence_source=_pages_to_source(source_docs),
+                                     factual_inputs={"policy": FACTUAL_POLICY, "account": cfg.observations,
+                                                     "witness": {**cfg.witness, "Claimed condition": cfg.condition, "Claim type": cfg.claim_type}})
+        attach_review(factual_result, final)
         return {
             "statement": final,
+            "statement_status": "unreviewed",
+            "factual_inputs": factual_result.factual_inputs,
+            "factual_review": factual_result.factual_review,
+            "factual_digest": digest_to_json(combined),
+            "factual_evidence_source": factual_result.evidence_source,
             "grounding_markdown": coverage_notice + grounding_markdown(
                 DraftResult(grounding=grounding, grounding_policy=GROUNDING_SOURCE_POLICY)
             ) if isinstance(grounding, dict) else "",
@@ -1180,10 +1201,14 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     (cfg.out_dir / "statement.md").write_text(
-        f"# Draft lay statement — {cfg.condition}\n\n{final['statement']}\n",
+        f"# Draft lay statement — {cfg.condition}\n\n"
+        "> Unreviewed output: compare every sentence with the original witness account and source records before use.\n\n"
+        f"{final['statement']}\n",
         encoding="utf-8",
     )
     (cfg.out_dir / "grounding.md").write_text(saved_grounding_markdown(final), encoding="utf-8")
+    from app.factual_integrity import review_markdown
+    (cfg.out_dir / "factual_review.md").write_text(review_markdown(saved_factual_review(final)), encoding="utf-8")
     log(f"ALL DONE in {(time.time() - t_all) / 60:.1f} min — statement "
         f"{len(final['statement']):,} chars, {final['facts_total']} facts "
         f"(pre-merge {final['facts_pre_merge']}), review issues {len(final['review_issues'])}")

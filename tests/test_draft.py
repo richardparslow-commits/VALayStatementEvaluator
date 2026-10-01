@@ -526,7 +526,7 @@ class TestRunDraftEdgeCases(unittest.TestCase):
         seen = []
         run_draft(_FakeLLM(), [_doc()], WITNESS, "obs", "cond", "Service connection", progress=lambda f, m: seen.append((f, m)))
         self.assertTrue(any("Step" in m for _, m in seen))
-        self.assertEqual(seen[-1][1], "Draft complete.")
+        self.assertEqual(seen[-1][1], "Review draft complete; source and witness approval required.")
 
     def test_payload_too_large_rejected_before_model_call(self):
         llm = _FakeLLM()
