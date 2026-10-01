@@ -393,6 +393,10 @@ def run_draft(
     progress: ProgressCallback | None = None,
 ) -> DraftResult:
     """Execute the full drafting pipeline."""
+    validate_drafting_request(
+        observations=observations, condition=condition, claim_type=claim_type,
+        witness=witness, records=records,
+    )
     rid = get_request_id() or "-"
     t0 = time.perf_counter()
     pages = sum(len(d.pages) for d in records)
@@ -407,12 +411,6 @@ def run_draft(
     from . import pilot
     with pilot.action_budget(records), tracing.run_span("draft", files=len(records), pages=pages, chars=len(observations)):
         try:
-            validate_drafting_request(
-                observations=observations,
-                condition=condition,
-                claim_type=claim_type,
-                witness=witness,
-            )
             result = _run_draft(
                 llm, records, witness, observations, condition, claim_type, progress
             )

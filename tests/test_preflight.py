@@ -21,6 +21,7 @@ from urllib.error import HTTPError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
+from app.documents import document_from_text
 
 from app.llm import CHAT_PROBE_MAX_TOKENS, ChatProbe, ModelProbe, probe_chat  # noqa: E402
 from app import preflight  # noqa: E402
@@ -1100,7 +1101,7 @@ class TestRunFlowsAreStopped(unittest.TestCase):
         ) as queued, patch.object(draft_view, "get_llm") as get_llm:
             draft_view._run_draft_flow(
                 rid="req_blocked",
-                records=[MagicMock()],
+                records=[document_from_text("synthetic.txt", "Knee pain noted.")],
                 condition="knee",
                 claim_type="personal",
                 witness={
@@ -1125,7 +1126,7 @@ class TestRunFlowsAreStopped(unittest.TestCase):
         ), patch.object(evaluate_view, "_run_evaluation_queued") as queued, patch.object(
             evaluate_view, "new_run_request_id", return_value="req_blocked"
         ):
-            evaluate_view._run_evaluation_flow("statement", [MagicMock()])
+            evaluate_view._run_evaluation_flow("statement", [document_from_text("synthetic.txt", "Knee pain noted.")])
         queued.assert_not_called()
 
 

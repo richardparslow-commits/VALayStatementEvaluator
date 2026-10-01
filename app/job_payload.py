@@ -141,6 +141,26 @@ def document_from_json(raw: Any) -> ExtractedDocument | None:
                              coverage_known=data.get("schema_version") == 2 and data.get("coverage_known", True) is True)
 
 
+def request_documents_from_json(raw: Any) -> list[ExtractedDocument]:
+    """Read request pages without silently dropping malformed record text."""
+    if not isinstance(raw, list) or not raw:
+        raise PayloadError("Job payload carries no extractable record text.")
+    for entry in raw:
+        if not isinstance(entry, dict) or not isinstance(entry.get("filename"), str):
+            raise PayloadError("Medical record filenames must be text.")
+        pages = entry.get("pages")
+        if not isinstance(pages, list) or not pages:
+            raise PayloadError("Each medical record needs extractable page text.")
+        for page in pages:
+            if (not isinstance(page, dict) or not isinstance(page.get("text"), str)
+                    or not page["text"].strip() or type(page.get("page")) is not int or page["page"] < 1):
+                raise PayloadError("Medical record pages must contain text and valid page addresses.")
+    records = documents_from_json(raw)
+    if len(records) != len(raw):
+        raise PayloadError("Medical record inputs could not be decoded completely.")
+    return records
+
+
 def documents_to_json(records: list[ExtractedDocument]) -> list[dict[str, Any]]:
     return [document_to_json(doc) for doc in records]
 
@@ -475,6 +495,21 @@ def _dump(payload: dict[str, Any]) -> str:
     return encoded
 
 
+def validate_job(kind: str, job: EvaluateJob | DraftJob) -> None:
+    """Reject malformed requests before encoding, blob writes or worker calls."""
+    from .request_validation import RequestValidationError, validate_draft_request, validate_evaluation_request
+    try:
+        if kind == KIND_EVALUATE and isinstance(job, EvaluateJob):
+            validate_evaluation_request(statement_text=job.statement_text, records=job.records, witness=job.witness)
+        elif kind == KIND_DRAFT and isinstance(job, DraftJob):
+            validate_draft_request(observations=job.observations, condition=job.condition,
+                                   claim_type=job.claim_type, witness=job.witness, records=job.records)
+        else:
+            raise PayloadError("Job kind does not match its input type.")
+    except RequestValidationError as exc:
+        raise PayloadError(str(exc)) from exc
+
+
 def documents_bundle(job: EvaluateJob | DraftJob) -> bytes:
     """The bytes a blob store holds for a job: just its extracted documents.
 
@@ -482,12 +517,14 @@ def documents_bundle(job: EvaluateJob | DraftJob) -> bytes:
     useful: two users submitting the same record bundle reuse one blob, because
     the statement/observations sitting next to it never enter the hash.
     """
+    validate_job(KIND_EVALUATE if isinstance(job, EvaluateJob) else KIND_DRAFT, job)
     return dumps_documents(
         {"version": PAYLOAD_VERSION, "documents": documents_to_json(job.records)}
     )
 
 
 def _job_envelope(kind: str, job: EvaluateJob | DraftJob) -> dict[str, Any]:
+    validate_job(kind, job)
     base: dict[str, Any] = {
         "version": PAYLOAD_VERSION,
         "kind": kind,
@@ -566,35 +603,31 @@ def decode_job(
     if data.get("documents_ref") is not None:
         records = _documents_from_ref(data.get("documents_ref"), blob_store)
     else:
-        records = documents_from_json(data.get("documents"))
+        records = request_documents_from_json(data.get("documents"))
     if not records:
         raise PayloadError("job payload carries no extractable record text")
     request_id = _as_str(data.get("request_id"))
     sources = _str_items(data.get("record_sources"))
+    # Validate raw field types before the tolerant result deserializers can
+    # replace bad values with defaults. Requests must never be repaired silently.
+    job: EvaluateJob | DraftJob
     if kind == KIND_EVALUATE:
-        statement = _as_str(data.get("statement_text"))
-        if not statement.strip():
-            raise PayloadError("job payload carries no statement text")
-        return EvaluateJob(
-            statement_text=statement,
-            records=records,
-            request_id=request_id,
-            record_sources=sources,
-            witness=_str_map(data.get("witness")),
-            trace_context=_str_map(data.get("trace_context")),
+        job = EvaluateJob(
+            statement_text=data.get("statement_text", ""), records=records,
+            request_id=request_id, record_sources=sources,
+            witness=data.get("witness", {}), trace_context=_str_map(data.get("trace_context")),
         )
-    if kind == KIND_DRAFT:
-        return DraftJob(
-            records=records,
-            witness=_str_map(data.get("witness")),
-            observations=_as_str(data.get("observations")),
-            condition=_as_str(data.get("condition")),
-            claim_type=_as_str(data.get("claim_type")),
-            request_id=request_id,
-            record_sources=sources,
-            trace_context=_str_map(data.get("trace_context")),
+    elif kind == KIND_DRAFT:
+        job = DraftJob(
+            records=records, witness=data.get("witness", {}),
+            observations=data.get("observations", ""), condition=data.get("condition", ""),
+            claim_type=data.get("claim_type", ""), request_id=request_id,
+            record_sources=sources, trace_context=_str_map(data.get("trace_context")),
         )
-    raise PayloadError(f"unknown job kind: {kind!r}")
+    else:
+        raise PayloadError(f"unknown job kind: {kind!r}")
+    validate_job(kind, job)
+    return job
 
 
 def _documents_from_ref(raw: Any, blob_store: BlobStore | None) -> list[ExtractedDocument]:
@@ -612,7 +645,7 @@ def _documents_from_ref(raw: Any, blob_store: BlobStore | None) -> list[Extracte
         bundle = loads_documents(blob_store.get(ref))
     except BlobStoreError as exc:
         raise PayloadError(str(exc)) from exc
-    return documents_from_json(bundle.get("documents"))
+    return request_documents_from_json(bundle.get("documents"))
 
 
 def encode_result(run: RunResult) -> str:

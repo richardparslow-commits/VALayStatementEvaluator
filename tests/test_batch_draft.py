@@ -33,6 +33,7 @@ from unittest import mock
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 from tests.grounding_fixtures import complete_grounding
 
+from app.documents import document_from_text
 from app import config  # noqa: E402
 from app.llm import ChatProbe  # noqa: E402
 
@@ -488,7 +489,7 @@ class TestFinalPhaseSemantics(unittest.TestCase):
     ) + DRAFT
 
     def _run_final(self, review_behavior: str, *,
-                   bad_grounding_once: bool = False, grounding_override=None) -> dict:
+                   bad_grounding_once: bool = False, grounding_override=None, legacy_unknown_sources=False) -> dict:
         from app.medical_review import MedicalDigest, MedicalFact
 
         cfg = _make_cfg(Path(tempfile.mkdtemp()))
@@ -497,6 +498,10 @@ class TestFinalPhaseSemantics(unittest.TestCase):
                                description="Nightmares most nights", source="p. 1")],
             pages_in_files=10, pages_reviewed=10,
         ))
+
+        cfg.part_glob = "*.txt"
+        (cfg.records_dir / "Part1.txt").write_text("Nightmares most nights", encoding="utf-8")
+        batch_state["source_files"] = ["Part1.txt"]
 
         draft_text = self.DRAFT
         improved_text = self.IMPROVED
@@ -529,6 +534,10 @@ class TestFinalPhaseSemantics(unittest.TestCase):
                     return ["not", "an", "object"]
                 return complete_grounding() if grounding_override is None else grounding_override
 
+        states = {"batch_01": batch_state}
+        if legacy_unknown_sources:
+            states["batch_legacy"] = batch_draft.digest_to_state(MedicalDigest(
+                facts=[MedicalFact("2023", "symptom", "Unresolved legacy fact", "p. 1")]))
         llm = FakeLLM()
         # The final phase's own resilience (_retry_phase sleeps between outer
         # attempts and polls the breaker inside _wait_for_breaker) is covered
@@ -541,7 +550,7 @@ class TestFinalPhaseSemantics(unittest.TestCase):
                         side_effect=lambda llm2, d, progress=None, **kw: d.facts), \
              mock.patch.object(batch_draft.time, "sleep"), \
              mock.patch.object(batch_draft, "_wait_for_breaker"):
-            result = batch_draft.final_phase(llm, cfg, {"batch_01": batch_state})
+            result = batch_draft.final_phase(llm, cfg, states)
         result["_calls"] = (llm.chat_calls, llm.chat_json_calls)  # grounding + review
         return result
 
@@ -969,10 +978,10 @@ def _main_argv(tmp: Path) -> list[str]:
     final phase, which these tests do not own."""
     records = tmp / "records"
     records.mkdir(parents=True, exist_ok=True)
-    (records / "Part1.pdf").write_text("EVT", encoding="utf-8")
+    (records / "Part1.txt").write_text("EVT", encoding="utf-8")
     obs = tmp / "observations.txt"
     obs.write_text("I have watched the veteran decline since 2022.", encoding="utf-8")
-    return ["--records", str(records), "--glob", "Part*.pdf",
+    return ["--records", str(records), "--glob", "Part*.txt",
             "--out", str(tmp / "out"),
             "--condition", "PTSD", "--claim-type", "Initial claim",
             "--observations", str(obs), "--no-final"]
@@ -987,7 +996,7 @@ def _retry_argv(tmp: Path, final_error: str = "",
     """
     records = tmp / "records"
     records.mkdir(parents=True, exist_ok=True)
-    (records / "Part1.pdf").write_text("EVT", encoding="utf-8")
+    (records / "Part1.txt").write_text("EVT", encoding="utf-8")
     obs = tmp / "observations.txt"
     obs.write_text("I have watched the veteran decline since 2022.", encoding="utf-8")
     out = tmp / "out"
@@ -1000,7 +1009,7 @@ def _retry_argv(tmp: Path, final_error: str = "",
     elif final_result is not None:
         state["final"] = final_result
     batch_draft.save_state(cfg, state)
-    return ["--records", str(records), "--glob", "Part*.pdf",
+    return ["--records", str(records), "--glob", "Part*.txt",
             "--out", str(out),
             "--condition", "PTSD", "--claim-type", "Initial claim",
             "--observations", str(obs)]
@@ -1091,7 +1100,7 @@ class TestFatalAuthHaltsTheRun(unittest.TestCase):
 
         with (
             mock.patch("app.documents.records_from_local_path",
-                       side_effect=lambda p: ([], [])),
+                       side_effect=lambda p: ([document_from_text("synthetic.txt", "EVT note.")], [])),
             mock.patch("app.medical_review.review_medical_records", side_effect=refused),
         ):
             with self.assertRaises(SystemExit) as ctx:
@@ -1125,7 +1134,7 @@ class TestFatalAuthHaltsTheRun(unittest.TestCase):
                 mock.patch("app.config.load_settings", return_value=_gate_settings()),
                 mock.patch("app.llm.probe_chat", return_value=ChatProbe(200, "", "OK")),
                 mock.patch("app.documents.records_from_local_path",
-                           side_effect=lambda p: ([], [])),
+                           side_effect=lambda p: ([document_from_text("synthetic.txt", "EVT note.")], [])),
                 mock.patch("app.medical_review.review_medical_records",
                            side_effect=refused_review),
             ):
@@ -1165,6 +1174,10 @@ class TestMergeRoundCheckpointing(unittest.TestCase):
                     for i in range(200)],
             pages_in_files=10, pages_reviewed=10,
         ))
+
+        cfg.part_glob = "*.txt"
+        (cfg.records_dir / "Part1.txt").write_text("Synthetic record facts.", encoding="utf-8")
+        batch_state["source_files"] = ["Part1.txt"]
 
         class FactPassingLLM:
             """Merge calls pass facts through unchanged, like test_core's fake."""

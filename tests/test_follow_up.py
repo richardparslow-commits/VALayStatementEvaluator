@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
+from app.documents import document_from_text
 from tests.topic_fixtures import complete_topics, topic_result_fields
 from tests.rubric_fixtures import scored_result_fields
 
@@ -298,7 +299,7 @@ class TestFollowUpRunIntegration(unittest.TestCase):
         ):
             draft_view._run_draft_flow(
                 rid="req_draft_1",
-                records=[MagicMock(pages=["p1"])],
+                records=[document_from_text("synthetic.txt", "Knee pain noted.")],
                 condition="PTSD",
                 claim_type="Service connection",
                 witness={

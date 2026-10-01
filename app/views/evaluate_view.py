@@ -266,15 +266,18 @@ def _render_statement_length_guidance(statement_text: str) -> None:
         , container=st, method="caption")
 
 
-def _validate_evaluate_inputs(statement_text: str, records: list) -> bool:
+def _validate_evaluate_inputs(statement_text: str, records: list, witness: dict[str, str] | None = None) -> bool:
     """Pre-run validation; shows the specific error and returns False when invalid."""
     # Minted rather than defaulted to "-": each rejection below is written to the
     # run log under this id, and an id the user cannot see is not a reference.
     rid = ensure_request_id()
-    if not statement_text.strip():
-        msg = "Provide the lay statement first (upload or paste)."
-        run_log_event("evaluate", "rejected", request_id=rid, error=msg, reason="no_statement")
-        pilot.display(f"{msg}{reference_suffix(rid)}", container=st, method="error")
+    from ..request_validation import RequestValidationError, validate_evaluation_request
+    try:
+        validate_evaluation_request(statement_text=statement_text, records=records, witness=witness)
+    except RequestValidationError as exc:
+        reason = {"statement_text": "no_statement", "records": "no_records"}.get(exc.field, exc.reason)
+        run_log_event("evaluate", "rejected", request_id=rid, error=str(exc), reason=reason)
+        pilot.display(f"{exc}{reference_suffix(rid)}", container=st, method="error")
         return False
     if len(statement_text) > MAX_STATEMENT_CHARS and not st.session_state.get(
         "eval_confirm_oversize"
@@ -294,11 +297,6 @@ def _validate_evaluate_inputs(statement_text: str, records: list) -> bool:
         )
         pilot.display(f"{msg}{reference_suffix(rid)}", container=st, method="error")
         return False
-    if not records:
-        msg = "Upload at least one medical record file."
-        run_log_event("evaluate", "rejected", request_id=rid, error=msg, reason="no_records")
-        pilot.display(f"{msg}{reference_suffix(rid)}", container=st, method="error")
-        return False
     return True
 
 
@@ -311,13 +309,21 @@ def _run_evaluation_flow(statement_text: str, records: list, witness: dict[str, 
     paths. ``None``/``{}`` keeps every prompt byte-identical to the
     pre-intake pipeline.
     """
+    if not _validate_evaluate_inputs(statement_text, records, witness):
+        return
+    queued = job_runner.queue_mode_active()
+    _input_key = evaluation_input_key(statement_text, records, witness or {})
+    submitted_statement = (statement_text if queued else
+                           append_follow_up_answers(statement_text.strip(), slot="eval", input_key=_input_key))
+    if not _validate_evaluate_inputs(submitted_statement, records, witness):
+        return
     # Before anything is spent: a configuration whose every call is rejected is
     # detectable in one request. This is the only entry point into the pipeline, so
     # the queued path is covered too, and the worker never re-checks inside its own
     # session-less run.
     if not check_endpoint_gate("evaluation", log_action="evaluate"):
         return
-    if job_runner.queue_mode_active():
+    if queued:
         _run_evaluation_queued(statement_text, records, witness or {})
         return
     rid = new_run_request_id()
@@ -367,11 +373,10 @@ def _run_evaluation_flow(statement_text: str, records: list, witness: dict[str, 
     t0 = time.perf_counter()
     try:
         check_memory_before_run()
-        _input_key = evaluation_input_key(statement_text, records, witness or {})
         result = run_with_timeout(
             run_evaluation,
             llm,
-            append_follow_up_answers(statement_text.strip(), slot="eval", input_key=_input_key),
+            submitted_statement,
             records,
             progress=update,
             witness=witness or {},

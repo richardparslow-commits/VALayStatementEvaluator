@@ -419,27 +419,26 @@ def _render_observations_length_guidance(observations: str) -> None:
         , container=st, method="caption")
 
 
-def _validate_draft_inputs(records: list, observations: str, condition: str, rid: str) -> bool:
+_NO_WITNESS = object()
+
+
+def _validate_draft_inputs(records: list, observations: str, condition: str, rid: str,
+                           *, claim_type: str = "Service connection", witness: Any = _NO_WITNESS) -> bool:
     """Pre-run validation; shows the specific error and returns False when invalid.
 
     Every rejection is recorded in the persistent run log so the reference shown
     in future error messages is always correlatable, even for pre-pipeline
     failures that never reach the audit log.
     """
-    if not records:
-        msg = "Upload at least one medical record file first."
-        run_log_event("draft", "rejected", request_id=rid, error=msg, reason="no_records")
-        # Shown with the id the run log recorded, so a rejection the user quotes
-        # is findable even though it never reached the audit log.
-        pilot.display(f"{msg}{reference_suffix(rid)}", container=st, method="error")
-        return False
-    if not observations.strip() or not condition.strip():
-        msg = "Enter the condition and the witness's observations."
-        run_log_event(
-            "draft", "rejected", request_id=rid, error=msg,
-            reason="missing_observations" if not observations.strip() else "missing_condition",
-        )
-        pilot.display(f"{msg}{reference_suffix(rid)}", container=st, method="error")
+    from ..request_validation import RequestValidationError, validate_draft_request, validate_records
+    try:
+        validate_records(records)
+        validate_draft_request(observations=observations, condition=condition, claim_type=claim_type,
+                               witness={} if witness is _NO_WITNESS else witness, records=records)
+    except RequestValidationError as exc:
+        reason = {"records": "no_records", "observations": "missing_observations", "condition": "missing_condition"}.get(exc.field, exc.reason)
+        run_log_event("draft", "rejected", request_id=rid, error=str(exc), reason=reason)
+        pilot.display(f"{exc}{reference_suffix(rid)}", container=st, method="error")
         return False
     if len(observations) > MAX_OBSERVATIONS_CHARS and not st.session_state.get(
         "draft_confirm_oversize"
@@ -473,12 +472,18 @@ def _run_draft_flow(
     observations: str,
 ) -> None:
     """Run the pipeline with the pre-minted run id; persist the result."""
+    if not _validate_draft_inputs(records, observations, condition, rid, claim_type=claim_type, witness=witness):
+        return
+    queued = job_runner.queue_mode_active()
+    submitted_observations = observations if queued else append_follow_up_answers(observations.strip(), slot="draft")
+    if not _validate_draft_inputs(records, submitted_observations, condition, rid, claim_type=claim_type, witness=witness):
+        return
     # Before anything is spent: a configuration whose every call is rejected is
     # detectable in one request. Covers the queued path too — this is the only
     # entry point, and the worker never re-checks inside its own session-less run.
     if not check_endpoint_gate("draft", log_action="draft", request_id=rid):
         return
-    if job_runner.queue_mode_active():
+    if queued:
         _run_draft_queued(
             rid=rid,
             records=records,
@@ -544,7 +549,7 @@ def _run_draft_flow(
             llm,
             records,
             witness,
-            append_follow_up_answers(observations.strip(), slot="draft"),
+            submitted_observations,
             condition.strip(),
             claim_type,
             progress=update,

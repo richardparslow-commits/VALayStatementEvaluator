@@ -496,6 +496,10 @@ def digest_group(llm: Any, cfg: BatchConfig, group_label: str,
     from app.medical_review import review_medical_records
     from app.pipeline_guard import run_with_timeout
 
+    from app.request_validation import validate_draft_request, validate_records
+    validate_draft_request(observations=cfg.observations, condition=cfg.condition,
+                           claim_type=cfg.claim_type, witness=cfg.witness, validate_record_set=False)
+
     # Guard against empty file list to prevent infinite recursion in bisection.
     # This should never happen in practice (batch_files() never produces empty
     # batches), but defensive programming prevents theoretical edge cases.
@@ -510,6 +514,7 @@ def digest_group(llm: Any, cfg: BatchConfig, group_label: str,
         if not dst.exists() or dst.stat().st_size != src.stat().st_size:
             shutil.copy2(src, dst)
     docs, _skipped = records_from_local_path(str(sdir))
+    validate_records(docs)
     pages = sum(d.source_page_count for d in docs)
     t0 = time.time()
     try:
@@ -699,6 +704,10 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
     from app.pipeline_guard import run_with_timeout
     from app.prompt_sanitize import GUARD_NOTE, sanitize_digest_text, sanitize_for_prompt
 
+    from app.request_validation import validate_draft_request, validate_records
+    validate_draft_request(observations=cfg.observations, condition=cfg.condition,
+                           claim_type=cfg.claim_type, witness=cfg.witness, validate_record_set=False)
+
     def work() -> dict:
         parts = [digest_from_state(s) for s in batch_states.values() if "facts" in s]
         all_facts = [f for d in parts for f in d.facts]
@@ -727,30 +736,6 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
             pages_in_files=sum(d.pages_in_files for d in parts),
             chunks_without_facts=sum(d.chunks_without_facts for d in parts),
         )
-        merged = _merge_facts(
-            llm,
-            combined,
-            progress=progress_cb("merge"),
-            # Merge-round checkpointing: every completed round is persisted
-            # (keyed to this exact input's fingerprint), and a relaunch resumes
-            # the consolidation instead of redoing an hour of rounds. The
-            # hooks never raise into the merge (both sides guard); a broken
-            # or stale checkpoint degrades to a from-scratch merge.
-            on_round=lambda round_no, facts: save_merge_checkpoint(
-                cfg, fingerprint, round_no, facts),
-            resume=lambda: load_merge_checkpoint(cfg, fingerprint),
-        )
-        combined.facts = merged
-        log(f"combined: {len(merged)} facts after merge -> summarize")
-        combined.summary = _retry_phase(lambda: _summarize(llm, combined), "summarize")
-        log("combined: summary done")
-
-        obs_for_prompt, removed = _truncate_for_prompt(cfg.observations, DRAFT_INTERNAL_MAX_CHARS)
-        if removed or len(cfg.observations) > MAX_OBSERVATIONS_CHARS:
-            log(f"WARNING: observations are {len(cfg.observations):,} chars — "
-                f"{removed:,} truncated for prompts; details at the end may be missed")
-        grounding_query = f"{cfg.condition} {obs_for_prompt}"
-
         # Re-extract current source units: legacy checkpoints contain facts, not
         # authenticated source text. Never validate a quote against a summary.
         quarantined = {name for state in batch_states.values() for name in state.get("quarantined", [])}
@@ -795,6 +780,32 @@ def final_phase(llm: Any, cfg: BatchConfig, batch_states: dict[str, dict]) -> di
                         "A retained batch source input could not be re-extracted; restore it or re-run record review."
                     ) from exc
                 source_docs.extend(docs)
+        validate_records(source_docs)
+
+        merged = _merge_facts(
+            llm,
+            combined,
+            progress=progress_cb("merge"),
+            # Merge-round checkpointing: every completed round is persisted
+            # (keyed to this exact input's fingerprint), and a relaunch resumes
+            # the consolidation instead of redoing an hour of rounds. The
+            # hooks never raise into the merge (both sides guard); a broken
+            # or stale checkpoint degrades to a from-scratch merge.
+            on_round=lambda round_no, facts: save_merge_checkpoint(
+                cfg, fingerprint, round_no, facts),
+            resume=lambda: load_merge_checkpoint(cfg, fingerprint),
+        )
+        combined.facts = merged
+        log(f"combined: {len(merged)} facts after merge -> summarize")
+        combined.summary = _retry_phase(lambda: _summarize(llm, combined), "summarize")
+        log("combined: summary done")
+
+        obs_for_prompt, removed = _truncate_for_prompt(cfg.observations, DRAFT_INTERNAL_MAX_CHARS)
+        if removed or len(cfg.observations) > MAX_OBSERVATIONS_CHARS:
+            log(f"WARNING: observations are {len(cfg.observations):,} chars — "
+                f"{removed:,} truncated for prompts; details at the end may be missed")
+        grounding_query = f"{cfg.condition} {obs_for_prompt}"
+
         catalog, catalog_text = grounding_catalog(combined, source_docs, grounding_query)
         source_index = build_source_index(source_docs)
 
@@ -994,10 +1005,12 @@ def config_from_args(args: argparse.Namespace) -> BatchConfig:
     observations = ""
     if args.witness_json:
         data = json.loads(args.witness_json.read_text(encoding="utf-8"))
-        witness = {str(k): str(v) for k, v in (data.get("witness") or {}).items()}
-        condition = str(data.get("condition") or "")
-        claim_type = str(data.get("claim_type") or "")
-        observations = str(data.get("observations") or "")
+        if not isinstance(data, dict):
+            raise ValueError("Witness JSON must contain a request object.")
+        witness = data.get("witness", {})
+        condition = data.get("condition", "")
+        claim_type = data.get("claim_type", "")
+        observations = data.get("observations", "")
     if args.observations:
         observations = args.observations.read_text(encoding="utf-8").strip()
     return BatchConfig(
@@ -1017,20 +1030,19 @@ def config_from_args(args: argparse.Namespace) -> BatchConfig:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    cfg = config_from_args(args)
+    from app.request_validation import RequestValidationError, validate_draft_request
+    try:
+        cfg = config_from_args(args)
+        validate_draft_request(observations=cfg.observations, condition=cfg.condition,
+                               claim_type=cfg.claim_type, witness=cfg.witness, validate_record_set=False)
+    except (RequestValidationError, ValueError) as exc:
+        # JSON parser errors may include submitted text; expose only contract errors.
+        log(f"FATAL: {exc}" if isinstance(exc, RequestValidationError) else "FATAL: invalid witness JSON request.")
+        return 2
 
     if not cfg.records_dir.is_dir():
         log(f"FATAL: records directory not found: {cfg.records_dir}")
         return 1
-    if not cfg.condition or not cfg.claim_type:
-        log("FATAL: --condition and --claim-type are required "
-            "(directly or via --witness-json)")
-        return 2
-    if not cfg.observations:
-        log("FATAL: observations are required (--observations FILE, "
-            "or 'observations' in --witness-json)")
-        return 2
-
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
     state = load_state(cfg, fresh=args.fresh)
     if args.fresh:
@@ -1047,6 +1059,26 @@ def main(argv: list[str] | None = None) -> int:
     if not part_files:
         log(f"FATAL: no parts match {cfg.records_dir / cfg.part_glob}")
         return 1
+    # Validate source inputs before even the credential probe. Read one part at
+    # a time so the admission check does not hold the whole C-file in memory.
+    from app.documents import ExtractionError, records_from_local_path
+    from app.request_validation import validate_records
+    from app import config
+    input_pages = input_bytes = 0
+    try:
+        for path in part_files:
+            source_docs, _ = records_from_local_path(str(path))
+            validate_records(source_docs)
+            input_pages += sum(max(doc.source_page_count, len(doc.pages)) for doc in source_docs)
+            input_bytes += sum(len(page.text.encode("utf-8")) for doc in source_docs for page in doc.pages)
+            if input_pages > config.MAX_RECORD_PAGES or input_bytes > config.MAX_TOTAL_UPLOAD_BYTES:
+                raise RequestValidationError("Batch records exceed the configured total input limits. Split the record set.",
+                                             field="records", reason="payload_too_large")
+            del source_docs
+    except (RequestValidationError, ExtractionError, OSError):
+        log("FATAL: batch records need usable extracted text within the configured input limits.")
+        return 2
+
     batches = plan_batches(part_files, cfg.parts_per_batch)
     log(f"{len(part_files)} parts -> {len(batches)} batches of ≤{cfg.parts_per_batch}")
 
