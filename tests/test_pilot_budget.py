@@ -47,6 +47,11 @@ class TestDurableLedger(unittest.TestCase):
         with sqlite3.connect(self.path) as db:
             return db.execute('SELECT charged, reserved_attempts FROM control').fetchone()
 
+    def debit(self, ledger, run, chars):
+        number=ledger.attempt(run,chars)
+        ledger.complete_attempt(run,number)  # Simulated local call has returned/raised.
+        return number
+
     def test_entire_run_envelope_reserved_before_attempts(self):
         ledger = self.ledger()
         run = ledger.start('opaque-test-owner')
@@ -57,14 +62,14 @@ class TestDurableLedger(unittest.TestCase):
     def test_unstarted_slots_released_but_failed_attempts_keep_full_charge(self):
         ledger = self.ledger()
         run = ledger.start('owner')
-        ledger.attempt(run, 10)  # No response or reconciliation.
+        self.debit(ledger, run, 10)  # No response or reconciliation.
         ledger.finish(run)
         self.assertEqual(self.counters(), (1_000_000, 1))
 
     def test_reported_usage_is_recorded_once_and_never_refunds_attempt(self):
         ledger = self.ledger()
         run = ledger.start('owner')
-        number = ledger.attempt(run, 10)
+        number = self.debit(ledger, run, 10)
         ledger.reconcile(run, number, 4, 2)
         ledger.reconcile(run, number, 1, 1)
         with sqlite3.connect(self.path) as db:
@@ -76,7 +81,7 @@ class TestDurableLedger(unittest.TestCase):
         ledger = self.ledger()
         run = ledger.start('owner')
         for tokens in ((None, None), (True, -1), (1.2, 'private')):
-            ledger.reconcile(run, ledger.attempt(run, 1), *tokens)
+            ledger.reconcile(run, self.debit(ledger, run, 1), *tokens)
         with sqlite3.connect(self.path) as db:
             self.assertEqual(db.execute('SELECT input_tokens,output_tokens FROM attempts').fetchall(), [(None,None)]*3)
         ledger.finish(run)
@@ -89,13 +94,13 @@ class TestDurableLedger(unittest.TestCase):
         pilot_budget.provision(self.path, self.data)
         ledger = self.ledger()
         run = ledger.start('owner')
-        ledger.attempt(run, 6)
+        self.debit(ledger, run, 6)
         with self.assertRaises(pilot.PilotBlocked):
-            ledger.attempt(run, 1)
-        ledger.attempt(run, 0)
-        ledger.attempt(run, 0)
+            self.debit(ledger, run, 1)
+        self.debit(ledger, run, 0)
+        self.debit(ledger, run, 0)
         with self.assertRaises(pilot.PilotBlocked):
-            ledger.attempt(run, 0)
+            self.debit(ledger, run, 0)
         ledger.finish(run)
         self.assertEqual(self.counters(), (3_000_000, 3))
 
@@ -104,7 +109,7 @@ class TestDurableLedger(unittest.TestCase):
         run = ledger.start('owner')
         def attempt(_):
             try:
-                ledger.attempt(run, 1)
+                self.debit(ledger, run, 1)
                 return True
             except pilot.PilotBlocked:
                 return False
@@ -154,7 +159,7 @@ class TestDurableLedger(unittest.TestCase):
                 self.addCleanup(ledger.close)
                 run = ledger.start('one')
                 for _ in range(3):
-                    ledger.attempt(run, 1)
+                    self.debit(ledger, run, 1)
                 ledger.finish(run)
                 with self.assertRaises(pilot.PilotBlocked):
                     ledger.start('another')
@@ -162,7 +167,7 @@ class TestDurableLedger(unittest.TestCase):
     def test_crashed_run_keeps_full_reservation_on_restart(self):
         ledger = self.ledger()
         run = ledger.start('owner')
-        ledger.attempt(run, 1)
+        self.debit(ledger, run, 1)
         ledger.close()
         ledger = self.ledger()
         self.assertEqual(self.counters(), (3_000_000, 3))
@@ -302,7 +307,7 @@ print('INHERITED_LEASE_REFUSED')''')
     def test_metadata_has_no_owner_or_record_content_and_old_rows_prune(self):
         ledger = self.ledger()
         run = ledger.start(CANARY)
-        ledger.reconcile(run,ledger.attempt(run,10),2,1)
+        ledger.reconcile(run,self.debit(ledger, run,10),2,1)
         ledger.finish(run)
         self.assertNotIn(CANARY.encode(),self.path.read_bytes())
         self.now += 86400
@@ -388,6 +393,52 @@ class TestProviderBudgetIntegration(unittest.TestCase):
                 pool.submit(context.run,self.wire,client).result()
         with self.assertRaises(pilot.PilotBlocked): context.run(self.wire,client)
         self.assertEqual(client._client.chat.completions.create.call_count,1)
+
+    def test_aborted_run_keeps_active_slot_until_outstanding_worker_returns(self):
+        entered,released=threading.Event(),threading.Event()
+        client=self.client()
+        def wait_for_release(**kwargs):
+            entered.set()
+            if not released.wait(4): raise RuntimeError('Synthetic worker deadline')
+            return MagicMock()
+        client._client.chat.completions.create.side_effect=wait_for_release
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            try:
+                with self.assertRaises(ValueError),pilot.action_budget(self.docs):
+                    context=contextvars.copy_context()
+                    future=pool.submit(context.run,self.wire,client)
+                    self.assertTrue(entered.wait(2))
+                    raise ValueError('Synthetic pipeline refusal')
+                with sqlite3.connect(self.path) as db:
+                    self.assertEqual(db.execute('SELECT state FROM runs').fetchone()[0],'closing')
+                    self.assertEqual(db.execute('SELECT charged,reserved_attempts FROM control').fetchone(),(2_000_000,2))
+                with self.assertRaises(pilot.PilotBlocked),pilot.action_budget(self.docs):
+                    self.fail('A second run overlapped an outstanding worker')
+            finally:
+                released.set()
+            future.result(timeout=3)
+        with sqlite3.connect(self.path) as db:
+            self.assertEqual(db.execute('SELECT state FROM runs').fetchone()[0],'finished')
+            self.assertEqual(db.execute('SELECT charged,reserved_attempts FROM control').fetchone(),(1_000_000,1))
+        with pilot.action_budget(self.docs): pass
+
+    def test_withdrawal_during_durable_debit_blocks_both_wire_formats(self):
+        ledger=pilot_budget.get_ledger(self.data)
+        original=ledger.attempt
+        def withdraw(run,chars):
+            number=original(run,chars)
+            self.state['_pilot_consent_grant'].revoked.set()
+            return number
+        for responses in (False,True):
+            self.state['_pilot_consent_grant']=pilot.ConsentGrant(pilot.notice_binding(self.owner,self.data))
+            client=self.client()
+            with self.subTest(responses=responses),self.assertRaises(pilot.PilotBlocked), \
+                    pilot.action_budget(self.docs),patch.object(ledger,'attempt',side_effect=withdraw):
+                self.wire(client,responses=responses)
+            client._client.chat.completions.create.assert_not_called()
+            client._client.responses.create.assert_not_called()
+        with sqlite3.connect(self.path) as db:
+            self.assertEqual(db.execute('SELECT DISTINCT state FROM runs').fetchall(),[('finished',)])
 
     def test_error_attempt_is_charged_and_retry_cannot_bypass_run_cap(self):
         client=self.client()

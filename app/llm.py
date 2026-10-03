@@ -1581,24 +1581,36 @@ class LLMClient:
                 pilot.recheck_owner(owner)  # Includes withdrawal during request preparation.
                 ledger, run, number, max_tokens = pilot.reserve_provider_attempt(owner, len(system) + len(user), max_tokens)
                 request["max_output_tokens"] = max_tokens
-            response = client.responses.create(**request)
+            try:
+                if pilot.enabled():
+                    pilot.recheck_owner(owner)  # Includes withdrawal during durable budget writes.
+                response = client.responses.create(**request)
+            finally:
+                if pilot.enabled():
+                    ledger.complete_attempt(run, number)
             responses = True
         else:
             privacy_options: dict[str, Any] = {"store": False} if pilot.enabled() else {}
             if pilot.enabled():
                 pilot.recheck_owner(owner)
                 ledger, run, number, max_tokens = pilot.reserve_provider_attempt(owner, len(system) + len(user), max_tokens)
-            response = client.chat.completions.create(
-                **privacy_options,
-                model=model,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                timeout=request_timeout,
-            )
+            try:
+                if pilot.enabled():
+                    pilot.recheck_owner(owner)
+                response = client.chat.completions.create(
+                    **privacy_options,
+                    model=model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    timeout=request_timeout,
+                )
+            finally:
+                if pilot.enabled():
+                    ledger.complete_attempt(run, number)
             responses = False
         if pilot.enabled():
             tokens = _responses_usage_tokens(response) if responses else _usage_tokens(response)

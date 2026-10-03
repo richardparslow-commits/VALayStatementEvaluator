@@ -39,6 +39,12 @@ application retries debit separately. Normal exit releases only unused slots;
 every attempted slot keeps its full $1 charge. A crash, failed ledger, or unknown
 in-flight outcome retains the entire reservation. This can close the pilot early.
 
+If a pipeline aborts with local SDK requests still in flight, the run enters a
+closing state: no new attempts or runs are admitted, and the full reservation
+remains until those requests return or raise. A crash abandons that closing run
+without refund. Local transport timeout does not prove that a remote provider
+stopped processing; independent cutoff/in-flight exposure acceptance covers that.
+
 Returned input/output usage is recorded once for reconciliation evidence. Missing,
 invalid and uncertain usage stays unknown; no tokenizer guess, optimistic price,
 failed-call refund or usage-based discount replenishes the budget. These counters
@@ -114,7 +120,7 @@ Clearing/signing out of a case must retain quotas. Control backups are excluded.
 | B02 Independent cutoff | Bounded synthetic test reaches the configured account/gateway limit and further billable requests are refused, with metering lag/in-flight exposure accounted for |
 | B03 Restarts | Two starts, a process/container/host restart and a third same-owner start cannot reset rolling limits or global budget; crash keeps reservations |
 | B04 Tabs/workers/retries | Two tabs, concurrent participants, multiple clients, worker threads and all retries consume the same run/global envelope; failed or unknown calls retain charges |
-| B05 Storage boundary | Only the web runtime mounts the private durable volume; second process refuses; missing/corrupt/replaced/rolled-back store causes suspension; no automatic creation/reset |
+| B05 Storage boundary | Only the web runtime mounts the private durable volume; second process refuses; missing/corrupt/replaced files close admission; no automatic creation/reset. A privileged in-place rollback requires explicit operator suspension/reconciliation and evidence that the independent account/gateway ceiling still bounds exposure; local detection is not promised |
 | B06 Active ingress | Upload limits and repeated actions on an already upgraded WebSocket refuse before provider work; handshake rate limiting alone is insufficient |
 | B07 Operations | Named owner receives actual account alerts, suspends admission and reconciles remaining exposure; no volume reset or unreviewed provider change |
 | B08 Privacy/deletion | Notice and retention approve pseudonymous control metadata, excluded backups and full stopped-volume deletion schedule; execute the synthetic deletion check |

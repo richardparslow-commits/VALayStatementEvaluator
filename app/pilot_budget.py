@@ -91,10 +91,10 @@ def provision(path: Path, approval: Mapping[str, Any]) -> None:
             CREATE TABLE runs (id TEXT PRIMARY KEY, owner TEXT NOT NULL, started REAL NOT NULL,
                 state TEXT NOT NULL, attempted INTEGER NOT NULL, prompt_chars INTEGER NOT NULL);
             CREATE TABLE attempts (run TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
-                number INTEGER NOT NULL, reconciled INTEGER NOT NULL,
+                number INTEGER NOT NULL, reconciled INTEGER NOT NULL, inflight INTEGER NOT NULL,
                 input_tokens INTEGER, output_tokens INTEGER, PRIMARY KEY(run, number));
         """)
-        db.execute("INSERT INTO control VALUES (1, ?, ?, 0, 0, ?)",
+        db.execute("INSERT INTO control VALUES (2, ?, ?, 0, 0, ?)",
                    (json.dumps(settings, sort_keys=True), secrets.token_hex(32), _now()))
 
 
@@ -121,7 +121,7 @@ class Ledger:
                     raise ValueError
                 # Old process is gone (exclusive lock acquired). Unknown in-flight
                 # spend keeps the FULL reservation. Never refund on restart.
-                db.execute("UPDATE runs SET state='abandoned' WHERE state='active'")
+                db.execute("UPDATE runs SET state='abandoned' WHERE state IN ('active','closing')")
         except (OSError, ValueError, sqlite3.Error, PilotBlocked) as exc:
             self.close()
             raise PilotBlocked(REFUSAL) from exc
@@ -175,13 +175,13 @@ class Ledger:
                     raise ValueError
                 version, saved, salt, charged, attempts, last = rows[0]
                 now = _now()
-                if (version != 1 or json.loads(saved) != self.settings or len(bytes.fromhex(salt)) != 32
+                if (version != 2 or json.loads(saved) != self.settings or len(bytes.fromhex(salt)) != 32
                         or type(charged) is not int or not 0 <= charged <= self.settings["pilot_total_microusd"]
                         or type(attempts) is not int or not 0 <= attempts <= self.settings["pilot_total_attempts"]
                         or now < last or now >= datetime.fromisoformat(self.settings["expires_at"].replace("Z", "+00:00")).timestamp()):
                     raise ValueError
                 db.execute("UPDATE control SET last_now=?", (now,))
-                db.execute("DELETE FROM runs WHERE state!='active' AND started<=?", (now - 86400,))
+                db.execute("DELETE FROM runs WHERE state IN ('finished','abandoned') AND started<=?", (now - 86400,))
                 yield db
                 db.commit()
             except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
@@ -207,7 +207,7 @@ class Ledger:
             capacity = self.settings["run_attempts"]
             cost = capacity * self.settings["attempt_charge_microusd"]
             if ((hourly or 0) >= 2 or daily >= self.settings["participant_daily_starts"]
-                    or db.execute("SELECT 1 FROM runs WHERE state='active'").fetchone()
+                    or db.execute("SELECT 1 FROM runs WHERE state IN ('active','closing')").fetchone()
                     or charged + cost > self.settings["pilot_total_microusd"]
                     or attempts + capacity > self.settings["pilot_total_attempts"]):
                 raise PilotBlocked(REFUSAL)
@@ -227,7 +227,7 @@ class Ledger:
                 raise PilotBlocked(REFUSAL)
             number = int(row[0]) + 1
             db.execute("UPDATE runs SET attempted=?, prompt_chars=prompt_chars+? WHERE id=?", (number, prompt_chars, run))
-            db.execute("INSERT INTO attempts VALUES (?, ?, 0, NULL, NULL)", (run, number))
+            db.execute("INSERT INTO attempts VALUES (?, ?, 0, 1, NULL, NULL)", (run, number))
             return number
 
     def reconcile(self, run: str, number: int, input_tokens: Any, output_tokens: Any) -> None:
@@ -241,13 +241,29 @@ class Ledger:
 
     def finish(self, run: str) -> None:
         with self.transaction() as db:
-            row = db.execute("SELECT attempted FROM runs WHERE id=? AND state='active'", (run,)).fetchone()
-            if row is None or type(row[0]) is not int or not 0 <= row[0] <= self.settings["run_attempts"]:
+            if not db.execute("SELECT 1 FROM runs WHERE id=? AND state='active'", (run,)).fetchone():
                 raise PilotBlocked(REFUSAL)
-            unused = self.settings["run_attempts"] - row[0]
-            db.execute("UPDATE control SET charged=charged-?, reserved_attempts=reserved_attempts-?",
-                       (unused * self.settings["attempt_charge_microusd"], unused))
-            db.execute("UPDATE runs SET state='finished' WHERE id=?", (run,))
+            # The pool can unwind without waiting for another worker's SDK call.
+            # Close NEW attempts immediately, keep the active slot/reservation
+            # until all durably marked local wire calls have returned or raised.
+            db.execute("UPDATE runs SET state='closing' WHERE id=?", (run,))
+            self._finish_if_idle(db, run)
+
+    def complete_attempt(self, run: str, number: int) -> None:
+        with self.transaction() as db:
+            db.execute("UPDATE attempts SET inflight=0 WHERE run=? AND number=?", (run, number))
+            self._finish_if_idle(db, run)
+
+    def _finish_if_idle(self, db: sqlite3.Connection, run: str) -> None:
+        row = db.execute("SELECT attempted FROM runs WHERE id=? AND state='closing'", (run,)).fetchone()
+        if row is None or db.execute("SELECT 1 FROM attempts WHERE run=? AND inflight=1", (run,)).fetchone():
+            return
+        if type(row[0]) is not int or not 0 <= row[0] <= self.settings["run_attempts"]:
+            raise ValueError
+        unused = self.settings["run_attempts"] - row[0]
+        db.execute("UPDATE control SET charged=charged-?, reserved_attempts=reserved_attempts-?",
+                   (unused * self.settings["attempt_charge_microusd"], unused))
+        db.execute("UPDATE runs SET state='finished' WHERE id=?", (run,))
 
 
 _instance: Ledger | None = None
