@@ -178,6 +178,7 @@ class TestRevocationDuringWork(unittest.TestCase):
                 patch.object(main, "render_failure_detail") as diagnostics:
             at = AppTest.from_file(str(root / "run_app.py"))
             at.session_state["_pilot_notice_consent"] = pilot.notice_binding(pilot.current_owner(), self.data)
+            at.session_state["_pilot_consent_grant"] = pilot.ConsentGrant(at.session_state["_pilot_notice_consent"])
             at.session_state["private_case"] = "SYNTHETIC_CASE_CANARY"
             at.run()
         self.assertFalse(at.exception)

@@ -140,7 +140,7 @@ class TestAdmission(unittest.TestCase):
                 patch.object(config, "load_settings", return_value=settings), patch.object(st, "user", user), \
                 patch.object(config, "MAX_RECORD_PAGES", 500), patch.object(config, "BLOB_STORE_MODE", "none"), \
                 patch.object(config, "SHARED_CACHE_URL", ""), patch.object(config, "SHARED_CACHE_TOKEN", ""), \
-                patch("sys.platform", "linux"), patch("os.geteuid", return_value=1000), \
+                patch("sys.platform", "linux"), patch("os.geteuid", return_value=os.geteuid()), \
                 patch("app.isolated_extract.parser_health"):
             at = AppTest.from_file(str(root / "run_app.py"))
             at.secrets["auth"] = auth

@@ -1,6 +1,9 @@
 # 🎖️ VA Lay Statement Evaluator
 
 For real veteran information, use the restricted [controlled-pilot guide](PILOT.md).
+The private host diagnostic tool `python scripts/pilot_status.py` reports fixed
+service state/counts without raw logs or environment values; see the
+[R08 privacy procedure](deploy/PILOT_PRIVACY_ACCEPTANCE.md).
 The general deployment examples are synthetic-data scaffolding until separately reviewed.
 
 A Streamlit application that performs **exhaustive medical-record review** to:

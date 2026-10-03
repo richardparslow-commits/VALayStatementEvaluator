@@ -150,6 +150,9 @@ supported controlled-pilot environment.
    docker compose -f docker-compose.pilot.yml up --build -d
    ```
 
+   The pilot server entrypoint starts cleanup and private health before any
+   browser connects. Use this entrypoint on equivalent hosts too; running only
+   `streamlit run run_app.py` does not initialize cleanup until a browser opens.
    Never scale this profile. Do not use the general Compose/Kubernetes worker
    examples for real pilot records. Pin deployment image digests after the build
    and scanner checks; restrict outgoing traffic to reviewed destinations and
@@ -200,7 +203,10 @@ sooner. Failed/stale retention closes subsequent admission. The Compose profile
 disables container log persistence. Backups and restores are excluded pending a
 separate review; historical backups and stopped-volume/snapshot deletion require
 the actual host operator's accepted lifecycle procedure. Clearing/sign-out also
-removes notice consent. See [R08 acceptance and notice worksheet](deploy/PILOT_PRIVACY_ACCEPTANCE.md).
+revokes the shared consent grant so copied workers stop at their next sensitive
+boundary, then removes session consent. Private host diagnostics are available
+through `python scripts/pilot_status.py` (fixed service state/counts only), plus
+the private app/parser health channels. See [R08 acceptance and notice worksheet](deploy/PILOT_PRIVACY_ACCEPTANCE.md).
 
 Pilot logs keep fixed lifecycle labels, opaque generated references and numeric
 counts. They omit filenames, conditions, witness text, arbitrary extras,

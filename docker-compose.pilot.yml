@@ -6,7 +6,7 @@ services:
       target: runtime
       args:
         VA_LSE_BUILD_SHA: ${VA_LSE_BUILD_SHA:?Set the reviewed immutable revision}
-    command: [streamlit, run, run_app.py, --server.port=8501, --server.address=0.0.0.0, --server.headless=true, --server.disconnectedSessionTTL=60]
+    command: [python, -m, app.pilot_server, --server.port=8501, --server.address=0.0.0.0, --server.headless=true, --server.disconnectedSessionTTL=60]
     env_file: ${VA_LSE_PILOT_ENV_FILE:?Set the operator environment file}
     environment:
       VA_LSE_MODE: controlled-pilot

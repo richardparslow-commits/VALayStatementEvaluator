@@ -88,8 +88,19 @@ class PilotLogHandler(RotatingFileHandler):
             candidates = [path, *(p for p in path.parent.glob(path.name + ".*")
                                   if p.name[len(path.name) + 1:].isdigit())]
             for candidate in candidates:
-                if not candidate.exists():
+                if not candidate.exists() and not candidate.is_symlink():
                     continue
+                # Private permissions apply to retained rotations too. Check
+                # type before reading so a FIFO cannot block the cleanup loop.
+                fd = os.open(candidate, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                try:
+                    info = os.fstat(fd)
+                    import stat
+                    if info.st_uid != os.geteuid() or not stat.S_ISREG(info.st_mode):
+                        raise OSError("Pilot log ownership or type is unsafe.")
+                    os.fchmod(fd, 0o600)
+                finally:
+                    os.close(fd)
                 first = self._oldest if candidate == path and self._oldest is not None else _first_event(candidate, instant)
                 if first is None or first <= instant - self.days * 86400:
                     if candidate == path:

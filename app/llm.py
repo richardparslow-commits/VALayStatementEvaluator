@@ -1582,10 +1582,14 @@ class LLMClient:
                 request["temperature"] = temperature
             if request_timeout is not NOT_GIVEN:
                 request["timeout"] = request_timeout
+            if pilot.enabled():
+                pilot.recheck_owner(owner)  # Includes withdrawal during request preparation.
             response = client.responses.create(**request)
             responses = True
         else:
             privacy_options: dict[str, Any] = {"store": False} if pilot.enabled() else {}
+            if pilot.enabled():
+                pilot.recheck_owner(owner)
             response = client.chat.completions.create(
                 **privacy_options,
                 model=model,

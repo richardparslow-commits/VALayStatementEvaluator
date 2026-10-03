@@ -177,10 +177,27 @@ print('IDLE_SWEEP_OK')
         other.write_text(line(self.now))
         self.path.unlink()
         self.path.symlink_to(other)
-        h = self.handler()
-        self.emit(h, CANARY)
-        self.assertTrue(h.write_failed)
+        with self.assertRaises(OSError):
+            self.handler()
         self.assertNotIn(CANARY, other.read_text())
+
+    def test_retained_rotations_get_private_modes_before_admission(self):
+        for name in ('app.log', 'app.log.1', 'app.log.99'):
+            path = self.path.parent / name
+            path.write_text(line(self.now))
+            path.chmod(0o644)
+        self.handler()
+        for path in self.path.parent.glob('app.log*'):
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_non_regular_or_foreign_owned_rotations_are_refused(self):
+        os.mkfifo(self.path.with_name('app.log.1'))
+        with self.assertRaises(OSError):
+            self.handler()
+        self.path.with_name('app.log.1').unlink()
+        self.path.write_text(line(self.now))
+        with patch.object(log_retention.os, 'geteuid', return_value=os.geteuid() + 1), self.assertRaises(OSError):
+            self.handler()
 
     def test_policy_requires_explicit_bounded_days(self):
         for value in ('', '0', '-1', '31', '7.0', 'true'):
@@ -225,6 +242,45 @@ class TestPolicyAdmission(unittest.TestCase):
         logging_config.configure_logging(force=True)
         audit.configure_audit_logging(force=True)
 
+    def test_server_initializes_cleanup_before_cli_and_without_browser(self):
+        # Run the process entrypoint, with CLI replaced only after initialize.
+        from app import pilot_server
+        with patch.dict(os.environ, {'VA_LSE_HEALTH_PORT': '0'}), \
+                patch('streamlit.web.cli.main') as cli, patch.object(sys, 'argv', ['fixture']):
+            pilot_server.main(['--server.port=8501'])
+            self.assertEqual(sys.argv, ['streamlit', 'run', 'run_app.py', '--server.port=8501'])
+        cli.assert_called_once()
+        self.assertTrue(log_retention.retention_health()['active'])
+
+    def test_fresh_process_cleans_existing_volume_without_browser(self):
+        script = r'''from tests import hermetic
+import os, sys, json
+from pathlib import Path
+from datetime import datetime, timezone
+from app import pilot_server
+root=Path(sys.argv[1])
+os.environ.update({'VA_LSE_MODE':'controlled-pilot','VA_LSE_PILOT_LOG_RETENTION_DAYS':'1','VA_LSE_LOG_DIR':str(root),'VA_LSE_AUDIT_LOG_DIR':str(root),'VA_LSE_RUN_LOG_DIR':str(root),'VA_LSE_HEALTH_PORT':'0'})
+for name in ('app.log','audit.log','runs.jsonl'):
+    (root/name).write_text(json.dumps({'timestamp':datetime.fromtimestamp(1,timezone.utc).isoformat(),'pages':84923})+'\n')
+assert all(json.loads((root/name).read_text())['pages']==84923 for name in ('app.log','audit.log','runs.jsonl'))
+pilot_server.initialize()
+assert all('84923' not in (root/name).read_text() for name in ('app.log','audit.log','runs.jsonl'))
+print('SERVER_STARTUP_CLEANUP_OK')'''
+        with tempfile.TemporaryDirectory() as directory:
+            result=subprocess.run([sys.executable,'-c',script,directory],capture_output=True,text=True,timeout=10)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn('SERVER_STARTUP_CLEANUP_OK',result.stdout)
+
+    def test_failed_audit_write_keeps_counter_and_retention_signal(self):
+        logger = audit.configure_audit_logging(force=True)
+        file_handler = next(h for h in logger.handlers if isinstance(h, log_retention.PilotLogHandler))
+        before = audit.audit_health()['write_failures']
+        with patch.object(file_handler, '_open', side_effect=OSError(CANARY)):
+            audit.audit_event('evaluate', 'error', request_id='req_aaaaaaaaaaaa', error=ValueError(CANARY))
+        self.assertEqual(audit.audit_health()['write_failures'],before+1)
+        self.assertTrue(file_handler.write_failed)
+        self.assertNotIn(CANARY,repr(audit.audit_health()))
+
     def test_matching_healthy_policy_is_admitted(self):
         pilot.validate_log_policy(approval())
 
@@ -255,12 +311,15 @@ class TestPolicyAdmission(unittest.TestCase):
 class TestNoticeLifecycle(unittest.TestCase):
     def setUp(self):
         import streamlit as st
+        from app import llm
+        llm._sdk_name('NOT_GIVEN')  # Normal client construction binds this sentinel.
         self.data = approval()
         self.now = time.time()
         self.claims = {'is_logged_in': True, 'iss': self.data['issuer'], 'sub': 'participant',
                        'iat': self.now - 1, 'exp': self.now + 300}
         self.owner = pilot.authorized_identity(self.claims, self.data)
         self.state = {'_pilot_owner': self.owner,
+                      '_pilot_consent_grant': pilot.ConsentGrant(pilot.notice_binding(self.owner, self.data)),
                       '_pilot_notice_consent': pilot.notice_binding(self.owner, self.data)}
         for context in (patch.dict(os.environ, {'VA_LSE_MODE': 'controlled-pilot'}),
                         patch.object(pilot, 'load_approval', side_effect=lambda: self.data),
@@ -292,6 +351,7 @@ class TestNoticeLifecycle(unittest.TestCase):
         client = LLMClient.__new__(LLMClient)
         client._client = MagicMock()
         self.state.pop('_pilot_notice_consent')
+        self.state.pop('_pilot_consent_grant')
         with self.assertRaises(pilot.PilotBlocked):
             client._call_openai('primary', 'test-model', 'system', CANARY, 0, 100, None)
         client._client.chat.completions.create.assert_not_called()
@@ -301,7 +361,7 @@ class TestNoticeLifecycle(unittest.TestCase):
         with self.assertRaises(pilot.PilotBlocked), pilot.action_budget(docs):
             context = contextvars.copy_context()
             with ThreadPoolExecutor(max_workers=1) as executor:
-                self.assertEqual(executor.submit(context.run, pilot.require_consent, self.owner).result(),
+                self.assertEqual(executor.submit(context.run, pilot.require_consent, self.owner).result().binding,
                                  self.state['_pilot_notice_consent'])
             self.data['participant_notice'] += ' Changed notice.'
             with self.assertRaises(pilot.PilotBlocked):
@@ -324,6 +384,57 @@ class TestNoticeLifecycle(unittest.TestCase):
         self.claims['sub'] = 'operator'
         with self.assertRaises(pilot.PilotBlocked):
             pilot.require_consent(pilot.current_owner())
+
+    def test_clearing_revokes_copied_workers_before_their_next_provider_request(self):
+        from app.llm import LLMClient
+        docs=[document_from_text('synthetic.txt','Synthetic knee observation.')]
+        client=LLMClient.__new__(LLMClient)
+        client._client=MagicMock()
+        with self.assertRaises(pilot.PilotBlocked), pilot.action_budget(docs):
+            context=contextvars.copy_context()
+            pilot.clear_case()
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future=executor.submit(context.run, client._call_openai,'primary','test-model','system',CANARY,0,100,None)
+                with self.assertRaises(pilot.PilotBlocked):
+                    future.result()
+        client._client.chat.completions.create.assert_not_called()
+        self.assertIsNone(pilot._run_notice.get())
+
+    def test_withdrawal_during_preparation_stops_both_request_formats(self):
+        from app import llm
+        for responses in (False,True):
+            self.state['_pilot_consent_grant']=pilot.ConsentGrant(pilot.notice_binding(self.owner,self.data))
+            client=llm.LLMClient.__new__(llm.LLMClient)
+            client._client=MagicMock()
+            client._settings=MagicMock(base_url=self.data['provider_base_url'])
+            client._pilot_calls=0
+            client._pilot_prompt_chars=0
+            client._pilot_call_lock=threading.Lock()
+            with self.subTest(responses=responses), \
+                    patch.object(pilot,'require_destination',side_effect=lambda *a: self.state['_pilot_consent_grant'].revoked.set()), \
+                    patch.object(llm,'_uses_responses_schema',return_value=responses), self.assertRaises(pilot.PilotBlocked):
+                client._call_openai('primary','test-model','system',CANARY,0,100,None)
+            client._client.chat.completions.create.assert_not_called()
+            client._client.responses.create.assert_not_called()
+
+    def test_in_flight_response_is_refused_after_session_clear(self):
+        from app import llm
+        docs=[document_from_text('synthetic.txt','Synthetic knee observation.')]
+        client=llm.LLMClient.__new__(llm.LLMClient)
+        client._client=MagicMock()
+        client._settings=MagicMock(base_url=self.data['provider_base_url'])
+        client._pilot_calls=0
+        client._pilot_prompt_chars=0
+        client._pilot_call_lock=threading.Lock()
+        def clear(**kwargs):
+            pilot.clear_case()
+            return MagicMock()
+        client._client.chat.completions.create.side_effect=clear
+        with self.assertRaises(pilot.PilotBlocked), pilot.action_budget(docs), \
+                patch.object(pilot,'require_destination'), patch.object(llm,'_uses_responses_schema',return_value=False):
+            client._call_openai('primary','test-model','system',CANARY,0,100,None)
+        client._client.chat.completions.create.assert_called_once()
+        self.assertEqual(self.state,{})
 
     def test_backup_and_restore_cannot_bypass_exclusion_with_injected_destination(self):
         destination = MagicMock()

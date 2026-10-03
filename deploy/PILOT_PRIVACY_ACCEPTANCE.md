@@ -31,6 +31,11 @@ same integer. There is no real-data default. Obtain independent acceptance for
 this maximum; a stricter policy can require a smaller value or excluding logs.
 The deliberately incomplete example is not a usable approval.
 
+The pilot Compose entrypoint (`python -m app.pilot_server`) initializes cleanup
+and the private health server before Streamlit starts listening, without waiting
+for a browser session. An unusable policy/sink stops process startup. Other pilot
+hosts must use this entrypoint or prove equivalent server-start initialization.
+
 All three local count-only streams (`app.log`, `audit.log`, `runs.jsonl`) use size
 rotation plus age cleanup under each writer's lock. The first event's timestamp
 sets the file's expiry; continued writes and changed filesystem modification
@@ -52,12 +57,23 @@ sweeps again on startup before admission, but this does not establish the offlin
 deletion deadline. Logical unlink is not certified secure erasure of underlying
 blocks; disk encryption and host lifecycle are separate review evidence.
 
+Retained rotations are also restricted to owner-only mode, with file-type/owner
+validation; audit write failures preserve both the audit counter and retention
+failure signal.
+
 The pilot Compose profile disables container log persistence for web, launcher
 and proxy. Local count logs remain on the private volume. Audit backup,
 verification/download and restore entry points refuse pilot execution, including
 explicit destination overrides. Do not enable general backup/restore examples,
 log drains or snapshots for this pilot without separate destination, contents and
-retention approval. Historical backups created before this change are unaffected.
+retention approval. Historical backups created before this change are unaffected. Operators can run
+`python scripts/pilot_status.py` from the private host checkout to inspect only
+fixed service states, exit/restart counts, OOM and health classifications. It reads
+no raw logs, environment or health-check output, and never echoes CLI errors.
+Use the private app health endpoint for count-only audit/retention status and the
+private parser health protocol for readiness. These prepared diagnostics do not
+replace R12 actual-host monitoring/incident acceptance; deeper investigation
+requires a separately approved synthetic reproduction, not enabling record logs.
 No durable case blob, queue or optional external service is admitted.
 
 Before case controls appear, an invited participant reads the exact notice as
@@ -68,7 +84,10 @@ case at the next screen admission and require consent again. Work start, each
 provider request/response and cached/delayed result access check current consent.
 Worker threads receive the accepted notice snapshot; changing the notice during
 work refuses its delayed result. A transmitted request cannot be recalled.
-Clearing/sign-out clears consent too. Other open sessions and provider copies
+Clearing/sign-out revokes the shared session consent grant before removing
+uploads, so already-copied worker contexts refuse subsequent attempts and delayed
+responses. A provider attempt already begun cannot be recalled. Clearing/sign-out
+clears consent too. Other open sessions and provider copies
 have the separately documented R07 limits. The 60-second disconnected-session
 setting is checked; actual release on the actual host still needs observation.
 
@@ -107,12 +126,12 @@ hash and policy. Retain only synthetic fixture identifiers/counts in the report.
 | P02 | Independent review establishes training use, retention/deletion exceptions, subprocessors, regions, support/incident handling; notice accurately reflects each. |
 | P03 | Missing notice or age policy, policy mismatch, disabled/missing local sink, bad permissions, stale cleanup, unapproved backup and a disconnect setting above 60 seconds close admission. |
 | P04 | Invited sign-in shows full literal notice before statement/upload/action controls. No acceptance prevents upload/provider work; consent permits the released controls. |
-| P05 | Change notice, provider/model or privacy/retention reference; existing case is cleared, cached results/provider calls are refused and fresh consent is required. Test during a delayed run too. |
+| P05 | Change notice, provider/model or privacy/retention reference; existing case is cleared, cached results/provider calls are refused and fresh consent is required. Test during a delayed run, during request preparation, and after clearing/sign-out in another execution context too. |
 | P06 | Synthetic personal/token/filename canaries cover upload, parse success/refusal, provider success/error/timeout, cancellation and clearing. Inspect all three logs, STDERR/platform sinks and effective network destinations; no content canary or unapproved destination is present. |
 | P07 | Clear/sign-out removes working session values and registered uploads; new identity cannot inherit case or consent. Document provider/original/other-tab limits truthfully. |
 | P08 | Disconnect beyond 60 seconds, reconnect and restart; observe actual session and upload-manager release. Record transient in-flight request/worker limitations. |
-| P09 | Exercise low-volume active files, continued writes, size rotations, idle expiry, restart, malformed legacy files and failed deletion. Health signals failure/staleness; no expired file is read/admitted at restart. Review clock synchronisation. |
-| P10 | Verify effective container logging driver, absent backup destinations/drains and denied override/restore. Test accepted stopped-volume/snapshot/decommission expiry and restore policy. |
+| P09 | Start the server without opening a browser and verify cleanup starts. Exercise low-volume active files, continued writes, size rotations, idle expiry, restart, malformed legacy files and failed deletion. Health signals failure/staleness; no expired file is read/admitted at restart. Review clock synchronisation. |
+| P10 | Verify effective container logging driver, absent backup destinations/drains and denied override/restore, private retained rotations, preserved audit loss counters and restricted service-state diagnostics. Test accepted stopped-volume/snapshot/decommission expiry and restore policy. |
 | P11 | Privacy owner accepts the exact notice, actual provider terms and separate policies for every copy, deletion deadline/exception and incident process. |
 
 Copy and complete this evidence record. All fields deliberately remain empty.

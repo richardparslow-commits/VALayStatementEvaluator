@@ -360,6 +360,11 @@ def configure_audit_logging(
     class _CountingRotatingFileHandler(_FailureCountingHandler, logging.handlers.RotatingFileHandler):
         pass
 
+    class _CountingPilotFileHandler(PilotLogHandler):
+        def handleError(self, record: logging.LogRecord) -> None:
+            _note_write_failure(OSError("Pilot audit file write failed."))
+            super().handleError(record)
+
     class _CountingStreamHandler(_FailureCountingHandler, logging.StreamHandler):
         pass
 
@@ -394,7 +399,7 @@ def configure_audit_logging(
             log_path = Path(raw_dir).expanduser().resolve()
             log_path.mkdir(parents=True, exist_ok=True)
             file_path = log_path / raw_file
-            handler_type = PilotLogHandler if pilot.enabled() else _CountingRotatingFileHandler
+            handler_type = _CountingPilotFileHandler if pilot.enabled() else _CountingRotatingFileHandler
             file_handler = handler_type(
                 str(file_path), maxBytes=raw_max, backupCount=raw_backups, encoding="utf-8"
             )

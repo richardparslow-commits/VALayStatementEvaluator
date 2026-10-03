@@ -19,6 +19,7 @@ from collections import defaultdict, deque
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 from urllib.parse import urlsplit
@@ -28,7 +29,13 @@ class PilotBlocked(RuntimeError):
     """A pilot admission or privacy requirement has not been met."""
 
 
-_run_notice: ContextVar[str | None] = ContextVar("pilot_notice_consent", default=None)
+@dataclass
+class ConsentGrant:
+    binding: str
+    revoked: threading.Event = field(default_factory=threading.Event)
+
+
+_run_notice: ContextVar[ConsentGrant | None] = ContextVar("pilot_notice_consent", default=None)
 _run_claims: ContextVar[dict[str, Any] | None] = ContextVar("pilot_verified_claims", default=None)
 
 
@@ -216,15 +223,16 @@ def notice_binding(owner: str, approval: Mapping[str, Any]) -> str:
     return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
 
 
-def require_consent(owner: str) -> str:
+def require_consent(owner: str) -> ConsentGrant:
     import streamlit as st
     expected = notice_binding(owner, load_approval())
     accepted = _run_notice.get()
     if accepted is None:
-        accepted = st.session_state.get("_pilot_notice_consent")
-    if accepted != expected:
+        accepted = st.session_state.get("_pilot_consent_grant")
+    if (not isinstance(accepted, ConsentGrant) or accepted.binding != expected
+            or accepted.revoked.is_set()):
         raise PilotBlocked("Read the current pilot privacy notice and give consent before continuing.")
-    return expected
+    return accepted
 
 
 def recheck_owner(owner: str) -> None:
@@ -258,6 +266,9 @@ def operator_allowed() -> bool:
 def clear_case() -> None:
     import streamlit as st
     from streamlit.runtime.scriptrunner_utils.script_run_context import get_script_run_ctx
+    grant = st.session_state.get("_pilot_consent_grant")
+    if isinstance(grant, ConsentGrant):
+        grant.revoked.set()  # Shared object: copied worker contexts see this too.
     context = get_script_run_ctx(suppress_warning=True)
     if context is not None:
         context.uploaded_file_mgr.remove_session_files(context.session_id)
@@ -299,12 +310,15 @@ def render_admission() -> None:
                        "only to an approved destination.")
             st.caption("Clear case releases this session's working data. It cannot erase "
                        "downloads, provider copies, or records held outside this app.")
-        if st.session_state.get("_pilot_notice_consent") != binding:
+        grant = st.session_state.get("_pilot_consent_grant")
+        if (st.session_state.get("_pilot_notice_consent") != binding
+                or not isinstance(grant, ConsentGrant) or grant.revoked.is_set()):
             st.title("Pilot privacy notice")
             st.text(approval["participant_notice"])
             if st.checkbox("I have authority to use this information and consent to the uses described in this notice.",
                            key="notice_" + binding):
                 st.session_state["_pilot_notice_consent"] = binding
+                st.session_state["_pilot_consent_grant"] = ConsentGrant(binding)
                 st.rerun()
             st.stop()
         with st.sidebar.expander("Pilot privacy notice"):
