@@ -603,6 +603,9 @@ def verify_backup(
     check_lines: bool = True,
 ) -> VerifyReport:
     """List, download, hash, and reassemble a backup. Never raises."""
+    from . import pilot
+    if pilot.enabled():
+        return VerifyReport(destination={}, listed=False, list_error="Log backup access is disabled in the controlled pilot.")
     try:
         dest = destination if destination is not None else build_destination()
     except BackupError as exc:
@@ -651,6 +654,9 @@ def restore_backup(
     silently replacing a previous restoration (and its manifest) is the kind of thing
     that quietly destroys the record an operator was about to hand to an auditor.
     """
+    from . import pilot
+    if pilot.enabled():
+        return RestoreReport(target=str(target), error="Log restores are disabled in the controlled pilot.")
     try:
         dest = destination if destination is not None else build_destination()
     except BackupError as exc:

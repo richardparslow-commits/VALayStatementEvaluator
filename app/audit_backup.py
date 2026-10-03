@@ -515,6 +515,10 @@ def build_destination(*, overrides: Mapping[str, str] | None = None) -> BackupDe
     with a read-only key — without mutating process-global config.
     """
 
+    from . import pilot
+    if pilot.enabled():
+        raise BackupError("Log backups are disabled in the controlled pilot pending destination/retention review.")
+
     def value(name: str) -> str:
         if overrides and name in overrides:
             return str(overrides[name]).strip()
@@ -824,6 +828,10 @@ def run_backup(
     file and in the returned result so ``/health`` and the CronJob's exit code can
     both report it.
     """
+    from . import pilot
+    if pilot.enabled():
+        return BackupResult(configured=True, destination="disabled-pilot",
+                            error="Log backups are disabled in the controlled pilot.")
     dest: BackupDestination
     try:
         dest = destination if destination is not None else build_destination()

@@ -294,6 +294,10 @@ def _health_payload(*, probe_cache: bool = False, probe_queue: bool = False) -> 
         payload["audit_backup"] = _abh()
     except Exception:  # noqa: BLE001
         payload["audit_backup"] = {"status": "unavailable"}
+    from . import pilot
+    if pilot.enabled():
+        from .log_retention import retention_health
+        payload["pilot_log_retention"] = retention_health()
     # Free space on the log volume. "No protection against disk-space exhaustion"
     # is answered by making it observable: below VA_LSE_DISK_MIN_FREE_BYTES this
     # reports below_floor, and audit.write_failures says whether it is already

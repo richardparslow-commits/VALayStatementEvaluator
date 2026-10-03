@@ -29,12 +29,21 @@ def approval() -> dict:
         "issuer": "https://identity.example.test", "deployment_url": "https://pilot.example.test",
         "subjects": ["participant", "operator"], "operators": ["operator"],
         "models": ["test-model"], "provider_base_url": "https://provider.example.test/v1",
+        "participant_notice": "SYNTHETIC NOTICE: test operator sends record and statement text to the synthetic test provider. Seven-day local count logs. Provider deletion is separate. Contact test operator.",
+        "local_log_retention_days": 7,
         "single_instance": True, **{name: "synthetic evidence" for name in pilot.EVIDENCE_FIELDS},
     }
 
 
 class TestAdmission(unittest.TestCase):
     def setUp(self):
+        from tests.log_isolation import isolate_app_logs
+        from app.logging_config import configure_logging
+        directory = isolate_app_logs(self)
+        context = patch.dict(os.environ, {"VA_LSE_LOG_DIR": directory})
+        context.start()
+        self.addCleanup(context.stop)
+        self.addCleanup(lambda: configure_logging(log_dir="", force=True))
         from app import documents
         self.addCleanup(documents.set_active_extractor, documents._ACTIVE_EXTRACTOR)
 
@@ -49,7 +58,9 @@ class TestAdmission(unittest.TestCase):
                 self.assertEqual(pilot.load_approval()["subjects"], data["subjects"])
                 for field, value in (("privacy_review", ""), ("reviewed_revision", "old-revision"),
                                      ("expires_at", "2000-01-01T00:00:00Z"),
-                                     ("single_instance", False), ("operators", ["outsider"])):
+                                     ("single_instance", False), ("operators", ["outsider"]),
+                                     ("participant_notice", ""), ("local_log_retention_days", True),
+                                     ("local_log_retention_days", 31)):
                     with self.subTest(field=field):
                         path.write_text(json.dumps({**data, field: value}))
                         with self.assertRaises(pilot.PilotBlocked):
@@ -69,7 +80,7 @@ class TestAdmission(unittest.TestCase):
     def test_default_closed_pilot_has_no_upload_or_action_controls(self):
         from streamlit.testing.v1 import AppTest
         root = Path(__file__).resolve().parents[1]
-        with patch.dict(os.environ, {"VA_LSE_MODE": "controlled-pilot", "VA_LSE_PILOT_APPROVAL_FILE": "/missing/approval.json"}):
+        with patch.dict(os.environ, {"VA_LSE_MODE": "controlled-pilot", "VA_LSE_PILOT_LOG_RETENTION_DAYS": "7", "VA_LSE_PILOT_APPROVAL_FILE": "/missing/approval.json"}):
             at = AppTest.from_file(str(root / "run_app.py")).run()
         self.assertFalse(at.exception)
         self.assertTrue(at.error)
@@ -77,7 +88,7 @@ class TestAdmission(unittest.TestCase):
         self.assertEqual(len(at.text_area), 0)
 
     def test_destination_refuses_private_resolution_and_unapproved_urls(self):
-        with patch.dict(os.environ, {"VA_LSE_MODE": "controlled-pilot"}), patch.object(pilot, "load_approval", return_value=approval()):
+        with patch.dict(os.environ, {"VA_LSE_MODE": "controlled-pilot", "VA_LSE_PILOT_LOG_RETENTION_DAYS": "7"}), patch.object(pilot, "load_approval", return_value=approval()):
             with self.assertRaises(pilot.PilotBlocked):
                 pilot.require_destination("https://evil.example.test/v1")
             with self.assertRaises(pilot.PilotBlocked):
@@ -125,7 +136,7 @@ class TestAdmission(unittest.TestCase):
                 "server_metadata_url": data["issuer"] + "/.well-known/openid-configuration",
                 "client_id": "synthetic-client", "client_secret": "synthetic-secret",
                 "cookie_secret": "a" * 64}
-        with patch.dict(os.environ, {"VA_LSE_MODE": "controlled-pilot"}), patch.object(pilot, "load_approval", return_value=data), \
+        with patch.dict(os.environ, {"VA_LSE_MODE": "controlled-pilot", "VA_LSE_PILOT_LOG_RETENTION_DAYS": "7"}), patch.object(pilot, "load_approval", return_value=data), \
                 patch.object(config, "load_settings", return_value=settings), patch.object(st, "user", user), \
                 patch.object(config, "MAX_RECORD_PAGES", 500), patch.object(config, "BLOB_STORE_MODE", "none"), \
                 patch.object(config, "SHARED_CACHE_URL", ""), patch.object(config, "SHARED_CACHE_TOKEN", ""), \
@@ -134,6 +145,17 @@ class TestAdmission(unittest.TestCase):
             at = AppTest.from_file(str(root / "run_app.py"))
             at.secrets["auth"] = auth
             at.run()
+            self.assertEqual(len(at.tabs), 0)
+            self.assertEqual(len(at.text_area), 0)
+            at.checkbox[0].check().run()
+            self.assertEqual(len(at.tabs), 4)
+            at.session_state["private_case"] = CANARY
+            data["participant_notice"] += " Updated notice."
+            at.run()
+            self.assertEqual(len(at.tabs), 0)
+            self.assertNotIn("private_case", at.session_state)
+            self.assertEqual(len(at.text_area), 0)
+            at.checkbox[0].check().run()
         self.assertFalse(at.exception)
         self.assertFalse(at.error)
         self.assertEqual(len(at.tabs), 4)
@@ -148,7 +170,7 @@ class TestAdmission(unittest.TestCase):
         client._pilot_call_lock = threading.Lock()
         client._client = MagicMock()
         client._settings = MagicMock(base_url=approval()["provider_base_url"])
-        with patch.dict(os.environ, {"VA_LSE_MODE": "controlled-pilot"}), \
+        with patch.dict(os.environ, {"VA_LSE_MODE": "controlled-pilot", "VA_LSE_PILOT_LOG_RETENTION_DAYS": "7"}), \
                 patch.object(pilot, "current_owner", return_value="participant"), \
                 patch.object(pilot, "require_destination"):
             with self.assertRaises(pilot.PilotBlocked):
@@ -163,8 +185,9 @@ class TestAdmission(unittest.TestCase):
         data = approval()
         claims = {"is_logged_in": True, "iss": data["issuer"], "sub": "participant", "iat": now - 1, "exp": now + 300}
         docs = [document_from_text("a.txt", "Synthetic knee observation for a thread identity test.")]
-        with patch.dict(os.environ, {"VA_LSE_MODE": "controlled-pilot"}), \
-                patch.object(pilot, "load_approval", return_value=data), patch.object(st, "user", claims):
+        with patch.dict(os.environ, {"VA_LSE_MODE": "controlled-pilot", "VA_LSE_PILOT_LOG_RETENTION_DAYS": "7"}), \
+                patch.object(pilot, "load_approval", return_value=data), patch.object(st, "user", claims), \
+                patch.object(pilot, "require_consent", return_value="synthetic-consent"):
             with self.assertRaises(pilot.PilotBlocked), pilot.action_budget(docs):
                 context = contextvars.copy_context()
                 with ThreadPoolExecutor(max_workers=1) as executor:
@@ -204,7 +227,7 @@ class TestOwnershipAndPrivacy(unittest.TestCase):
         record.record_pages = 3
         record.diagnostics = {"name": CANARY}
         record.stack_info = CANARY
-        with patch.dict(os.environ, {"VA_LSE_MODE": "controlled-pilot"}):
+        with patch.dict(os.environ, {"VA_LSE_MODE": "controlled-pilot", "VA_LSE_PILOT_LOG_RETENTION_DAYS": "7"}):
             for formatter in (JsonFormatter(), PlainFormatter()):
                 self.assertNotIn(CANARY, formatter.format(record))
             handler = CaptureHandler()
@@ -223,7 +246,7 @@ class TestOwnershipAndPrivacy(unittest.TestCase):
     def test_telemetry_and_downloads_have_no_outbound_pilot_path(self):
         from app import telemetry, agiloop_telemetry
         container = MagicMock()
-        with patch.dict(os.environ, {"VA_LSE_MODE": "controlled-pilot"}), patch.object(telemetry, "HTTPSConnection") as network:
+        with patch.dict(os.environ, {"VA_LSE_MODE": "controlled-pilot", "VA_LSE_PILOT_LOG_RETENTION_DAYS": "7"}), patch.object(telemetry, "HTTPSConnection") as network:
             telemetry._send({"record": CANARY})
             telemetry._dispatch({"record": CANARY})
             agiloop_telemetry.track_feature_error("test", ValueError(CANARY), source=CANARY)
@@ -234,7 +257,7 @@ class TestOwnershipAndPrivacy(unittest.TestCase):
     def test_record_markup_is_literal_and_dynamic_labels_are_escaped(self):
         container = MagicMock()
         content = f'![record](https://outside.invalid/{CANARY})<img src="https://outside.invalid/{CANARY}">'
-        with patch.dict(os.environ, {"VA_LSE_MODE": "controlled-pilot"}):
+        with patch.dict(os.environ, {"VA_LSE_MODE": "controlled-pilot", "VA_LSE_PILOT_LOG_RETENTION_DAYS": "7"}):
             for method in ("markdown", "write", "caption", "error", "warning"):
                 pilot.display(content, container=container, method=method, unsafe_allow_html=True)
                 getattr(container, method).assert_not_called()
@@ -264,7 +287,7 @@ class TestOwnershipAndPrivacy(unittest.TestCase):
             thread.start()
             url = f"http://127.0.0.1:{server.server_port}/redirect"
             try:
-                with patch.dict(os.environ, {"VA_LSE_MODE": "controlled-pilot",
+                with patch.dict(os.environ, {"VA_LSE_MODE": "controlled-pilot", "VA_LSE_PILOT_LOG_RETENTION_DAYS": "7",
                                             "HTTP_PROXY": "http://127.0.0.1:1", "NO_PROXY": ""}), \
                         patch.object(pilot, "require_destination"):
                     client = _pilot_transport("https://approved.example.test/v1")["http_client"]
@@ -280,7 +303,8 @@ class TestOwnershipAndPrivacy(unittest.TestCase):
 
     def test_quota_limits_and_missing_coverage_fail_before_work(self):
         docs = [document_from_text("record.txt", "Synthetic medical text for a bounded test.")]
-        with patch.dict(os.environ, {"VA_LSE_MODE": "controlled-pilot"}), patch.object(pilot, "current_owner", return_value="quota-test"):
+        with patch.dict(os.environ, {"VA_LSE_MODE": "controlled-pilot", "VA_LSE_PILOT_LOG_RETENTION_DAYS": "7"}), patch.object(pilot, "current_owner", return_value="quota-test"), \
+                patch.object(pilot, "require_consent", return_value="synthetic-consent"):
             pilot._history.clear()
             with pilot.action_budget(docs):
                 with self.assertRaises(pilot.PilotBlocked):
@@ -370,7 +394,7 @@ class TestEvidenceRegressions(unittest.TestCase):
             MedicalFact("unknown", "symptom", "Synthetic observation", "a.pdf p1"),
         ])
         result = MagicMock(digest=digest)
-        with patch.dict(os.environ, {"VA_LSE_MODE": "controlled-pilot"}), \
+        with patch.dict(os.environ, {"VA_LSE_MODE": "controlled-pilot", "VA_LSE_PILOT_LOG_RETENTION_DAYS": "7"}), \
                 patch.object(evaluate_view.st, "session_state", {}), \
                 patch.object(evaluate_view, "get_llm") as provider, \
                 patch.object(evaluate_view, "build_timeline_data", return_value={}) as build:

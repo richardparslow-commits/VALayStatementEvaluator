@@ -5,10 +5,16 @@
   "expires_at": "2000-01-02T00:00:00Z",
   "deployment_url": "https://pilot.example.invalid",
   "issuer": "https://identity.example.invalid",
-  "subjects": ["REPLACE_WITH_INVITED_OIDC_SUBJECT"],
-  "operators": ["REPLACE_WITH_OPERATOR_OIDC_SUBJECT"],
+  "subjects": [
+    "REPLACE_WITH_INVITED_OIDC_SUBJECT"
+  ],
+  "operators": [
+    "REPLACE_WITH_OPERATOR_OIDC_SUBJECT"
+  ],
   "provider_base_url": "https://provider.example.invalid/v1",
-  "models": ["REPLACE_WITH_APPROVED_MODEL"],
+  "models": [
+    "REPLACE_WITH_APPROVED_MODEL"
+  ],
   "single_instance": true,
   "provider_terms": "",
   "retention_policy": "",
@@ -16,5 +22,7 @@
   "legal_review": "",
   "accuracy_validation": "",
   "deployment_validation": "",
-  "incident_response": ""
+  "incident_response": "",
+  "participant_notice": "",
+  "local_log_retention_days": null
 }

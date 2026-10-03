@@ -29,6 +29,7 @@ Design:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 from datetime import datetime, timezone
@@ -43,6 +44,25 @@ logger = get_logger("app.run_log")
 
 _LOCK = threading.Lock()
 _FILENAME = "runs.jsonl"
+_pilot_handler: Any = None
+
+
+def prepare_pilot_handler() -> Any:
+    """Called under _LOCK; one live writer/cleanup lock for the run stream."""
+    from .log_retention import PilotLogHandler, retention_days
+    global _pilot_handler
+    path = _resolve_log_path()
+    if path == Path("/dev/null"):
+        raise ValueError("The pilot run log must be available.")
+    days = retention_days()
+    if (_pilot_handler is None or _pilot_handler.baseFilename != str(path)
+            or _pilot_handler.days != days):
+        if _pilot_handler is not None:
+            _pilot_handler.close()
+        _pilot_handler = PilotLogHandler(str(path), maxBytes=config.RUN_LOG_MAX_BYTES,
+                                         backupCount=config.RUN_LOG_BACKUPS)
+        _pilot_handler.setFormatter(logging.Formatter("%(message)s"))
+    return _pilot_handler
 
 
 def _rotated_names(path: Path) -> list[Path]:
@@ -128,6 +148,10 @@ def run_log_event(
     try:
         line = json.dumps(payload, ensure_ascii=False)
         with _LOCK:
+            if pilot.enabled():
+                handler = prepare_pilot_handler()
+                handler.handle(logging.LogRecord("runs", logging.INFO, "", 0, line, (), None))
+                return
             path = _resolve_log_path()
             _rotate_if_needed(path)
             with open(path, "a", encoding="utf-8") as fh:
@@ -143,6 +167,10 @@ def read_recent_events(limit: int = 200) -> list[dict[str, Any]]:
     the common case touches one file rather than the whole retained history.
     """
     try:
+        from . import pilot
+        if pilot.enabled():
+            with _LOCK:
+                prepare_pilot_handler().prune()
         path = _resolve_log_path()
         if not path.exists():
             return []
