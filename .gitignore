@@ -59,3 +59,5 @@ CLAUDE.md
 *.pilot.env
 pilot-approval.json
 pilot-budget.sqlite3*
+# Local benchmark approvals, full synthetic prompts/responses and reviewer files.
+accuracy-evidence/

@@ -81,3 +81,4 @@ _leftover_backup/
 **/pilot-approval.json
 **/pilot-control/
 **/pilot-budget.sqlite3*
+**/accuracy-evidence/

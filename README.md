@@ -4,6 +4,10 @@ For real veteran information, use the restricted [controlled-pilot guide](PILOT.
 The private host diagnostic tool `python scripts/pilot_status.py` reports fixed
 service state/counts without raw logs or environment values; see the
 [R08 privacy procedure](deploy/PILOT_PRIVACY_ACCEPTANCE.md).
+The [R10 accuracy procedure](deploy/PILOT_ACCURACY_ACCEPTANCE.md) provides an
+unreviewed synthetic corpus and offline evidence checks through
+`python scripts/accuracy_benchmark.py`. Actual approved-model
+runs and independently signed factual acceptance are still required.
 The [R09 budget procedure](deploy/PILOT_BUDGET_ACCEPTANCE.md) covers persistent
 quotas, conservative reservations and the actual account spending-cutoff test.
 The general deployment examples are synthetic-data scaffolding until separately reviewed.
