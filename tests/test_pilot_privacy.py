@@ -245,8 +245,12 @@ class TestPolicyAdmission(unittest.TestCase):
     def test_server_initializes_cleanup_before_cli_and_without_browser(self):
         # Run the process entrypoint, with CLI replaced only after initialize.
         from app import pilot_server
+        from tests.pilot_budget_fixtures import install_budget
+        data = approval()
+        install_budget(self, data)
         with patch.dict(os.environ, {'VA_LSE_HEALTH_PORT': '0'}), \
-                patch('streamlit.web.cli.main') as cli, patch.object(sys, 'argv', ['fixture']):
+                patch('streamlit.web.cli.main') as cli, patch.object(sys, 'argv', ['fixture']), \
+                patch.object(pilot, 'load_approval', return_value=data):
             pilot_server.main(['--server.port=8501'])
             self.assertEqual(sys.argv, ['streamlit', 'run', 'run_app.py', '--server.port=8501'])
         cli.assert_called_once()
@@ -258,8 +262,14 @@ import os, sys, json
 from pathlib import Path
 from datetime import datetime, timezone
 from app import pilot_server
+from app import pilot, pilot_budget
+from tests.test_controlled_pilot import approval
 root=Path(sys.argv[1])
 os.environ.update({'VA_LSE_MODE':'controlled-pilot','VA_LSE_PILOT_LOG_RETENTION_DAYS':'1','VA_LSE_LOG_DIR':str(root),'VA_LSE_AUDIT_LOG_DIR':str(root),'VA_LSE_RUN_LOG_DIR':str(root),'VA_LSE_HEALTH_PORT':'0'})
+data=approval()
+pilot.load_approval=lambda: data
+pilot_budget.provision(root/'pilot-budget.sqlite3', data)
+os.environ['VA_LSE_PILOT_BUDGET_FILE']=str(root/'pilot-budget.sqlite3')
 for name in ('app.log','audit.log','runs.jsonl'):
     (root/name).write_text(json.dumps({'timestamp':datetime.fromtimestamp(1,timezone.utc).isoformat(),'pages':84923})+'\n')
 assert all(json.loads((root/name).read_text())['pages']==84923 for name in ('app.log','audit.log','runs.jsonl'))
@@ -315,6 +325,8 @@ class TestNoticeLifecycle(unittest.TestCase):
         llm._sdk_name('NOT_GIVEN')  # Normal client construction binds this sentinel.
         self.data = approval()
         self.now = time.time()
+        from tests.pilot_budget_fixtures import install_budget
+        install_budget(self, self.data)
         self.claims = {'is_logged_in': True, 'iss': self.data['issuer'], 'sub': 'participant',
                        'iat': self.now - 1, 'exp': self.now + 300}
         self.owner = pilot.authorized_identity(self.claims, self.data)
@@ -326,8 +338,6 @@ class TestNoticeLifecycle(unittest.TestCase):
                         patch.object(st, 'user', self.claims), patch.object(st, 'session_state', self.state)):
             context.start()
             self.addCleanup(context.stop)
-        pilot._history.clear()
-        self.addCleanup(pilot._history.clear)
 
     def test_current_notice_allows_owner_and_changed_notice_refuses_cached_case(self):
         pilot.require_session_access()

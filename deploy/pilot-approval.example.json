@@ -24,5 +24,17 @@
   "deployment_validation": "",
   "incident_response": "",
   "participant_notice": "",
-  "local_log_retention_days": null
+  "local_log_retention_days": null,
+  "spending_controls": "",
+  "quota_policy": {
+    "pilot_id": "REPLACE_WITH_NEW_REVIEWED_PILOT_UUID",
+    "expires_at": "2000-01-02T00:00:00Z",
+    "participant_daily_starts": 2,
+    "run_attempts": 50,
+    "run_prompt_chars": 2000000,
+    "attempt_output_tokens": 8192,
+    "attempt_charge_microusd": 1000000,
+    "pilot_total_microusd": 250000000,
+    "pilot_total_attempts": 250
+  }
 }

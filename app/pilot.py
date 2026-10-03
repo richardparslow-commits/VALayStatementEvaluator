@@ -15,7 +15,6 @@ import socket
 import threading
 import time
 import uuid
-from collections import defaultdict, deque
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
@@ -45,7 +44,7 @@ def enabled() -> bool:
 
 EVIDENCE_FIELDS = (
     "provider_terms", "retention_policy", "privacy_review", "legal_review",
-    "accuracy_validation", "deployment_validation", "incident_response",
+    "accuracy_validation", "deployment_validation", "incident_response", "spending_controls",
 )
 
 
@@ -94,6 +93,8 @@ def load_approval() -> dict[str, Any]:
         if (not isinstance(notice, str) or not 80 <= len(notice.strip()) <= 16000
                 or type(days) is not int or not 1 <= days <= 30):
             raise ValueError
+        from .pilot_budget import policy
+        policy(data)
         return data
     except (KeyError, ValueError, TypeError, OSError, OverflowError) as exc:
         raise PilotBlocked("Pilot admission is closed. The operator must supply current, "
@@ -158,6 +159,8 @@ def validate_configuration() -> dict[str, Any]:
     )):
         raise PilotBlocked("External telemetry is outside the controlled pilot profile.")
     validate_log_policy(approval)
+    from .pilot_budget import get_ledger
+    get_ledger(approval)
     if config.AUDIT_BACKUP_DESTINATION not in ("", "none") or config.AUDIT_BACKUP_REQUIRED:
         raise PilotBlocked("Log backup destinations require a separate review and are disabled in this pilot.")
     import streamlit as st
@@ -219,7 +222,8 @@ def notice_binding(owner: str, approval: Mapping[str, Any]) -> str:
     """Consent is session-only and specific to identity, notice and approvals."""
     data = [owner, approval["participant_notice"], approval["privacy_review"],
             approval["provider_terms"], approval["retention_policy"],
-            approval["provider_base_url"], approval["models"], approval["local_log_retention_days"]]
+            approval["provider_base_url"], approval["models"], approval["local_log_retention_days"],
+            approval["quota_policy"], approval["spending_controls"]]
     return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
 
 
@@ -351,23 +355,33 @@ def require_destination(base_url: str, model: str | None = None) -> None:
 
 
 _lock = threading.Lock()
-_history: dict[str, deque[float]] = defaultdict(deque)
 _active = 0
+_run_budget: ContextVar[tuple[Any, str, str] | None] = ContextVar("pilot_run_budget", default=None)
+
+
+def reserve_provider_attempt(owner: str, prompt_chars: int, max_tokens: int) -> tuple[Any, str, int, int]:
+    """Durably debit immediately before EVERY SDK request, across all clients."""
+    from .pilot_budget import REFUSAL
+    budget = _run_budget.get()
+    if budget is None or budget[2] != owner or type(max_tokens) is not int or max_tokens <= 0:
+        raise PilotBlocked(REFUSAL)
+    ledger, run, _ = budget
+    ledger.verify(load_approval())
+    number = ledger.attempt(run, prompt_chars)
+    return ledger, run, number, min(max_tokens, ledger.settings["attempt_output_tokens"])
 
 
 @contextmanager
 def action_budget(records: list[Any]) -> Iterator[None]:
-    """Single-instance pilot quota: two starts per hour and one active run.
-
-    Runs cannot survive a process restart in this profile. The ingress must also
-    enforce request limits; the manifest requires evidence for that control.
-    """
+    """Reserve the full run envelope before any work; persistent rolling quotas."""
     global _active
     if not enabled():
         yield
         return
     owner = current_owner()
     notice = require_consent(owner)
+    if _run_budget.get() is not None:
+        raise PilotBlocked("A pilot run is already active in this context.")
     import streamlit as st
     claims = _run_claims.get()
     if claims is None:
@@ -379,27 +393,37 @@ def action_budget(records: list[Any]) -> Iterator[None]:
                            or not getattr(d, "pages", [])
                            or getattr(d, "unreadable_pages", []) for d in records)):
         raise PilotBlocked("Upload records with known, complete text coverage before a pilot run.")
-    now = time.monotonic()
+    from .pilot_budget import get_ledger
+    ledger = get_ledger(load_approval())
+    run = ledger.start(owner)
     with _lock:
-        starts = _history[owner]
-        while starts and starts[0] <= now - 3600:
-            starts.popleft()
-        if len(starts) >= 2 or _active:
-            raise PilotBlocked("Pilot run limit reached. Wait before starting another run.")
-        starts.append(now)
         _active += 1
     identity_token = _run_claims.set(claims)
     notice_token = _run_notice.set(notice)
+    budget_token = _run_budget.set((ledger, run, owner))
     try:
         yield
         # Provider checks cannot cover work after the final call, cached/fake
         # backends or final CPU-bound processing. Reject the completed run too.
         recheck_owner(owner)
     finally:
+        import sys
+        unwinding = sys.exc_info()[0] is not None
+        _run_budget.reset(budget_token)
         _run_notice.reset(notice_token)
         _run_claims.reset(identity_token)
         with _lock:
             _active -= 1
+        try:
+            ledger.finish(run)
+        except PilotBlocked:
+            # A failed ledger retains the full reservation and closes further
+            # admission. Preserve an existing pipeline/access exception.
+            if not unwinding:
+                raise
+    # Return to the parent/UI identity after resetting worker token snapshots.
+    # A different signed-in user must not receive the old owner's completed run.
+    recheck_owner(owner)
 
 
 def safe_metadata(data: Mapping[str, Any]) -> dict[str, Any]:

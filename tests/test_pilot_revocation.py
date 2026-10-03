@@ -19,6 +19,8 @@ class TestRevocationDuringWork(unittest.TestCase):
         from app import documents
         self.addCleanup(documents.set_active_extractor, documents._ACTIVE_EXTRACTOR)
         self.data = approval()
+        from tests.pilot_budget_fixtures import install_budget
+        install_budget(self, self.data)
         llm._sdk_name("NOT_GIVEN")  # Normal client construction binds this SDK sentinel.
         self.now = 1000
         self.claims = {"is_logged_in": True, "iss": self.data["issuer"],
@@ -33,8 +35,6 @@ class TestRevocationDuringWork(unittest.TestCase):
         ):
             context.start()
             self.addCleanup(context.stop)
-        self.addCleanup(pilot._history.clear)
-        pilot._history.clear()
         self.client = llm.LLMClient.__new__(llm.LLMClient)
         self.client._pilot_calls = 0
         self.client._pilot_prompt_chars = 0
@@ -49,7 +49,8 @@ class TestRevocationDuringWork(unittest.TestCase):
         self.client._client.responses.create.side_effect = response
         self.client._client.chat.completions.create.side_effect = response
         with patch.object(llm, "_uses_responses_schema", return_value=responses):
-            return self.client._call_openai("primary", "test-model", "system", "synthetic account", 0.2, 100, None)
+            with pilot.action_budget(self.docs):
+                return self.client._call_openai("primary", "test-model", "system", "synthetic account", 0.2, 100, None)
 
     def revoke(self, **_):
         self.data["subjects"].remove("participant")
