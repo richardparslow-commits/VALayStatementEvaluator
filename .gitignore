@@ -58,3 +58,4 @@ CLAUDE.md
 # Operator-owned pilot configuration; invitations and credentials stay external.
 *.pilot.env
 pilot-approval.json
+pilot-budget.sqlite3*

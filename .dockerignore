@@ -79,3 +79,5 @@ _leftover_backup/
 # Operator-owned pilot configuration; invitations and credentials stay external.
 **/*.pilot.env
 **/pilot-approval.json
+**/pilot-control/
+**/pilot-budget.sqlite3*

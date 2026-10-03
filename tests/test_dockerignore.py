@@ -62,6 +62,7 @@ SENSITIVE_NAMES = (".env", "usage_history.json", "secrets.toml")
 #: root — the VA.gov scraper can be run from any cwd, so its artifacts and
 #: Chrome-profile directories can materialize at any depth.
 SENSITIVE_DIR_NAMES = (
+    "pilot-control",
     "va_gov_download_artifacts",
     ".va_lse_debug_chrome",
     ".va_lse_va_gov_profile",
@@ -73,6 +74,9 @@ SENSITIVE_SUFFIXES = (".pem", ".key")
 #: One path per category this guard exists for, so a future edit that keeps the
 #: file non-empty but drops a category fails by name instead of by arithmetic.
 SENSITIVE_PATH_EXAMPLES = (
+    "pilot-control/pilot-budget.sqlite3",
+    "pilot-control/pilot-budget.sqlite3.lock",
+    "deploy/private/pilot-budget.sqlite3-journal",
     ".env",
     ".env.local",
     ".env.dev.local",
@@ -139,6 +143,8 @@ def is_sensitive(path: str) -> bool:
     if parts[-1] == ".env" or parts[-1].startswith(".env."):
         return True
     if parts[-1] in SENSITIVE_NAMES:
+        return True
+    if parts[-1].startswith("pilot-budget.sqlite3"):
         return True
     if parts[-1].endswith(SENSITIVE_SUFFIXES):
         return True

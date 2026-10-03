@@ -31,6 +31,14 @@ same integer. There is no real-data default. Obtain independent acceptance for
 this maximum; a stricter policy can require a smaller value or excluding logs.
 The deliberately incomplete example is not a usable approval.
 
+R09 adds a separate private control volume containing a random pilot ID,
+HMAC-derived participant identifiers, run/attempt timestamps, counters and
+reported token counts. These are pseudonymous metadata, not anonymous data.
+Approve their use and deletion deadline in the participant notice and retention
+review; see the [budget procedure](PILOT_BUDGET_ACCEPTANCE.md). Case clearing
+preserves quota controls. Exclude the control volume from snapshots/backups;
+never delete or restore it during an active pilot to reset limits.
+
 The pilot Compose entrypoint (`python -m app.pilot_server`) initializes cleanup
 and the private health server before Streamlit starts listening, without waiting
 for a browser session. An unusable policy/sink stops process startup. Other pilot

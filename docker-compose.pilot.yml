@@ -11,6 +11,7 @@ services:
     environment:
       VA_LSE_MODE: controlled-pilot
       VA_LSE_PILOT_APPROVAL_FILE: /run/pilot/approval.json
+      VA_LSE_PILOT_BUDGET_FILE: /app/pilot-control/pilot-budget.sqlite3
       VA_LSE_MAX_RECORD_PAGES: "500"
       VA_LSE_JOB_QUEUE: "0"
       VA_LSE_BLOB_STORE: none
@@ -29,6 +30,7 @@ services:
       - ${VA_LSE_PILOT_APPROVAL_HOST_FILE:?Set the reviewed approval file}:/run/pilot/approval.json:ro
       - ${VA_LSE_OIDC_SECRETS_FILE:?Set the OIDC secrets file}:/app/.streamlit/secrets.toml:ro
       - pilot-logs:/app/logs
+      - pilot-control:/app/pilot-control
       - parser-channel:/run/parser:ro
     depends_on:
       parser-launcher:
@@ -96,4 +98,5 @@ services:
     restart: unless-stopped
 volumes:
   pilot-logs:
+  pilot-control:
   parser-channel:

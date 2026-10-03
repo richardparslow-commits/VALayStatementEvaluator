@@ -690,11 +690,13 @@ def probe_chat(base_url: str, api_key: str, model: str) -> ChatProbe:
     (``messages`` / ``max_tokens``) everywhere else — the same split the run-time
     client uses, so the probe practices exactly what a run will do.
     """
+    from . import pilot
+    if pilot.enabled():
+        return ChatProbe(None, "Paid credential probes are disabled in the controlled pilot.")
     if not api_key or not api_key.strip():
         return ChatProbe(None, "no API key was supplied")
     if not model or not model.strip():
         return ChatProbe(None, "no model was configured to call")
-    from . import pilot
     pilot.require_destination(base_url, model)
     responses = _uses_responses_schema(base_url)
     url = _endpoint_request_url(base_url, responses=responses)
@@ -1368,6 +1370,8 @@ def _probe_open(req: Any, timeout: float) -> Any:
     from . import pilot
     if not pilot.enabled():
         return urllib.request.urlopen(req, timeout=timeout)
+    if req.get_method() not in ("GET", "HEAD"):
+        raise pilot.PilotBlocked("Paid credential probes are disabled in the controlled pilot.")
     class NoRedirect(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, req: Any, fp: Any, code: int, msg: str,
                              headers: Any, newurl: str) -> None:
@@ -1421,9 +1425,6 @@ class LLMClient:
                 **_pilot_transport(fallback.base_url),
             )
         self.usage = UsageTracker()
-        self._pilot_calls = 0
-        self._pilot_prompt_chars = 0
-        self._pilot_call_lock = threading.Lock()
 
     # -------------------------------------------------------------- endpoints
 
@@ -1556,12 +1557,6 @@ class LLMClient:
             owner = pilot.current_owner()
             pilot.require_consent(owner)
             pilot.require_destination(self._endpoint_base_url(endpoint), model)
-            with self._pilot_call_lock:
-                if self._pilot_calls >= 200 or self._pilot_prompt_chars + len(system) + len(user) > 2_000_000:
-                    raise pilot.PilotBlocked("Pilot provider-call budget reached. Ask the operator to review this run.")
-                self._pilot_calls += 1
-                self._pilot_prompt_chars += len(system) + len(user)
-            max_tokens = min(max_tokens, 8192)
         client = self._endpoint_client(endpoint)
         if _uses_responses_schema(self._endpoint_base_url(endpoint)):
             request: dict[str, Any] = {
@@ -1584,25 +1579,42 @@ class LLMClient:
                 request["timeout"] = request_timeout
             if pilot.enabled():
                 pilot.recheck_owner(owner)  # Includes withdrawal during request preparation.
-            response = client.responses.create(**request)
+                ledger, run, number, max_tokens = pilot.reserve_provider_attempt(owner, len(system) + len(user), max_tokens)
+                request["max_output_tokens"] = max_tokens
+            try:
+                if pilot.enabled():
+                    pilot.recheck_owner(owner)  # Includes withdrawal during durable budget writes.
+                response = client.responses.create(**request)
+            finally:
+                if pilot.enabled():
+                    ledger.complete_attempt(run, number)
             responses = True
         else:
             privacy_options: dict[str, Any] = {"store": False} if pilot.enabled() else {}
             if pilot.enabled():
                 pilot.recheck_owner(owner)
-            response = client.chat.completions.create(
-                **privacy_options,
-                model=model,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                timeout=request_timeout,
-            )
+                ledger, run, number, max_tokens = pilot.reserve_provider_attempt(owner, len(system) + len(user), max_tokens)
+            try:
+                if pilot.enabled():
+                    pilot.recheck_owner(owner)
+                response = client.chat.completions.create(
+                    **privacy_options,
+                    model=model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    timeout=request_timeout,
+                )
+            finally:
+                if pilot.enabled():
+                    ledger.complete_attempt(run, number)
             responses = False
         if pilot.enabled():
+            tokens = _responses_usage_tokens(response) if responses else _usage_tokens(response)
+            ledger.reconcile(run, number, *tokens)
             # A request already sent cannot be recalled. Its response must not
             # enter usage, pipelines or session results after access has ended.
             pilot.recheck_owner(owner)

@@ -18,6 +18,7 @@ from app import pilot
 from app.documents import DocumentPage, ExtractedDocument, ExtractionError, document_from_text
 
 CANARY = "SYNTHETIC_PERSON_RECORD_CANARY_84923"
+_QUOTA_EXPIRY = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
 
 
 def approval() -> dict:
@@ -31,6 +32,10 @@ def approval() -> dict:
         "models": ["test-model"], "provider_base_url": "https://provider.example.test/v1",
         "participant_notice": "SYNTHETIC NOTICE: test operator sends record and statement text to the synthetic test provider. Seven-day local count logs. Provider deletion is separate. Contact test operator.",
         "local_log_retention_days": 7,
+        "quota_policy": {"pilot_id": "22f9db15-2a9a-4e00-83a5-c7bfe30062a4", "expires_at": _QUOTA_EXPIRY,
+                         "participant_daily_starts": 2, "run_attempts": 50, "run_prompt_chars": 2_000_000,
+                         "attempt_output_tokens": 8192, "attempt_charge_microusd": 1_000_000,
+                         "pilot_total_microusd": 250_000_000, "pilot_total_attempts": 250},
         "single_instance": True, **{name: "synthetic evidence" for name in pilot.EVIDENCE_FIELDS},
     }
 
@@ -129,6 +134,8 @@ class TestAdmission(unittest.TestCase):
         class VerifiedTestUser(dict):
             is_logged_in = True
         user = VerifiedTestUser(is_logged_in=True, iss=data["issuer"], sub="participant", iat=now - 1, exp=now + 300)
+        from tests.pilot_budget_fixtures import install_budget
+        install_budget(self, data)
         settings = replace(config.load_settings(), api_key=CANARY,
                            base_url=data["provider_base_url"], model_main="test-model", model_fast="test-model",
                            fallback_base_url="", fetch_api_key="")
@@ -184,6 +191,8 @@ class TestAdmission(unittest.TestCase):
         now = int(datetime.now(timezone.utc).timestamp())
         data = approval()
         claims = {"is_logged_in": True, "iss": data["issuer"], "sub": "participant", "iat": now - 1, "exp": now + 300}
+        from tests.pilot_budget_fixtures import install_budget
+        install_budget(self, data)
         docs = [document_from_text("a.txt", "Synthetic knee observation for a thread identity test.")]
         with patch.dict(os.environ, {"VA_LSE_MODE": "controlled-pilot", "VA_LSE_PILOT_LOG_RETENTION_DAYS": "7"}), \
                 patch.object(pilot, "load_approval", return_value=data), patch.object(st, "user", claims), \
@@ -302,10 +311,12 @@ class TestOwnershipAndPrivacy(unittest.TestCase):
         self.assertEqual(received, ["/redirect", "/redirect"])
 
     def test_quota_limits_and_missing_coverage_fail_before_work(self):
+        from tests.pilot_budget_fixtures import install_budget
+        data = approval()
+        install_budget(self, data)
         docs = [document_from_text("record.txt", "Synthetic medical text for a bounded test.")]
         with patch.dict(os.environ, {"VA_LSE_MODE": "controlled-pilot", "VA_LSE_PILOT_LOG_RETENTION_DAYS": "7"}), patch.object(pilot, "current_owner", return_value="quota-test"), \
-                patch.object(pilot, "require_consent", return_value="synthetic-consent"):
-            pilot._history.clear()
+                patch.object(pilot, "require_consent", return_value="synthetic-consent"), patch.object(pilot, "load_approval", return_value=data):
             with pilot.action_budget(docs):
                 with self.assertRaises(pilot.PilotBlocked):
                     with pilot.action_budget(docs):

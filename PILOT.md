@@ -11,10 +11,19 @@ expired and incomplete. Do not replace evidence references with a general
 
 ## Released pilot scope
 
+Complete the [budget and quota acceptance procedure](deploy/PILOT_BUDGET_ACCEPTANCE.md)
+before admission. The prepared proposal is $250 total, two starts per participant
+per rolling day, 50 attempts per run and a provisional $1 per-attempt charge
+ceiling. It reserves $50 before each run. These values do not establish the
+actual provider's worst-case price or spending cutoff; the example stays expired
+and its `spending_controls` evidence reference stays empty.
+
 - At most ten invited OIDC subjects, with a separately listed operator role.
 - One application instance; one active analysis; at most two starts per participant
-  per hour. These process-local counters reset on restart. The operator must also
-  enforce an account spending limit and ingress limits.
+  per rolling hour and the reviewed daily limit per rolling 24 hours. A private
+  pre-provisioned control ledger retains quotas across restarts and holds an
+  exclusive host process lease. The operator must also prove an independent
+  account spending cutoff and ingress/message limits.
 - Uploads only: at most 500 source pages per case, 50 MB per file, 200 MB total.
   Each parse runs in a fresh non-root Linux container with no network access or
   application mounts. A 60-second child deadline (70-second supervisor deadline),
@@ -22,9 +31,13 @@ expired and incomplete. Do not replace evidence references with a general
   temporary filesystem bound each parse. There is no web-process fallback.
 - One operator-configured HTTPS analysis provider and approved model list. The
   pilot HTTP client refuses redirects and environment proxies. Each run is
-  limited to 200 actual provider attempts, two million submitted prompt
-  characters, and 8,192 requested output tokens per attempt. Character limits
-  are not a guarantee of dollar cost.
+  limited by its explicit reviewed policy, with ceilings of 200 actual provider
+  attempts, two million submitted prompt characters, and 8,192 requested output
+  tokens per attempt. Before work starts, the ledger reserves every attempt at
+  the operator's conservative maximum charge. Failed/retried attempts keep their
+  full charge; normal run unwinding releases only unstarted attempts. A crash
+  keeps the entire reservation. Usage counts never trigger estimated refunds.
+  Character limits and an unverified charge ceiling do not guarantee dollar cost.
 - Cases in the current Streamlit session. Queueing, durable case blobs, shared
   remote cache, external telemetry, tracing, remote fetching, research tools,
   local folder access, and external OCR runners are blocked in this profile.

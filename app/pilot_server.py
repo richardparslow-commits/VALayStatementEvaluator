@@ -14,6 +14,8 @@ def initialize() -> None:
     # No OIDC/user context or provider request is needed to clean local logs.
     # Full account/revision/identity acceptance remains at screen admission.
     pilot.validate_log_policy({"local_log_retention_days": retention_days()})
+    from .pilot_budget import get_ledger
+    get_ledger(pilot.load_approval())  # Hold the single-process lock before listening.
     from .shutdown import install_signal_handlers
     install_signal_handlers()
     if os.getenv("VA_LSE_HEALTH_PORT", "").strip() != "0":

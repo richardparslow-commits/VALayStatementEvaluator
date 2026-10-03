@@ -65,6 +65,7 @@ ENV VA_LSE_BUILD_SHA=${VA_LSE_BUILD_SHA}
 # or PVC mounted over a path that does not exist here is created root-owned, and
 # the non-root process below would then be unable to write to it.
 RUN mkdir -p /app/logs /app/blobs && chown -R nobody:nogroup /app/logs /app/blobs
+RUN mkdir -p /app/pilot-control && chown nobody:nogroup /app/pilot-control && chmod 0700 /app/pilot-control
 
 # Run as non-root for security
 USER nobody
