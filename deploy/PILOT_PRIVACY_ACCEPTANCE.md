@@ -70,6 +70,9 @@ retention approval. Historical backups created before this change are unaffected
 `python scripts/pilot_status.py` from the private host checkout to inspect only
 fixed service states, exit/restart counts, OOM and health classifications. It reads
 no raw logs, environment or health-check output, and never echoes CLI errors.
+The status tool exits successfully only when web/parser health is `healthy` and
+all three processes are running; nginx has no health check, so its process state
+does not establish TLS/routing acceptance. Pending/unavailable health is refusal.
 Use the private app health endpoint for count-only audit/retention status and the
 private parser health protocol for readiness. These prepared diagnostics do not
 replace R12 actual-host monitoring/incident acceptance; deeper investigation

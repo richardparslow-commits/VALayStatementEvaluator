@@ -38,3 +38,15 @@ class TestPilotStatus(unittest.TestCase):
             self.assertEqual(pilot_status.status(),{s:{'status':'absent'} for s in pilot_status.SERVICES})
         with patch.object(pilot_status,'status',return_value={s:{'status':'exited'} for s in pilot_status.SERVICES}),patch('builtins.print'):
             self.assertEqual(pilot_status.main(),2)
+
+    def test_success_requires_healthy_web_and_parser_but_not_nginx_healthcheck(self):
+        base={s:{'status':'running','health':'healthy'} for s in pilot_status.SERVICES}
+        base['nginx']['health']='unavailable'
+        with patch.object(pilot_status,'status',return_value=base),patch('builtins.print'):
+            self.assertEqual(pilot_status.main(),0)
+            for service in ('streamlit-web','parser-launcher'):
+                for health in ('starting','unavailable','unhealthy'):
+                    base[service]['health']=health
+                    with self.subTest(service=service,health=health):
+                        self.assertEqual(pilot_status.main(),2)
+                base[service]['health']='healthy'

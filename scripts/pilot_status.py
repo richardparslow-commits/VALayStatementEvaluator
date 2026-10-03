@@ -49,7 +49,8 @@ def main() -> int:
     report = status()
     print(json.dumps(report))
     return 2 if any(v['status'] != 'running' or v.get('health') == 'unhealthy'
-                    for v in report.values()) else 0
+                    or (service != 'nginx' and v.get('health') != 'healthy')
+                    for service, v in report.items()) else 0
 
 
 if __name__ == '__main__':
