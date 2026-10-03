@@ -7,7 +7,8 @@ from one is ambient: two deployments of identical code behave differently, and t
 suite cannot say which behaviour was tested.
 
 The pilot admission check is the narrow exception: it checks effective XSRF
-and CORS values so a command-line override cannot bypass the committed policy.
+and CORS values and the disconnected-session age ceiling so a command-line
+override cannot bypass the committed security/privacy policy.
 All other runtime option reads remain prohibited.
 
 The case that matters most is security posture. ``app/main.py`` checks that the
@@ -80,14 +81,15 @@ REMEDY = (
 
 def option_read_offence(name: str | Path, source: str) -> list[str]:
     """Lines where *source* reads a Streamlit config option, as ``name:line``."""
-    allowed_security_line = (
-        'if not st.get_option("server.enableXsrfProtection") or not st.get_option("server.enableCORS"):'
-    )
+    allowed_security_lines = {
+        'if not st.get_option("server.enableXsrfProtection") or not st.get_option("server.enableCORS"):',
+        'if st.get_option("server.disconnectedSessionTTL") > 60:',
+    }
     return [
         f"{name}:{number}: {line.strip()}"
         for number, line in enumerate(source.splitlines(), start=1)
         if any(pattern.search(line) for pattern in OPTION_READ_PATTERNS)
-        and not (str(name) == "app/pilot.py" and line.strip() == allowed_security_line)
+        and not (str(name) == "app/pilot.py" and line.strip() in allowed_security_lines)
     ]
 
 

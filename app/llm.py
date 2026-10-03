@@ -1554,6 +1554,7 @@ class LLMClient:
         owner = ""
         if pilot.enabled():
             owner = pilot.current_owner()
+            pilot.require_consent(owner)
             pilot.require_destination(self._endpoint_base_url(endpoint), model)
             with self._pilot_call_lock:
                 if self._pilot_calls >= 200 or self._pilot_prompt_chars + len(system) + len(user) > 2_000_000:
@@ -1570,9 +1571,9 @@ class LLMClient:
                 # The endpoint is stateless for this app's use: every prompt is
                 # fully self-contained, nothing is continued via
                 # previous_response_id, and the payloads carry medical records.
-                # Opting out of server-side storage keeps retrievable copies of
-                # that content from accumulating on the provider — the
-                # documented way to run once and leave nothing behind.
+                # This requests no retrievable response storage. It does not
+                # establish the actual account's logging, abuse-monitoring or
+                # other retention policy; the operator must review those terms.
                 "store": False,
             }
             if system.strip():
@@ -1581,10 +1582,14 @@ class LLMClient:
                 request["temperature"] = temperature
             if request_timeout is not NOT_GIVEN:
                 request["timeout"] = request_timeout
+            if pilot.enabled():
+                pilot.recheck_owner(owner)  # Includes withdrawal during request preparation.
             response = client.responses.create(**request)
             responses = True
         else:
             privacy_options: dict[str, Any] = {"store": False} if pilot.enabled() else {}
+            if pilot.enabled():
+                pilot.recheck_owner(owner)
             response = client.chat.completions.create(
                 **privacy_options,
                 model=model,

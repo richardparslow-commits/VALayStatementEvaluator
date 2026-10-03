@@ -814,6 +814,13 @@ class TestTheAppReadsNoStreamlitConfigOption(unittest.TestCase):
             "app/main.py:_check_streamlit_config_hardening).",
         )
 
+    def test_only_pilot_can_check_effective_disconnect_age_ceiling(self) -> None:
+        source = 'if st.get_option("server.disconnectedSessionTTL") > 60:\n    raise PilotBlocked()\n'
+        self.assertEqual(streamlit_option_reads.option_read_offence("app/pilot.py", source), [])
+        self.assertTrue(streamlit_option_reads.option_read_offence("app/other.py", source))
+        self.assertTrue(streamlit_option_reads.option_read_offence("app/pilot.py", source.replace(
+            "server.disconnectedSessionTTL", "server.port")))
+
     def test_the_scan_flags_a_planted_read(self) -> None:
         """A guard that cannot fail is decoration."""
         source = "import streamlit as st\n\n\ndef f():\n    return st.get_option('server.port')\n"

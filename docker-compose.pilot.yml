@@ -6,7 +6,7 @@ services:
       target: runtime
       args:
         VA_LSE_BUILD_SHA: ${VA_LSE_BUILD_SHA:?Set the reviewed immutable revision}
-    command: [streamlit, run, run_app.py, --server.port=8501, --server.address=0.0.0.0, --server.headless=true, --server.disconnectedSessionTTL=60]
+    command: [python, -m, app.pilot_server, --server.port=8501, --server.address=0.0.0.0, --server.headless=true, --server.disconnectedSessionTTL=60]
     env_file: ${VA_LSE_PILOT_ENV_FILE:?Set the operator environment file}
     environment:
       VA_LSE_MODE: controlled-pilot
@@ -21,6 +21,10 @@ services:
       VA_LSE_LOG_JSON: "1"
       VA_LSE_LOG_DIR: /app/logs
       VA_LSE_AUDIT_LOG_DIR: /app/logs
+      VA_LSE_RUN_LOG_DIR: /app/logs
+      VA_LSE_PILOT_LOG_RETENTION_DAYS: ${VA_LSE_PILOT_LOG_RETENTION_DAYS:?Set the reviewed local log age limit}
+      VA_LSE_AUDIT_BACKUP_DESTINATION: none
+      VA_LSE_AUDIT_BACKUP_REQUIRED: "0"
     volumes:
       - ${VA_LSE_PILOT_APPROVAL_HOST_FILE:?Set the reviewed approval file}:/run/pilot/approval.json:ro
       - ${VA_LSE_OIDC_SECRETS_FILE:?Set the OIDC secrets file}:/app/.streamlit/secrets.toml:ro
@@ -42,6 +46,8 @@ services:
     read_only: true
     tmpfs:
       - /tmp:size=256M,mode=1777
+    logging:
+      driver: "none"
     restart: unless-stopped
   parser-launcher:
     build:
@@ -70,6 +76,8 @@ services:
       interval: 90s
       timeout: 15s
       retries: 2
+    logging:
+      driver: "none"
     restart: unless-stopped
   nginx:
     image: nginx:1.27-alpine
@@ -83,6 +91,8 @@ services:
       streamlit-web:
         condition: service_healthy
     security_opt: [no-new-privileges:true]
+    logging:
+      driver: "none"
     restart: unless-stopped
 volumes:
   pilot-logs:

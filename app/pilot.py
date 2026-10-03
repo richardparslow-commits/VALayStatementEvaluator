@@ -19,6 +19,7 @@ from collections import defaultdict, deque
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 from urllib.parse import urlsplit
@@ -28,6 +29,13 @@ class PilotBlocked(RuntimeError):
     """A pilot admission or privacy requirement has not been met."""
 
 
+@dataclass
+class ConsentGrant:
+    binding: str
+    revoked: threading.Event = field(default_factory=threading.Event)
+
+
+_run_notice: ContextVar[ConsentGrant | None] = ContextVar("pilot_notice_consent", default=None)
 _run_claims: ContextVar[dict[str, Any] | None] = ContextVar("pilot_verified_claims", default=None)
 
 
@@ -81,10 +89,40 @@ def load_approval() -> dict[str, Any]:
             raise ValueError
         if data.get("single_instance") is not True:
             raise ValueError
+        notice = data.get("participant_notice")
+        days = data.get("local_log_retention_days")
+        if (not isinstance(notice, str) or not 80 <= len(notice.strip()) <= 16000
+                or type(days) is not int or not 1 <= days <= 30):
+            raise ValueError
         return data
     except (KeyError, ValueError, TypeError, OSError, OverflowError) as exc:
         raise PilotBlocked("Pilot admission is closed. The operator must supply current, "
                            "revision-specific review evidence and an invitation list.") from exc
+
+
+def validate_log_policy(approval: Mapping[str, Any]) -> None:
+    """Require all three local writers and a healthy matching age policy."""
+    from .log_retention import retention_days, PilotLogHandler, retention_health
+    try:
+        if retention_days() != approval["local_log_retention_days"]:
+            raise ValueError
+        from .logging_config import configure_logging
+        from .audit import configure_audit_logging
+        from . import run_log
+        handlers = [h for log in (configure_logging(), configure_audit_logging())
+                    for h in log.handlers if isinstance(h, PilotLogHandler)]
+        with run_log._LOCK:
+            handlers.append(run_log.prepare_pilot_handler())
+        if (len(handlers) != 3 or len({h.baseFilename for h in handlers}) != 3
+                or any(h.days != retention_days() for h in handlers)):
+            raise ValueError
+        for handler in handlers:
+            handler.verify_sink()
+        health = retention_health()
+        if not health["active"] or health["failed"] or health["stale"]:
+            raise ValueError
+    except (OSError, ValueError, KeyError) as exc:
+        raise PilotBlocked("Pilot log retention must match the reviewed policy and be healthy.") from exc
 
 
 def validate_configuration() -> dict[str, Any]:
@@ -119,6 +157,12 @@ def validate_configuration() -> dict[str, Any]:
         "AGILOOP_INSPECT_API_KEY", "AGILOOP_INSPECT_URL",
     )):
         raise PilotBlocked("External telemetry is outside the controlled pilot profile.")
+    validate_log_policy(approval)
+    if config.AUDIT_BACKUP_DESTINATION not in ("", "none") or config.AUDIT_BACKUP_REQUIRED:
+        raise PilotBlocked("Log backup destinations require a separate review and are disabled in this pilot.")
+    import streamlit as st
+    if st.get_option("server.disconnectedSessionTTL") > 60:
+        raise PilotBlocked("Pilot disconnected sessions must expire within 60 seconds.")
     settings = config.load_settings()
     if (not settings.api_key or settings.fallback_base_url or settings.fetch_api_key
             or https_url(settings.base_url) != https_url(approval["provider_base_url"])
@@ -171,10 +215,32 @@ def owns(record: Any) -> bool:
     return bool(getattr(record, "owner_id", "")) and record.owner_id == current_owner()
 
 
+def notice_binding(owner: str, approval: Mapping[str, Any]) -> str:
+    """Consent is session-only and specific to identity, notice and approvals."""
+    data = [owner, approval["participant_notice"], approval["privacy_review"],
+            approval["provider_terms"], approval["retention_policy"],
+            approval["provider_base_url"], approval["models"], approval["local_log_retention_days"]]
+    return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
+
+
+def require_consent(owner: str) -> ConsentGrant:
+    import streamlit as st
+    expected = notice_binding(owner, load_approval())
+    accepted = _run_notice.get()
+    if accepted is None:
+        accepted = st.session_state.get("_pilot_consent_grant")
+    if (not isinstance(accepted, ConsentGrant) or accepted.binding != expected
+            or accepted.revoked.is_set()):
+        raise PilotBlocked("Read the current pilot privacy notice and give consent before continuing.")
+    return accepted
+
+
 def recheck_owner(owner: str) -> None:
     """Refuse delayed work after expiry, invitation removal or identity change."""
-    if enabled() and current_owner() != owner:
-        raise PilotBlocked("Access changed while this work was running. Sign in again.")
+    if enabled():
+        if current_owner() != owner:
+            raise PilotBlocked("Access changed while this work was running. Sign in again.")
+        require_consent(owner)
 
 
 def require_session_access() -> None:
@@ -200,6 +266,9 @@ def operator_allowed() -> bool:
 def clear_case() -> None:
     import streamlit as st
     from streamlit.runtime.scriptrunner_utils.script_run_context import get_script_run_ctx
+    grant = st.session_state.get("_pilot_consent_grant")
+    if isinstance(grant, ConsentGrant):
+        grant.revoked.set()  # Shared object: copied worker contexts see this too.
     context = get_script_run_ctx(suppress_warning=True)
     if context is not None:
         context.uploaded_file_mgr.remove_session_files(context.session_id)
@@ -210,7 +279,7 @@ def clear_case() -> None:
 def render_admission() -> None:
     import streamlit as st
     try:
-        validate_configuration()
+        approval = validate_configuration()
         if not enabled():
             st.caption("Synthetic-data mode. Do not enter real veteran information.")
             return
@@ -222,6 +291,10 @@ def render_admission() -> None:
             st.stop()
         owner = current_owner()  # Recheck expiry and revocation on every rerun.
         if st.session_state.get("_pilot_owner") not in (None, owner):
+            clear_case()
+        binding = notice_binding(owner, approval)
+        accepted = st.session_state.get("_pilot_notice_consent")
+        if accepted not in (None, binding):
             clear_case()
         st.session_state["_pilot_owner"] = owner
         with st.sidebar:
@@ -237,6 +310,19 @@ def render_admission() -> None:
                        "only to an approved destination.")
             st.caption("Clear case releases this session's working data. It cannot erase "
                        "downloads, provider copies, or records held outside this app.")
+        grant = st.session_state.get("_pilot_consent_grant")
+        if (st.session_state.get("_pilot_notice_consent") != binding
+                or not isinstance(grant, ConsentGrant) or grant.revoked.is_set()):
+            st.title("Pilot privacy notice")
+            st.text(approval["participant_notice"])
+            if st.checkbox("I have authority to use this information and consent to the uses described in this notice.",
+                           key="notice_" + binding):
+                st.session_state["_pilot_notice_consent"] = binding
+                st.session_state["_pilot_consent_grant"] = ConsentGrant(binding)
+                st.rerun()
+            st.stop()
+        with st.sidebar.expander("Pilot privacy notice"):
+            st.text(approval["participant_notice"])
     except PilotBlocked as blocked:
         from .error_report import report_failure
         clear_case()
@@ -281,6 +367,7 @@ def action_budget(records: list[Any]) -> Iterator[None]:
         yield
         return
     owner = current_owner()
+    notice = require_consent(owner)
     import streamlit as st
     claims = _run_claims.get()
     if claims is None:
@@ -302,12 +389,14 @@ def action_budget(records: list[Any]) -> Iterator[None]:
         starts.append(now)
         _active += 1
     identity_token = _run_claims.set(claims)
+    notice_token = _run_notice.set(notice)
     try:
         yield
         # Provider checks cannot cover work after the final call, cached/fake
         # backends or final CPU-bound processing. Reject the completed run too.
         recheck_owner(owner)
     finally:
+        _run_notice.reset(notice_token)
         _run_claims.reset(identity_token)
         with _lock:
             _active -= 1

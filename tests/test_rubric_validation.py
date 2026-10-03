@@ -398,7 +398,8 @@ class TestRubricPilotDiagnostics(unittest.TestCase):
         from app.views.ops import _event_row
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "runs.jsonl"
-            with patch.object(pilot, "enabled", return_value=True), patch.object(run_log, "_resolve_log_path", return_value=path):
+            with patch.dict("os.environ", {"VA_LSE_PILOT_LOG_RETENTION_DAYS": "7"}), \
+                    patch.object(pilot, "enabled", return_value=True), patch.object(run_log, "_resolve_log_path", return_value=path):
                 run_log.run_log_event("evaluate", "partial", request_id="req_0123456789ab",
                     scoring_status="incomplete", error="PRIVATE_METADATA_SENTINEL", patient="PRIVATE_METADATA_SENTINEL")
             persisted = path.read_text()

@@ -24,11 +24,12 @@ class TestRevocationDuringWork(unittest.TestCase):
         self.claims = {"is_logged_in": True, "iss": self.data["issuer"],
                        "sub": "participant", "iat": 950, "exp": 1100}
         for context in (
-            patch.dict(os.environ, {"VA_LSE_MODE": "controlled-pilot"}),
+            patch.dict(os.environ, {"VA_LSE_MODE": "controlled-pilot", "VA_LSE_PILOT_LOG_RETENTION_DAYS": "7"}),
             patch.object(pilot, "load_approval", side_effect=lambda: self.data),
             patch.object(pilot.time, "time", side_effect=lambda: self.now),
             patch.object(st, "user", self.claims),
             patch.object(pilot, "require_destination"),
+            patch.object(pilot, "require_consent", side_effect=lambda owner: pilot.notice_binding(owner, self.data)),
         ):
             context.start()
             self.addCleanup(context.stop)
@@ -176,6 +177,8 @@ class TestRevocationDuringWork(unittest.TestCase):
                 patch.object(main, "render_draft_tab") as draft_view, \
                 patch.object(main, "render_failure_detail") as diagnostics:
             at = AppTest.from_file(str(root / "run_app.py"))
+            at.session_state["_pilot_notice_consent"] = pilot.notice_binding(pilot.current_owner(), self.data)
+            at.session_state["_pilot_consent_grant"] = pilot.ConsentGrant(at.session_state["_pilot_notice_consent"])
             at.session_state["private_case"] = "SYNTHETIC_CASE_CANARY"
             at.run()
         self.assertFalse(at.exception)

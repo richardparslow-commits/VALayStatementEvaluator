@@ -318,8 +318,12 @@ def configure_audit_logging(
     """
     global _CONFIGURED  # noqa: PLW0603
 
+    from . import pilot
+    from .log_retention import PilotLogHandler
     if _CONFIGURED and not force:
-        return logging.getLogger(_AUDIT_LOGGER_NAME)
+        has_pilot_sink = any(isinstance(h, PilotLogHandler) for h in logging.getLogger(_AUDIT_LOGGER_NAME).handlers)
+        if pilot.enabled() == has_pilot_sink:
+            return logging.getLogger(_AUDIT_LOGGER_NAME)
 
     # Resolve settings — explicit args win, otherwise env / config defaults.
     raw_dir = _resolve_audit_dir(log_dir)
@@ -356,6 +360,11 @@ def configure_audit_logging(
     class _CountingRotatingFileHandler(_FailureCountingHandler, logging.handlers.RotatingFileHandler):
         pass
 
+    class _CountingPilotFileHandler(PilotLogHandler):
+        def handleError(self, record: logging.LogRecord) -> None:
+            _note_write_failure(OSError("Pilot audit file write failed."))
+            super().handleError(record)
+
     class _CountingStreamHandler(_FailureCountingHandler, logging.StreamHandler):
         pass
 
@@ -390,7 +399,8 @@ def configure_audit_logging(
             log_path = Path(raw_dir).expanduser().resolve()
             log_path.mkdir(parents=True, exist_ok=True)
             file_path = log_path / raw_file
-            file_handler = _CountingRotatingFileHandler(
+            handler_type = _CountingPilotFileHandler if pilot.enabled() else _CountingRotatingFileHandler
+            file_handler = handler_type(
                 str(file_path), maxBytes=raw_max, backupCount=raw_backups, encoding="utf-8"
             )
             file_handler.setFormatter(formatter)

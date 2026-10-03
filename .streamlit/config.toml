@@ -49,6 +49,8 @@ enableWebsocketCompression = false
 # Upload cap — matches the in-code guard (app/config.py VA_LSE_MAX_UPLOAD_BYTES).
 # Streamlit >= 1.32 enforces this server-side before Python sees the file.
 maxUploadSize = 50
+# Release disconnected session state/uploads promptly; the pilot verifies this.
+disconnectedSessionTTL = 60
 
 [client]
 # Hide the fork/deploy buttons in shared/hosted deployments.
@@ -65,4 +67,3 @@ level = "info"
 # No map features in this app.
 
 [theme]
-

@@ -260,8 +260,12 @@ def configure_logging(
     """
     global _CONFIGURED  # noqa: PLW0603
 
+    from . import pilot
+    from .log_retention import PilotLogHandler
     if _CONFIGURED and not force:
-        return logging.getLogger("app")
+        has_pilot_sink = any(isinstance(h, PilotLogHandler) for h in logging.getLogger("app").handlers)
+        if pilot.enabled() == has_pilot_sink:
+            return logging.getLogger("app")
 
     lvl = level if level is not None else _level_from_env()
     use_json = json_output if json_output is not None else _env_bool("VA_LSE_LOG_JSON", False)
@@ -304,7 +308,8 @@ def configure_logging(
             log_path = Path(raw_dir).expanduser().resolve()
             log_path.mkdir(parents=True, exist_ok=True)
             file_path = log_path / raw_file
-            file_handler = logging.handlers.RotatingFileHandler(
+            handler_type = PilotLogHandler if pilot.enabled() else logging.handlers.RotatingFileHandler
+            file_handler = handler_type(
                 str(file_path), maxBytes=raw_max, backupCount=raw_backups, encoding="utf-8"
             )
             file_handler.setFormatter(formatter)

@@ -80,7 +80,13 @@ supported controlled-pilot environment.
    retention/deletion, subprocessors, region and incident handling for the account
    and models being used. `store=false` is requested for generated responses;
    it does not guarantee that a provider retains no copies. Record the agreed
-   retention policy and the participant privacy notice.
+   retention policy and the exact participant privacy notice. Complete
+   [R08 provider/privacy acceptance](deploy/PILOT_PRIVACY_ACCEPTANCE.md) for the
+   actual account. The approval must contain `participant_notice` and integer
+   `local_log_retention_days` (1–30); set `VA_LSE_PILOT_LOG_RETENTION_DAYS` to the
+   same value. Missing or mismatched policy closes admission. The participant
+   must consent to this exact notice before case controls appear; changed terms,
+   destinations or notice require fresh consent.
 3. Obtain independent privacy, security, and accredited legal/evidence review.
    Evaluate synthetic cases with known dates, negation, uncertainty, witness
    attribution, missing scans, conflicting evidence, and false citations. Record
@@ -126,6 +132,7 @@ supported controlled-pilot environment.
    | `VA_LSE_BUILD_SHA` | Reviewed immutable revision |
    | `VA_LSE_PARSER_IMAGE` | Local parser image ID (`sha256:` plus 64 hex digits), built from that revision |
    | `VA_LSE_DOCKER_GID` | Linux Docker socket group ID; added only to the trusted launcher |
+   | `VA_LSE_PILOT_LOG_RETENTION_DAYS` | Reviewed 1–30 day local log maximum, matching the approval |
    | `VA_LSE_PILOT_ENV_FILE` | Protected provider environment file |
    | `VA_LSE_PILOT_APPROVAL_HOST_FILE` | Absolute path to actual approval JSON |
    | `VA_LSE_OIDC_SECRETS_FILE` | Absolute path to OIDC secrets |
@@ -143,6 +150,9 @@ supported controlled-pilot environment.
    docker compose -f docker-compose.pilot.yml up --build -d
    ```
 
+   The pilot server entrypoint starts cleanup and private health before any
+   browser connects. Use this entrypoint on equivalent hosts too; running only
+   `streamlit run run_app.py` does not initialize cleanup until a browser opens.
    Never scale this profile. Do not use the general Compose/Kubernetes worker
    examples for real pilot records. Pin deployment image digests after the build
    and scanner checks; restrict outgoing traffic to reviewed destinations and
@@ -186,7 +196,17 @@ in-flight requests may already have reached the provider. Browser content,
 copied text, originals and provider copies follow their own retention policies.
 Set and verify a short disconnected-session timeout, prohibit shared browser
 profiles, and encrypt the host and operational log volume. Back up only the
-count-only pilot operational logs using the reviewed retention policy.
+count-only pilot operational logs using the reviewed retention policy. All three
+local streams expire whole files using their first event timestamp, at startup,
+before writes and during a 60-second idle sweep; size rotation can delete them
+sooner. Failed/stale retention closes subsequent admission. The Compose profile
+disables container log persistence. Backups and restores are excluded pending a
+separate review; historical backups and stopped-volume/snapshot deletion require
+the actual host operator's accepted lifecycle procedure. Clearing/sign-out also
+revokes the shared consent grant so copied workers stop at their next sensitive
+boundary, then removes session consent. Private host diagnostics are available
+through `python scripts/pilot_status.py` (fixed service state/counts only), plus
+the private app/parser health channels. See [R08 acceptance and notice worksheet](deploy/PILOT_PRIVACY_ACCEPTANCE.md).
 
 Pilot logs keep fixed lifecycle labels, opaque generated references and numeric
 counts. They omit filenames, conditions, witness text, arbitrary extras,
