@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "provider": "",
+  "base_url": "https://api.perplexity.ai/v1",
+  "account_reference": "",
+  "region_reference": "",
+  "approval_reference": "",
+  "tools": [],
+  "fallbacks": [],
+  "request_profiles": []
+}
