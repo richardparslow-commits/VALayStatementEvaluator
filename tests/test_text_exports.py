@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import gc
 import json
 import os
@@ -361,7 +362,18 @@ with patch.object(pilot, "load_approval", return_value=data), patch.object(st, "
         bomb = create_signed_value(SECRET, "_streamlit_user", "x" * 1_000_000).decode()
         with self.assertRaises(ExportUnavailable):
             export_cookie.claims(["_streamlit_user=" + bomb], SECRET, ORIGIN)
-        self.refused(self.get(cookie="_streamlit_user=" + raw[:-1] + ("A" if raw[-1] != "A" else "B")))
+        signed, signature = raw.rsplit(".", 1)
+        decoded = base64.urlsafe_b64decode(signature + "=" * (-len(signature) % 4))
+        # The last base64 character has unused bits: changing it can preserve
+        # the signature bytes. Change the leading character instead and prove
+        # that every alternate fixture represents an actual signature change.
+        for replacement in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_":
+            if replacement == signature[0]:
+                continue
+            changed = replacement + signature[1:]
+            with self.subTest(signature_prefix=replacement):
+                self.assertNotEqual(decoded, base64.urlsafe_b64decode(changed + "=" * (-len(changed) % 4)))
+                self.refused(self.get(cookie="_streamlit_user=" + signed + "." + changed))
 
     def test_actual_streamlit_chunked_cookie_protocol_and_duplicate_json_refusal(self):
         payload = json.dumps(self.identity())

@@ -51,6 +51,8 @@ from pathlib import Path
 from typing import Any
 
 from . import config
+from .pilot import PilotBlocked
+from .storage_policy import require_synthetic_storage, synthetic_storage, synthetic_storage_mode
 
 logger = logging.getLogger("app.blob_store")
 
@@ -139,17 +141,24 @@ class BlobStore:
     @contextmanager
     def submission_guard(self, ref: BlobRef) -> Iterator[None]:
         """Refuse submissions referencing absent/corrupt documents."""
+        require_synthetic_storage()
         self.get(ref)
+        require_synthetic_storage()
         yield
+        require_synthetic_storage()
 
+    @synthetic_storage
     def sweep(self, *, max_age_seconds: int | None = None) -> int:
         """Delete blobs older than the age limit. Returns the count removed."""
         return 0
 
+    @synthetic_storage
     def ping(self) -> bool:
         return True
 
     def health(self) -> dict[str, Any]:
+        if not synthetic_storage_mode():
+            return {"backend": "excluded", "is_shared": False, "reachable": False}
         return {"backend": self.name, "is_shared": self.is_shared, "reachable": self.ping()}
 
     # -- shared helpers -----------------------------------------------------
@@ -198,6 +207,7 @@ class FilesystemBlobStore(BlobStore):
     # surface the mistake with a specific message.
     is_shared = True
 
+    @synthetic_storage
     def __init__(self, root: str | Path, *, sweep_age_seconds: int = _DEFAULT_SWEEP_AGE_SECONDS,
                  retained_keys: Callable[[], set[str]] | None = None) -> None:
         if sweep_age_seconds <= 0:
@@ -216,8 +226,9 @@ class FilesystemBlobStore(BlobStore):
     def root(self) -> Path:
         return self._root
 
+    @synthetic_storage
     def _path_for(self, key: str) -> Path:
-        if not _KEY_RE.match(key):
+        if not _KEY_RE.fullmatch(key):
             raise BlobStoreError(f"refusing to use an unrecognized blob key: {key!r}")
         path = self._root / key
         if (self._root / "blobs").is_symlink() or path.parent.is_symlink() or path.is_symlink():
@@ -232,6 +243,7 @@ class FilesystemBlobStore(BlobStore):
         lock a different inode. Closing the descriptor releases crashed writers'
         locks. The deployed volume must support cross-pod advisory flock.
         """
+        require_synthetic_storage()
         try:
             import fcntl
         except ImportError as exc:
@@ -249,10 +261,13 @@ class FilesystemBlobStore(BlobStore):
                         raise BlobStoreError("filesystem blob lock timed out") from exc
                     time.sleep(0.01)
             try:
+                require_synthetic_storage()
                 yield
+                require_synthetic_storage()
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
+    @synthetic_storage
     def put(self, data: bytes) -> BlobRef:
         self._check_size(data)
         key = content_key(data)
@@ -284,6 +299,7 @@ class FilesystemBlobStore(BlobStore):
         self._maybe_sweep()
         return BlobRef(key=key, size=len(data), sha256=digest, backend=self.name)
 
+    @synthetic_storage
     def get(self, ref: BlobRef) -> bytes:
         path = self._path_for(ref.key)
         try:
@@ -300,19 +316,25 @@ class FilesystemBlobStore(BlobStore):
 
     @contextmanager
     def submission_guard(self, ref: BlobRef) -> Iterator[None]:
+        require_synthetic_storage()
         with self._storage_lock():
             self.get(ref)  # Verify before a retained wire payload is admitted.
             os.utime(self._path_for(ref.key), None)
+            require_synthetic_storage()
             yield
+            require_synthetic_storage()
 
+    @synthetic_storage
     def delete(self, ref: BlobRef) -> None:
         try:
             path = self._path_for(ref.key)
             with self._storage_lock():
                 path.unlink(missing_ok=True)
         except (OSError, BlobStoreError) as exc:
-            logger.warning("could not delete blob %s: %s", ref.key, exc)
+            require_synthetic_storage()
+            raise BlobStoreError("Filesystem blob deletion is unconfirmed.") from exc
 
+    @synthetic_storage
     def _maybe_sweep(self) -> None:
         """Best-effort TTL sweep, rate-limited to one per few minutes per process."""
         now = time.monotonic()
@@ -323,8 +345,10 @@ class FilesystemBlobStore(BlobStore):
         try:
             self.sweep()
         except Exception as exc:  # noqa: BLE001 - housekeeping is never fatal
+            require_synthetic_storage()
             logger.warning("blob sweep failed: %s", exc)
 
+    @synthetic_storage
     def sweep(self, *, max_age_seconds: int | None = None, dry_run: bool = False,
               retained_keys: Callable[[], set[str]] | None = None) -> int:
         limit = self._sweep_age if max_age_seconds is None else max_age_seconds
@@ -338,6 +362,7 @@ class FilesystemBlobStore(BlobStore):
         # Every concurrently admitted blob is renewed under that lock, so its
         # mtime is newer than this cutoff even if SCAN misses the new input key.
         protected = (retained_keys or self._retained_keys)()
+        require_synthetic_storage()
         namespace = self._root / "blobs"
         if namespace.is_symlink():
             raise BlobStoreError("refusing a symlink in the filesystem blob namespace")
@@ -401,6 +426,7 @@ class FilesystemBlobStore(BlobStore):
             logger.info("blob sweep %s %d expired file(s)", "found" if dry_run else "removed", removed)
         return removed
 
+    @synthetic_storage
     def ping(self) -> bool:
         try:
             self._root.mkdir(parents=True, exist_ok=True)
@@ -409,6 +435,8 @@ class FilesystemBlobStore(BlobStore):
             return False
 
     def health(self) -> dict[str, Any]:
+        if not synthetic_storage_mode():
+            return {"backend": "excluded", "is_shared": False, "reachable": False}
         return {
             "backend": self.name,
             "is_shared": self.is_shared,
@@ -427,6 +455,7 @@ class S3BlobStore(BlobStore):
     name = "s3"
     is_shared = True
 
+    @synthetic_storage
     def __init__(self, bucket: str, *, prefix: str = "", endpoint_url: str = "") -> None:
         try:
             import boto3  # noqa: PLC0415 - optional dependency, imported lazily
@@ -439,11 +468,13 @@ class S3BlobStore(BlobStore):
         self._prefix = prefix.strip("/")
         self._client: Any = boto3.client("s3", endpoint_url=endpoint_url or None)
 
+    @synthetic_storage
     def _object_key(self, key: str) -> str:
-        if not _KEY_RE.match(key):
+        if not _KEY_RE.fullmatch(key):
             raise BlobStoreError(f"refusing to use an unrecognized blob key: {key!r}")
         return f"{self._prefix}/{key}" if self._prefix else key
 
+    @synthetic_storage
     def put(self, data: bytes) -> BlobRef:
         self._check_size(data)
         key = content_key(data)
@@ -459,12 +490,19 @@ class S3BlobStore(BlobStore):
             raise BlobStoreError(f"could not write blob {key}: {type(exc).__name__}: {exc}") from exc
         return BlobRef(key=key, size=len(data), sha256=digest, backend=self.name)
 
+    @synthetic_storage
     def get(self, ref: BlobRef) -> bytes:
         from botocore.exceptions import ClientError  # noqa: PLC0415
 
         try:
             response = self._client.get_object(Bucket=self._bucket, Key=self._object_key(ref.key))
-            body: bytes = response["Body"].read()
+            stream = response["Body"]
+            try:
+                require_synthetic_storage()
+                body: bytes = stream.read()
+                require_synthetic_storage()
+            finally:
+                stream.close()
         except ClientError as exc:
             code = str(exc.response.get("Error", {}).get("Code", ""))
             if code in ("NoSuchKey", "404"):
@@ -477,12 +515,59 @@ class S3BlobStore(BlobStore):
             raise BlobStoreError(f"could not read blob {ref.key}: {type(exc).__name__}: {exc}") from exc
         return self._verify(ref, body)
 
+    @synthetic_storage
     def delete(self, ref: BlobRef) -> None:
-        try:
-            self._client.delete_object(Bucket=self._bucket, Key=self._object_key(ref.key))
-        except Exception as exc:  # noqa: BLE001 - a failed delete falls back to the bucket's lifecycle rule
-            logger.warning("could not delete blob %s: %s", ref.key, exc)
+        """Delete only verified never-versioned synthetic objects; report uncertainty.
 
+        Versioned/suspended buckets need a separate case/version inventory and
+        approved deletion implementation. Never silently create a delete marker.
+        """
+        from botocore.exceptions import ClientError
+
+        try:
+            key = self._object_key(ref.key)
+            self._require_unversioned()
+            response = self._client.delete_object(Bucket=self._bucket, Key=key)
+            require_synthetic_storage()
+            if not isinstance(response, dict) or set(response) - {"ResponseMetadata", "RequestCharged"}:
+                raise BlobStoreError("S3 blob deletion is unconfirmed.")
+            metadata = response.get("ResponseMetadata")
+            if "ResponseMetadata" in response and (not isinstance(metadata, dict)
+                    or metadata.get("HTTPStatusCode") not in (200, 204)):
+                raise BlobStoreError("S3 blob deletion is unconfirmed.")
+            try:
+                self._client.head_object(Bucket=self._bucket, Key=key)
+            except ClientError as exc:
+                require_synthetic_storage()
+                code = str(exc.response.get("Error", {}).get("Code", ""))
+                metadata = exc.response.get("ResponseMetadata", {})
+                status = metadata.get("HTTPStatusCode")
+                headers = metadata.get("HTTPHeaders", {})
+                if (code not in ("NoSuchKey", "404") or status != 404 or not isinstance(headers, dict)
+                        or "x-amz-delete-marker" in headers or "x-amz-version-id" in headers):
+                    raise BlobStoreError("S3 blob deletion is unconfirmed.") from exc
+            else:
+                raise BlobStoreError("S3 blob deletion is unconfirmed.")
+            self._require_unversioned()
+        except PilotBlocked:
+            raise
+        except BlobStoreError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - callers must observe unconfirmed deletion
+            require_synthetic_storage()
+            raise BlobStoreError("S3 blob deletion is unconfirmed.") from exc
+
+    @synthetic_storage
+    def _require_unversioned(self) -> None:
+        state = self._client.get_bucket_versioning(Bucket=self._bucket)
+        require_synthetic_storage()
+        if not isinstance(state, dict) or set(state) - {"ResponseMetadata"}:
+            raise BlobStoreError("Versioned or unverified S3 storage requires separate deletion acceptance.")
+        metadata = state.get("ResponseMetadata")
+        if "ResponseMetadata" in state and (not isinstance(metadata, dict) or metadata.get("HTTPStatusCode") != 200):
+            raise BlobStoreError("Versioned or unverified S3 storage requires separate deletion acceptance.")
+
+    @synthetic_storage
     def ping(self) -> bool:
         try:
             self._client.head_bucket(Bucket=self._bucket)
@@ -491,6 +576,8 @@ class S3BlobStore(BlobStore):
             return False
 
     def health(self) -> dict[str, Any]:
+        if not synthetic_storage_mode():
+            return {"backend": "excluded", "is_shared": False, "reachable": False}
         return {
             "backend": self.name,
             "is_shared": self.is_shared,
@@ -511,15 +598,18 @@ class NullBlobStore(BlobStore):
     name = "none"
     is_shared = False
 
+    @synthetic_storage
     def put(self, data: bytes) -> BlobRef:
         raise BlobStoreError(
             "no blob store is configured, so a job too large to inline cannot be queued. "
             "Set VA_LSE_BLOB_DIR (shared volume) or VA_LSE_BLOB_S3_BUCKET."
         )
 
+    @synthetic_storage
     def get(self, ref: BlobRef) -> bytes:
         raise BlobStoreError("no blob store is configured (VA_LSE_BLOB_DIR / VA_LSE_BLOB_S3_BUCKET)")
 
+    @synthetic_storage
     def delete(self, ref: BlobRef) -> None:
         return
 
@@ -528,6 +618,7 @@ _store: BlobStore | None = None
 _store_lock = threading.Lock()
 
 
+@synthetic_storage
 def build_blob_store() -> BlobStore:
     """Select a backend from configuration (see the module docstring)."""
     mode = config.BLOB_STORE_MODE
@@ -571,6 +662,7 @@ def build_blob_store() -> BlobStore:
     return NullBlobStore()
 
 
+@synthetic_storage
 def get_blob_store() -> BlobStore:
     """Return (and lazily create) the process-global blob store."""
     global _store  # noqa: PLW0603

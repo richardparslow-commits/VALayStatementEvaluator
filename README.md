@@ -30,6 +30,13 @@ queue serialization/results refuse controlled-pilot and unknown modes.
 unapproved exact-source worksheet. Real-information queues require a separate
 implementation of shared consent, spending and durable case deletion, followed
 by actual-host acceptance; no setting or worksheet enables them in this release.
+The [R16 deletion design/acceptance procedure](deploy/PILOT_DELETION_ACCEPTANCE.md)
+keeps durable case blobs synthetic-only, including cached/direct stores and cleanup.
+Delete failures are visible; legacy S3 deletion refuses versioned/suspended or
+unverified buckets. `python scripts/deletion_review.py --out deletion-evidence/draft.json`
+prepares an unapproved exact-source worksheet. A separate owner-aware inventory,
+deletion/tombstone and restore design plus actual acceptance are required before
+durable real-information storage; session clearing does not certify complete erasure.
 The [R09 budget procedure](deploy/PILOT_BUDGET_ACCEPTANCE.md) covers persistent
 quotas, conservative reservations and the actual account spending-cutoff test.
 The general deployment examples are synthetic-data scaffolding until separately reviewed.
