@@ -11,6 +11,14 @@ expired and incomplete. Do not replace evidence references with a general
 
 ## Released pilot scope
 
+Complete the [resource and overload acceptance procedure](deploy/PILOT_RESOURCE_ACCEPTANCE.md)
+for the reviewed release. HTTP uploads now require signed identity, live consent
+and session ownership before body receipt; participant/process byte, file, rate
+and retained-text limits apply. Upload one file at a time. Cases with rejected
+selected files cannot proceed as a partial batch. Timed-out work retains capacity
+until its futures finish; arbitrary blocked threads still have no guaranteed hard
+cutoff. Actual-host load, fault and cleanup evidence remains open.
+
 Complete the [budget and quota acceptance procedure](deploy/PILOT_BUDGET_ACCEPTANCE.md)
 before admission. The prepared proposal is $250 total, two starts per participant
 per rolling day, 50 attempts per run and a provisional $1 per-attempt charge

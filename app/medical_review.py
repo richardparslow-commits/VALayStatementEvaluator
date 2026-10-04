@@ -32,7 +32,7 @@ from .documents import (
     Chunk,
     ExtractedDocument,
     chunk_page_labelled_text,
-    iter_page_labelled_chunks,
+    ChunkPlan,
     page_limit_message,
     paragraph_index,
 )
@@ -47,7 +47,7 @@ from .llm import (
     QueueFullError,
 )
 from .logging_config import PhaseTimer, get_request_id
-from .pipeline_guard import check_pipeline_cancelled, pipeline_as_completed
+from .pipeline_guard import bounded_pipeline_futures, track_pipeline_future, check_pipeline_cancelled, pipeline_as_completed
 from .pilot import PilotBlocked
 from .preflight import REFUSAL_STATUSES
 from .profiler import get_current_run_profiler, worker_timer
@@ -846,11 +846,7 @@ def review_medical_records(
     # pipeline retains — for text that exists only to be sliced). The iterator
     # produces byte-identical chunks to chunk_page_labelled_text; see its
     # docstring for the locality argument and the property test that pins it.
-    chunks = list(
-        iter_page_labelled_chunks(
-            page for doc in unique_docs for page in doc.pages
-        )
-    )
+    chunks = ChunkPlan(page for doc in unique_docs for page in doc.pages)
     total_units = len(chunks)
     # Deterministic per-page context for the digest prompt: the dates actually
     # printed on the page (an anchor for the fact's own date) and the VA.gov
@@ -999,18 +995,29 @@ def review_medical_records(
         },
     )
 
-    def run_round(pending: list[Chunk], *, retry: bool = False) -> None:
+    def run_round(pending: ChunkPlan, *, retry: bool = False) -> None:
         nonlocal cause, fail_fast_chunks
         done = 0
         stopped = False
         pool = ThreadPoolExecutor(max_workers=config.RECORDS_CONCURRENCY)
         try:
-            future_map = {
-                pool.submit(contextvars.copy_context().run, digest_chunk, c): c
-                for c in pending
-            }
-            for future in pipeline_as_completed(future_map):
-                chunk = future_map[future]
+            remaining_chunks = iter(pending)
+            future_map = {}
+            def submit_next() -> bool:
+                chunk = next(remaining_chunks, None)
+                if chunk is None:
+                    return False
+                check_pipeline_cancelled()
+                future = pool.submit(contextvars.copy_context().run, digest_chunk, chunk)
+                track_pipeline_future(future)
+                future_map[future] = chunk
+                return True
+            for _ in range(max(1, config.RECORDS_CONCURRENCY * 2)):
+                if not submit_next():
+                    break
+            while future_map:
+                future = next(pipeline_as_completed(tuple(future_map)))
+                chunk = future_map.pop(future)
                 if future.cancelled():
                     # Never sent: the pass stopped at a refusal (below). Counted
                     # apart from failures, and it does not advance the progress
@@ -1077,8 +1084,11 @@ def review_medical_records(
                     # outcome.
                     stopped = True
                     for queued in future_map:
-                        if queued is not future and not queued.done():
+                        if not queued.done():
                             queued.cancel()
+                    not_attempted.update(c.index for c in remaining_chunks)
+                if not stopped:
+                    submit_next()
         finally:
             pool.shutdown(wait=False, cancel_futures=True)
         if stopped and not_attempted:
@@ -1116,9 +1126,9 @@ def review_medical_records(
     # over every chunk — hundreds of fail-fast rejections and their warnings — to
     # reach the conclusion the first pass already had.
     if failed:
-        retry_targets = [
-            c for c in chunks if c.index in failed and _retriable_failure(failed[c.index])
-        ]
+        retry_targets = chunks.select(
+            index for index, error in failed.items() if _retriable_failure(error)
+        )
         not_retried = {i: exc for i, exc in failed.items() if not _retriable_failure(exc)}
         logger.warning(
             "records digest retry pending=%d not_retried=%d failed=%s",
@@ -1183,7 +1193,7 @@ def review_medical_records(
     conditions: Counter[str] = Counter()
     providers: Counter[str] = Counter()
     chunks_without_facts = 0
-    chunks_by_index = {chunk.index: chunk for chunk in chunks}
+    chunks_by_index = {chunk.index: Chunk(chunk.index, chunk.total, "", chunk.pages) for chunk in chunks}
     for index in sorted(results):
         check_pipeline_cancelled()
         data = results[index]
@@ -1590,12 +1600,10 @@ def _merge_facts(
 
         pool = ThreadPoolExecutor(max_workers=config.RECORDS_CONCURRENCY)
         try:
-            future_map = {
-                pool.submit(contextvars.copy_context().run, _merge_with_ctx, batch): batch_index
-                for batch_index, batch in enumerate(batches)
-            }
-            for future in pipeline_as_completed(future_map):
-                batch_index = future_map[future]
+            for future, batch_index in bounded_pipeline_futures(
+                pool, lambda index: _merge_with_ctx(batches[index]),
+                range(len(batches)), max(1, config.RECORDS_CONCURRENCY * 2),
+            ):
                 try:
                     merged_by_batch[batch_index] = future.result() or batches[batch_index]
                 except _MERGE_TOLERATED_ERRORS as exc:
@@ -1788,12 +1796,8 @@ def _stem(token: str) -> str:
     return token
 
 
-@lru_cache(maxsize=10_000)
-def _tokens(text: str) -> frozenset[str]:
-    """Tokenize text into content words; LRU-cached (bounded at 10k entries)
-    because facts and paragraphs are scored repeatedly during verification of
-    many claims. Bounded LRU prevents unbounded memory growth on large record
-    sets while retaining high hit rates for repeated phrases.
+def _tokens_uncached(text: str) -> frozenset[str]:
+    """Tokenize text into content words without retaining source arguments.
 
     Each token is emitted alongside its stem and its clinical synonym, so
     "reports neck pain" and "cervical pain reported" share tokens. Expansion is
@@ -1815,9 +1819,18 @@ def _tokens(text: str) -> frozenset[str]:
     return frozenset(tokens)
 
 
+@lru_cache(maxsize=10_000)
+def _tokens_cached(text: str) -> frozenset[str]:
+    return _tokens_uncached(text)
+
+
+def _tokens(text: str) -> frozenset[str]:
+    from . import pilot
+    return _tokens_uncached(text) if pilot.enabled() else _tokens_cached(text)
+
+
 # Backwards-compat alias: some tooling/tests may import _TOKEN_CACHE.
-# Expose the underlying cache mapping via the LRU wrapper's cache_info.
-_TOKEN_CACHE: dict[str, frozenset[str]] = {}  # deprecated; _tokens is now LRU-bounded
+_TOKEN_CACHE: dict[str, frozenset[str]] = {}  # deprecated; synthetic LRU is _tokens_cached
 
 
 # ------------------------------------------------------------------- timeline

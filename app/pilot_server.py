@@ -11,11 +11,18 @@ def initialize() -> None:
     from .log_retention import retention_days
     if not pilot.enabled():
         raise pilot.PilotBlocked("This server launcher requires controlled-pilot mode.")
+    from importlib.metadata import version
+    if version("streamlit") != "1.63.0":
+        raise pilot.PilotBlocked("Upload admission requires the reviewed Streamlit release.")
+    from urllib.parse import urlsplit
+    approval = pilot.load_approval()
+    if urlsplit(pilot.https_url(approval["deployment_url"])).path not in ("", "/"):
+        raise pilot.PilotBlocked("Pilot upload admission requires a root deployment URL.")
     # No OIDC/user context or provider request is needed to clean local logs.
     # Full account/revision/identity acceptance remains at screen admission.
     pilot.validate_log_policy({"local_log_retention_days": retention_days()})
     from .pilot_budget import get_ledger
-    get_ledger(pilot.load_approval())  # Hold the single-process lock before listening.
+    get_ledger(approval)  # Hold the single-process lock before listening.
     if os.getenv("VA_LSE_PILOT_TEXT_EXPORTS", "0") == "1":
         from importlib.metadata import version
         from .text_exports import STORE, ExportUnavailable, policy_binding

@@ -24,8 +24,10 @@ Wraps the long-running ``run_evaluation`` and ``run_draft`` calls with:
   memory growth visible in structured logs without adding a dependency.
 
 Cancellation is cooperative: checkpoints stop further work, but cannot kill a
-thread blocked inside a library call. A hard CPU/memory cutoff requires process
-isolation. Memory checks gracefully degrade on unsupported platforms.
+thread blocked inside a library call. Pilot capacity remains reserved until its
+worker and tracked children actually exit. A hard CPU/memory cutoff requires
+process isolation. Pilot memory admission fails closed if headroom is unknown,
+and uses the stricter host/container figure when both are available.
 """
 
 from __future__ import annotations
@@ -37,12 +39,14 @@ import os
 import threading
 import time
 from typing import Any, Callable, TypeVar
+from pathlib import Path
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 
 logger = logging.getLogger("app.pipeline_guard")
 
 T = TypeVar("T")
+U = TypeVar("U")
 
 # ------------------------------------------------------------------ config
 
@@ -90,10 +94,65 @@ class PipelineCancelledError(BaseException):
     """Internal control flow; must bypass provider retries and best-effort fallbacks."""
 
 
+# A timed-out caller does not free capacity while its threads are still alive.
+_jobs_lock = threading.Lock()
+_jobs: set[str] = set()
+
+
+class _WorkLease:
+    def __init__(self, owner: str, grant: Any) -> None:
+        self.owner = owner
+        self.grant = grant
+        self.parts = 1
+        self.lock = threading.Lock()
+
+    def add(self) -> None:
+        with self.lock:
+            self.parts += 1
+
+    def release(self) -> None:
+        with self.lock:
+            self.parts -= 1
+            if self.parts == 0:
+                with _jobs_lock:
+                    _jobs.discard(self.owner)
+                self.grant = None
+
+
+def require_work_capacity(owner: str) -> None:
+    with _jobs_lock:
+        if owner in _jobs or len(_jobs) >= 2:
+            from .pilot import PilotBlocked
+            raise PilotBlocked("Earlier work is still finishing. Wait before starting another case.")
+
+
+def _reserve_work() -> _WorkLease | None:
+    from . import pilot
+    if not pilot.enabled():
+        return None
+    owner = pilot.current_owner()
+    grant = pilot.require_consent(owner)
+    with _jobs_lock:
+        if owner in _jobs or len(_jobs) >= 2:
+            raise pilot.PilotBlocked("Earlier work is still finishing. Wait before starting another case.")
+        check_memory_before_run(minimum_mb=200 * (len(_jobs) + 1))
+        _jobs.add(owner)
+    return _WorkLease(owner, grant)
+
+
+def track_pipeline_future(future: concurrent.futures.Future[Any]) -> None:
+    run = _pipeline_run.get()
+    if run is not None and run.lease is not None:
+        lease = run.lease
+        lease.add()
+        future.add_done_callback(lambda _: lease.release())
+
+
 @dataclass
 class _PipelineRun:
     deadline: float
     cancelled: threading.Event = field(default_factory=threading.Event)
+    lease: _WorkLease | None = None
 
 
 _pipeline_run: contextvars.ContextVar[_PipelineRun | None] = contextvars.ContextVar(
@@ -143,10 +202,41 @@ def pipeline_as_completed(
             yield future
 
 
+def bounded_pipeline_futures(
+    pool: concurrent.futures.ThreadPoolExecutor, fn: Callable[[U], T],
+    items: Iterable[U], limit: int,
+) -> Iterator[tuple[concurrent.futures.Future[T], U]]:
+    """Bound queued inputs and track children until they actually exit."""
+    iterator = iter(items)
+    pending: dict[concurrent.futures.Future[T], U] = {}
+    def submit() -> bool:
+        check_pipeline_cancelled()
+        try:
+            item = next(iterator)
+        except StopIteration:
+            return False
+        future = pool.submit(contextvars.copy_context().run, fn, item)
+        track_pipeline_future(future)
+        pending[future] = item
+        return True
+    try:
+        for _ in range(max(1, limit)):
+            if not submit():
+                break
+        while pending:
+            future = next(pipeline_as_completed(pending))
+            item = pending.pop(future)
+            yield future, item
+            submit()
+    finally:
+        for future in pending:
+            future.cancel()
+
+
 # --------------------------------------------------------- memory helpers
 
 
-def _read_available_memory_mb() -> float | None:
+def _read_host_available_memory_mb() -> float | None:
     """Return available system memory in MB, or None if unavailable.
 
     The pre-run guard answers "can this machine absorb a long pipeline?" —
@@ -160,7 +250,8 @@ def _read_available_memory_mb() -> float | None:
       + speculative pages — Apple keeps caches warm, so this is the honest
       "truly free" figure). Purgeable/swap headroom is ignored on purpose:
       this is a conservative gate, not a swappiness model.
-    - Everything else: ``None`` → the guard degrades to advisory-only.
+    - Everything else: ``None``; the caller refuses pilot admission when neither
+      a host nor a finite container figure is available.
     """
     # Linux: MemAvailable from /proc/meminfo.
     try:
@@ -184,9 +275,9 @@ def _read_available_memory_mb() -> float | None:
             page_size = 4096
             free = inactive = speculative = 0
             for line in proc.stdout.splitlines():
-                if line.startswith("page size of"):
+                if "page size of" in line:
                     try:
-                        page_size = int(line.split()[-2])
+                        page_size = int(line.split("page size of", 1)[1].split()[0])
                     except (ValueError, IndexError):
                         pass
                 elif line.startswith("Pages free:"):
@@ -200,6 +291,29 @@ def _read_available_memory_mb() -> float | None:
         pass
 
     return None
+
+
+def _read_cgroup_available_memory_mb() -> float | None:
+    """Container headroom, when finite, for cgroup v2 or v1."""
+    for limit_file, usage_file in (
+        ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"),
+        ("/sys/fs/cgroup/memory/memory.limit_in_bytes", "/sys/fs/cgroup/memory/memory.usage_in_bytes"),
+    ):
+        try:
+            limit = int(Path(limit_file).read_text().strip())
+            usage = int(Path(usage_file).read_text().strip())
+            if 0 < limit < 2 ** 60 and usage >= 0:
+                return max(0, limit - usage) / (1024 ** 2)
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _read_available_memory_mb() -> float | None:
+    host = _read_host_available_memory_mb()
+    container = _read_cgroup_available_memory_mb()
+    values = [v for v in (host, container) if v is not None]
+    return min(values) if values else None
 
 
 def _read_rss_mb() -> float | None:
@@ -239,7 +353,7 @@ def _read_rss_mb() -> float | None:
     return None
 
 
-def check_memory_before_run() -> None:
+def check_memory_before_run(*, minimum_mb: float = 200) -> None:
     """Check *available system memory* before starting a pipeline run.
 
     Logs the current availability. If below 200 MB, raises MemoryError to
@@ -255,6 +369,9 @@ def check_memory_before_run() -> None:
     """
     avail_mb = _read_available_memory_mb()
     if avail_mb is None:
+        from . import pilot
+        if pilot.enabled():
+            raise MemoryError("Pilot memory headroom could not be verified.")
         logger.debug("memory check skipped: available-memory figure unavailable on this platform")
         return
 
@@ -264,11 +381,11 @@ def check_memory_before_run() -> None:
         extra={"phase": "pipeline_guard", "status": "ok", "available_mb": round(avail_mb)},
     )
 
-    if avail_mb < 200:
+    if avail_mb < minimum_mb:
         raise MemoryError(
             f"Critical memory shortage: only {avail_mb:.0f} MB of system memory available. "
             f"Free memory (close other apps / reduce other workloads) or reduce the record set. "
-            f"(threshold: 200 MB minimum available)"
+            f"(threshold: {minimum_mb:.0f} MB minimum available)"
         )
 
     warn_mb = _memory_warn_mb()
@@ -407,7 +524,7 @@ def run_with_timeout(
         },
     )
 
-    run = _PipelineRun(deadline=time.monotonic() + timeout_seconds)
+    run = _PipelineRun(deadline=time.monotonic() + timeout_seconds, lease=_reserve_work())
 
     def checked() -> T:
         check_pipeline_cancelled()
@@ -415,15 +532,19 @@ def run_with_timeout(
         check_pipeline_cancelled()
         return result
 
-    token = _pipeline_run.set(run)
+    pool: concurrent.futures.ThreadPoolExecutor | None = None
+    submitted = False
     try:
-        wrapped = _propagate_streamlit_ctx(checked)
-    finally:
-        _pipeline_run.reset(token)
-
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    try:
+        token = _pipeline_run.set(run)
+        try:
+            wrapped = _propagate_streamlit_ctx(checked)
+        finally:
+            _pipeline_run.reset(token)
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         future = pool.submit(wrapped)
+        submitted = True
+        if run.lease is not None:
+            future.add_done_callback(lambda _: run.lease.release() if run.lease else None)
         done, _ = concurrent.futures.wait(
             [future], timeout=max(0.0, run.deadline - time.monotonic())
         )
@@ -451,7 +572,10 @@ def run_with_timeout(
         raise PipelineTimeoutError(elapsed, timeout_seconds) from None
     finally:
         run.cancelled.set()
-        pool.shutdown(wait=False, cancel_futures=True)
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+        if not submitted and run.lease is not None:
+            run.lease.release()
 
 
 def _get_request_id() -> str:

@@ -85,7 +85,11 @@ def default_output_path(source: Path) -> Path:
 
 
 def _run(command: list[str], *, what: str) -> None:
-    result = subprocess.run(command, capture_output=True, text=True)
+    from app.child_process import run_bounded
+    try:
+        result = run_bounded(command)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"{what} exceeded the processing deadline.") from None
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()[:500]
         raise RuntimeError(f"{what} failed (exit {result.returncode}): {detail}")
@@ -134,11 +138,8 @@ def _ocr_page(source: Path, number: int, dpi: int, workdir: Path) -> str | None:
     if not rasterised:
         _out(f"  page {number}: could not rasterise, left blank", err=True)
         return None
-    result = subprocess.run(
-        ["tesseract", str(rasterised[0]), "stdout", "--psm", "6"],
-        capture_output=True,
-        text=True,
-    )
+    from app.child_process import run_bounded
+    result = run_bounded(["tesseract", str(rasterised[0]), "stdout", "--psm", "6"])
     if result.returncode != 0:
         _out(f"  page {number}: tesseract failed, left blank", err=True)
         return None
@@ -157,11 +158,11 @@ def _ocr_pages_parallel(
 
     results: dict[int, str | None] = {}
     with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
-        futures = {
-            number: pool.submit(_ocr_page, source, number, dpi, workdir)
-            for number in numbers
-        }
-        for number, future in futures.items():
+        from app.pipeline_guard import bounded_pipeline_futures
+        for future, number in bounded_pipeline_futures(
+            pool, lambda number: _ocr_page(source, number, dpi, workdir),
+            numbers, max(1, jobs * 2),
+        ):
             try:
                 results[number] = future.result()
             except Exception as exc:  # noqa: BLE001 - one page must not stop the run

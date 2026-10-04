@@ -223,7 +223,7 @@ class TestParallelFallback(unittest.TestCase):
                     prefix.with_name(prefix.name + "-1.png").write_bytes(b"png")
 
             with patch.object(ocr_records, "_run", side_effect=fake_run), patch(
-                "scripts.ocr_records.subprocess.run",
+                "app.child_process.run_bounded",
                 return_value=mock.Mock(returncode=0, stdout="OCR text."),
             ):
                 out = tmp / "out.pdf"
@@ -248,7 +248,7 @@ class TestParallelFallback(unittest.TestCase):
                     prefix.with_name(prefix.name + "-1.png").write_bytes(b"png")
 
             with patch.object(ocr_records, "_run", side_effect=fake_run), patch(
-                "scripts.ocr_records.subprocess.run",
+                "app.child_process.run_bounded",
                 return_value=mock.Mock(returncode=0, stdout="OCR text."),
             ):
                 out = tmp / "out.pdf"
@@ -280,7 +280,7 @@ class TestParallelFallback(unittest.TestCase):
             import time
 
             with patch.object(ocr_records, "_run", side_effect=fake_run), patch(
-                "scripts.ocr_records.subprocess.run",
+                "app.child_process.run_bounded",
                 return_value=mock.Mock(returncode=0, stdout="OCR text."),
             ):
                 out = tmp / "out.pdf"

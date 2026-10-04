@@ -139,6 +139,8 @@ def records_uploader(slot: str) -> list:
         type=["pdf", "txt", "md", "docx", "zip"],
         accept_multiple_files=True,
         key=f"files_{slot}",
+        help="Upload one file at a time. A pilot case can retain up to 32 uploaded files and record versions."
+             if pilot.enabled() else None,
     )
     # Enforce upload size caps before extraction so the tight 50 MB default
     # surfaces as a clear message rather than a downstream failure.
@@ -150,6 +152,9 @@ def records_uploader(slot: str) -> list:
                     msg, phase="upload_limits", severity="warning", once=True
                 )
             , container=st, method="warning")
+        if pilot.enabled() and rejections:
+            pilot.display("Resolve every selected file before starting this case.", container=st, method="error")
+            return []
         files = accepted if rejections else files
     documents = extract_uploads(files, slot)
     # Pages the files contain, not pages that yielded text: a scan-only bundle has

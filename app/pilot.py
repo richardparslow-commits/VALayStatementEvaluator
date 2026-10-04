@@ -372,6 +372,8 @@ def clear_case() -> None:
     context = get_script_run_ctx(suppress_warning=True)
     if context is not None:
         context.uploaded_file_mgr.remove_session_files(context.session_id)
+        from .upload_admission import UPLOADS
+        UPLOADS.revoke(context.session_id)
     for key in list(st.session_state):
         del st.session_state[key]
 
@@ -424,6 +426,8 @@ def render_admission() -> None:
             st.stop()
         with st.sidebar.expander("Pilot privacy notice"):
             st.text(approval["participant_notice"])
+        from .upload_admission import bind_session
+        bind_session(owner, require_consent(owner))
     except PilotBlocked as blocked:
         from .error_report import report_failure
         clear_case()

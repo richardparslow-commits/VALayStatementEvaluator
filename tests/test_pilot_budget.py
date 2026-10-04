@@ -350,11 +350,67 @@ class TestProviderBudgetIntegration(unittest.TestCase):
         client._client=MagicMock()
         client._settings=MagicMock(base_url=self.data['provider_base_url'],model_main='test-model')
         client.usage=MagicMock()
+        client._new_attempt_client=MagicMock(return_value=client._client)
         return client
 
     def wire(self,client,*,responses=False,tokens=200):
         with patch.object(llm,'_uses_responses_schema',return_value=responses):
             return client._call_openai('primary','test-model','system','synthetic',0.2,tokens,None)
+
+    def test_pilot_attempts_use_private_pools_and_deadline_clipped_watchdogs(self):
+        client = self.client()
+        del client._new_attempt_client  # Exercise the real constructor path.
+        owned = [MagicMock(), MagicMock()]
+        for sdk in owned:
+            sdk.chat.completions.create.return_value = MagicMock(
+                choices=[MagicMock(message=MagicMock(content="Invented result", refusal=None), finish_reason="stop")],
+                usage=MagicMock(prompt_tokens=2, completion_tokens=2))
+        factory = MagicMock(side_effect=owned)
+        transports = [MagicMock(), MagicMock()]
+        timers = [MagicMock(), MagicMock()]
+        rate = MagicMock(enabled=False)
+        with patch.object(llm, '_sdk_name', return_value=factory), \
+                patch.object(llm, '_pilot_transport', side_effect=[{'http_client': t} for t in transports]), \
+                patch.object(llm, '_uses_responses_schema', return_value=False), \
+                patch.object(llm, 'get_llm_breaker', return_value=MagicMock()), \
+                patch.object(llm, 'get_llm_limiter', return_value=MagicMock(queue_timeout=10)), \
+                patch.object(llm, 'get_llm_rate_gate', return_value=rate), \
+                patch.object(llm, '_stall_watchdog_seconds', return_value=0), \
+                patch.object(llm, 'pipeline_remaining_seconds', return_value=.5), \
+                patch.object(llm.threading, 'Timer', side_effect=timers) as timer, pilot.action_budget(self.docs):
+            self.assertEqual(client._chat_on_endpoint('primary', 'system', 'synthetic'), 'Invented result')
+            self.assertEqual(client._chat_on_endpoint('primary', 'system', 'synthetic'), 'Invented result')
+        for index, sdk in enumerate(owned):
+            sdk.chat.completions.create.assert_called_once()
+            sdk.close.assert_called_once()
+            self.assertEqual(timer.call_args_list[index].args[0], .5)
+            self.assertIs(timer.call_args_list[index].kwargs['args'][-1], sdk)
+            self.assertIs(factory.call_args_list[index].kwargs['http_client'], transports[index])
+            self.assertEqual(factory.call_args_list[index].kwargs['max_retries'], 0)
+            timers[index].cancel.assert_called_once()
+        client._client.close.assert_not_called()
+        self.assertIsNone(llm._attempt_client.get())
+
+    def test_attempt_watchdog_does_not_close_or_rebuild_other_provider_pools(self):
+        client = self.client()
+        owned = MagicMock()
+        with patch.object(llm, '_shutdown_pool_sockets', return_value=1) as shutdown, \
+                patch.object(client, '_rebuild_client') as rebuild:
+            client._stall_watchdog_fired('primary', 'invented', 'invented', 'test-model', 1, .5, owned)
+        shutdown.assert_called_once_with(owned)
+        owned.close.assert_called_once()
+        client._client.close.assert_not_called()
+        rebuild.assert_not_called()
+
+    def test_failed_attempt_client_construction_closes_the_new_transport(self):
+        client = self.client()
+        del client._new_attempt_client
+        transport = MagicMock()
+        with patch.object(llm, '_sdk_name', return_value=MagicMock(side_effect=RuntimeError('Invented setup failure'))), \
+                patch.object(llm, '_pilot_transport', return_value={'http_client': transport}):
+            with self.assertRaises(RuntimeError):
+                client._new_attempt_client('primary')
+        transport.close.assert_called_once()
 
     def test_direct_provider_call_without_reserved_run_never_reaches_sdk(self):
         client=self.client()
