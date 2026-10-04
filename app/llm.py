@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextvars import ContextVar
+
 import json
 import logging
 import random
@@ -111,6 +113,8 @@ __all__ = [
     "probe_models",
     "probe_chat",
 ]
+
+_attempt_client: ContextVar[Any] = ContextVar("pilot_attempt_client", default=None)
 
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 1.0
@@ -1471,6 +1475,20 @@ class LLMClient:
             max_retries=0,  # Application retries must observe pipeline cancellation.
         )
 
+    def _new_attempt_client(self, endpoint: str) -> OpenAI:
+        """Pilot attempts own their transport; rescue cannot close another pool."""
+        target = _fallback_target(self._settings) if endpoint == FALLBACK_ENDPOINT else self._settings
+        OpenAI_cls = cast("type[OpenAI]", _sdk_name("OpenAI"))
+        transport = _pilot_transport(target.base_url)
+        try:
+            return OpenAI_cls(api_key=target.api_key, base_url=target.base_url,
+                              timeout=max(1.0, _configured_timeout_seconds()), max_retries=0,
+                              **transport)
+        except BaseException:
+            if "http_client" in transport:
+                transport["http_client"].close()
+            raise
+
     def _stall_watchdog_fired(
         self,
         endpoint: str,
@@ -1479,22 +1497,18 @@ class LLMClient:
         model: str,
         attempt: int,
         budget: float,
+        request_client: OpenAI | None = None,
     ) -> None:
         """Watchdog callback (runs on its timer thread): rescue a stalled call.
 
-        A call that outlived this budget is past its HTTP deadline twice over
-        and its socket read is parked with no end in sight. The rescue is
-        physical, not cooperative: the raw sockets beneath the pool are
-        ``shutdown()`` so the parked read fails immediately, the client is
-        closed, and a fresh client (new pool) is built so the retry does not
-        land on the dead sockets. Races are harmless — a call that completed
-        microseconds earlier had its timer cancelled already, and closing a
-        pool whose only request just finished only costs the next call one
-        new TCP handshake. Any call still alive at this point has already
-        outlived its own deadline, so pool-wide collateral is bounded to calls
-        that are themselves anomalous.
+        Pilot calls pass an attempt-owned client, so closing its sockets cannot
+        interrupt another attempt. The timer is clipped to the remaining run
+        deadline. Socket discovery depends on SDK/transport internals and is
+        best-effort; the work lease remains held until the call actually exits.
+        Synthetic mode retains the legacy shared-pool rescue and rebuild,
+        which can affect other calls using that endpoint.
         """
-        client = self._endpoint_client(endpoint)
+        client = request_client if request_client is not None else self._endpoint_client(endpoint)
         touched = _shutdown_pool_sockets(client)
         try:
             client.close()
@@ -1503,7 +1517,8 @@ class LLMClient:
                 "llm stall watchdog could not close the %s client", endpoint, exc_info=True
             )
         try:
-            self._rebuild_client(endpoint)
+            if request_client is None:
+                self._rebuild_client(endpoint)
         except Exception:  # noqa: BLE001 - retry may still land on the closed pool once
             logger.warning(
                 "llm stall watchdog could not rebuild the %s client — the next "
@@ -1557,7 +1572,7 @@ class LLMClient:
             owner = pilot.current_owner()
             pilot.require_consent(owner)
             pilot.require_destination(self._endpoint_base_url(endpoint), model)
-        client = self._endpoint_client(endpoint)
+        client = _attempt_client.get() or self._endpoint_client(endpoint)
         if _uses_responses_schema(self._endpoint_base_url(endpoint)):
             request: dict[str, Any] = {
                 "model": model,
@@ -1838,9 +1853,8 @@ class LLMClient:
             last_error: Exception | None = None
             nudged = False
             t0 = time.perf_counter()
-            # Watchdog budget for one wire call (see _stall_watchdog_fired);
-            # 0 disables the watchdog. Computed once — it does not vary per
-            # attempt.
+            # Synthetic mode permits disabling the legacy watchdog. Pilot
+            # attempts always arm their own timer, clipped to the run deadline.
             stall_budget = _stall_watchdog_seconds()
             for attempt in range(MAX_RETRIES):
                 check_pipeline_cancelled()
@@ -1860,28 +1874,23 @@ class LLMClient:
                             )
                             if remaining is not None else NOT_GIVEN
                         )
-                        if stall_budget > 0:
-                            # Armed only around the wire call: once _call_openai
-                            # returns, the response is fully buffered and there is
-                            # nothing left to stall. The timer fires on its own
-                            # daemon thread and force-closes the pool (see
-                            # _stall_watchdog_fired); cancelling here is cheap
-                            # and races are harmless.
-                            stall_timer = threading.Timer(
-                                stall_budget,
-                                self._stall_watchdog_fired,
-                                args=(
-                                    endpoint,
-                                    rid,
-                                    phase,
-                                    model,
-                                    attempt + 1,
-                                    stall_budget,
-                                ),
-                            )
-                            stall_timer.daemon = True
-                            stall_timer.start()
+                        from . import pilot
+                        wire_client = self._new_attempt_client(endpoint) if pilot.enabled() else None
+                        wire_budget = stall_budget
+                        if pilot.enabled() and wire_budget <= 0:
+                            wire_budget = 2 * _configured_timeout_seconds()
+                        if remaining is not None and wire_client is not None:
+                            wire_budget = min(wire_budget, remaining)
+                        token = _attempt_client.set(wire_client)
                         try:
+                            if wire_budget > 0:
+                                watchdog_args: tuple[Any, ...] = (endpoint, rid, phase, model, attempt + 1, wire_budget)
+                                if wire_client is not None:
+                                    watchdog_args += (wire_client,)
+                                stall_timer = threading.Timer(wire_budget, self._stall_watchdog_fired,
+                                                              args=watchdog_args)
+                                stall_timer.daemon = True
+                                stall_timer.start()
                             response, responses = self._call_openai(
                                 endpoint, model, system, user, temperature, max_tokens,
                                 request_timeout,
@@ -1889,6 +1898,12 @@ class LLMClient:
                         finally:
                             if stall_timer is not None:
                                 stall_timer.cancel()
+                            _attempt_client.reset(token)
+                            if wire_client is not None:
+                                try:
+                                    wire_client.close()
+                                except Exception:
+                                    pass
                     check_pipeline_cancelled()
                     content = (
                         _responses_output_text(response) if responses

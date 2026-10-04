@@ -4,9 +4,11 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 import streamlit as st
+from starlette.middleware import Middleware
 
 from app.export_routes import routes
 from app.text_exports import STORE
+from app.upload_admission import PilotUploadMiddleware
 
 
 @asynccontextmanager
@@ -17,4 +19,5 @@ async def lifespan(app: st.App) -> AsyncIterator[None]:
         STORE.close()
 
 
-app = st.App(Path(__file__).resolve().parent.parent / "run_app.py", routes=routes(), lifespan=lifespan)
+app = st.App(Path(__file__).resolve().parent.parent / "run_app.py", routes=routes(), lifespan=lifespan,
+             middleware=[Middleware(PilotUploadMiddleware)])

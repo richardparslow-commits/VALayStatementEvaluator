@@ -173,7 +173,9 @@ class TestRevocationDuringWork(unittest.TestCase):
         user = VerifiedUser(self.claims)
         root = Path(__file__).resolve().parents[1]
         with patch.object(pilot, "validate_configuration", return_value=self.data), \
+                patch("app.upload_admission.bind_session"), \
                 patch.object(st, "user", user), \
+                patch.object(pilot, "require_consent", side_effect=lambda owner: st.session_state["_pilot_consent_grant"]), \
                 patch.object(main, "render_evaluate_tab", side_effect=pilot.PilotBlocked("Access ended.")), \
                 patch.object(main, "render_draft_tab") as draft_view, \
                 patch.object(main, "render_failure_detail") as diagnostics:

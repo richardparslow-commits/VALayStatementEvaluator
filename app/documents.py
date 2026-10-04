@@ -570,20 +570,10 @@ def _read_docx_member_limited(
     return bytes(output)
 
 
-def archive_members(
-    filename: str, data: bytes
-) -> tuple[list[tuple[str, bytes]], list[str]]:
-    """Expand a ``.zip`` upload into ``(member label, bytes)`` pairs, plus skips.
-
-    Provider portals and My HealtheVet hand back folders as archives, and the
-    natural thing to do with one is upload it as it came. Expansion is bounded at
-    every step — member count, per-member uncompressed size, per-member compression
-    ratio, and total uncompressed size — because the archive is untrusted input and
-    the extracted text is held in memory. Members that exceed a *per-member* bound
-    are skipped with a message; exceeding the total is a hard stop. Nested archives
-    are skipped rather than expanded recursively, which would reintroduce the
-    amplification this protects against.
-    """
+def iter_archive_members(
+    filename: str, data: bytes, skipped: list[str]
+) -> Iterator[tuple[str, bytes]]:
+    """Validate metadata first, then expand one member with actual-byte quotas."""
     try:
         archive = zipfile.ZipFile(io.BytesIO(data))
     except Exception as exc:  # noqa: BLE001 - named, not a bare zip traceback
@@ -603,7 +593,6 @@ def archive_members(
 
         label_prefix = Path(filename).stem or "archive"
         selected: list[tuple[str, str, zipfile.ZipInfo]] = []
-        skipped: list[str] = []
         for info in infos:
             relative = info.filename.replace("\\", "/")
             base = Path(relative).name
@@ -643,15 +632,34 @@ def archive_members(
                 "batches."
             )
 
-        members: list[tuple[str, bytes]] = []
+        expanded = 0
+        yielded = False
         for label, relative, info in selected:
             try:
-                members.append((label, archive.read(info)))
+                member = bytearray()
+                with archive.open(info) as stream:
+                    while True:
+                        allowance = min(config.ZIP_MAX_MEMBER_BYTES - len(member),
+                                        config.ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES - expanded)
+                        part = stream.read(min(65536, max(0, allowance) + 1))
+                        if not part:
+                            break
+                        expanded += len(part)
+                        if len(member) + len(part) > config.ZIP_MAX_MEMBER_BYTES or expanded > config.ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES:
+                            raise ExtractionError("Archive actual expansion exceeds its limit.")
+                        member.extend(part)
+                yielded = True
+                yield label, bytes(member)
             except Exception as exc:  # noqa: BLE001 - one bad member must not lose the rest
                 skipped.append(f"✖️ {filename}: could not read {relative} ({exc})")
-        if not members and not skipped:
+        if not yielded and not skipped:
             raise ExtractionError(f"{filename}: archive contains no record files.")
-    return members, skipped
+
+
+def archive_members(filename: str, data: bytes) -> tuple[list[tuple[str, bytes]], list[str]]:
+    """Compatibility list API; ingestion uses the incremental member iterator."""
+    skipped: list[str] = []
+    return list(iter_archive_members(filename, data, skipped)), skipped
 
 
 class InProcessExtractor:
@@ -668,9 +676,9 @@ class InProcessExtractor:
         same however it arrives.
         """
         if label.lower().endswith(ARCHIVE_EXTENSIONS):
-            members, skipped = archive_members(label, data)
+            skipped: list[str] = []
             documents: list[ExtractedDocument] = []
-            for member_label, member_bytes in members:
+            for member_label, member_bytes in iter_archive_members(label, data, skipped):
                 try:
                     documents.append(extract_document(member_label, member_bytes))
                 except ExtractionError as exc:
@@ -997,26 +1005,10 @@ class _StreamingCutter:
             self._base += len(self._parts.popleft())
 
 
-def iter_page_labelled_chunks(
-    pages: Iterable[DocumentPage], max_chars: int = DEFAULT_CHUNK_CHARS
-) -> Iterator[Chunk]:
-    """Yield the same chunks as :func:`chunk_page_labelled_text` over page
-    objects, without ever materializing the joined corpus.
-
-    Cut positions, overlap handling, and the original's ``max_chars + 1``
-    hard-cut slice are reproduced exactly, so the chunks are byte-identical to
-    the joined implementation (pinned by the property test in
-    ``tests/test_core.py``). Chunk texts accumulate before the first yield
-    because ``Chunk.total`` must be known up front; the memory this saves is
-    the joined corpus itself plus the second cleaned copy of it — the texts the
-    caller keeps anyway (the chunks, the pages) are untouched.
-
-    ``max_chars`` is floored at :data:`MIN_CHUNK_CHARS`, matching
-    :func:`chunk_page_labelled_text` exactly.
-    """
+def _iter_chunk_text(pages: Iterable[DocumentPage], max_chars: int) -> Iterator[str]:
+    """Cut identical windows with the current window/page, not all chunk texts."""
     max_chars = max(max_chars, MIN_CHUNK_CHARS)
     cutter = _StreamingCutter(pages, max_chars)
-    pieces: list[str] = []
     start = 0
     while True:
         # Fill one past the window: the original branches on ``end < len(text)``
@@ -1030,9 +1022,9 @@ def iter_page_labelled_chunks(
             # joined implementation, whose clean_text("") yields one empty
             # chunk (and therefore one — degenerate — digest call).
             if start == 0 and cutter._filled == 0:
-                pieces.append("")
+                yield ""
             else:
-                pieces.append(window)
+                yield window
             break
         # Prefer cutting at a paragraph, then sentence, then hard cut.
         cut = window.rfind("\n\n")
@@ -1041,15 +1033,49 @@ def iter_page_labelled_chunks(
         if cut < max_chars // 2:
             cut = max_chars
         end = start + cut + 1
-        pieces.append(cutter._read(start, end))
+        yield cutter._read(start, end)
         if cutter._exhausted and end >= cutter._filled:
             break  # the cut consumed the corpus: no overlap-tail iteration
         next_start = max(end - CHUNK_OVERLAP_CHARS, start + 1)
         cutter._drop_before(next_start)
         start = next_start
-    total = len(pieces)
-    for i, chunk_text in enumerate(pieces, start=1):
-        yield Chunk(i, total, chunk_text, _chunk_pages(chunk_text))
+
+
+def iter_page_labelled_chunks(
+    pages: Iterable[DocumentPage], max_chars: int = DEFAULT_CHUNK_CHARS
+) -> Iterator[Chunk]:
+    """Compatibility adapter for one-shot page iterators with an upfront total.
+
+    Production medical review uses ChunkPlan: it counts in one bounded pass and
+    yields in another, so no complete chunk-text list is retained.
+    """
+    pieces = list(_iter_chunk_text(pages, max_chars))
+    for index, text in enumerate(pieces, start=1):
+        yield Chunk(index, len(pieces), text, _chunk_pages(text))
+
+
+class ChunkPlan:
+    """Replayable, bounded-memory chunks over already retained source pages."""
+    def __init__(self, pages: Iterable[DocumentPage], max_chars: int = DEFAULT_CHUNK_CHARS,
+                 *, total: int | None = None, indices: frozenset[int] | None = None) -> None:
+        self.pages = tuple(pages)
+        self.max_chars = max_chars
+        self.total = sum(1 for _ in _iter_chunk_text(self.pages, max_chars)) if total is None else total
+        self.indices = indices
+
+    def __len__(self) -> int:
+        return self.total if self.indices is None else len(self.indices)
+
+    def __iter__(self) -> Iterator[Chunk]:
+        for index, text in enumerate(_iter_chunk_text(self.pages, self.max_chars), start=1):
+            if self.indices is None or index in self.indices:
+                yield Chunk(index, self.total, text, _chunk_pages(text))
+
+    def select(self, indices: Iterable[int]) -> ChunkPlan:
+        selected = frozenset(indices)
+        if any(not 1 <= i <= self.total for i in selected):
+            raise ValueError("Invalid chunk selection.")
+        return ChunkPlan(self.pages, self.max_chars, total=self.total, indices=selected)
 
 
 # ------------------------------------------------------- paragraph retrieval
@@ -1099,8 +1125,8 @@ def _split_oversized(block: str, limit: int = PARAGRAPH_MAX_CHARS) -> list[str]:
 # ~12 MB of paragraph strings (measured), so an entry-count-only cap of 64 retains
 # hundreds of MB in a long-lived server process — the difference between a session
 # that survives a week and one the OOM killer takes. Oldest entries are evicted
-# once either bound is exceeded; the newest is always kept, so a single oversized
-# document is still cached rather than recomputed on every query.
+# once either bound is exceeded; oversized indexes are returned to the caller
+# without being retained in this process-wide cache.
 _PARAGRAPH_CACHE: OrderedDict[tuple[str, int, int], list[Paragraph]] = OrderedDict()
 _PARAGRAPH_CACHE_LOCK = threading.Lock()
 _PARAGRAPH_CACHE_MAX_ENTRIES = 64
@@ -1127,6 +1153,8 @@ def _cache_put(key: tuple[str, int, int], paragraphs: list[Paragraph]) -> None:
     with _PARAGRAPH_CACHE_LOCK:
         if key in _PARAGRAPH_CACHE:
             _PARAGRAPH_CACHE.move_to_end(key)
+            return
+        if sum(len(p.text) for p in paragraphs) > _PARAGRAPH_CACHE_MAX_CHARS:
             return
         _PARAGRAPH_CACHE[key] = paragraphs
         total = _cached_paragraph_chars()
@@ -1160,7 +1188,9 @@ def paragraph_index(doc: ExtractedDocument, min_chars: int = 40) -> list[Paragra
         fingerprint.update(json.dumps(page_input, ensure_ascii=True).encode("ascii"))
     split_limit = PARAGRAPH_MAX_CHARS
     key = (fingerprint.hexdigest(), min_chars, split_limit)
-    cached = _cache_get(key)
+    from . import pilot
+    cache_allowed = not pilot.enabled()
+    cached = _cache_get(key) if cache_allowed else None
     if cached is not None:
         return cached
     paragraphs: list[Paragraph] = []
@@ -1171,7 +1201,8 @@ def paragraph_index(doc: ExtractedDocument, min_chars: int = 40) -> list[Paragra
                 continue
             for piece in _split_oversized(block, limit=split_limit):
                 paragraphs.append(Paragraph(label, piece))
-    _cache_put(key, paragraphs)
+    if cache_allowed:
+        _cache_put(key, paragraphs)
     return paragraphs
 
 

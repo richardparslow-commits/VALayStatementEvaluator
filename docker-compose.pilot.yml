@@ -93,6 +93,11 @@ services:
     depends_on:
       streamlit-web:
         condition: service_healthy
+    mem_limit: 512m
+    cpus: 1
+    pids_limit: 64
+    tmpfs:
+      - /var/cache/nginx:rw,noexec,nosuid,nodev,size=128M,mode=1777
     security_opt: [no-new-privileges:true]
     logging:
       driver: "none"

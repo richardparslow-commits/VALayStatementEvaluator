@@ -77,7 +77,7 @@ def validate_records(records: Any) -> tuple[int, int]:
     if not records:
         raise RequestValidationError("Upload at least one medical record file with extractable text.",
                                      field="records", reason="payload_missing")
-    source_pages = text_bytes = 0
+    source_pages = text_bytes = text_chars = 0
     for doc in records:
         if not isinstance(doc, ExtractedDocument):
             raise RequestValidationError("Medical records must be extracted documents.", field="records")
@@ -91,6 +91,7 @@ def validate_records(records: Any) -> tuple[int, int]:
                     or type(page.page) is not int or page.page < 1 or page.kind not in ("page", "block")):
                 raise RequestValidationError("Medical record page addresses are invalid.", field="records")
             text_bytes += validate_text(page.text, field="records", label="Record page text", limit=config.MAX_TOTAL_UPLOAD_BYTES)
+            text_chars += len(page.text)
         source_pages += max(doc.source_page_count, len(doc.pages))
     if source_pages > config.MAX_RECORD_PAGES:
         raise RequestValidationError("Medical records exceed the configured page limit. Split the record set.",
@@ -99,6 +100,9 @@ def validate_records(records: Any) -> tuple[int, int]:
         raise RequestValidationError("Medical record text exceeds the configured total input limit. Split the record set.",
                                      field="records", reason="payload_too_large")
 
+    from . import pilot
+    if pilot.enabled() and text_chars > 20 * 1024 * 1024:
+        raise RequestValidationError("The pilot record text exceeds its processing limit.", field="records")
     return source_pages, text_bytes
 
 

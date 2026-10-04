@@ -124,10 +124,19 @@ class TestAdmission(unittest.TestCase):
         self.assertEqual(managed.base_url, "https://approved.example/v1")
 
     def test_valid_invited_profile_renders_without_managed_secret_widgets(self):
+        import pandas  # noqa: F401 - load native platform metadata before the Linux fixture
         from dataclasses import replace
         import streamlit as st
         from streamlit.testing.v1 import AppTest
         from app import config
+        from app import upload_admission
+        actual_runtime = upload_admission.runtime
+        def guarded_test_runtime():
+            # AppTest runs scripts without HTTP. Model installation here; the
+            # real upload route and missing-guard refusal have boundary tests.
+            current = actual_runtime()
+            upload_admission._GUARDED_RUNTIMES.add(current)
+            return current
         root = Path(__file__).resolve().parents[1]
         data = approval()
         now = int(datetime.now(timezone.utc).timestamp())
@@ -147,6 +156,7 @@ class TestAdmission(unittest.TestCase):
                 patch.object(config, "load_settings", return_value=settings), patch.object(st, "user", user), \
                 patch.object(config, "MAX_RECORD_PAGES", 500), patch.object(config, "BLOB_STORE_MODE", "none"), \
                 patch.object(config, "SHARED_CACHE_URL", ""), patch.object(config, "SHARED_CACHE_TOKEN", ""), \
+                patch.object(upload_admission, "runtime", side_effect=guarded_test_runtime), \
                 patch("sys.platform", "linux"), patch("os.geteuid", return_value=os.geteuid()), \
                 patch("app.isolated_extract.parser_health"):
             at = AppTest.from_file(str(root / "run_app.py"))

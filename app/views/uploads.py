@@ -34,9 +34,14 @@ def check_upload_limits(files: Any) -> tuple[list[Any], list[str]]:
     # len(getvalue()) for test fakes that only expose getvalue().
     def _size(f: Any) -> int:
         try:
-            return int(getattr(f, "size", None) or len(f.getvalue()))
+            size = getattr(f, "size", None)
+            if size is None:
+                size = len(f.getvalue())
+            if type(size) is not int or size < 0:
+                raise ValueError("Invalid byte count.")
+            return size
         except Exception:  # noqa: BLE001
-            return 0
+            raise ValueError("Upload size could not be verified.") from None
 
     per_file_limit = config.MAX_UPLOAD_BYTES
     total_limit = config.MAX_TOTAL_UPLOAD_BYTES
@@ -44,7 +49,11 @@ def check_upload_limits(files: Any) -> tuple[list[Any], list[str]]:
     # Per-file check
     accepted: list = []
     for f in files:
-        sz = _size(f)
+        try:
+            sz = _size(f)
+        except ValueError:
+            rejected_msgs.append("✖️ Upload size could not be verified. Remove and reselect this file.")
+            continue
         if sz > per_file_limit:
             rejected_msgs.append(
                 f"✖️ {f.name}: {sz // 1_048_576} MB exceeds the per-file limit "
@@ -129,6 +138,9 @@ def extract_uploads(files: Any, slot: str) -> list[Any]:
         new_docs, file_skipped = extract_uploaded_documents([uploaded])
         skipped.extend(file_skipped)
         if new_docs:
+            if pilot.enabled():
+                from ..upload_admission import claim_documents
+                claim_documents(cache_key, new_docs)
             st.session_state[cache_key] = {"documents": new_docs, "skipped": file_skipped}
             documents.extend(new_docs)
     _prune_upload_cache(slot, live_keys)
