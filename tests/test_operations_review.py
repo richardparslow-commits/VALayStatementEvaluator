@@ -59,7 +59,7 @@ class OperationsReviewTests(unittest.TestCase):
                             for r in packet["checks"]))
         release = packet["release_template"]
         self.assertEqual(release["evidence_references"], {field: "" for field in EVIDENCE_FIELDS})
-        self.assertEqual(len(release["evidence_references"]), 8)
+        self.assertEqual(len(release["evidence_references"]), 9)
         self.assertEqual(release["backup_restore_scope"], "excluded_pending_separate_acceptance")
         self.assertFalse(release["operator_id"] or release["deployment_url"])
         self.assertEqual(len(CHECKS), 22)

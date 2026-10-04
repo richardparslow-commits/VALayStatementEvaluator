@@ -47,6 +47,7 @@ def enabled() -> bool:
 EVIDENCE_FIELDS = (
     "provider_terms", "retention_policy", "privacy_review", "legal_review",
     "accuracy_validation", "deployment_validation", "incident_response", "spending_controls",
+    "ingestion_security",
 )
 
 
@@ -302,7 +303,8 @@ def notice_binding(owner: str, approval: Mapping[str, Any]) -> str:
     data = [owner, approval["participant_notice"], approval["privacy_review"],
             approval["provider_terms"], approval["retention_policy"],
             approval["provider_base_url"], approval["models"], approval["local_log_retention_days"],
-            approval["quota_policy"], approval["spending_controls"], approval.get("text_export_policy")]
+            approval["quota_policy"], approval["spending_controls"], approval.get("text_export_policy"),
+            approval["ingestion_security"]]
     return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
 
 

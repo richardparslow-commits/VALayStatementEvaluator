@@ -9,6 +9,8 @@ import struct
 import time
 from typing import Any, BinaryIO
 
+from .ingestion_policy import IngestionRefused, validate_label
+
 MAX_INPUT = 50 * 1024 * 1024
 MAX_OUTPUT = 32 * 1024 * 1024
 MAX_HEADER = 4096
@@ -86,6 +88,10 @@ def validate_request(value: Any) -> dict[str, Any]:
             or not isinstance(value["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", value["sha256"])
             or not isinstance(value["nonce"], str) or not re.fullmatch(r"[0-9a-f]{32}", value["nonce"])):
         raise ParserRefused("Invalid parser request.")
+    try:
+        validate_label(value["label"])
+    except IngestionRefused as exc:
+        raise ParserRefused("Invalid parser file label.") from exc
     return value
 
 

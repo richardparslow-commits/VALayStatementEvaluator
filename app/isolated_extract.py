@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .documents import DocumentPage, ExtractedDocument, ExtractionError
+from .ingestion_policy import IngestionRefused, validate_label
 from .parser_protocol import (DEADLINE, MAX_HEADER, MAX_INPUT, MAX_OUTPUT, MAX_TEXT, MAX_PAGES,
                               SOCKET_PATH, ParserRefused, decode, encode, frame,
                               recv_frame, validate_request)
@@ -71,6 +72,10 @@ def _documents(reply: Any, request: dict[str, Any], image: str) -> tuple[list[Ex
                 "unreadable_pages", "pagination", "coverage_known", "pages"}):
             raise ParserRefused("Invalid parser document schema.")
         name = item["filename"]
+        try:
+            validate_label(name, limit=2048)
+        except IngestionRefused as exc:
+            raise ParserRefused("Invalid parser document label.") from exc
         label = request["label"]
         # Archive members are citation labels, never paths that the client opens.
         prefix = (Path(label).stem or "archive") + "/"

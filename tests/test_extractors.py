@@ -263,12 +263,12 @@ class TestSandboxRefusals(ExtractorTestCase):
     def test_a_zip_member_of_a_staged_archive_is_allowed(self) -> None:
         """Archive members legitimately extend the staged label."""
         data = _pdf_bytes([TYPED])
-        member = extract_document("bundle.zip: records.pdf", data)
+        member = extract_document("bundle/records.pdf", data)
         extractor = self.sandbox(FakeRunner(self.report_for("bundle.zip", [member])))
 
         documents, _ = extractor.extract("bundle.zip", data)
 
-        self.assertEqual([d.filename for d in documents], ["bundle.zip: records.pdf"])
+        self.assertEqual([d.filename for d in documents], ["bundle/records.pdf"])
 
     def test_stdout_that_is_not_json_is_refused_with_its_size(self) -> None:
         extractor = self.sandbox(FakeRunner("Traceback (most recent call last): …"))

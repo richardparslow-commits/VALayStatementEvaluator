@@ -23,6 +23,7 @@ EXTRA = (
     "deploy/PILOT_ACCEPTANCE.md", "deploy/PILOT_PRIVACY_ACCEPTANCE.md",
     "deploy/PILOT_BUDGET_ACCEPTANCE.md", "deploy/PILOT_ACCURACY_ACCEPTANCE.md",
     "deploy/PILOT_LEGAL_ACCEPTANCE.md", "deploy/monitoring/prometheus.yml",
+    "deploy/PILOT_INGESTION_ACCEPTANCE.md", "deploy/PILOT_RESOURCE_ACCEPTANCE.md",
     "deploy/monitoring/alertmanager.yml", "deploy/monitoring/alerts.yml", ".github/workflows/test.yml",
 )
 

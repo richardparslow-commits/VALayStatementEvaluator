@@ -27,6 +27,10 @@ its presence is not a completed R07 verdict. If prerequisites are missing, keep
 admission closed, collect only host/proxy evidence that is independently
 accessible, and mark the dependent tests **BLOCKED**.
 
+The separate [ingestion acceptance](PILOT_INGESTION_ACCEPTANCE.md) now requires
+an `ingestion_security` review reference for the passive-file policy and residual
+malware decision. Old manifests without that reference keep admission closed.
+
 Bind the packet to these actual values before testing:
 
 | Field | Required observation |

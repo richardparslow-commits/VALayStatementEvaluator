@@ -81,14 +81,14 @@ def _pdf_bytes(pages: list[str]) -> bytes:
 
 
 class TestTextDecoding(unittest.TestCase):
-    def test_cp1252_text_is_read_not_replaced(self) -> None:
-        """A Windows-encoded export must not turn into mojibake in quotes."""
-        from app.documents import extract_document
+    def test_ambiguous_legacy_encoding_requires_explicit_conversion(self) -> None:
+        """Do not silently select a code page or emit replaced clinical text."""
+        from app.documents import extract_document, ExtractionError
 
         # 0x92 is a right single quote in cp1252 and invalid UTF-8.
         raw = b"Patient\x92s knee pain began in service."
-        doc = extract_document("notes.txt", raw)
-        self.assertIn("Patient’s knee pain", doc.full_text)
+        with self.assertRaisesRegex(ExtractionError, "Save as UTF-8"):
+            extract_document("notes.txt", raw)
 
     def test_utf8_still_wins(self) -> None:
         from app.documents import extract_document
@@ -837,10 +837,10 @@ class TestArchiveUploads(unittest.TestCase):
                 archive_members("records.zip", payload)
         self.assertIn("smaller batches", str(ctx.exception))
 
-    def test_a_file_that_is_not_an_archive_says_so_by_name(self) -> None:
+    def test_a_file_that_is_not_an_archive_has_a_fixed_policy_refusal(self) -> None:
         with self.assertRaises(ExtractionError) as ctx:
             archive_members("records.zip", b"not a zip at all")
-        self.assertIn("records.zip", str(ctx.exception))
+        self.assertIn("ZIP package header", str(ctx.exception))
 
     def test_an_archive_with_no_files_at_all_is_refused(self) -> None:
         buffer = io.BytesIO()

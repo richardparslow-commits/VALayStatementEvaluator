@@ -84,6 +84,43 @@ class ParserContainerTests(unittest.TestCase):
         self.assertEqual(len(skipped), 1)
         self.assertIn('physical page limit before text extraction', skipped[0])
 
+    def test_packaged_parser_enforces_passive_formats_with_no_mode_environment(self):
+        from tests.ingestion_fixtures import docx_parts, package
+        from pypdf import PdfWriter
+
+        def parse(label, data):
+            req = {**self.request, 'label': label, 'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+            return _documents(_unpack_reply(wire.decode(self.runner.run(req, data)), IMAGE), req, IMAGE)
+
+        for label, data in (('unicode.txt', 'Synthetic NO dose: 10 mg; β = −1.'.encode('utf-16')),
+                            ('passive.docx', package(docx_parts()))):
+            with self.subTest(label=label):
+                docs, skipped = parse(label, data)
+                self.assertEqual(len(docs), 1)
+                self.assertFalse(skipped)
+        output = io.BytesIO()
+        writer = PdfWriter(); writer.add_blank_page(width=100, height=100)
+        writer.add_js('app.alert("synthetic");'); writer.write(output)
+        parts = docx_parts()
+        parts['customXml/item1.xml'] = b'<!DOCTYPE x [<!ENTITY e "synthetic">]><x>&e;</x>'
+        for label, data in (('renamed.txt', b'\x89PNG\r\n\x1a\nSynthetic binary'),
+                            ('active.pdf', output.getvalue()), ('entities.docx', package(parts))):
+            with self.subTest(label=label):
+                docs, skipped = parse(label, data)
+                self.assertFalse(docs)
+                self.assertEqual(len(skipped), 1)
+
+    def test_packaged_parser_refuses_unsafe_archive_before_partial_results(self):
+        from tests.ingestion_fixtures import package
+        data = package({'valid.txt': self.data, '../unsafe.txt': b'Synthetic unsafe name.'})
+        req = {**self.request, 'label': 'records.zip', 'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+        with self.assertRaises(wire.ParserRefused):
+            self.runner.run(req, data)
+        # A refusal must not poison the next container/job.
+        docs, skipped = _documents(_unpack_reply(wire.decode(self.runner.run(self.request, self.data)), IMAGE), self.request, IMAGE)
+        self.assertEqual(len(docs), 1)
+        self.assertFalse(skipped)
+
     def test_linux_uid_capabilities_seccomp_apparmor_and_limits_are_active(self):
         result = self.probe('''import sys, os, json, resource
 sys.stdin.buffer.read()

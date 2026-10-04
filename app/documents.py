@@ -9,7 +9,6 @@ import math
 import re
 import threading
 import zipfile
-import xml.etree.ElementTree as ET
 from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -20,6 +19,7 @@ from typing import Any, Iterable, Iterator, Protocol, Sequence
 from pypdf import PdfReader
 
 from . import config
+from . import ingestion_policy as policy
 
 
 class UploadedFile(Protocol):
@@ -214,23 +214,20 @@ class ExtractedDocument:
 
 # ---------------------------------------------------------------- extraction
 def _decode_text(data: bytes) -> str:
-    """Decode a text file, preferring the encodings real exports actually use.
-
-    ``utf-8`` with ``errors="replace"`` alone silently turns a Windows/cp1252
-    export (common for clinic notes and Word's "save as text") into mojibake, and
-    that mojibake then flows into extracted quotes and citations. Try the likely
-    encodings in order before falling back to a lossy replace.
-    """
-    for encoding in ("utf-8", "cp1252", "latin-1"):
-        try:
-            return data.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-    return data.decode("utf-8", errors="replace")
+    """Decode supported Unicode; never guess or replace source bytes."""
+    try:
+        return policy.decode_text(data)
+    except policy.IngestionRefused as exc:
+        raise ExtractionError(str(exc)) from exc
 
 
 def extract_document(filename: str, data: bytes) -> ExtractedDocument:
-    """Extract text from an uploaded file based on its extension."""
+    """Validate identity, signature and structure before extracting source text."""
+    try:
+        policy.validate_label(filename)
+        policy.validate_signature(Path(filename).suffix.lower(), data)
+    except policy.IngestionRefused as exc:
+        raise ExtractionError(str(exc)) from exc
     lower = filename.lower()
     if lower.endswith(".pdf"):
         return _extract_pdf(filename, data)
@@ -404,10 +401,10 @@ def strip_running_headers(pages: list[DocumentPage]) -> list[DocumentPage]:
 
 def _extract_pdf(filename: str, data: bytes) -> ExtractedDocument:
     try:
-        reader = PdfReader(io.BytesIO(data))
+        reader = PdfReader(io.BytesIO(data), strict=True)
         encrypted = bool(getattr(reader, "is_encrypted", False))
     except Exception as exc:  # noqa: BLE001
-        raise ExtractionError(f"{filename}: could not read PDF ({exc})") from exc
+        raise ExtractionError(f"{filename}: could not read PDF structure.") from exc
 
     # A password-protected export (My HealtheVet offers one) parses fine and then
     # raises FileNotDecryptedError the moment its pages are touched. Left uncaught
@@ -420,9 +417,12 @@ def _extract_pdf(filename: str, data: bytes) -> ExtractedDocument:
             "upload that copy."
         )
     try:
+        policy.validate_pdf(reader)
         source_pages = list(reader.pages)
+    except policy.IngestionRefused as exc:
+        raise ExtractionError(str(exc)) from exc
     except Exception as exc:  # noqa: BLE001 - damaged or unsupported structure
-        raise ExtractionError(f"{filename}: could not read PDF pages ({exc})") from exc
+        raise ExtractionError(f"{filename}: could not validate PDF structure or read its pages.") from exc
 
     if len(source_pages) > config.MAX_RECORD_PAGES:
         raise ExtractionError("PDF exceeds the physical page limit before text extraction.")
@@ -455,7 +455,7 @@ def _extract_docx(filename: str, data: bytes) -> ExtractedDocument:
     max_member_count = config.DOCX_MAX_INTERNAL_FILE_COUNT
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
-            existing_total_bytes = _validate_docx_uncompressed_sizes(
+            _validate_docx_uncompressed_sizes(
                 filename,
                 archive=archive,
                 max_member_bytes=max_member_bytes,
@@ -463,20 +463,26 @@ def _extract_docx(filename: str, data: bytes) -> ExtractedDocument:
                 max_member_count=max_member_count,
                 target_member_name="word/document.xml",
             )
-            xml_bytes = _read_docx_member_limited(
-                filename,
-                archive=archive,
-                member_name="word/document.xml",
-                max_member_bytes=max_member_bytes,
-                max_total_bytes=max_total_bytes,
-                existing_total_bytes=existing_total_bytes,
-            )
+            expanded = 0
+
+            def read_part(name: str) -> bytes:
+                nonlocal expanded
+                body = _read_docx_member_limited(
+                    filename, archive=archive, member_name=name,
+                    max_member_bytes=max_member_bytes, max_total_bytes=max_total_bytes,
+                    existing_total_bytes=expanded,
+                )
+                expanded += len(body)
+                return body
+
+            root = policy.validate_docx(archive, read_part)
+    except policy.IngestionRefused as exc:
+        raise ExtractionError(str(exc)) from exc
     except ExtractionError:
         raise
     except Exception as exc:  # noqa: BLE001
-        raise ExtractionError(f"{filename}: could not read DOCX ({exc})") from exc
+        raise ExtractionError("Could not read a structurally valid DOCX package.") from exc
 
-    root = ET.fromstring(xml_bytes)
     namespace = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
     paragraphs: list[str] = []
     for para in root.iter(f"{namespace}p"):
@@ -575,14 +581,22 @@ def iter_archive_members(
 ) -> Iterator[tuple[str, bytes]]:
     """Validate metadata first, then expand one member with actual-byte quotas."""
     try:
+        policy.validate_label(filename)
+        policy.validate_signature(".zip", data)
         archive = zipfile.ZipFile(io.BytesIO(data))
+    except policy.IngestionRefused as exc:
+        raise ExtractionError(str(exc)) from exc
     except Exception as exc:  # noqa: BLE001 - named, not a bare zip traceback
-        raise ExtractionError(f"{filename}: could not read the archive ({exc})") from exc
+        raise ExtractionError("Could not read a structurally valid ZIP archive.") from exc
 
     # The archive stays open for the whole function: reading a member after the
     # ``with`` block closes it raises "ZIP archive that was already closed", which
     # would leave every archive uploading as a list of skips.
     with archive:
+        try:
+            policy.validate_zip_entries(archive)
+        except policy.IngestionRefused as exc:
+            raise ExtractionError(str(exc)) from exc
         infos = [info for info in archive.infolist() if not info.is_dir()]
         if len(infos) > config.ZIP_MAX_MEMBERS:
             raise ExtractionError(
@@ -594,12 +608,16 @@ def iter_archive_members(
         label_prefix = Path(filename).stem or "archive"
         selected: list[tuple[str, str, zipfile.ZipInfo]] = []
         for info in infos:
-            relative = info.filename.replace("\\", "/")
+            relative = info.filename
             base = Path(relative).name
             # Editor/OS bookkeeping that ends up in most zips; never record content.
             if not base or base.startswith(".") or "__MACOSX/" in f"{relative}/":
                 continue
-            label = f"{label_prefix}/{relative.lstrip('./')}"
+            label = f"{label_prefix}/{relative}"
+            try:
+                policy.validate_label(label)
+            except policy.IngestionRefused as exc:
+                raise ExtractionError(str(exc)) from exc
             if not relative.lower().endswith(SUPPORTED_EXTENSIONS):
                 nested = relative.lower().endswith(ARCHIVE_EXTENSIONS)
                 reason = "nested archive, not expanded" if nested else "unsupported file type"
@@ -650,8 +668,10 @@ def iter_archive_members(
                         member.extend(part)
                 yielded = True
                 yield label, bytes(member)
+            except ExtractionError as exc:
+                skipped.append(str(exc))
             except Exception as exc:  # noqa: BLE001 - one bad member must not lose the rest
-                skipped.append(f"✖️ {filename}: could not read {relative} ({exc})")
+                skipped.append(f"✖️ {filename}: could not read archive member {relative}.")
         if not yielded and not skipped:
             raise ExtractionError(f"{filename}: archive contains no record files.")
 
@@ -665,8 +685,8 @@ def archive_members(filename: str, data: bytes) -> tuple[list[tuple[str, bytes]]
 class InProcessExtractor:
     """The default ``RecordExtractor``: this module's reader, nothing external.
 
-    Unchanged behavior, deliberately: it is the body the uploader always ran, so
-    installing it (or failing back to it) cannot alter what a user sees.
+    The isolated parser uses this same passive-format policy. Pilot admission
+    still requires OS isolation; these checks do not make in-process parsing safe.
     """
 
     def extract(self, label: str, data: bytes) -> tuple[list[ExtractedDocument], list[str]]:

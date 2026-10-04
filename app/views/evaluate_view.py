@@ -151,6 +151,8 @@ def render_evaluate_tab() -> None:
             "Upload the statement (PDF, TXT, MD, DOCX)",
             type=["pdf", "txt", "md", "docx"],
             key="eval_statement_file",
+            help="Use passive documents and UTF-8 text. PDF/Word scripts, attachments, macros, and external links "
+                 "are refused; keep the original and upload a passive copy.",
         )
         if files is not None:
             accepted, rejections = check_upload_limits([files])
