@@ -120,6 +120,12 @@ def document_specs(inputs: dict[str, Any]) -> list[dict[str, Any]]:
             doc["pages"].append({"filename": filename, "page": number, "text": unit["text"], "kind": kind})
     require(all(doc["pages"] for doc in documents.values()),
             "Each benchmark document needs at least one readable page accepted by the app.")
+    for doc in documents.values():
+        addresses = [page["page"] for page in doc["pages"]] + doc["unreadable_pages"]
+        # Positive addresses bounded by total_pages cover 1..N exactly iff their
+        # unique count equals N. Avoid allocating an untrusted range up to N.
+        require(len(set(addresses)) == len(addresses) == doc["total_pages"],
+                "Every source page/block must be supplied or explicitly marked unreadable; no missing or duplicate addresses.")
     return list(documents.values())
 
 

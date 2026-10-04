@@ -130,6 +130,18 @@ class AccuracyBenchmarkTests(unittest.TestCase):
         case["inputs"]["records"][1].update(unreadable=True,label="standalone.pdf p.1")
         with self.assertRaises(BenchmarkInvalid): document_specs(case["inputs"])
 
+    def test_missing_page_or_block_requires_explicit_coverage(self):
+        for letter in ("p","b"):
+            inputs={"records":[{"label":f"synthetic.txt {letter}.1","text":"first"},
+                               {"label":f"synthetic.txt {letter}.3","text":"third"}]}
+            with self.assertRaises(BenchmarkInvalid): document_specs(inputs)
+        inputs["records"]=[{"label":"synthetic.pdf p.1","text":"first"},
+                           {"label":"synthetic.pdf p.3","text":"third"},
+                           {"label":"synthetic.pdf p.2","text":"","unreadable":True}]
+        self.assertEqual(document_specs(inputs)[0]["unreadable_pages"],[2])
+        inputs["records"].append(inputs["records"][0])
+        with self.assertRaises(BenchmarkInvalid): document_specs(inputs)
+
     def test_non_object_evidence_rows_raise_sanitized_validation_error(self):
         for collection in ("reviewers","signatures","runs","requests","ratings","adjudications"):
             with self.subTest(collection=collection):
