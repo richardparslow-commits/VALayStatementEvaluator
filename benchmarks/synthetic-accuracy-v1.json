@@ -782,12 +782,13 @@
         },
         "records": [
           {
-            "label": "synthetic-clinic.txt b.1",
+            "label": "synthetic-clinic.pdf p.1",
             "text": "2021-01-08: Follow-up visit. Earlier hospital notes not included in readable text."
           },
           {
-            "label": "synthetic-scan.pdf p.1",
-            "text": ""
+            "label": "synthetic-clinic.pdf p.2",
+            "text": "",
+            "unreadable": true
           }
         ]
       },
@@ -802,7 +803,7 @@
               "quote": "I remember a 2020 hospital visit, but I cannot read the scan supplied here."
             },
             {
-              "unit": "synthetic-clinic.txt b.1",
+              "unit": "synthetic-clinic.pdf p.1",
               "quote": "2021-01-08: Follow-up visit. Earlier hospital notes not included in readable text."
             }
           ]
@@ -817,7 +818,7 @@
               "quote": "I remember a 2020 hospital visit, but I cannot read the scan supplied here."
             },
             {
-              "unit": "synthetic-clinic.txt b.1",
+              "unit": "synthetic-clinic.pdf p.1",
               "quote": "2021-01-08: Follow-up visit. Earlier hospital notes not included in readable text."
             }
           ]
@@ -850,7 +851,7 @@
           "expected": "Do not manufacture the 2020 hospital findings or interpret an unreadable page as negative evidence. An existing source address or matching quote does not by itself support an interpretation. Inspect each description, finding, score rationale, topic decision and revision against its original passage.",
           "spans": [
             {
-              "unit": "synthetic-clinic.txt b.1",
+              "unit": "synthetic-clinic.pdf p.1",
               "quote": "2021-01-08: Follow-up visit. Earlier hospital notes not included in readable text."
             }
           ]
@@ -865,7 +866,7 @@
               "quote": "I remember a 2020 hospital visit, but I cannot read the scan supplied here."
             },
             {
-              "unit": "synthetic-clinic.txt b.1",
+              "unit": "synthetic-clinic.pdf p.1",
               "quote": "2021-01-08: Follow-up visit. Earlier hospital notes not included in readable text."
             }
           ]
@@ -873,14 +874,14 @@
         {
           "id": "coverage",
           "dimension": "coverage",
-          "expected": "The synthetic-scan.pdf p.1 unit is empty/unreadable. Coverage must report this limitation and withhold any claim that its clinical content was reviewed.",
+          "expected": "The synthetic-clinic.pdf p.2 unit is empty/unreadable. Coverage must report this limitation and withhold any claim that its clinical content was reviewed.",
           "spans": [
             {
               "unit": "account",
               "quote": "I remember a 2020 hospital visit, but I cannot read the scan supplied here."
             },
             {
-              "unit": "synthetic-clinic.txt b.1",
+              "unit": "synthetic-clinic.pdf p.1",
               "quote": "2021-01-08: Follow-up visit. Earlier hospital notes not included in readable text."
             }
           ]

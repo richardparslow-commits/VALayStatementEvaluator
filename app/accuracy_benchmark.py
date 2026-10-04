@@ -93,6 +93,36 @@ def source_snapshot(repo: Path) -> dict[str, Any]:
     return {"revision": revision, "tree": tree, "file_sha256": fingerprints}
 
 
+def document_specs(inputs: dict[str, Any]) -> list[dict[str, Any]]:
+    """Pure serialized document descriptors, with unreadable metadata, not blank pages."""
+    records = inputs.get("records")
+    require(isinstance(records, list) and bool(records), "Synthetic records must be a nonempty list.")
+    assert isinstance(records, list)
+    documents: dict[str, dict[str, Any]] = {}
+    for unit in records:
+        require(isinstance(unit, dict) and text(unit.get("label")) and isinstance(unit.get("text"), str),
+                "Synthetic record unit must be an object with an address and text.")
+        match = re.fullmatch(r"(.+) ([pb])\.([1-9]\d*)", unit["label"])
+        require(match is not None, "Synthetic source label must name one page or block.")
+        assert match is not None
+        filename, letter, number = match.group(1), match.group(2), int(match.group(3))
+        kind = "page" if letter == "p" else "block"
+        unreadable = unit.get("unreadable", False)
+        require(type(unreadable) is bool and (bool(unit["text"].strip()) != unreadable)
+                and (not unreadable or kind == "page"), "Unreadable pages need explicit metadata and no extracted text.")
+        doc = documents.setdefault(filename, {"filename": filename, "pages": [], "total_pages": 0,
+                                              "unreadable_pages": [], "pagination": kind, "coverage_known": True})
+        require(doc["pagination"] == kind, "One document cannot mix pages and text blocks.")
+        doc["total_pages"] = max(doc["total_pages"], number)
+        if unreadable:
+            doc["unreadable_pages"].append(number)
+        else:
+            doc["pages"].append({"filename": filename, "page": number, "text": unit["text"], "kind": kind})
+    require(all(doc["pages"] for doc in documents.values()),
+            "Each benchmark document needs at least one readable page accepted by the app.")
+    return list(documents.values())
+
+
 def validate_corpus(corpus: dict[str, Any]) -> None:
     require(corpus.get("schema_version") == SCHEMA and corpus.get("synthetic") is True,
             "Only the synthetic corpus schema is supported.")
@@ -113,6 +143,7 @@ def validate_corpus(corpus: dict[str, Any]) -> None:
         require(isinstance(inputs, dict) and text(inputs.get("account"))
                 and text(inputs.get("condition")) and isinstance(inputs.get("witness"), dict),
                 "Missing synthetic inputs.")
+        document_specs(inputs)
         units = {"account": inputs["account"]}
         for unit in inputs["records"]:
             require(isinstance(unit, dict) and text(unit.get("label"))
@@ -123,6 +154,7 @@ def validate_corpus(corpus: dict[str, Any]) -> None:
         require(isinstance(case.get("checkpoints"), list) and bool(case["checkpoints"]),
                 "Case has no expected checkpoints.")
         for check in case["checkpoints"]:
+            require(isinstance(check, dict), "Expected checkpoint must be an object.")
             require(text(check.get("id")) and check["id"] not in checks
                     and check.get("dimension") in DIMENSIONS and text(check.get("expected")),
                     "Missing or duplicate expected checkpoint.")
@@ -131,6 +163,7 @@ def validate_corpus(corpus: dict[str, Any]) -> None:
             require(isinstance(check.get("spans"), list) and bool(check["spans"]),
                     "Expected finding must link an original span.")
             for span in check["spans"]:
+                require(isinstance(span, dict), "Expected source span must be an object.")
                 require(span.get("unit") in units and text(span.get("quote"))
                         and span["quote"] in units[span["unit"]], "Expected quote is absent from its unit.")
     require(tags == SCENARIOS and dimensions == DIMENSIONS, "Required scenario or review dimension is absent.")
@@ -159,6 +192,7 @@ def validate_configuration(configuration: dict[str, Any]) -> dict[str, dict[str,
     require(configuration.get("tools") == [] and configuration.get("fallbacks") == [],
             "Search/tools and untested fallback routes must be disabled.")
     profiles: dict[str, dict[str, Any]] = {}
+    require(isinstance(configuration.get("request_profiles"), list), "Request profiles must be a list.")
     for profile in configuration["request_profiles"]:
         require(isinstance(profile, dict) and text(profile.get("id")) and profile["id"] not in profiles,
                 "Invalid or duplicate request profile.")
@@ -293,6 +327,7 @@ def assess(plan: dict[str, Any], agreement: dict[str, Any], results: dict[str, A
     require(isinstance(reviewers, list) and len(reviewers) == 3, "Three distinct qualified reviewers required.")
     by_role: dict[str, str] = {}
     for person in reviewers:
+        require(isinstance(person, dict), "Reviewer must be an object.")
         require(person.get("role") in {"evidence", "medical", "qa"} and text(person.get("id"))
                 and person["id"] not in by_role.values() and person["role"] not in by_role
                 and person.get("independent") is True and text(person.get("qualification_reference"))
@@ -306,6 +341,7 @@ def assess(plan: dict[str, Any], agreement: dict[str, Any], results: dict[str, A
     require(signed <= completed <= datetime.now(timezone.utc), "Invalid review timeline.")
     signers = review["signatures"]
     require(isinstance(signers, list) and len(signers) == 3
+            and all(isinstance(s, dict) for s in signers)
             and {s["reviewer_id"] for s in signers} == set(by_role.values())
             and all(text(s.get("signature_reference")) for s in signers), "Final reviewer signatures incomplete.")
     cases = {c["id"]: c for c in plan["corpus"]["cases"]}
@@ -315,7 +351,9 @@ def assess(plan: dict[str, Any], agreement: dict[str, Any], results: dict[str, A
     used_profiles: set[tuple[str, str]] = set()
     request_ids: set[str] = set()
     incomplete_runs = 0
+    require(isinstance(results.get("runs"), list), "Runs must be a list.")
     for run in results["runs"]:
+        require(isinstance(run, dict), "Run must be an object.")
         require(type(run.get("repetition")) is int, "Invalid repetition.")
         run_key = (run["case_id"], run["pathway"], run["repetition"])
         require(run_key in expected and run_key not in runs, "Missing, duplicate or extra run.")
@@ -337,6 +375,7 @@ def assess(plan: dict[str, Any], agreement: dict[str, Any], results: dict[str, A
             require(text(run.get("fault_injection_reference")), "Truncation injection evidence required.")
         require(isinstance(run["requests"], list) and bool(run["requests"]), "Actual provider attempt evidence missing.")
         for request in run["requests"]:
+            require(isinstance(request, dict), "Provider request must be an object.")
             profile = profiles.get(request.get("profile_id"))
             require(profile is not None, "Untested request profile.")
             assert profile is not None
@@ -358,7 +397,9 @@ def assess(plan: dict[str, Any], agreement: dict[str, Any], results: dict[str, A
             "Not all runs or required phase/model profiles were exercised in each pathway.")
     targets = {(c, p, n, check["id"]) for c, p, n in expected for check in cases[c]["checkpoints"]}
     ratings: dict[tuple[str, str, int, str], dict[str, tuple[bool, int, int, int]]] = {}
+    require(isinstance(review.get("ratings"), list), "Ratings must be a list.")
     for row in review["ratings"]:
+        require(isinstance(row, dict), "Rating must be an object.")
         require(type(row.get("repetition")) is int, "Invalid review repetition.")
         key = (row["case_id"], row["pathway"], row["repetition"], row["checkpoint_id"])
         require(key in targets and row.get("reviewer_id") in {by_role["evidence"], by_role["medical"]},
@@ -369,7 +410,9 @@ def assess(plan: dict[str, Any], agreement: dict[str, Any], results: dict[str, A
         votes[row["reviewer_id"]] = rating(row)
     require(set(ratings) == targets and all(len(v) == 2 for v in ratings.values()), "Independent checkpoint reviews are incomplete.")
     adjudications = {}
+    require(isinstance(review.get("adjudications"), list), "Adjudications must be a list.")
     for row in review["adjudications"]:
+        require(isinstance(row, dict), "Adjudication must be an object.")
         require(type(row.get("repetition")) is int, "Invalid adjudication repetition.")
         key = (row["case_id"], row["pathway"], row["repetition"], row["checkpoint_id"])
         require(key in targets and key not in adjudications and row.get("reviewer_id") == by_role["qa"]

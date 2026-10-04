@@ -13,7 +13,7 @@ from tests.topic_fixtures import topic_result_fields
 from tests.grounding_fixtures import complete_grounding
 
 from app.accuracy_benchmark import (
-    BenchmarkInvalid, assess, digest, prepare, read_json, source_snapshot, validate_corpus,
+    BenchmarkInvalid, assess, digest, document_specs, prepare, read_json, source_snapshot, validate_corpus,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -105,6 +105,42 @@ class AccuracyBenchmarkTests(unittest.TestCase):
         self.corpus["cases"][0]["checkpoints"][0]["spans"][0]["quote"] = "absent quote"
         with self.assertRaises(BenchmarkInvalid):
             validate_corpus(self.corpus)
+
+    def test_every_seed_case_passes_both_application_input_contracts(self):
+        from app.documents import DocumentPage, ExtractedDocument
+        from app.request_validation import validate_draft_request, validate_evaluation_request
+        for case in self.corpus["cases"]:
+            with self.subTest(case=case["id"]):
+                inputs=case["inputs"]
+                records=[]
+                for descriptor in document_specs(inputs):
+                    descriptor["pages"]=[DocumentPage(**page) for page in descriptor["pages"]]
+                    records.append(ExtractedDocument(**descriptor))
+                validate_evaluation_request(statement_text=inputs["account"],records=records,witness=inputs["witness"])
+                validate_draft_request(observations=inputs["account"],condition=inputs["condition"],
+                                       claim_type=inputs["claim_type"],witness=inputs["witness"],records=records)
+                if case["scenario"]=="missing_scan":
+                    self.assertEqual(len(records),1)
+                    self.assertEqual((records[0].total_pages,len(records[0].pages),records[0].unreadable_pages),(2,1,[2]))
+
+    def test_unreadable_unit_requires_explicit_metadata_and_readable_sibling(self):
+        case=copy.deepcopy(next(c for c in self.corpus["cases"] if c["scenario"]=="missing_scan"))
+        del case["inputs"]["records"][1]["unreadable"]
+        with self.assertRaises(BenchmarkInvalid): document_specs(case["inputs"])
+        case["inputs"]["records"][1].update(unreadable=True,label="standalone.pdf p.1")
+        with self.assertRaises(BenchmarkInvalid): document_specs(case["inputs"])
+
+    def test_non_object_evidence_rows_raise_sanitized_validation_error(self):
+        for collection in ("reviewers","signatures","runs","requests","ratings","adjudications"):
+            with self.subTest(collection=collection):
+                agreement,results,review=copy.deepcopy((self.agreement,self.results,self.review))
+                if collection=="reviewers": agreement["reviewers"][0]="malformed"
+                elif collection=="requests": results["runs"][0]["requests"][0]="malformed"
+                elif collection=="runs": results["runs"][0]="malformed"
+                else: review[collection]=["malformed"] if collection=="adjudications" else ["malformed"]+review[collection][1:]
+                results["agreement_sha256"]=review["agreement_sha256"]=digest(agreement)
+                review["results_sha256"]=digest(results)
+                with self.assertRaises(BenchmarkInvalid): assess(self.plan,agreement,results,review,self.source)
 
     def test_changed_plan_cannot_reuse_review(self):
         self.plan["corpus"]["cases"][0]["inputs"]["account"] += " changed"

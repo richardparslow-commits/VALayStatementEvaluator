@@ -128,7 +128,18 @@ A trusted operator/QA collector must run the frozen application's
 `run_evaluation` and `run_draft` entry points using the approved actual LLM client,
 with approved transport, privacy and spending safeguards. Supply `inputs.account`
 as statement/observations and the exact witness, condition and claim type. Preserve
-each labeled record as its typed page/block; the empty scan stays unreadable.
+each labeled record as its typed page/block. An empty unit must explicitly have
+`unreadable: true` and share a document with a readable page. The missing-scan
+case has readable `synthetic-clinic.pdf p.1` and unreadable page 2.
+`app.accuracy_benchmark.document_specs(inputs)` groups these frozen units into
+serialized document descriptors: `pages` includes only nonempty readable text,
+`total_pages` includes unreadable pages, and `unreadable_pages` reserves their
+page numbers. A trusted collector converts each page descriptor with
+`DocumentPage(**page)` and the surrounding descriptor with
+`ExtractedDocument(**descriptor)`; it never creates a blank DocumentPage.
+An entirely unreadable standalone document is excluded because the current app
+entry points reject it. Every seed case is checked against both actual input
+validators without provider work.
 Use the full dataclass result (`dataclasses.asdict`), including digest, provenance,
 factual comparison/review, initial/final text, topics, scores and incomplete status.
 On failure preserve the partial result and safe failure evidence; never omit or
