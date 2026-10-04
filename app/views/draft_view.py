@@ -481,6 +481,7 @@ def _run_draft_flow(
     observations: str,
 ) -> None:
     """Run the pipeline with the pre-minted run id; persist the result."""
+    pilot.invalidate_exports("draft")
     if not _validate_draft_inputs(records, observations, condition, rid, claim_type=claim_type, witness=witness):
         return
     queued = job_runner.queue_mode_active()
@@ -840,11 +841,15 @@ def _render_draft_results(draft_result: Any) -> None:
         "Submit on VA Form 21-10210 (one form per witness)."
     , container=st, method="caption")
     edited = st.text_area(
-        "Statement", value=draft_result.output_statement, height=460, key="draft_edited"
+        "Statement", value=draft_result.output_statement, height=460, key="draft_edited",
+        on_change=pilot.invalidate_exports, args=("draft",),
     )
     from .factual_review import render_factual_review
     factual_confirmed = render_factual_review(draft_result, edited, slot="draft")
     export_confirmed = factual_confirmed and pilot.confirm_export(edited)
+    if pilot.enabled():
+        from .text_export import render_text_export
+        render_text_export(edited, slot="draft", confirmed=export_confirmed)
     col_a, col_b = st.columns(2)
     pilot.file_download(
         "⬇️ Download statement (.txt)",
@@ -860,7 +865,7 @@ def _render_draft_results(draft_result: Any) -> None:
         file_name="lay_statement_draft.md",
         mime="text/markdown",
      container=col_b)
-    if export_confirmed:
+    if export_confirmed and not pilot.enabled():
         _render_pdf_export(edited)
 
     if draft_result.digest:

@@ -48,7 +48,9 @@ def render_about_tab() -> None:
         pilot.display("Cases remain in the current session. Clear case removes working data and "
                  "registered uploads; it cannot erase provider copies or text copied elsewhere. "
                  "Provider retention follows the reviewed pilot notice.", container=st, method="write")
-        pilot.display("File downloads, remote fetching, research tools and worker queues are disabled. "
+        pilot.display(("Only separately accepted reviewed .txt downloads are available; other exports, remote fetching, "
+                       "research tools and worker queues are disabled. " if pilot.text_exports_enabled() else
+                       "File downloads, remote fetching, research tools and worker queues are disabled. ") +
                  "Copy reviewed text only to an approved destination. The tool does not certify "
                  "legal sufficiency or the truth of a witness statement.", container=st, method="write")
         render_run_log_tail()

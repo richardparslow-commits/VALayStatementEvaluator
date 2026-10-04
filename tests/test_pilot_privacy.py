@@ -252,7 +252,7 @@ class TestPolicyAdmission(unittest.TestCase):
                 patch('streamlit.web.cli.main') as cli, patch.object(sys, 'argv', ['fixture']), \
                 patch.object(pilot, 'load_approval', return_value=data):
             pilot_server.main(['--server.port=8501'])
-            self.assertEqual(sys.argv, ['streamlit', 'run', 'run_app.py', '--server.port=8501'])
+            self.assertEqual(sys.argv, ['streamlit', 'run', 'app/pilot_asgi.py', '--server.port=8501'])
         cli.assert_called_once()
         self.assertTrue(log_retention.retention_health()['active'])
 

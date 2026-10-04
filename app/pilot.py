@@ -236,6 +236,15 @@ def validate_configuration() -> dict[str, Any]:
     import streamlit as st
     if st.get_option("server.disconnectedSessionTTL") > 60:
         raise PilotBlocked("Pilot disconnected sessions must expire within 60 seconds.")
+    if os.getenv("VA_LSE_PILOT_TEXT_EXPORTS", "0") == "1":
+        from importlib.metadata import version
+        from .text_exports import STORE, ExportUnavailable, policy_binding
+        try:
+            policy_binding(approval)
+            if not STORE.active or version("streamlit") != "1.63.0":
+                raise ExportUnavailable("The private export service is unavailable.")
+        except ExportUnavailable as exc:
+            raise PilotBlocked("Reviewed TXT downloads require the accepted root-origin service and pinned runtime.") from exc
     settings = config.load_settings()
     if (not settings.api_key or settings.fallback_base_url or settings.fetch_api_key
             or https_url(settings.base_url) != https_url(approval["provider_base_url"])
@@ -293,7 +302,7 @@ def notice_binding(owner: str, approval: Mapping[str, Any]) -> str:
     data = [owner, approval["participant_notice"], approval["privacy_review"],
             approval["provider_terms"], approval["retention_policy"],
             approval["provider_base_url"], approval["models"], approval["local_log_retention_days"],
-            approval["quota_policy"], approval["spending_controls"]]
+            approval["quota_policy"], approval["spending_controls"], approval.get("text_export_policy")]
     return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
 
 
@@ -337,9 +346,26 @@ def operator_allowed() -> bool:
     return st.user.get("sub") in approval["operators"]
 
 
+def text_exports_enabled() -> bool:
+    if not enabled() or os.getenv("VA_LSE_PILOT_TEXT_EXPORTS", "0") != "1":
+        return False
+    from .text_exports import ExportUnavailable, policy_binding
+    try:
+        policy_binding(load_approval())
+        return True
+    except ExportUnavailable:
+        return False
+
+
+def invalidate_exports(slot: str | None = None) -> None:
+    from .text_exports import invalidate
+    invalidate(slot)
+
+
 def clear_case() -> None:
     import streamlit as st
     from streamlit.runtime.scriptrunner_utils.script_run_context import get_script_run_ctx
+    invalidate_exports()
     grant = st.session_state.get("_pilot_consent_grant")
     if isinstance(grant, ConsentGrant):
         grant.revoked.set()  # Shared object: copied worker contexts see this too.
@@ -380,7 +406,8 @@ def render_admission() -> None:
             if st.button("Clear this case"):
                 clear_case()
                 st.rerun()
-            st.caption("File downloads are disabled for this pilot. Copy reviewed text "
+            st.caption("Only separately accepted, reviewed .txt downloads are permitted; other file exports remain disabled."
+                       if text_exports_enabled() else "File downloads are disabled for this pilot. Copy reviewed text "
                        "only to an approved destination.")
             st.caption("Clear case releases this session's working data. It cannot erase "
                        "downloads, provider copies, or records held outside this app.")
@@ -527,7 +554,8 @@ def confirm_export(text: str) -> bool:
                "records and witness account; preserve uncertainty and attribution.")
     digest = hashlib.sha256(text.encode()).hexdigest()
     return bool(st.checkbox("I reviewed this exact text against the sources and confirmed "
-                            "all facts with the witness before export.", key="review_" + digest))
+                            "all facts with the witness before export.", key="review_" + digest,
+                            on_change=invalidate_exports))
 
 
 def file_download(*args: Any, container: Any, **kwargs: Any) -> bool:

@@ -20,6 +20,9 @@ The [R13 accessibility/comprehension procedure](deploy/PILOT_ACCESSIBILITY_ACCEP
 covers actual participant browsers, assistive tools, keyboard/focus behavior and
 invented-case teach-back. `python scripts/accessibility_review.py --out accessibility-evidence/draft.json`
 prepares an unapproved source-bound worksheet; actual participant testing and independent acceptance remain required.
+The [R14 authenticated TXT export procedure](deploy/PILOT_EXPORT_ACCEPTANCE.md)
+describes the optional owner-checked service and actual-host checks. It remains
+disabled by default; repository tests and merging do not approve activation.
 The [R09 budget procedure](deploy/PILOT_BUDGET_ACCEPTANCE.md) covers persistent
 quotas, conservative reservations and the actual account spending-cutoff test.
 The general deployment examples are synthetic-data scaffolding until separately reviewed.
