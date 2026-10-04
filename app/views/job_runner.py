@@ -19,6 +19,7 @@ cannot see.
 from __future__ import annotations
 
 from .. import pilot
+from ..queue_policy import require_synthetic_queue, synthetic_mode, synthetic_queue
 
 import time
 from dataclasses import dataclass
@@ -95,17 +96,21 @@ def _pending_request_key(slot: str) -> str:
 
 def queue_mode_active() -> bool:
     """True when runs should be submitted to a worker instead of run in-process."""
-    if not config.JOB_QUEUE_ENABLED:
+    if not synthetic_mode() or not config.JOB_QUEUE_ENABLED:
         return False
     try:
-        return bool(get_job_backend().is_distributed)
+        distributed = bool(get_job_backend().is_distributed)
+        return synthetic_mode() and distributed
     except Exception as exc:  # noqa: BLE001 - fall back to in-process, never break the tab
+        if not synthetic_mode():
+            return False
         logger.warning(
             "job queue unavailable; running in-process: %s", f"{type(exc).__name__}: {exc}"
         )
         return False
 
 
+@synthetic_queue
 def worker_config_error() -> str:
     """Return why a worker could not authenticate, or "" when it is configured.
 
@@ -128,9 +133,17 @@ def worker_config_error() -> str:
     return ""
 
 
+@synthetic_queue
 def _hydrate(slot: str, run: RunResult) -> None:
     """Store a decoded result under the keys the tab's results renderer reads."""
     result_key, usage_key, rid_key = _RESULT_KEYS[slot]
+    try:
+        from .usage import record_watchdog_run
+
+        record_watchdog_run(run.usage)
+    except Exception:  # noqa: BLE001 - the watchdog is advisory
+        pass
+    require_synthetic_queue()
     if slot == "eval":
         # Recovery cannot bind new questions to the current form inputs. Keep
         # earlier answers and their own binding, but block collection into it.
@@ -138,18 +151,15 @@ def _hydrate(slot: str, run: RunResult) -> None:
     st.session_state[result_key] = run.result
     st.session_state[usage_key] = run.usage
     st.session_state[rid_key] = run.request_id or st.session_state.get(rid_key, "")
-    try:
-        from .usage import record_watchdog_run
-
-        record_watchdog_run(run.usage)
-    except Exception:  # noqa: BLE001 - the watchdog is advisory
-        pass
 
 
+@synthetic_queue
 def _fetch_outcome(backend: JobBackend, record: JobRecord, slot: str) -> QueueOutcome:
     """Turn a terminal job record into an outcome, decoding the result on success."""
     if not pilot.owns(record):
         return QueueOutcome(ok=False, error="Run unavailable for this session.", error_class="AccessDenied")
+    if slot not in _RESULT_KEYS or record.kind != (KIND_EVALUATE if slot == "eval" else KIND_DRAFT):
+        return QueueOutcome(ok=False, error="Queued result does not match this run.", error_class="PayloadError")
     request_id = record.request_id or ""
     if record.status != STATUS_DONE:
         return QueueOutcome(
@@ -159,6 +169,7 @@ def _fetch_outcome(backend: JobBackend, record: JobRecord, slot: str) -> QueueOu
             request_id=request_id,
         )
     raw = backend.get_result(record.job_id)
+    require_synthetic_queue()
     if not raw:
         return QueueOutcome(
             ok=False,
@@ -169,6 +180,8 @@ def _fetch_outcome(backend: JobBackend, record: JobRecord, slot: str) -> QueueOu
         )
     try:
         run = decode_result(raw)
+        if run.kind != record.kind or (record.request_id and run.request_id != record.request_id):
+            raise PayloadError("Queued result does not match this run.")
     except PayloadError as exc:
         return QueueOutcome(
             ok=False,
@@ -180,6 +193,7 @@ def _fetch_outcome(backend: JobBackend, record: JobRecord, slot: str) -> QueueOu
     return QueueOutcome(ok=True, run=run, request_id=request_id)
 
 
+@synthetic_queue
 def _poll(
     backend: JobBackend,
     job_id: str,
@@ -196,8 +210,12 @@ def _poll(
         while True:
             try:
                 record = backend.get(job_id)
+                require_synthetic_queue()
                 consecutive_errors = 0
+            except pilot.PilotBlocked:
+                raise
             except Exception as exc:  # noqa: BLE001 - a flaky queue must not lose the job
+                require_synthetic_queue()
                 consecutive_errors += 1
                 if consecutive_errors >= 5:
                     return QueueOutcome(
@@ -239,6 +257,7 @@ def _poll(
     return _fetch_outcome(backend, record, slot)
 
 
+@synthetic_queue
 def _render_failure(outcome: QueueOutcome, action_label: str) -> None:
     """Show a queued run's failure (or still-running state) to the user."""
     if outcome.still_running:
@@ -252,6 +271,7 @@ def _render_failure(outcome: QueueOutcome, action_label: str) -> None:
         render_failure_detail(outcome.request_id)
 
 
+@synthetic_queue
 def _encode_payload(kind: str, job: EvaluateJob | DraftJob) -> str:
     """Encode a job, externalizing its documents when they are large.
 
@@ -277,6 +297,7 @@ def _encode_payload(kind: str, job: EvaluateJob | DraftJob) -> str:
     return encode_job_with_blob(kind, job, ref)
 
 
+@synthetic_queue
 def submit_job(
     *,
     slot: str,
@@ -315,7 +336,9 @@ def submit_job(
     if isinstance(existing, str) and existing:
         try:
             record_in_flight = backend.get(existing)
+            require_synthetic_queue()
         except Exception:  # noqa: BLE001 - fall through and let the submit fail loudly
+            require_synthetic_queue()
             record_in_flight = None
         checking_confirmed = isinstance(pending, dict) and pending.get("confirmed_job_id") == existing
         if record_in_flight is not None and not record_in_flight.is_terminal and not checking_confirmed:
@@ -361,6 +384,7 @@ def submit_job(
                     "condition": condition, "sources": sources, "action_label": action_label,
                 }
         except (PayloadError, BlobStoreError) as exc:
+            require_synthetic_queue()
             run_log_event(kind, "rejected", request_id=request_id, error=str(exc), reason="payload")
             pilot.display(
                 report_failure(
@@ -373,7 +397,9 @@ def submit_job(
             return None
         try:
             record = backend.enqueue(kind, payload, request_id=request_id, owner_id=owner)
+            require_synthetic_queue()
         except Exception as exc:  # noqa: BLE001 - any enqueue failure must surface, not crash the tab
+            require_synthetic_queue()
             run_log_event(
                 kind, "error", request_id=request_id,
                 error=f"{type(exc).__name__}: {exc}", reason="submission_unconfirmed",
@@ -436,6 +462,7 @@ def submit_job(
     return outcome
 
 
+@synthetic_queue
 def _render_uncertain_submission(slot: str) -> None:
     pending = st.session_state.get(f"{slot}_queue_submission")
     if not isinstance(pending, dict):
@@ -490,7 +517,7 @@ def resume_pending_job(slot: str, *, action_label: str) -> None:
     cannot find it — so a user who reloads mid-run sees an empty tab and
     re-submits work that is already 20 minutes into the digest.
     """
-    if not queue_mode_active():
+    if not synthetic_mode() or not queue_mode_active():
         return
     _render_uncertain_submission(slot)
     job_id = st.session_state.get(_pending_key(slot))
@@ -512,7 +539,9 @@ def resume_pending_job(slot: str, *, action_label: str) -> None:
         return
     try:
         record = get_job_backend().get(job_id)
+        require_synthetic_queue()
     except Exception:  # noqa: BLE001 - never break the tab over a status read
+        require_synthetic_queue()
         return
     if record is None:
         st.session_state.pop(_pending_key(slot), None)
@@ -549,6 +578,7 @@ def resume_pending_job(slot: str, *, action_label: str) -> None:
             st.rerun()
 
 
+@synthetic_queue
 def _resolve_job_by_request_id(request_id: str) -> str | None:
     """Look up a job_id from the recovery index in the job backend."""
     try:
@@ -557,6 +587,7 @@ def _resolve_job_by_request_id(request_id: str) -> str | None:
         return None
 
 
+@synthetic_queue
 def recover_job_by_request_id(
     slot: str, request_id: str, *, action_label: str
 ) -> QueueOutcome | None:
@@ -581,7 +612,9 @@ def recover_job_by_request_id(
     st.session_state[_pending_request_key(slot)] = request_id
     try:
         record = get_job_backend().get(job_id)
+        require_synthetic_queue()
     except Exception:  # noqa: BLE001
+        require_synthetic_queue()
         return None
     if record is None:
         st.session_state.pop(_pending_key(slot), None)
@@ -618,7 +651,7 @@ def render_recovery_form(slot: str, *, action_label: str) -> None:
     this session — exactly the case where a browser restart or pod failover lost
     the session state that normally routes the UI back to the backend.
     """
-    if not queue_mode_active():
+    if not synthetic_mode() or not queue_mode_active():
         return
     # Only show the recovery form when there is no result to display and no
     # pending job is already attached.
@@ -652,8 +685,14 @@ def queue_status_line() -> str:
     Upstash tier's ``depth()`` is two HTTP requests. Backlog depth belongs in
     ``GET /health`` (``job_queue.depth``), which monitoring polls on a schedule.
     """
+    if not synthetic_mode():
+        return "queued processing excluded"
     try:
         backend = get_job_backend()
     except Exception as exc:  # noqa: BLE001
+        if not synthetic_mode():
+            return "queued processing excluded"
         return f"job queue unavailable ({type(exc).__name__})"
+    if not synthetic_mode():
+        return "queued processing excluded"
     return f"handed to a worker via {backend.name}"

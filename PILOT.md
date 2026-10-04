@@ -41,6 +41,12 @@ and its `spending_controls` evidence reference stays empty.
 - Cases in the current Streamlit session. Queueing, durable case blobs, shared
   remote cache, external telemetry, tracing, remote fetching, research tools,
   local folder access, and external OCR runners are blocked in this profile.
+- Queue backends and cached instances, serialization, worker/recovery entrypoints
+  and hydration also refuse every non-synthetic mode. The
+  [R15 future queue procedure](deploy/PILOT_QUEUE_ACCEPTANCE.md) and offline
+  `scripts/queue_review.py` worksheet do not enable queues. Distributed consent,
+  shared spending and R16 durable case deletion still require separate implementation
+  and actual acceptance before any real-information queue capability.
 - Record text and model reports render as literal text, preventing embedded
   Markdown images or HTML assets from contacting outside services.
   Pilot status messages use fixed markup with escaped text and alert/status roles.
