@@ -810,6 +810,8 @@ def _render_draft_results(draft_result: Any) -> None:
 
     st.divider()
     st.subheader("📋 Draft Results")
+    from ..accessibility import render_reading_guide
+    render_reading_guide(st)
 
     with st.expander("Grounding analysis — how the draft ties to the records", expanded=True):
         pilot.display(grounding_markdown(draft_result, literal=pilot.enabled()), container=st, method="markdown")

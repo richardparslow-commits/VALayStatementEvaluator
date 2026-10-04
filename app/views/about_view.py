@@ -40,6 +40,8 @@ def render_about_tab() -> None:
     _render_build_identity()
     if pilot.enabled():
         st.subheader("Controlled pilot guide")
+        from ..accessibility import render_reading_guide
+        render_reading_guide(st, expanded=True)
         pilot.display("Only invited users can upload records and request analysis. Keep the source "
                  "records and witness account open while reviewing every AI statement. "
                  "The app blocks unknown page coverage and unverified record citations.", container=st, method="write")
@@ -169,7 +171,7 @@ def _render_reference_lookup() -> None:
             f"**Run-log events** ({len(detail.events)} of {detail.scanned} examined) — "
             "written by whichever process ran the job, including workers:"
         , container=st, method="markdown")
-        st.dataframe(detail.events, width="stretch", hide_index=True)
+        pilot.dataframe(st, detail.events, width="stretch", hide_index=True)
     else:
         pilot.display(
             f"No run-log event for `{detail.reference}` in the last "

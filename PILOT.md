@@ -43,11 +43,22 @@ and its `spending_controls` evidence reference stays empty.
   local folder access, and external OCR runners are blocked in this profile.
 - Record text and model reports render as literal text, preventing embedded
   Markdown images or HTML assets from contacting outside services.
+  Pilot status messages use fixed markup with escaped text and alert/status roles.
+  Pilot data tables use escaped native headers and cells, without interactive CSV
+  download toolbars. Synthetic mode retains its interactive dataframes.
+  Original passages can be read in full outside the source table; About and
+  result panels explain the model's labels and review/copy limitations.
   Undated timeline entries stay undated; optional model date inference is disabled.
 - File downloads are disabled: Streamlit media URLs do not provide the owner
   authorization this release requires. Participants can copy reviewed text from
   their authorized session to an approved destination. Re-enabling file exports
   requires an authenticated, owner-authorized download service.
+
+Complete the [R13 accessibility and comprehension acceptance procedure](deploy/PILOT_ACCESSIBILITY_ACCEPTANCE.md)
+on the actual reviewed release and intended participant browser/device/assistive-tool
+matrix. Local synthetic UI checks do not establish spoken announcements, complete
+keyboard access or participant understanding. The offline worksheet starts unapproved,
+with every actual task `not_run`; real-information admission remains NO-GO pending acceptance.
 
 The private parser launcher accepts only a file label, size, hash, random request
 identifier, bounded extraction page limit and bounded bytes. It fixes the image, command, user, network, mounts

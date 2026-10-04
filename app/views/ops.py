@@ -93,7 +93,7 @@ def render_run_log_tail(limit: int = _RUN_LOG_LIMIT) -> None:
         f"{error_count} failure(s) in this window. "
         "Full detail: `grep <request-id> logs/runs.jsonl`."
     , container=st, method="caption")
-    st.dataframe(
+    pilot.dataframe(st,
         [_event_row(e) for e in events],
         width="stretch",
         hide_index=True,
@@ -144,7 +144,7 @@ def render_failure_detail(reference: str, *, label: str = "What happened?") -> N
         if detail.lines:
             st.code("\n".join(detail.lines), language=None)
         if detail.events:
-            st.dataframe(
+            pilot.dataframe(st,
                 [_event_row(e) for e in detail.events],
                 width="stretch",
                 hide_index=True,

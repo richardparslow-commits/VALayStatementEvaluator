@@ -797,7 +797,7 @@ def _render_evidence_dashboard(eval_result: Any) -> None:
             }
             for record_type, counts in sorted(dashboard.items())
         ]
-        st.dataframe(percentage_rows, width="stretch", hide_index=True)
+        pilot.dataframe(st, percentage_rows, width="stretch", hide_index=True)
 
         weakest_type = min(
             dashboard.items(),
@@ -1306,7 +1306,7 @@ def _render_record_coverage(eval_result: Any) -> None:
         for line in coverage_lines(digest):
             pilot.display(line, container=st, method="markdown")
         if digest.files:
-            st.dataframe(digest.files, width="stretch", hide_index=True)
+            pilot.dataframe(st, digest.files, width="stretch", hide_index=True)
         if digest.duplicate_pages:
             shown = ", ".join(
                 f"{row.get('document')} p.{row.get('page')} = {row.get('duplicate_of')}"
@@ -1409,6 +1409,8 @@ def _render_framework_currency_flags(eval_result: Any) -> None:
 
 
 def _render_evaluation_results(eval_result: Any) -> None:
+    from ..accessibility import render_reading_guide
+    render_reading_guide(st)
     render_usage_summary(st.session_state.get("eval_usage"))
     pilot.display(
         source_reference_notice(eval_result), container=st,
@@ -1485,7 +1487,7 @@ def _render_evaluation_results(eval_result: Any) -> None:
                     "Note": v.get("note", ""),
                 }
             )
-        st.dataframe(rows, width="stretch", hide_index=True)
+        pilot.dataframe(st, rows, width="stretch", hide_index=True)
 
     _render_evidence_dashboard(eval_result)
 
@@ -1499,7 +1501,7 @@ def _render_evaluation_results(eval_result: Any) -> None:
                 }
                 for k in DIMENSION_LABELS
             ]
-            st.dataframe(score_rows, width="stretch", hide_index=True)
+            pilot.dataframe(st, score_rows, width="stretch", hide_index=True)
             st.bar_chart(
                 {DIMENSION_LABELS[k]: eval_result.scores.get(k, 0) for k in DIMENSION_LABELS},
                 horizontal=True,
@@ -1523,7 +1525,7 @@ def _render_evaluation_results(eval_result: Any) -> None:
                 }
                 for t in eval_result.topic_rows
             ]
-            st.dataframe(topic_table, width="stretch", hide_index=True)
+            pilot.dataframe(st, topic_table, width="stretch", hide_index=True)
             # Before the gaps, not after: a topic whose committed text is out of date can
             # be *the reason* a gap was reported here, so the caveat has to arrive before
             # the reader acts on the gaps rather than as a footnote.
@@ -1579,7 +1581,7 @@ def _render_evaluation_results(eval_result: Any) -> None:
                         }
                         for c in eval_result.revision_changes
                     ]
-                    st.dataframe(change_rows, width="stretch", hide_index=True)
+                    pilot.dataframe(st, change_rows, width="stretch", hide_index=True)
                     from ..factual_integrity import attach_review, review_markdown
                     attach_review(eval_result, eval_result.revised_statement)
                     with st.expander("Factual checks for proposed edits"):

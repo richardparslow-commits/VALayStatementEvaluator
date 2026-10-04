@@ -368,7 +368,7 @@ def _va_gov_records(slot: str) -> list[Any]:
     merged = va_gov_client.merge_records(other_sources)
 
     st.subheader("Merged records summary")
-    st.dataframe(
+    pilot.dataframe(st,
         [
             {"Source": row.source, "File": row.filename, "Pages": row.pages}
             for row in merged.summary

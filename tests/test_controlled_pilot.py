@@ -270,7 +270,14 @@ class TestOwnershipAndPrivacy(unittest.TestCase):
             for method in ("markdown", "write", "caption", "error", "warning"):
                 pilot.display(content, container=container, method=method, unsafe_allow_html=True)
                 getattr(container, method).assert_not_called()
-                self.assertIn(content, container.text.call_args.args[0])
+                if method in ("error", "warning"):
+                    from html import unescape
+                    body = container.html.call_args.args[0]
+                    self.assertIn(content, unescape(body))
+                    self.assertNotIn('<img src=', body)
+                    self.assertEqual(container.html.call_args.kwargs, {})
+                else:
+                    self.assertIn(content, container.text.call_args.args[0])
             self.assertIn(r"\!\[record\]\(", pilot.text_label(content))
         with patch.dict(os.environ, {"VA_LSE_MODE": "synthetic"}):
             pilot.display("synthetic report", container=container, method="markdown")

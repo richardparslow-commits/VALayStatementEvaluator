@@ -114,7 +114,7 @@ def render_usage_summary(usage: Any) -> None:
                     "Models (calls)": models,
                 }
             )
-        st.dataframe(rows, width="stretch", hide_index=True)
+        pilot.dataframe(st, rows, width="stretch", hide_index=True)
         pilot.display(
             f"**Total:** {total.calls} call(s) · "
             f"{total.prompt_tokens:,} input / {total.completion_tokens:,} output tokens "

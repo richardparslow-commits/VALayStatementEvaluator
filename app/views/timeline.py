@@ -297,7 +297,7 @@ def render_timeline_in_results(digest: medical_review.MedicalDigest) -> None:
             "Source": event.source,
         })
 
-    st.dataframe(rows, width="stretch", hide_index=True)
+    pilot.dataframe(st, rows, width="stretch", hide_index=True)
 
     if len(events) > 20:
         pilot.display(f"...and {len(events) - 20} more events. Use the Timeline tab for the full view.", container=st, method="caption")

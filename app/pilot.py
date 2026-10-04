@@ -547,14 +547,32 @@ def display(*args: Any, container: Any, method: str, **kwargs: Any) -> Any:
     Record text and model output are untrusted. A Markdown image URL could send
     its embedded record text to another service from the participant's browser.
     The pilot accepts plain text in place of rich reports for this reason.
+    Status messages use fixed, escaped markup to retain alert/status roles.
     """
     if not enabled():
         return getattr(container, method)(*args, **kwargs)
-    prefix = {"error": "Error: ", "warning": "Warning: ", "info": "", "success": ""}.get(method, "")
     result = None
     for value in args:
-        result = container.text(prefix + str(value))
+        if method in ("error", "warning", "info", "success"):
+            from .accessibility import status_html
+            # Keep status semantics without parsing caller Markdown/HTML.
+            # JavaScript remains disabled by the Streamlit HTML default.
+            result = container.html(status_html(method, value))
+        else:
+            result = container.text(str(value))
     return result
+
+
+def dataframe(container: Any, data: Any, **kwargs: Any) -> Any:
+    """Pilot tables have native headers, literal cells and no CSV download UI."""
+    if not enabled():
+        return container.dataframe(data, **kwargs)
+    if not isinstance(data, list) or not all(isinstance(row, dict) for row in data):
+        raise TypeError("Pilot tables require row dictionaries.")
+    if not data:
+        return container.text("No rows.")
+    from .accessibility import table_html
+    return container.html(table_html(data))
 
 
 def text_label(value: str) -> str:

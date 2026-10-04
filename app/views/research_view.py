@@ -244,7 +244,7 @@ def _render_currency_report(report: currency.CurrencyReport) -> None:
         currency.STATUS_CHANGED: "⚠️ changed",
         currency.STATUS_UNCONFIRMED: "❓ unclear",
     }
-    st.dataframe(
+    pilot.dataframe(st,
         [
             {
                 "Topic": f"{verdict.topic} — {verdict.label}",
@@ -647,7 +647,7 @@ def _render_findings(findings: dict[str, object]) -> None:
         rows = findings.get("framework_findings")
         if isinstance(rows, list) and rows:
             pilot.display("**Checklist currency**", container=st, method="markdown")
-            st.dataframe(rows, width="stretch", hide_index=True)
+            pilot.dataframe(st, rows, width="stretch", hide_index=True)
 
 
 def _render_scope_note() -> None:

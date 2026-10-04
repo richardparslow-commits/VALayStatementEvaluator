@@ -19,7 +19,16 @@ def render_factual_review(result: Any, text: str, *, slot: str) -> bool:
     with st.expander("Compare each sentence with the original account and sources", expanded=initial["status"] == "blocked"):
         if sources:
             kinds = {"witness_account": "Witness account", "witness_field": "Witness detail", "record_quote": "Record quotation"}
-            st.dataframe([{"Source": s["label"], "Source type": kinds[s["kind"]], "Original passage": s["text"]}
+            with st.expander("Read an original passage in full without the table"):
+                selected_source = st.selectbox(
+                    "Original passage to read in full", list(sources),
+                    format_func=lambda sid: pilot.text_label(kinds[sources[sid]["kind"]] + ": " + sources[sid]["label"]),
+                    key=prefix + "_read_original",
+                )
+                source = sources[selected_source]
+                pilot.display(source["label"], container=st, method="caption")
+                st.text(source["text"])
+            pilot.dataframe(st, [{"Source": s["label"], "Source type": kinds[s["kind"]], "Original passage": s["text"]}
                           for s in sources.values()], hide_index=True, width="stretch")
         for index, row in enumerate(initial["rows"], 1):
             pilot.display(f"Sentence {index}", container=st, method="caption")
