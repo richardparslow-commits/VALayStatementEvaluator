@@ -10,6 +10,7 @@ services:
     env_file: ${VA_LSE_PILOT_ENV_FILE:?Set the operator environment file}
     environment:
       VA_LSE_MODE: controlled-pilot
+      VA_LSE_PILOT_TEXT_EXPORTS: ${VA_LSE_PILOT_TEXT_EXPORTS:-0}
       VA_LSE_PILOT_APPROVAL_FILE: /run/pilot/approval.json
       VA_LSE_PILOT_BUDGET_FILE: /app/pilot-control/pilot-budget.sqlite3
       VA_LSE_MAX_RECORD_PAGES: "500"

@@ -316,6 +316,7 @@ def _run_evaluation_flow(statement_text: str, records: list, witness: dict[str, 
     paths. ``None``/``{}`` keeps every prompt byte-identical to the
     pre-intake pipeline.
     """
+    pilot.invalidate_exports("eval")
     if not _validate_evaluate_inputs(statement_text, records, witness):
         return
     queued = job_runner.queue_mode_active()
@@ -1605,10 +1606,14 @@ def _render_evaluation_results(eval_result: Any) -> None:
                     value=eval_result.revised_statement,
                     height=420,
                     key="eval_revised_statement",
+                    on_change=pilot.invalidate_exports, args=("eval",),
                 )
                 from .factual_review import render_factual_review
                 factual_confirmed = render_factual_review(eval_result, revised, slot="eval")
                 export_confirmed = factual_confirmed and pilot.confirm_export(revised)
+                if pilot.enabled():
+                    from .text_export import render_text_export
+                    render_text_export(revised, slot="eval", confirmed=export_confirmed)
                 col_a, col_b = st.columns(2)
                 pilot.file_download(
                     "⬇️ Download revised statement (.txt)",
@@ -1624,7 +1629,7 @@ def _render_evaluation_results(eval_result: Any) -> None:
                     file_name="lay_statement_revised.md",
                     mime="text/markdown",
                  container=col_b)
-                if export_confirmed:
+                if export_confirmed and not pilot.enabled():
                     _render_pdf_export(revised, entry_point="evaluate")
 
     _render_fact_export_section(eval_result)

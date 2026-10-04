@@ -39,6 +39,7 @@ def render_factual_review(result: Any, text: str, *, slot: str) -> bool:
                 default=row["sources"], max_selections=3,
                 format_func=lambda sid: sources[sid]["label"] + " — " + sources[sid]["text"][:120],
                 key=prefix + "_" + row["id"],
+                on_change=pilot.invalidate_exports, args=(slot,),
             )
             links[row["id"]] = selected if isinstance(selected, list) else []
         checked = (initial if all(links[row["id"]] == row["sources"] for row in initial["rows"])
@@ -58,11 +59,13 @@ def render_factual_review(result: Any, text: str, *, slot: str) -> bool:
     state_key = f"factual_{slot}_approval_scope"
     old = st.session_state.get(state_key)
     if old != scope:
+        pilot.invalidate_exports(slot)
         if isinstance(old, str):
             st.session_state.pop("factual_approve_" + old, None)
         st.session_state.pop(f"factual_{slot}_receipt", None)
         st.session_state[state_key] = scope
     if checked["status"] != "review_required":
+        pilot.invalidate_exports(slot)
         st.session_state.pop("factual_approve_" + scope, None)
         st.session_state.pop(f"factual_{slot}_receipt", None)
         pilot.display("This text has unresolved factual review items and cannot be marked reviewed. "
@@ -70,8 +73,10 @@ def render_factual_review(result: Any, text: str, *, slot: str) -> bool:
         return False
     accepted = st.checkbox("I compared every sentence with its selected original passages and confirmed "
                            "the meaning, dates, numbers, uncertainty and firsthand attribution with the witness. "
-                           "I reviewed this exact edited text.", key="factual_approve_" + scope)
+                           "I reviewed this exact edited text.", key="factual_approve_" + scope,
+                           on_change=pilot.invalidate_exports, args=(slot,))
     if accepted is not True:
+        pilot.invalidate_exports(slot)
         st.session_state.pop(f"factual_{slot}_receipt", None)
         return False
     st.session_state[f"factual_{slot}_receipt"] = {"scope": scope, "text_hash": checked["text_hash"],

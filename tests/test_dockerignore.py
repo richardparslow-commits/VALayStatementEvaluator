@@ -63,6 +63,7 @@ SENSITIVE_NAMES = (".env", "usage_history.json", "secrets.toml")
 #: Chrome-profile directories can materialize at any depth.
 SENSITIVE_DIR_NAMES = (
     "accessibility-evidence",
+    "export-evidence",
     "operations-evidence",
     "legal-evidence",
     "accuracy-evidence",
@@ -79,6 +80,8 @@ SENSITIVE_SUFFIXES = (".pem", ".key")
 #: file non-empty but drops a category fails by name instead of by arithmetic.
 SENSITIVE_PATH_EXAMPLES = (
     "accessibility-evidence/participant-observations.json",
+    "export-evidence/accepted-release.json",
+    "nested/export-evidence/observations.json",
     "nested/accessibility-evidence/review.json",
     "operations-evidence/accepted-release.json",
     "nested/operations-evidence/incident.json",

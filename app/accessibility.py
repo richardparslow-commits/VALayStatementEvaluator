@@ -52,6 +52,11 @@ def render_reading_guide(container: Any, *, expanded: bool = False) -> None:
         return
     with container.expander("How to read these results", expanded=expanded):
         for label, explanation in READING_GUIDE:
+            if label == "Copying and clearing" and pilot.text_exports_enabled():
+                explanation = ("Only reviewed .txt statements can be downloaded through the private authenticated service. "
+                               "Save or copy them only to an operator-approved destination. Other exports are disabled. "
+                               "Clear case revokes private links and releases session data and registered uploads; "
+                               "it cannot erase saved files, provider copies, originals or text copied elsewhere.")
             # Fixed labels have native headings; explanations are literal text.
             container.subheader(label)
             pilot.display(explanation, container=container, method="write")

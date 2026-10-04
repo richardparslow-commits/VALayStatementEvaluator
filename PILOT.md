@@ -49,10 +49,12 @@ and its `spending_controls` evidence reference stays empty.
   Original passages can be read in full outside the source table; About and
   result panels explain the model's labels and review/copy limitations.
   Undated timeline entries stay undated; optional model date inference is disabled.
-- File downloads are disabled: Streamlit media URLs do not provide the owner
-  authorization this release requires. Participants can copy reviewed text from
-  their authorized session to an approved destination. Re-enabling file exports
-  requires an authenticated, owner-authorized download service.
+- File downloads are disabled by default. The optional authenticated service
+  permits only exact-reviewed statement TXT files after separate R14 acceptance.
+  Streamlit media downloads, PDF and other formats remain excluded. Participants
+  can copy reviewed text to an approved destination. Follow the
+  [R14 export acceptance procedure](deploy/PILOT_EXPORT_ACCEPTANCE.md) before
+  setting `VA_LSE_PILOT_TEXT_EXPORTS=1` or approving `text_export_policy`.
 
 Complete the [R13 accessibility and comprehension acceptance procedure](deploy/PILOT_ACCESSIBILITY_ACCEPTANCE.md)
 on the actual reviewed release and intended participant browser/device/assistive-tool
@@ -181,6 +183,9 @@ supported controlled-pilot environment.
    The pilot server entrypoint starts cleanup and private health before any
    browser connects. Use this entrypoint on equivalent hosts too; running only
    `streamlit run run_app.py` does not initialize cleanup until a browser opens.
+   The launcher uses the pinned Streamlit `st.App` entrypoint in
+   `app/pilot_asgi.py`; the optional TXT service cannot deliver without its
+   independent expiry worker. Direct alternate launches are not accepted.
    Never scale this profile. Do not use the general Compose/Kubernetes worker
    examples for real pilot records. Pin deployment image digests after the build
    and scanner checks; restrict outgoing traffic to reviewed destinations and
@@ -269,7 +274,7 @@ only after the reviewed revision, invitations, evidence and secrets are current.
 | F11: hosted access/action controls | Verified invited OIDC identities, operator role, TLS/private pilot proxy, quotas, no media exports; monitoring ports local and anonymous dashboards disabled |
 | F12: dates | Shared calendar parser handles full and named-month dates; invalid full dates do not become partial dates; precise gaps require full dates |
 | F13: queue reliability | Atomic, input-bound submission/recovery indexing, bounded admission and AOF/fsync settings; synthetic crash/pressure/retry tests; actual hosted persistence and ownership still need worker-release acceptance; queue disabled in pilot |
-| F14: timeline PDF markup | Dynamic paragraph content escaped; PDF failures handled; file exports disabled in pilot |
+| F14: timeline PDF markup | Dynamic paragraph content escaped; PDF failures handled; PDF exports disabled in pilot; optional TXT requires separate R14 acceptance |
 | F15: legal/currency claims | Corrected general doubt/continuity/functional-loss language; all knowledge files fingerprinted; topic status cannot certify full legal currency |
 
 R12 approval-file protections and the source-bound operations worksheet are

@@ -119,8 +119,11 @@ admission-blocking failure. Include the privately accepted reference in the rele
 acceptance bundle referenced by the existing `deployment_validation` approval
 field only after that review; the example
 approval stays expired and incomplete. All other R07–R12 acceptance gates still
-apply. File exports remain excluded; if later enabled, repeat access testing and
-separately review rendered PDF/DOCX readability and layout.
+apply. File exports remain excluded by default; the optional R14 TXT service
+requires separate acceptance, including its preparation/download controls,
+expiry/refusal messages, approved destination and saved-copy limitations.
+Any future PDF/DOCX expansion also requires separate rendered readability and
+layout review; it is outside the TXT capability.
 
 The procedure uses [W3C keyboard guidance](https://www.w3.org/WAI/WCAG22/Understanding/keyboard.html),
 [status-message guidance](https://www.w3.org/WAI/WCAG22/Understanding/status-messages.html),

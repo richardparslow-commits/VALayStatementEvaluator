@@ -16,6 +16,16 @@ def initialize() -> None:
     pilot.validate_log_policy({"local_log_retention_days": retention_days()})
     from .pilot_budget import get_ledger
     get_ledger(pilot.load_approval())  # Hold the single-process lock before listening.
+    if os.getenv("VA_LSE_PILOT_TEXT_EXPORTS", "0") == "1":
+        from importlib.metadata import version
+        from .text_exports import STORE, ExportUnavailable, policy_binding
+        try:
+            policy_binding(pilot.load_approval())
+            if version("streamlit") != "1.63.0":
+                raise ExportUnavailable("Unsupported signed-cookie protocol.")
+        except ExportUnavailable as exc:
+            raise pilot.PilotBlocked("Text exports require separately accepted exact-release evidence.") from exc
+        STORE.start()
     from .shutdown import install_signal_handlers
     install_signal_handlers()
     if os.getenv("VA_LSE_HEALTH_PORT", "").strip() != "0":
@@ -27,7 +37,7 @@ def initialize() -> None:
 def main(argv: Sequence[str] | None = None) -> None:
     initialize()  # Deliberately fail startup if retention cannot be enforced.
     from streamlit.web.cli import main as streamlit_main
-    sys.argv = ["streamlit", "run", "run_app.py", *(sys.argv[1:] if argv is None else argv)]
+    sys.argv = ["streamlit", "run", "app/pilot_asgi.py", *(sys.argv[1:] if argv is None else argv)]
     streamlit_main()
 
 
