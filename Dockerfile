@@ -50,7 +50,8 @@ COPY app/ ./app/
 COPY run_app.py ./
 COPY scripts/backup_audit_logs.py scripts/restore_audit_logs.py ./scripts/
 
-# Build identity: `docker build --build-arg VA_LSE_BUILD_SHA=$(git rev-parse --short HEAD)`
+# Build identity: `docker build --build-arg VA_LSE_BUILD_SHA=$(git rev-parse HEAD)`
+# Controlled-pilot approval requires the full matching lowercase 40-character SHA.
 # stamps the image so the About tab can answer "is this deployment current?".
 # No .git directory ships in the image, so without this arg the build reports
 # "unknown" — honest, but not actionable. The ARG has no default on purpose: an

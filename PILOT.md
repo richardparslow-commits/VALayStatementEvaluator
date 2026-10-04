@@ -106,11 +106,15 @@ supported controlled-pilot environment.
    failures and the acceptance criteria. A matching quote proves quote presence,
    not that a model interpreted it correctly. Every generated factual sentence
    still requires source and witness review.
-4. Build and test the exact immutable revision. Set `VA_LSE_BUILD_SHA` to that
+4. Build and test the exact immutable revision (full 40-character lowercase Git SHA). Set `VA_LSE_BUILD_SHA` to that
    revision and record the same value as `reviewed_revision` in an operator-owned
    copy of [deploy/pilot-approval.example.json](deploy/pilot-approval.example.json).
-   Use absolute paths, protect this file from participants, and supply actual
-   evidence references for every required field. Approval lasts at most 30 days.
+   Use an absolute-path regular file owned by root or the runtime user, with no
+   group/world write permission and a protected read-only mount. Protect host
+   parent directories and replacement authority from participants/application
+   writes. Supply actual accepted references for all eight required fields.
+   Duplicate fields, linked/nonregular files and ambiguous lists are refused.
+   Approval lasts at most 30 days with explicit timezone-aware timestamps.
    Removing a subject or expiring approval blocks the next rerun/provider call.
 5. Register a confidential OIDC client with the exact redirect URI
    `https://YOUR-PILOT-DOMAIN/oauth2callback`. Configure identity tokens with an
@@ -181,6 +185,10 @@ and identity changes release the previous session's case. Test TLS and WebSocket
 upload caps, parser timeout/resource limits, real provider error paths, logs and
 egress restrictions. Verify that no case download URL is created and that
 `/health`, `/ready`, and `/metrics` are unavailable through the pilot proxy.
+Complete the [R12 operations procedure](deploy/PILOT_OPERATIONS_ACCEPTANCE.md)
+for immutable images, idle monitoring/cleanup, delivered private alerts, incident
+stop/recovery and authenticated exact-release acceptance. Generic monitoring
+templates are not a functioning controlled-pilot monitor or notification route.
 
 Use [the R07 host acceptance procedure](deploy/PILOT_ACCEPTANCE.md) to record the
 actual image IDs, identity/MFA, two-participant isolation, network restrictions,
@@ -208,8 +216,8 @@ also clears working state. Python memory release is not cryptographic erasure;
 in-flight requests may already have reached the provider. Browser content,
 copied text, originals and provider copies follow their own retention policies.
 Set and verify a short disconnected-session timeout, prohibit shared browser
-profiles, and encrypt the host and operational log volume. Back up only the
-count-only pilot operational logs using the reviewed retention policy. All three
+profiles, and encrypt the host and operational log volume. Case and operational-log
+backups/restores are excluded from this pilot pending separate acceptance. All three
 local streams expire whole files using their first event timestamp, at startup,
 before writes and during a 60-second idle sweep; size rotation can delete them
 sooner. Failed/stale retention closes subsequent admission. The Compose profile
@@ -246,12 +254,16 @@ only after the reviewed revision, invitations, evidence and secrets are current.
 | F07: factual rewrite/grounding/citations | Grounding requires every analysis section, meaningful typed rows, JSON boolean coverage flags and all checklist topics A–O; omitted witness analysis or malformed responses stop drafting; older incomplete results remain inspectable with a re-run warning. Automatic self-review cannot change witness text; complete contiguous quotes must match an unambiguous cited page, including their endings and punctuation; missing/short/unresolved citations block pilot generation; older prefix checks require a re-run; human verification of descriptions, dates and interpretations still required |
 | F08: parser exhaustion/fallback | Dedicated container, no application mounts, no sockets, AppArmor/default seccomp, bounded resources and replies, no pilot fallback |
 | F09: misleading retention/deletion | Session clearing includes registered uploads; accurate consent; queues/blobs excluded; provider retention requires review |
-| F10: deployment wiring | Runtime is default non-root image; backup scripts included; health checks use installed Python; service DNS and monitoring targets corrected |
+| F10: deployment wiring | Runtime is default non-root image; health checks use installed Python; R12 requires actual immutable image/monitor/alert/incident acceptance; generic backup and monitoring examples are excluded from the controlled pilot |
 | F11: hosted access/action controls | Verified invited OIDC identities, operator role, TLS/private pilot proxy, quotas, no media exports; monitoring ports local and anonymous dashboards disabled |
 | F12: dates | Shared calendar parser handles full and named-month dates; invalid full dates do not become partial dates; precise gaps require full dates |
 | F13: queue reliability | Atomic, input-bound submission/recovery indexing, bounded admission and AOF/fsync settings; synthetic crash/pressure/retry tests; actual hosted persistence and ownership still need worker-release acceptance; queue disabled in pilot |
 | F14: timeline PDF markup | Dynamic paragraph content escaped; PDF failures handled; file exports disabled in pilot |
 | F15: legal/currency claims | Corrected general doubt/continuity/functional-loss language; all knowledge files fingerprinted; topic status cannot certify full legal currency |
+
+R12 approval-file protections and the source-bound operations worksheet are
+implemented preparation. Actual-host observations, named owners, installed
+monitor/alert delivery and authenticated release acceptance remain outstanding.
 
 Deferred features are release-gated, not declared fixed or approved for real data.
 This restricted pilot must not be represented as a public launch, claims decision

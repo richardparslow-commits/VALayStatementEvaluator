@@ -24,7 +24,7 @@ _QUOTA_EXPIRY = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
 def approval() -> dict:
     now = datetime.now(timezone.utc)
     return {
-        "schema_version": 1, "reviewed_revision": "test-revision",
+        "schema_version": 1, "reviewed_revision": "a" * 40,
         "approved_at": (now - timedelta(minutes=1)).isoformat(),
         "expires_at": (now + timedelta(days=1)).isoformat(),
         "issuer": "https://identity.example.test", "deployment_url": "https://pilot.example.test",
@@ -56,7 +56,7 @@ class TestAdmission(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "approval.json"
             data = approval()
-            with patch.dict(os.environ, {"VA_LSE_PILOT_APPROVAL_FILE": str(path), "VA_LSE_BUILD_SHA": "test-revision"}):
+            with patch.dict(os.environ, {"VA_LSE_PILOT_APPROVAL_FILE": str(path), "VA_LSE_BUILD_SHA": "a" * 40}):
                 with self.assertRaises(pilot.PilotBlocked):
                     pilot.load_approval()
                 path.write_text(json.dumps(data))
