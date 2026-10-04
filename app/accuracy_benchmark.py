@@ -265,7 +265,7 @@ def internal_complete(pathway: str, result: dict[str, Any]) -> bool:
     for row in topics:
         if not isinstance(row, dict) or not text(row.get("topic")):
             return False
-        match = re.match(r"^([A-O])(?:\s*[.():\-–—]|\s|$)", row["topic"])
+        match = re.match(r"^([A-O])(?:\s*[.():\-–—]|\s|$)", row["topic"].strip())
         if (not match or match[1] in labels or type(row.get("applicable")) is not bool
                 or type(row.get("covered")) is not bool
                 or (row["covered"] and not row["applicable"])

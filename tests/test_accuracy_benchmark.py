@@ -287,6 +287,15 @@ class AccuracyBenchmarkTests(unittest.TestCase):
                 self.assertEqual(self.check()["disposition"],"NO_GO")
                 draft_result[field]=old
 
+    def test_complete_drafting_topic_labels_match_application_whitespace_rules(self):
+        from app.draft import _normalize_grounding
+        draft_result=self.results["runs"][1]["output"]["result"]
+        for topic in draft_result["grounding"]["topic_coverage"]:
+            topic["topic"]=" \t"+topic["topic"]+"  "
+        _normalize_grounding(draft_result["grounding"],observations_present=True)
+        self.bind_results()
+        self.assertEqual(self.check()["disposition"],"REVIEW_READY")
+
     def test_profile_must_run_in_each_required_pathway(self):
         new_config=copy.deepcopy(self.config)
         new_config["request_profiles"].append({**new_config["request_profiles"][0], "id":"both-pathways"})
