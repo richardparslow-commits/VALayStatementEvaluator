@@ -23,6 +23,13 @@ prepares an unapproved source-bound worksheet; actual participant testing and in
 The [R14 authenticated TXT export procedure](deploy/PILOT_EXPORT_ACCEPTANCE.md)
 describes the optional owner-checked service and actual-host checks. It remains
 disabled by default; repository tests and merging do not approve activation.
+The [R15 queue design/acceptance procedure](deploy/PILOT_QUEUE_ACCEPTANCE.md)
+keeps queued processing synthetic-only. Cached backends, direct workers and
+queue serialization/results refuse controlled-pilot and unknown modes.
+`python scripts/queue_review.py --out queue-evidence/draft.json` prepares an
+unapproved exact-source worksheet. Real-information queues require a separate
+implementation of shared consent, spending and durable case deletion, followed
+by actual-host acceptance; no setting or worksheet enables them in this release.
 The [R09 budget procedure](deploy/PILOT_BUDGET_ACCEPTANCE.md) covers persistent
 quotas, conservative reservations and the actual account spending-cutoff test.
 The general deployment examples are synthetic-data scaffolding until separately reviewed.

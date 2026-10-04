@@ -264,12 +264,17 @@ def _health_payload(*, probe_cache: bool = False, probe_queue: bool = False) -> 
     # backlog itself is only read for a local backend or when probe_queue is set,
     # because reading it on a remote tier is a network round trip on the liveness
     # path — see JobBackend.health.
-    try:
-        from .job_queue import get_job_backend as _gjb
+    from .queue_policy import synthetic_mode
+    if not synthetic_mode():
+        payload["job_queue"] = {"backend": "excluded", "enabled": False,
+                                "depth": None, "depth_source": "not_probed"}
+    else:
+        try:
+            from .job_queue import get_job_backend as _gjb
 
-        payload["job_queue"] = _gjb().health(probe=probe_queue)
-    except Exception:  # noqa: BLE001
-        payload["job_queue"] = {"backend": "unavailable"}
+            payload["job_queue"] = _gjb().health(probe=probe_queue)
+        except Exception:  # noqa: BLE001
+            payload["job_queue"] = {"backend": "unavailable"}
     # Include tracing status so "why are there no traces?" is answerable from the
     # same endpoint operators already poll. Reports configuration only — no probe
     # of the collector, because /health must not block on a network round trip.

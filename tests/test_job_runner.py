@@ -82,6 +82,7 @@ class _PresetBackend(InProcessJobBackend):
         super().__init__(prefix="test", ttl_seconds=60, is_distributed=True, name="preset")
         self._finish = finish
         self._result = result if result is not None else _result_json()
+        self._custom_result = result is not None
         self.last_payload: str | None = None
 
     def enqueue(self, kind: str, payload: str, *, request_id: str = "", owner_id: str = ""):  # noqa: ANN201
@@ -89,7 +90,8 @@ class _PresetBackend(InProcessJobBackend):
         self.last_payload = payload
         claimed, _ = self.claim([kind], worker_id="w1")
         if self._finish:
-            self.store_result(record.job_id, self._result, claim_token=claimed.claim_token)
+            self.store_result(record.job_id, self._result if self._custom_result else
+                              _result_json(request_id or "req_q1"), claim_token=claimed.claim_token)
             self.complete(record.job_id, claim_token=claimed.claim_token)
         else:
             # Simulate a worker holding the job without finishing.

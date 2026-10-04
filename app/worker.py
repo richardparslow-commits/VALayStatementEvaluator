@@ -27,6 +27,8 @@ produces exactly one audit record either way.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import socket
 import sys
@@ -38,6 +40,8 @@ from typing import Any, Callable
 
 from . import audit as audit_log
 from . import config
+from .pilot import PilotBlocked
+from .queue_policy import require_synthetic_queue, synthetic_queue
 from . import shutdown
 from . import tracing
 from .blob_store import BlobStoreError, get_blob_store
@@ -48,6 +52,7 @@ from .evaluate import EvaluationResult
 from .job_payload import (
     KIND_DRAFT,
     KIND_EVALUATE,
+    PAYLOAD_VERSION,
     DraftJob,
     EvaluateJob,
     PayloadError,
@@ -106,12 +111,36 @@ def default_worker_id() -> str:
 
 
 # ------------------------------------------------------------------- execution
+@synthetic_queue
+def verify_submission(record: JobRecord, payload: str) -> None:
+    """Check association before decoding documents or following blob references.
+
+    This digest detects mismatches; it does not authenticate a compromised store.
+    Legacy jobs without a recorded digest must be re-submitted from their inputs.
+    """
+    refusal = "Job inputs do not match the recorded submission."
+    if not isinstance(payload, str) or len(payload) > config.JOB_QUEUE_MAX_PAYLOAD_BYTES:
+        raise PayloadError(refusal)
+    raw = payload.encode("utf-8")
+    if len(raw) > config.JOB_QUEUE_MAX_PAYLOAD_BYTES or hashlib.sha256(raw).hexdigest() != record.submission_digest:
+        raise PayloadError(refusal)
+    try:
+        envelope = json.loads(payload)
+    except ValueError as exc:
+        raise PayloadError("Job payload is not valid JSON.") from exc
+    if (not isinstance(envelope, dict) or type(envelope.get("version")) is not int
+            or envelope["version"] != PAYLOAD_VERSION or envelope.get("kind") != record.kind
+            or (record.request_id and envelope.get("request_id") != record.request_id)):
+        raise PayloadError(refusal)
+
+
 def _progress_callback(backend: JobBackend, record: JobRecord) -> ProgressCallback:
     """Return a throttled progress callback that persists to the queue."""
     last_sent = 0.0
 
     def update(fraction: float, message: str) -> None:
         nonlocal last_sent
+        require_synthetic_queue()
         check_pipeline_cancelled()
         now = time.monotonic()
         if fraction < 1.0 and (now - last_sent) < _PROGRESS_MIN_INTERVAL_SECONDS:
@@ -119,9 +148,11 @@ def _progress_callback(backend: JobBackend, record: JobRecord) -> ProgressCallba
         last_sent = now
         try:
             backend.set_progress(record.job_id, fraction, message, claim_token=record.claim_token)
-        except JobLeaseLost:
+            require_synthetic_queue()
+        except (JobLeaseLost, PilotBlocked):
             raise
         except Exception as exc:  # noqa: BLE001 - progress must never kill a run
+            require_synthetic_queue()
             logger.warning(
                 "progress update failed job_id=%s error=%s",
                 record.job_id,
@@ -132,6 +163,7 @@ def _progress_callback(backend: JobBackend, record: JobRecord) -> ProgressCallba
     return update
 
 
+@synthetic_queue
 def build_llm() -> LLMClient:
     """Build the worker's LLM client from environment/secrets configuration.
 
@@ -153,6 +185,7 @@ def build_llm() -> LLMClient:
         raise WorkerConfigError(str(exc)) from exc
 
 
+@synthetic_queue
 def _run_pipeline(
     kind: str,
     job: EvaluateJob | DraftJob,
@@ -262,6 +295,7 @@ def _audit_ok(
         pass
 
 
+@synthetic_queue
 def execute_job(
     record: JobRecord,
     payload: str,
@@ -275,9 +309,7 @@ def execute_job(
     future threaded pool share exactly one execution path.
     """
     kind = record.kind
-    # The payload's request_id is the one the submit path showed the user, so it
-    # wins over the queue record's copy; the record is the fallback for a payload
-    # that never decodes.
+    # A payload may not change a recorded request reference or submission hash.
     request_id = record.request_id or "-"
     set_request_id(request_id)
     progress = _progress_callback(backend, record)
@@ -293,6 +325,7 @@ def execute_job(
     pages = 0
     started = False
     try:
+        verify_submission(record, payload)
         # Also resolves a documents reference when the web pod externalized a large
         # record bundle to the blob store (see app/blob_store.py).
         job = decode_job(kind, payload, blob_store=get_blob_store())
@@ -337,6 +370,8 @@ def execute_job(
         # instead of appearing as an unrelated trace from a different service.
         with tracing.attach_trace_context(job.trace_context):
             run = run_with_timeout(_run_pipeline, kind, job, client, progress)
+    except PilotBlocked:
+        raise
     except (PayloadError, BlobStoreError, WorkerConfigError) as exc:
         _fail(
             backend, record, exc, type(exc).__name__,
@@ -363,8 +398,11 @@ def execute_job(
         return False
 
     duration_ms = int((time.perf_counter() - t0) * 1000)
+    require_synthetic_queue()
     try:
         backend.store_result(record.job_id, encode_result(run), claim_token=record.claim_token)
+    except PilotBlocked:
+        raise
     except Exception as exc:  # noqa: BLE001 - an unstorable result is a failed job
         _fail(
             backend, record, exc, type(exc).__name__,
@@ -376,7 +414,10 @@ def execute_job(
             record.job_id, claim_token=record.claim_token,
             message=f"completed in {duration_ms / 1000:.0f}s",
         )
+    except PilotBlocked:
+        raise
     except Exception as exc:  # noqa: BLE001 - an unconfirmed completion is not success
+        require_synthetic_queue()
         logger.error(
             "could not mark job complete job_id=%s error=%s",
             record.job_id,
@@ -431,6 +472,7 @@ def execute_job(
     return True
 
 
+@synthetic_queue
 def _fail(
     backend: JobBackend,
     record: JobRecord,
@@ -489,6 +531,7 @@ def _fail(
             record.job_id, claim_token=record.claim_token, error=detail, error_class=error_class
         )
     except Exception as write_exc:  # noqa: BLE001
+        require_synthetic_queue()
         logger.error(
             "could not record job failure job_id=%s error=%s",
             record.job_id,
@@ -498,12 +541,17 @@ def _fail(
 
 
 # ---------------------------------------------------------------------- loop
+@synthetic_queue
 def drain_stale(backend: JobBackend | None = None) -> int:
     """Re-queue jobs whose worker died. Returns the number re-queued."""
     active = backend if backend is not None else get_job_backend()
     try:
         count = active.requeue_stale()
+        require_synthetic_queue()
+    except PilotBlocked:
+        raise
     except Exception as exc:  # noqa: BLE001
+        require_synthetic_queue()
         logger.warning("stale job sweep failed: %s", f"{type(exc).__name__}: {exc}")
         return 0
     if count:
@@ -515,6 +563,7 @@ def drain_stale(backend: JobBackend | None = None) -> int:
     return count
 
 
+@synthetic_queue
 def run_worker(
     *,
     once: bool = False,
@@ -560,7 +609,9 @@ def run_worker(
             stats.requeued += drain_stale(active)
         try:
             claimed = active.claim(KINDS, worker_id=me)
+            require_synthetic_queue()
         except JobQueueError as exc:
+            require_synthetic_queue()
             if len(stats.errors) < _MAX_RETAINED_ERRORS:
                 stats.errors.append(str(exc))
             logger.error("claim failed: %s", exc, extra={"phase": "worker", "status": "error"})
@@ -629,6 +680,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    try:
+        require_synthetic_queue()
+    except PilotBlocked as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
     configure_logging()
     try:
         audit_log.configure_audit_logging()
@@ -639,12 +696,19 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         backend = get_job_backend()
+    except PilotBlocked as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     except Exception as exc:  # noqa: BLE001
         logger.error("worker could not build a job backend: %s", exc)
         return 2
 
     if args.drain_stale:
-        count = drain_stale(backend)
+        try:
+            count = drain_stale(backend)
+        except PilotBlocked as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
         print(f"re-queued {count} stale job(s)")
         return 0
 
@@ -656,6 +720,9 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         stats = run_worker(once=args.once, backend=backend, max_jobs=args.max_jobs)
+    except PilotBlocked as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     except KeyboardInterrupt:  # pragma: no cover - interactive only
         logger.info("worker interrupted")
         return 130
@@ -675,6 +742,7 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+@synthetic_queue
 def _start_health_server() -> None:
     """Start the worker's liveness/readiness sidecar (best-effort)."""
     port = config.JOB_QUEUE_WORKER_HEALTH_PORT

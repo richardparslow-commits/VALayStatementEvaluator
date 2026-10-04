@@ -475,7 +475,7 @@ class TestBlobReferencedJob(_WorkerCase):
 
         tmp = TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        store, payload = self._externalize(_evaluate_job(), tmp.name)
+        store, payload = self._externalize(_evaluate_job(request_id="req_blobjob"), tmp.name)
         record = self.backend.enqueue(KIND_EVALUATE, payload, request_id="req_blobjob")
         claimed = self.backend.claim([KIND_EVALUATE], worker_id="w1")
 

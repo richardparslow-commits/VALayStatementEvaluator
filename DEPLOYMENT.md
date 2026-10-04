@@ -378,6 +378,13 @@ kubectl get pods -l app=va-lse -w
 
 ## 4. Pattern C — Kubernetes with a worker pool and Redis
 
+**Synthetic information only.** Queue APIs, cached instances, payload/result
+serialization and workers refuse controlled-pilot and unknown modes. Real-information
+queueing needs a separately implemented and accepted distributed consent/budget/
+deletion design; no flag or worksheet enables it in this release. Follow
+[R15 design and acceptance](deploy/PILOT_QUEUE_ACCEPTANCE.md). The examples below
+describe invented-data rehearsals only.
+
 This is the recommended pattern for 100 concurrent users.
 
 ### How it works
@@ -482,8 +489,10 @@ loss, eviction, and payload expiration are not worker-interruption recovery.
 
 **Upgrade:** drain/stop old web producers and all old worker processes before starting this version.
 Old workers do not enforce attempt ownership and must not overlap new workers.
-Existing queued jobs and leased running jobs keep their key layout and remain
-readable. Jobs already orphaned by an older version (absent from both the queue
+Existing synthetic jobs with a recorded submission digest keep their key layout.
+Workers now refuse missing digests or mismatched payload kind/version/request
+references before retrieving record blobs. Re-submit original invented inputs
+for legacy jobs without digests. Jobs already orphaned by an older version (absent from both the queue
 and lease set) need operator reconciliation or resubmission; this change does
 not scan all historical metadata. Redis credentials must permit `EVAL` and the
 commands it executes. The supplied deployment uses standalone Redis; on Redis

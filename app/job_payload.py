@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import config
+from .queue_policy import require_synthetic_queue, synthetic_mode, synthetic_queue
 from .blob_store import BlobRef, BlobStore, BlobStoreError, dumps_documents, loads_documents
 from .documents import DocumentPage, ExtractedDocument
 from .draft import DraftResult
@@ -509,6 +510,7 @@ def _dump(payload: dict[str, Any]) -> str:
     return encoded
 
 
+@synthetic_queue
 def validate_job(kind: str, job: EvaluateJob | DraftJob) -> None:
     """Reject malformed requests before encoding, blob writes or worker calls."""
     from .request_validation import RequestValidationError, validate_draft_request, validate_evaluation_request
@@ -524,6 +526,7 @@ def validate_job(kind: str, job: EvaluateJob | DraftJob) -> None:
         raise PayloadError(str(exc)) from exc
 
 
+@synthetic_queue
 def documents_bundle(job: EvaluateJob | DraftJob) -> bytes:
     """The bytes a blob store holds for a job: just its extracted documents.
 
@@ -568,6 +571,7 @@ def _job_envelope(kind: str, job: EvaluateJob | DraftJob) -> dict[str, Any]:
     return base
 
 
+@synthetic_queue
 def encode_job(kind: str, job: EvaluateJob | DraftJob) -> str:
     """Encode a job's inputs with its documents inline (size-checked)."""
     base = _job_envelope(kind, job)
@@ -575,6 +579,7 @@ def encode_job(kind: str, job: EvaluateJob | DraftJob) -> str:
     return _dump(base)
 
 
+@synthetic_queue
 def encode_job_with_blob(kind: str, job: EvaluateJob | DraftJob, ref: BlobRef) -> str:
     """Encode a job whose documents live in the blob store.
 
@@ -586,6 +591,7 @@ def encode_job_with_blob(kind: str, job: EvaluateJob | DraftJob, ref: BlobRef) -
     return _dump(base)
 
 
+@synthetic_queue
 def payload_needs_blob(kind: str, job: EvaluateJob | DraftJob) -> bool:
     """True when this job's inline payload would exceed the inline threshold."""
     try:
@@ -595,6 +601,7 @@ def payload_needs_blob(kind: str, job: EvaluateJob | DraftJob) -> bool:
     return len(encoded.encode("utf-8")) > config.JOB_QUEUE_INLINE_MAX_BYTES
 
 
+@synthetic_queue
 def decode_job(
     kind: str, raw: str, *, blob_store: BlobStore | None = None
 ) -> EvaluateJob | DraftJob:
@@ -662,6 +669,7 @@ def _documents_from_ref(raw: Any, blob_store: BlobStore | None) -> list[Extracte
     return request_documents_from_json(bundle.get("documents"))
 
 
+@synthetic_queue
 def encode_result(run: RunResult) -> str:
     """Encode a finished run for the queue (best-effort — never loses the run)."""
     body: dict[str, Any] = {
@@ -679,6 +687,7 @@ def encode_result(run: RunResult) -> str:
     return _dump(body)
 
 
+@synthetic_queue
 def decode_result(raw: str) -> RunResult:
     """Decode a worker's stored result back into pipeline dataclasses."""
     try:

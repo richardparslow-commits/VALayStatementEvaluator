@@ -50,6 +50,7 @@ from dataclasses import asdict, dataclass, fields, replace
 from typing import Any, Sequence
 
 from . import config
+from .queue_policy import require_synthetic_queue, synthetic_mode, synthetic_queue
 
 logger = logging.getLogger("app.job_queue")
 
@@ -319,6 +320,9 @@ class JobBackend:
         would report a healthy empty queue at exactly the moment the truth is
         unknown. ``depth_source`` says which case this is.
         """
+        if not synthetic_mode():
+            return {"backend": "excluded", "enabled": False, "is_distributed": False,
+                    "depth": None, "depth_source": "not_probed"}
         payload: dict[str, Any] = {
             "backend": self.name,
             "is_distributed": self.is_distributed,
@@ -365,6 +369,7 @@ class InProcessJobBackend(JobBackend):
     is_distributed = False
     depth_is_remote = False
 
+    @synthetic_queue
     def __init__(self, *, prefix: str, ttl_seconds: int, is_distributed: bool = False, name: str = "inprocess") -> None:
         self._prefix = prefix
         self._ttl = ttl_seconds
@@ -379,6 +384,7 @@ class InProcessJobBackend(JobBackend):
         self.name = name
 
     # -- producer -----------------------------------------------------------
+    @synthetic_queue
     def enqueue(self, kind: str, payload: str, *, request_id: str = "", owner_id: str = "") -> JobRecord:
         record = _submission(kind, payload, request_id, owner_id)
         with _blob_submission_guard(payload), self._cv:
@@ -401,6 +407,7 @@ class InProcessJobBackend(JobBackend):
         return replace(record)
 
     # -- consumer -----------------------------------------------------------
+    @synthetic_queue
     def claim(
         self, kinds: Sequence[str], *, worker_id: str
     ) -> tuple[JobRecord, str] | None:
@@ -450,6 +457,7 @@ class InProcessJobBackend(JobBackend):
             raise JobLeaseLost(f"job claim is no longer owned: {job_id}")
         return record
 
+    @synthetic_queue
     def set_progress(self, job_id: str, progress: float, message: str, *, claim_token: str) -> None:
         with self._lock:
             record = self._owned_record(job_id, claim_token)
@@ -458,11 +466,13 @@ class InProcessJobBackend(JobBackend):
             record.heartbeat_at = _now()
             record.updated_at = record.heartbeat_at
 
+    @synthetic_queue
     def store_result(self, job_id: str, result: str, *, claim_token: str) -> None:
         with self._lock:
             self._owned_record(job_id, claim_token)
             self._results[job_id] = result
 
+    @synthetic_queue
     def complete(self, job_id: str, *, claim_token: str, message: str = "") -> None:
         with self._lock:
             record = self._owned_record(job_id, claim_token)
@@ -471,6 +481,7 @@ class InProcessJobBackend(JobBackend):
             record.message = message or "completed"
             record.updated_at = _now()
 
+    @synthetic_queue
     def fail(self, job_id: str, *, claim_token: str, error: str, error_class: str = "") -> None:
         with self._lock:
             record = self._owned_record(job_id, claim_token)
@@ -481,15 +492,18 @@ class InProcessJobBackend(JobBackend):
             record.message = "failed"
             record.updated_at = _now()
 
+    @synthetic_queue
     def get(self, job_id: str) -> JobRecord | None:
         with self._lock:
             record = self._records.get(job_id)
             return replace(record) if record is not None else None
 
+    @synthetic_queue
     def get_result(self, job_id: str) -> str | None:
         with self._lock:
             return self._results.get(job_id)
 
+    @synthetic_queue
     def requeue(self, job_id: str, *, claim_token: str, reason: str = "") -> bool:
         with self._cv:
             record = self._records.get(job_id)
@@ -509,6 +523,7 @@ class InProcessJobBackend(JobBackend):
             self._cv.notify_all()
             return True
 
+    @synthetic_queue
     def requeue_stale(self) -> int:
         cutoff = _now() - float(config.JOB_QUEUE_LEASE_SECONDS)
         requeued = 0
@@ -537,18 +552,22 @@ class InProcessJobBackend(JobBackend):
                 self._cv.notify_all()
         return requeued
 
+    @synthetic_queue
     def depth(self) -> int:
         with self._lock:
             return sum(len(q) for q in self._queues.values())
 
+    @synthetic_queue
     def retained_blob_keys(self) -> set[str]:
         with self._lock:
             keys = (_retained_blob_key(payload) for payload in self._payloads.values())
             return {key for key in keys if key is not None}
 
+    @synthetic_queue
     def ping(self) -> bool:
         return True
 
+    @synthetic_queue
     def set_recovery_index(self, request_id: str, job_id: str) -> None:
         if not request_id:
             return
@@ -558,6 +577,7 @@ class InProcessJobBackend(JobBackend):
                 raise JobQueueError("request reference is already bound to another submission")
             self._recovery_index[request_id] = job_id
 
+    @synthetic_queue
     def lookup_by_request_id(self, request_id: str) -> str | None:
         if not request_id:
             return None
@@ -805,16 +825,20 @@ class _AtomicJobBackend(JobBackend):
     _ttl: int
     _poll_min_seconds = 0.05
 
+    @synthetic_queue
     def _command(self, *args: str | int | float) -> Any:
         raise NotImplementedError
 
+    @synthetic_queue
     def _read_record(self, job_id: str) -> JobRecord | None:
         raise NotImplementedError
 
+    @synthetic_queue
     def enqueue(self, kind: str, payload: str, *, request_id: str = "", owner_id: str = "") -> JobRecord:
         with _blob_submission_guard(payload):
             return self._enqueue(kind, payload, request_id=request_id, owner_id=owner_id)
 
+    @synthetic_queue
     def _enqueue(self, kind: str, payload: str, *, request_id: str, owner_id: str) -> JobRecord:
         candidate = _submission(kind, payload, request_id, owner_id)
         reference_key = (_recovery_key(self._prefix, request_id) if request_id
@@ -840,6 +864,7 @@ class _AtomicJobBackend(JobBackend):
             raise JobQueueError("submission returned invalid metadata; retry the same reference")
         return replace(record, recovery_available=recovery_available)
 
+    @synthetic_queue
     def retained_blob_keys(self) -> set[str]:
         # SCAN includes keys present for the whole iteration. Payload keys remain
         # present when claim/progress renews TTLs. New admissions renew their blob
@@ -899,6 +924,7 @@ class _AtomicJobBackend(JobBackend):
             operation, job_id, kind, token, _now(), self._ttl, *args,
         )
 
+    @synthetic_queue
     def claim(
         self, kinds: Sequence[str], *, worker_id: str
     ) -> tuple[JobRecord, str] | None:
@@ -933,6 +959,7 @@ class _AtomicJobBackend(JobBackend):
         ):
             raise JobLeaseLost(f"job claim is no longer owned: {job_id}")
 
+    @synthetic_queue
     def set_progress(
         self, job_id: str, progress: float, message: str, *, claim_token: str
     ) -> None:
@@ -940,17 +967,21 @@ class _AtomicJobBackend(JobBackend):
             "progress", job_id, claim_token, min(max(progress, 0.0), 1.0), message
         )
 
+    @synthetic_queue
     def store_result(self, job_id: str, result: str, *, claim_token: str) -> None:
         self._owned_transition("result", job_id, claim_token, result)
 
+    @synthetic_queue
     def complete(self, job_id: str, *, claim_token: str, message: str = "") -> None:
         self._owned_transition("done", job_id, claim_token, message or "completed", "", "")
 
+    @synthetic_queue
     def fail(
         self, job_id: str, *, claim_token: str, error: str, error_class: str = ""
     ) -> None:
         self._owned_transition("error", job_id, claim_token, "failed", error[:2000], error_class)
 
+    @synthetic_queue
     def requeue(self, job_id: str, *, claim_token: str, reason: str = "") -> bool:
         try:
             self._owned_transition("requeue", job_id, claim_token, reason or "re-queued")
@@ -961,6 +992,7 @@ class _AtomicJobBackend(JobBackend):
             logger.exception("requeue failed job_id=%s", job_id)
             return False
 
+    @synthetic_queue
     def requeue_stale(self) -> int:
         cutoff = _now() - float(config.JOB_QUEUE_LEASE_SECONDS)
         requeued = 0
@@ -974,6 +1006,7 @@ class _AtomicJobBackend(JobBackend):
                 ))
         return requeued
 
+    @synthetic_queue
     def set_recovery_index(self, request_id: str, job_id: str) -> None:
         if not request_id:
             return
@@ -984,6 +1017,7 @@ class _AtomicJobBackend(JobBackend):
             if self._command("GET", key) != job_id:
                 raise JobQueueError("request reference is already bound to another submission")
 
+    @synthetic_queue
     def lookup_by_request_id(self, request_id: str) -> str | None:
         if not request_id:
             return None
@@ -1005,6 +1039,7 @@ class RedisJobBackend(_AtomicJobBackend):
     name = "redis"
     is_distributed = True
 
+    @synthetic_queue
     def __init__(
         self, url: str, *, prefix: str, ttl_seconds: int, timeout_seconds: float = 5.0
     ) -> None:
@@ -1035,35 +1070,44 @@ class RedisJobBackend(_AtomicJobBackend):
         ``run_worker`` already implements — and would sidestep the ``JobQueueError``
         handling every caller is written against.
         """
+        require_synthetic_queue()
         try:
             yield
+            require_synthetic_queue()
         except JobQueueError:
+            require_synthetic_queue()
             raise
         except Exception as exc:  # noqa: BLE001 - normalize the whole redis.exceptions tree
+            require_synthetic_queue()
             raise JobQueueError(
                 f"redis {operation} failed: {type(exc).__name__}: {exc}"
             ) from exc
 
+    @synthetic_queue
     def _set_record(self, record: JobRecord) -> None:
         raw = record.to_json()
         with self._transport("set job record"):
             self._client.set(_meta_key(self._prefix, record.job_id), raw, ex=self._ttl)
 
+    @synthetic_queue
     def _read_record(self, job_id: str) -> JobRecord | None:
         with self._transport("read job record"):
             raw = self._client.get(_meta_key(self._prefix, job_id))
         return JobRecord.from_json(raw if isinstance(raw, str) else None)
 
+    @synthetic_queue
     def _command(self, *args: str | int | float) -> Any:
         with self._transport(str(args[0])):
             return self._client.execute_command(*args)
 
+    @synthetic_queue
     def get(self, job_id: str) -> JobRecord | None:
         try:
             return self._read_record(job_id)
         except Exception:  # noqa: BLE001 - polling must never break the UI
             return None
 
+    @synthetic_queue
     def get_result(self, job_id: str) -> str | None:
         try:
             with self._transport("read result"):
@@ -1072,6 +1116,7 @@ class RedisJobBackend(_AtomicJobBackend):
             return None
         return raw if isinstance(raw, str) else None
 
+    @synthetic_queue
     def depth(self) -> int:
         try:
             return sum(
@@ -1080,6 +1125,7 @@ class RedisJobBackend(_AtomicJobBackend):
         except Exception:  # noqa: BLE001
             return 0
 
+    @synthetic_queue
     def ping(self) -> bool:
         try:
             return bool(self._client.ping())
@@ -1097,11 +1143,13 @@ class _UpstashRest:
     instead, which is the documented command form and needs no package.
     """
 
+    @synthetic_queue
     def __init__(self, url: str, token: str, *, timeout_seconds: float) -> None:
         self._url = url.rstrip("/")
         self._token = token
         self._timeout = timeout_seconds
 
+    @synthetic_queue
     def command(self, *args: str | int | float) -> Any:
         body = json.dumps(list(args)).encode("utf-8")
         auth = base64.b64encode(self._token.encode("utf-8")).decode("utf-8")
@@ -1142,6 +1190,7 @@ class UpstashJobBackend(_AtomicJobBackend):
     is_distributed = True
     _poll_min_seconds = 0.25
 
+    @synthetic_queue
     def __init__(
         self,
         url: str,
@@ -1155,25 +1204,30 @@ class UpstashJobBackend(_AtomicJobBackend):
         self._ttl = ttl_seconds
         self._rest = _UpstashRest(url, token, timeout_seconds=timeout_seconds)
 
+    @synthetic_queue
     def _command(self, *args: str | int | float) -> Any:
         return self._rest.command(*args)
 
     # -- helpers ------------------------------------------------------------
+    @synthetic_queue
     def _set_record(self, record: JobRecord) -> None:
         self._rest.command(
             "SET", _meta_key(self._prefix, record.job_id), record.to_json(), "EX", self._ttl
         )
 
+    @synthetic_queue
     def _read_record(self, job_id: str) -> JobRecord | None:
         raw = self._rest.command("GET", _meta_key(self._prefix, job_id))
         return JobRecord.from_json(raw if isinstance(raw, str) else None)
 
+    @synthetic_queue
     def get(self, job_id: str) -> JobRecord | None:
         try:
             return self._read_record(job_id)
         except Exception:  # noqa: BLE001 - polling must never break the UI
             return None
 
+    @synthetic_queue
     def get_result(self, job_id: str) -> str | None:
         try:
             raw = self._rest.command("GET", _result_key(self._prefix, job_id))
@@ -1181,6 +1235,7 @@ class UpstashJobBackend(_AtomicJobBackend):
             return None
         return raw if isinstance(raw, str) else None
 
+    @synthetic_queue
     def depth(self) -> int:
         total = 0
         for kind in KINDS:
@@ -1191,6 +1246,7 @@ class UpstashJobBackend(_AtomicJobBackend):
                 continue
         return total
 
+    @synthetic_queue
     def ping(self) -> bool:
         try:
             self._rest.command("PING")
@@ -1204,6 +1260,7 @@ _backend: JobBackend | None = None
 _backend_lock = threading.Lock()
 
 
+@synthetic_queue
 def build_job_backend(*, require_distributed: bool = False) -> JobBackend:
     """Select a backend from configuration (see the module docstring)."""
     prefix = config.JOB_QUEUE_PREFIX
@@ -1238,6 +1295,7 @@ def build_job_backend(*, require_distributed: bool = False) -> JobBackend:
     return InProcessJobBackend(prefix=prefix, ttl_seconds=ttl)
 
 
+@synthetic_queue
 def get_job_backend() -> JobBackend:
     """Return (and lazily create) the process-global job backend."""
     global _backend  # noqa: PLW0603
