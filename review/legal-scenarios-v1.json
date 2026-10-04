@@ -1,0 +1,119 @@
+{
+  "schema_version": 1,
+  "status": "unreviewed_seed",
+  "synthetic": true,
+  "cases": [
+    {
+      "id": "S01",
+      "control_id": "C01",
+      "applicable_example": "Invented witness observes a knee buckle; separately attributes a clinician diagnosis.",
+      "inapplicable_example": "Invented witness guesses an imaging diagnosis without relevant knowledge or training.",
+      "review_question": "Distinguish firsthand observation, reporting a contemporaneous diagnosis and later medical support; do blanket diagnosis or medical-opinion prohibitions discard competent evidence?",
+      "status": "not_run"
+    },
+    {
+      "id": "S02",
+      "control_id": "C02",
+      "applicable_example": "Invented listed chronic disease with relevant symptom history and a separately considered combat incurrence question.",
+      "inapplicable_example": "Invented nonlisted condition or noncombat event; history remains evidence but does not automatically invoke the special route.",
+      "review_question": "Identify the factual and claim-type limits of each service-connection route; keep continuity under 3.303(b) distinct from other uses of symptom history.",
+      "status": "not_run"
+    },
+    {
+      "id": "S03",
+      "control_id": "C03",
+      "applicable_example": "Invented dated record affirmatively conflicts with the same date, side and event claimed by the witness.",
+      "inapplicable_example": "Invented silent clinic note or a normal visit between intermittent flares; do not treat as automatic refutation.",
+      "review_question": "Distinguish conservative uploaded-record labels from adjudicative negative-evidence analysis; review foundation, timing and context before treating silence or normal findings as substantive evidence.",
+      "status": "not_run"
+    },
+    {
+      "id": "S04",
+      "control_id": "C04",
+      "applicable_example": "Invented entrance-noted condition worsens during service; separate invented nonservice-connected condition worsens due to an established service-connected disability.",
+      "inapplicable_example": "Invented postservice onset with no preexisting condition or secondary relationship; do not impose a preservice template.",
+      "review_question": "Resolve the rubric paragraph mixing preservice aggravation, soundness and secondary aggravation; assess whether a lay baseline may incorrectly be presented as replacing required medical evidence.",
+      "status": "not_run"
+    },
+    {
+      "id": "S05",
+      "control_id": "C05",
+      "applicable_example": "Invented competing material evidence approaches balance; reviewer considers the whole record.",
+      "inapplicable_example": "Invented polished high-score statement with missing nexus evidence; writing score cannot establish entitlement.",
+      "review_question": "Keep the approximate-balance legal standard distinct from numerical writing scores; do examples imply that discrepancies must never affect credibility?",
+      "status": "not_run"
+    },
+    {
+      "id": "S06",
+      "control_id": "C06",
+      "applicable_example": "Invented joint pain limits repeated walking and worsens during flares.",
+      "inapplicable_example": "Invented condition governed by a different rating framework; do not force musculoskeletal or dangerous-consequence questions.",
+      "review_question": "Check limitations and diagnostic-code applicability of minimum-rating and functional-loss language; avoid declaring every static examination inadequate.",
+      "status": "not_run"
+    },
+    {
+      "id": "S07",
+      "control_id": "C07",
+      "applicable_example": "Invented competent symptom history raises an examination question in the relevant claim posture.",
+      "inapplicable_example": "Invented missing full claims file or unrelated exam; app cannot decide that an opinion is legally inadequate.",
+      "review_question": "Verify all examination triggers and exceptions, examiner-history requirements, credibility assumptions and remand compliance standards; avoid categorical legal findings from incomplete uploaded records.",
+      "status": "not_run"
+    },
+    {
+      "id": "S08",
+      "control_id": "C08",
+      "applicable_example": "Invented witness describes observed assistance with dressing and protection from hazards.",
+      "inapplicable_example": "Invented independent joint claimant has no caregiving need; do not force unsafe behavior or financial incompetence.",
+      "review_question": "Distinguish SMC aid and attendance, housebound, pension and competency criteria; assess forced B/C/E/J topics and whether safety/survival or constant-care language overstates requirements.",
+      "status": "not_run"
+    },
+    {
+      "id": "S09",
+      "control_id": "C09",
+      "applicable_example": "Invented coworker observed service-connected limitations at work; invented fellow service member personally witnessed a stressor.",
+      "inapplicable_example": "Invented family witness first met the veteran after service and did not witness the stressor; do not fabricate corroboration.",
+      "review_question": "Check claim posture, PTSD stressor routes and corroboration exceptions, occupational limitations and TDIU requirements; do not impose diagnosis, stressor or work conclusions on a lay witness.",
+      "status": "not_run"
+    },
+    {
+      "id": "S10",
+      "control_id": "C10",
+      "applicable_example": "Invented caregiver observes drowsiness after a reported medication change.",
+      "inapplicable_example": "Invented witness assumes a medication caused a new disease; observation alone does not decide clinical causation.",
+      "review_question": "Preserve observed temporal patterns while separating them from unqualified causation or diagnosis; confirm relevant underlying provider evidence and avoid inventing secondary claims.",
+      "status": "not_run"
+    },
+    {
+      "id": "S11",
+      "control_id": "C11",
+      "applicable_example": "Invented witness reviews exact draft then completes the current official form with required certification and signature through a separately verified path.",
+      "inapplicable_example": "Invented generated draft PDF or unsigned declaration; do not mark an official submission complete.",
+      "review_question": "Resolve official page/PDF edition discrepancy and verify signature, certification, addendum and submission paths; check claims of preferred forms or separate forms per condition.",
+      "status": "not_run"
+    },
+    {
+      "id": "S12",
+      "control_id": "C12",
+      "applicable_example": "Invented witness confirms an accurately quoted observation from their own account.",
+      "inapplicable_example": "Invented model inserts an unseen clinic fact into the witness voice; require explicit truthful basis and preserve attribution.",
+      "review_question": "Review provenance, missing-source limitations, proposed medical-record additions and witness sign-off; no source selection may waive unsupported factual changes.",
+      "status": "not_run"
+    },
+    {
+      "id": "S13",
+      "control_id": "C13",
+      "applicable_example": "Invented witness gives an honest approximate onset with observable examples.",
+      "inapplicable_example": "Invented model invents an exact date or frequency to improve specificity or appearance of credibility.",
+      "review_question": "Assess blanket statements that family accounts are most valuable or that understatement is safer; avoid unsupported evidentiary hierarchies, witness coaching or penalties for honest uncertainty.",
+      "status": "not_run"
+    },
+    {
+      "id": "S14",
+      "control_id": "C14",
+      "applicable_example": "Invented signed review binds complete source, exact primary authorities and accepted scope; other pilot gates still apply.",
+      "inapplicable_example": "Invented cached topic-current result, passing CI or preparation packet with blank signatures; none establishes legal acceptance.",
+      "review_question": "Verify source freshness separately from legal interpretation and individual-case applicability; topic checks cannot approve the complete knowledge or prompt revision.",
+      "status": "not_run"
+    }
+  ]
+}

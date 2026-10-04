@@ -62,6 +62,7 @@ SENSITIVE_NAMES = (".env", "usage_history.json", "secrets.toml")
 #: root — the VA.gov scraper can be run from any cwd, so its artifacts and
 #: Chrome-profile directories can materialize at any depth.
 SENSITIVE_DIR_NAMES = (
+    "legal-evidence",
     "accuracy-evidence",
     "pilot-control",
     "va_gov_download_artifacts",
@@ -75,6 +76,8 @@ SENSITIVE_SUFFIXES = (".pem", ".key")
 #: One path per category this guard exists for, so a future edit that keeps the
 #: file non-empty but drops a category fails by name instead of by arithmetic.
 SENSITIVE_PATH_EXAMPLES = (
+    "legal-evidence/signed-review.json",
+    "nested/legal-evidence/packet.json",
     "accuracy-evidence/plan.json",
     "nested/accuracy-evidence/results.json",
     "pilot-control/pilot-budget.sqlite3",

@@ -8,6 +8,10 @@ The [R10 accuracy procedure](deploy/PILOT_ACCURACY_ACCEPTANCE.md) provides an
 unreviewed synthetic corpus and offline evidence checks through
 `python scripts/accuracy_benchmark.py`. Actual approved-model
 runs and independently signed factual acceptance are still required.
+The [R11 legal/evidence procedure](deploy/PILOT_LEGAL_ACCEPTANCE.md) supplies an
+unreviewed candidate authority register and synthetic applicability questions.
+`python scripts/legal_review.py` freezes an unapproved source-bound review packet;
+an independent qualified reviewer must resolve the rules and sign the exact revision.
 The [R09 budget procedure](deploy/PILOT_BUDGET_ACCEPTANCE.md) covers persistent
 quotas, conservative reservations and the actual account spending-cutoff test.
 The general deployment examples are synthetic-data scaffolding until separately reviewed.
