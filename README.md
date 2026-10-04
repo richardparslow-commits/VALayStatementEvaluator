@@ -12,6 +12,10 @@ The [R11 legal/evidence procedure](deploy/PILOT_LEGAL_ACCEPTANCE.md) supplies an
 unreviewed candidate authority register and synthetic applicability questions.
 `python scripts/legal_review.py` freezes an unapproved source-bound review packet;
 an independent qualified reviewer must resolve the rules and sign the exact revision.
+The [R12 operations procedure](deploy/PILOT_OPERATIONS_ACCEPTANCE.md) covers
+actual-host monitoring, incident drills and exact-release sign-off.
+`python scripts/operations_review.py --out operations-evidence/draft.json`
+prepares a clean-source worksheet; actual observations and authenticated acceptance remain required.
 The [R09 budget procedure](deploy/PILOT_BUDGET_ACCEPTANCE.md) covers persistent
 quotas, conservative reservations and the actual account spending-cutoff test.
 The general deployment examples are synthetic-data scaffolding until separately reviewed.

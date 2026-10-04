@@ -9,9 +9,11 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import re
 import socket
+import stat
 import threading
 import time
 import uuid
@@ -59,30 +61,98 @@ def https_url(value: Any) -> str:
     return value.rstrip("/")
 
 
+_APPROVAL_LIMIT = 65536
+
+
+def _approval_bytes(path: Path) -> bytes:
+    """Read a bounded, stable regular file without following the leaf link.
+
+    A root-owned read-only mount can be readable by the non-root runtime. Host
+    parent directories and replacement authority still require operator review.
+    """
+    if (not path.is_absolute() or not hasattr(os, "O_NOFOLLOW")
+            or not hasattr(os, "O_NONBLOCK") or not hasattr(os, "geteuid")):
+        raise ValueError
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        before = os.fstat(fd)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid not in (0, os.geteuid())
+                or before.st_mode & 0o022 or before.st_size > _APPROVAL_LIMIT):
+            raise ValueError
+        raw = bytearray()
+        while len(raw) <= _APPROVAL_LIMIT:
+            chunk = os.read(fd, min(8192, _APPROVAL_LIMIT + 1 - len(raw)))
+            if not chunk:
+                break
+            raw.extend(chunk)
+        after = os.fstat(fd)
+        current = path.lstat()
+        def identity(value: os.stat_result) -> tuple[int, ...]:
+            return (value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+                    value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+        if (len(raw) > _APPROVAL_LIMIT or len(raw) != before.st_size
+                or identity(before) != identity(after) or identity(after) != identity(current)):
+            raise ValueError
+        return bytes(raw)
+    finally:
+        os.close(fd)
+
+
+def _approval_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError
+        result[key] = value
+    return result
+
+
+def _approval_constant(value: str) -> Any:
+    raise ValueError
+
+
+def _approval_float(value: str) -> float:
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError
+    return result
+
+
+def _approval_time(value: Any) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError
+    result = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if result.tzinfo is None:
+        raise ValueError
+    return result
+
+
 def load_approval() -> dict[str, Any]:
     try:
         path = Path(os.environ["VA_LSE_PILOT_APPROVAL_FILE"])
-        if not path.is_absolute() or path.stat().st_size > 65536:
-            raise ValueError
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict) or data.get("schema_version") != 1:
+        data = json.loads(_approval_bytes(path).decode("utf-8"), object_pairs_hook=_approval_pairs,
+                          parse_constant=_approval_constant, parse_float=_approval_float)
+        if (not isinstance(data, dict) or type(data.get("schema_version")) is not int
+                or data["schema_version"] != 1):
             raise ValueError
         now = datetime.now(timezone.utc)
-        start = datetime.fromisoformat(data["approved_at"].replace("Z", "+00:00"))
-        expiry = datetime.fromisoformat(data["expires_at"].replace("Z", "+00:00"))
+        start = _approval_time(data["approved_at"])
+        expiry = _approval_time(data["expires_at"])
         if not start <= now < expiry or (expiry - start).total_seconds() > 30 * 86400:
             raise ValueError
         for name in EVIDENCE_FIELDS:
             if not isinstance(data.get(name), str) or not data[name].strip():
                 raise ValueError
         revision = os.getenv("VA_LSE_BUILD_SHA", "").strip()
-        if not revision or data.get("reviewed_revision") != revision:
+        if not re.fullmatch(r"[0-9a-f]{40}", revision) or data.get("reviewed_revision") != revision:
             raise ValueError
         for name in ("deployment_url", "issuer", "provider_base_url"):
             https_url(data.get(name))
         for name in ("subjects", "operators", "models"):
             if (not isinstance(data.get(name), list) or not data[name]
-                    or any(not isinstance(v, str) or not v.strip() for v in data[name])):
+                    or any(not isinstance(v, str) or not v or v != v.strip()
+                           or any(ord(c) < 32 or ord(c) == 127 for c in v) for v in data[name])
+                    or len(set(data[name])) != len(data[name])):
                 raise ValueError
         if len(data["subjects"]) > 10 or not set(data["operators"]).issubset(data["subjects"]):
             raise ValueError
@@ -96,7 +166,7 @@ def load_approval() -> dict[str, Any]:
         from .pilot_budget import policy
         policy(data)
         return data
-    except (KeyError, ValueError, TypeError, OSError, OverflowError) as exc:
+    except (KeyError, ValueError, TypeError, OSError, OverflowError, RecursionError) as exc:
         raise PilotBlocked("Pilot admission is closed. The operator must supply current, "
                            "revision-specific review evidence and an invitation list.") from exc
 

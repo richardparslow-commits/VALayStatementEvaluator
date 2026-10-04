@@ -1,7 +1,7 @@
 # AlertManager configuration.
 #
-# The routing below is deliberately a working default rather than an empty one: it
-# splits by severity, which is the only decision this file has to get right. Wire
+# This generic routing example splits by severity but has no notification
+# integration configured. It is not controlled-pilot acceptance evidence. Wire
 # one real receiver (Slack or email is enough for a small business) and the
 # `critical` route is what wakes someone up.
 route:
@@ -27,7 +27,7 @@ route:
       repeat_interval: 12h
 
 receivers:
-  # Prints to the AlertManager log. Replace or extend before relying on this:
+  # These empty receivers deliver no notifications. Replace or extend before relying on this:
   # an alert nobody sees is the same as no alert at all.
   - name: default
 
