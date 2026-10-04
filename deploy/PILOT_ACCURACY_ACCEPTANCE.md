@@ -32,6 +32,9 @@ before agreeing to it. The generic topic checks deliberately avoid inventing
 legal determinations. R11 legal/authority review is a separate gate. A reviewer
 may need additional cases, explicit claim-level expected verdicts or A–O rows;
 add them before freezing and recollect the entire agreed matrix after changes.
+The v1 scenario/dimension taxonomy is fixed to the listed categories. Additional
+cases/checkpoints can use those categories; a new category/dimension requires a
+reviewed assessor source change, a new frozen plan and fresh acceptance evidence.
 These small cases do not establish large-document, condition-specific or
 population-wide accuracy. Include additional scale, domain and held-out cases
 before claiming those capabilities.
@@ -81,7 +84,10 @@ cannot pass assessment. Fill its non-secret fields in a private local copy:
 `approval_reference`, and `request_profiles`. Each profile has `id`, `model`,
 `version_reference`, and a nonempty `parameters` object containing the complete
 effective request settings (including output cap, temperature/reasoning where
-used and tier). Different phase settings need different profiles. Keep `tools`
+used and tier). Each profile also requires a `phase` name and nonempty distinct
+`required_pathways` list (`evaluate`, `draft`, or both). Different phase settings
+need different profiles. Every required profile/pathway pair must actually be
+exercised; requests must name the matching phase. Keep `tools`
 and `fallbacks` empty. Never include API keys or environment/secret dumps.
 
 The existing $250 pilot proposal is not new approval for a benchmark's costs.
@@ -96,8 +102,8 @@ There is no paid collection command in this tool and no live CI benchmark.
 Use a clean checkout of the exact committed revision to be evaluated. Store
 local artifacts under `accuracy-evidence/` (excluded from Git and Docker), with
 operator-approved permissions, retention and deletion. The source snapshot
-records revision/tree and SHA-256 of tracked application modules, knowledge and
-runtime lock bytes. Full modules bind prompt templates and pipeline code without
+records revision/tree and SHA-256 of every tracked file under `app/` (including
+runtime JSON data), plus runtime lock bytes. Full modules bind prompt templates and pipeline code without
 loading settings, clients, `.env` or secrets. Tracked bytes must match Git objects;
 untracked nonignored code or changed knowledge prevents freezing.
 
@@ -147,7 +153,7 @@ The offline assessor accepts this evidence contract:
 | Results | `agreement_sha256`; `runs` with exactly one entry for each case × pathway (`evaluate`/`draft`) × repetition (1-based) |
 | Each run | `case_id`, `pathway`, `repetition`, `input_sha256` of the exact case `inputs`, frozen `source_tree`, `configuration_sha256`, `origin` matching the case, `started_at`, `finished_at`, `provider_evidence_reference`, full `output`, and `requests`; injected case also needs `fault_injection_reference` |
 | Output | `status` (`complete`, `blocked`, `partial`, `error`), nonempty `result` object containing the complete app result/partial failure evidence |
-| Each request | `profile_id`, unique `request_id`, `returned_model`, `version_reference`, effective `parameters`, full nonempty `system`, `user`, `response` text |
+| Each request | `profile_id`, matching `phase`, unique `request_id`, `returned_model`, `version_reference`, effective `parameters`, full nonempty `system`, `user`, `response` text |
 | Review | `agreement_sha256`, `results_sha256`, `completed_at`; `signatures` for all three reviewer IDs, each with `signature_reference`; independent `ratings` and `adjudications` |
 | Each rating | `case_id`, `pathway`, integer `repetition`, `checkpoint_id`, `reviewer_id`; boolean `passed`; integer `unflagged_critical_changes`, `false_contradictions`, `missed_critical_facts` (all ≥0); `rationale`; `output_pointer` resolving into that run's output |
 | Adjudication | Same rating fields, QA `reviewer_id` and `signature_reference`; exactly one for each disputed judgment/count, retaining both original ratings |
@@ -158,7 +164,9 @@ judge every checkpoint independently, including negative findings and coverage
 gaps. An output pointer is a JSON pointer such as `/result/revised_statement` or
 `/result/digest/facts/0`; it locates evidence, not semantic proof. Record multiple
 locations and detailed error occurrences in the rationale/external review record.
-Each model request profile must be exercised somewhere in the complete matrix.
+Each model/phase profile must be exercised in every pathway that its pre-agreed
+`required_pathways` lists. Conditional phases may need extra cases to exercise
+them; do not remove an intended phase's coverage requirement after collection.
 
 ```sh
 python scripts/accuracy_benchmark.py assess \
@@ -173,7 +181,12 @@ Malformed, duplicate, incomplete, stale or mismatched evidence produces no
 assessment artifact and exit 2. A complete failing package produces `NO_GO` and
 exit 2. Submitted attestations within the proposed thresholds produce
 `REVIEW_READY` and exit 0. An incomplete ordinary actual-provider action always
-produces `NO_GO`, even if submitted judgments claim success. Every assessment says
+produces `NO_GO`, even if submitted judgments claim success. The assessor also
+checks the serialized application's rubric/topic policies, completion statuses,
+score fields, topic rows and claim/verdict coverage for evaluation, and current
+grounding policy, topic completeness and generated text for drafting. An outer
+`complete` label cannot override those missing/incomplete fields. These are
+structural checks; semantic support still requires reviewers. Every assessment says
 `pilot_admission: not_authorized_by_this_tool`. Hash binding cannot authenticate
 signatures, prove an actual provider call, prove corpus-only inputs or establish
 semantic correctness. A fabricated package can satisfy a local schema; the

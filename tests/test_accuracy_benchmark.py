@@ -8,6 +8,10 @@ from pathlib import Path
 
 from tests import hermetic  # noqa: E402,F401  (isolated test configuration)
 
+from tests.rubric_fixtures import scored_result_fields
+from tests.topic_fixtures import topic_result_fields
+from tests.grounding_fixtures import complete_grounding
+
 from app.accuracy_benchmark import (
     BenchmarkInvalid, assess, digest, prepare, read_json, source_snapshot, validate_corpus,
 )
@@ -25,6 +29,7 @@ class AccuracyBenchmarkTests(unittest.TestCase):
                        "region_reference": "fixture-only", "approval_reference": "fixture-only",
                        "tools": [], "fallbacks": [], "request_profiles": [{"id": "fixture",
                        "model": "invented-model-v1", "version_reference": "fixture-v1",
+                       "phase": "fixture-phase", "required_pathways": ["evaluate", "draft"],
                        "parameters": {"temperature": 0, "max_tokens": 100}}]}
         self.plan = prepare(self.corpus, self.source, self.config)
         people = [{"id": role, "role": role, "qualification_reference": "fixture-only",
@@ -45,12 +50,23 @@ class AccuracyBenchmarkTests(unittest.TestCase):
         for case in self.corpus["cases"]:
             for pathway in ("evaluate", "draft"):
                 identity = {"case_id": case["id"], "pathway": pathway, "repetition": 1}
+                result = {"text": "invented test output"}
+                if pathway == "evaluate":
+                    result.update(scored_result_fields())
+                    result.update(topic_result_fields())
+                    result.update(verification_policy="uploaded_source_unit_v1",
+                                  claims=[{"id":1,"text":case["inputs"]["account"]}],
+                                  verifications=[{"id":1,"verdict":"NOT FOUND"}])
+                else:
+                    result.update(draft=case["inputs"]["account"],
+                                  grounding_policy="retained_fact_full_quote_source_unit_v1",
+                                  grounding=complete_grounding(case["inputs"]["account"]))
                 run = {**identity, "input_sha256": digest(case["inputs"]), "source_tree": self.source["tree"],
                        "configuration_sha256": digest(self.config), "origin": case["origin"],
                        "provider_evidence_reference": "invented-fixture-only",
                        "started_at": "2020-01-02T00:00:00Z", "finished_at": "2020-01-03T00:00:00Z",
-                       "output": {"status": "complete", "result": {"text": "invented test output"}},
-                       "requests": [{"profile_id": "fixture", "request_id": case["id"] + pathway,
+                       "output": {"status": "complete", "result": result},
+                       "requests": [{"profile_id": "fixture", "phase":"fixture-phase", "request_id": case["id"] + pathway,
                                      "returned_model": "invented-model-v1", "version_reference": "fixture-v1",
                                      "parameters": self.config["request_profiles"][0]["parameters"],
                                      "system": "invented fixture", "user": "invented fixture",
@@ -130,7 +146,7 @@ class AccuracyBenchmarkTests(unittest.TestCase):
     def test_profile_settings_version_and_model_must_match(self):
         request = self.results["runs"][0]["requests"][0]
         for field, value in (("parameters", {}), ("version_reference", "different-version"),
-                             ("returned_model", "fallback-model"), ("profile_id", "unknown")):
+                             ("returned_model", "fallback-model"), ("profile_id", "unknown"), ("phase", "wrong-phase")):
             with self.subTest(field=field):
                 old = request[field]
                 request[field] = value
@@ -216,6 +232,42 @@ class AccuracyBenchmarkTests(unittest.TestCase):
                 self.assertEqual(result["disposition"], "NO_GO")
                 for row in self.review["ratings"][:2]: row[metric] = True if metric == "passed" else 0
 
+    def test_internal_evaluation_and_drafting_incomplete_cannot_be_labeled_complete(self):
+        eval_result=self.results["runs"][0]["output"]["result"]
+        for field,value in (("scoring_status","incomplete"),("topic_status","incomplete"),
+                            ("topic_rows",[]),("verifications",[]),("scores",{})):
+            with self.subTest(field=field):
+                old=eval_result[field]
+                eval_result[field]=value
+                self.bind_results()
+                self.assertEqual(self.check()["disposition"],"NO_GO")
+                eval_result[field]=old
+        draft_result=self.results["runs"][1]["output"]["result"]
+        for field,value in (("grounding",{}),("grounding_policy","legacy"),("draft","")):
+            with self.subTest(field=field):
+                old=draft_result[field]
+                draft_result[field]=value
+                self.bind_results()
+                self.assertEqual(self.check()["disposition"],"NO_GO")
+                draft_result[field]=old
+
+    def test_profile_must_run_in_each_required_pathway(self):
+        new_config=copy.deepcopy(self.config)
+        new_config["request_profiles"].append({**new_config["request_profiles"][0], "id":"both-pathways"})
+        self.plan=prepare(self.corpus,self.source,new_config)
+        self.agreement["plan_sha256"]=self.plan["plan_sha256"]
+        for bundle in (self.results,self.review):
+            bundle["plan_sha256"]=self.plan["plan_sha256"]
+            bundle["agreement_sha256"]=digest(self.agreement)
+        for run in self.results["runs"]:
+            run["configuration_sha256"]=digest(new_config)
+            if run["pathway"]=="evaluate":
+                request=copy.deepcopy(run["requests"][0])
+                request.update(profile_id="both-pathways",request_id=request["request_id"]+"additional")
+                run["requests"].append(request)
+        self.bind_results()
+        self.invalid()
+
     def test_duplicate_json_keys_and_nonfinite_numbers_block(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "fixture.json"
@@ -246,17 +298,18 @@ class AccuracyBenchmarkTests(unittest.TestCase):
             (repo / "app/knowledge").mkdir(parents=True)
             (repo / "app/example.py").write_text("pass\n")
             (repo / "app/knowledge/example.md").write_text("invented\n")
+            (repo / "app/condition_topics.json").write_text('{"fixture":true}\n')
             subprocess.run(["git", "-C", str(repo), "add", "app"], check=True)
             subprocess.run(["git", "-C", str(repo), "-c", "user.name=Fixture", "-c",
                             "user.email=fixture@example.invalid", "commit", "-qm", "fixture"], check=True)
             snapshot = source_snapshot(repo)
-            self.assertEqual(len(snapshot["file_sha256"]), 2)
+            self.assertEqual(len(snapshot["file_sha256"]), 3)
             (repo / "app/untracked.py").write_text("pass\n")
             with self.assertRaises(BenchmarkInvalid): source_snapshot(repo)
             (repo / "app/untracked.py").unlink()
             # Git's assume-unchanged must not hide altered prompt/knowledge bytes.
-            subprocess.run(["git", "-C", str(repo), "update-index", "--assume-unchanged", "app/example.py"], check=True)
-            (repo / "app/example.py").write_text("raise Exception\n")
+            subprocess.run(["git", "-C", str(repo), "update-index", "--assume-unchanged", "app/condition_topics.json"], check=True)
+            (repo / "app/condition_topics.json").write_text('{"fixture":false}\n')
             with self.assertRaises(BenchmarkInvalid): source_snapshot(repo)
 
 

@@ -8,11 +8,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from types import SimpleNamespace
 from urllib.parse import urlsplit
+
+from .rubric_validation import rubric_is_complete
 
 SCHEMA = 1
 DIMENSIONS = {"extraction", "findings", "topic_applicability", "revision",
@@ -76,7 +80,7 @@ def source_snapshot(repo: Path) -> dict[str, Any]:
     names = git("ls-tree", "-r", "--name-only", "HEAD", "app", "requirements.lock").splitlines()
     fingerprints = {}
     for name in names:
-        if name.endswith((".py", ".md")) or name == "requirements.lock":
+        if name.startswith("app/") or name == "requirements.lock":
             path = repo / name
             require(path.is_file() and not path.is_symlink(), "Source file is missing or linked.")
             raw = path.read_bytes()
@@ -161,9 +165,81 @@ def validate_configuration(configuration: dict[str, Any]) -> dict[str, dict[str,
         require(text(profile.get("model")) and text(profile.get("version_reference"))
                 and isinstance(profile.get("parameters"), dict) and bool(profile["parameters"]),
                 "Exact model/version and effective parameters required for each profile.")
+        require(text(profile.get("phase")) and isinstance(profile.get("required_pathways"), list)
+                and bool(profile["required_pathways"])
+                and len(set(profile["required_pathways"])) == len(profile["required_pathways"])
+                and set(profile["required_pathways"]).issubset({"evaluate", "draft"}),
+                "Each request profile must name its phase and required pathways.")
         profiles[profile["id"]] = profile
     require(bool(profiles), "All effective request profiles must be recorded.")
     return profiles
+
+
+def internal_complete(pathway: str, result: dict[str, Any]) -> bool:
+    """Validate offline serialized completion independently of the outer label.
+
+    Rubric uses the existing pure validator. Other checks stay here so assessment
+    never imports UI, settings, telemetry or LLM clients. Full semantic support
+    and the complete serialized payload remain independent review requirements.
+    """
+    if pathway == "evaluate":
+        if (not rubric_is_complete(SimpleNamespace(**result))
+                or result.get("topic_policy") != "complete_evaluation_topics_v1"
+                or result.get("topic_status") != "complete"
+                or result.get("verification_policy") != "uploaded_source_unit_v1"
+                or not text(result.get("topic_focus"))
+                or not isinstance(result.get("topic_notes"), str)
+                or not isinstance(result.get("topic_critical_gaps"), list)):
+            return False
+        rows = result.get("topic_rows")
+        if not isinstance(rows, list) or len(rows) != 15:
+            return False
+        labels = set()
+        for row in rows:
+            if not isinstance(row, dict) or set(row) != {"topic", "applicable", "coverage", "evidence", "gap_note"}:
+                return False
+            match = re.match(r"^([A-O])(?:\s*[.():\-–—]|\s|$)", str(row["topic"]))
+            if (not match or match[1] in labels or type(row["applicable"]) is not bool
+                    or row["coverage"] not in {"covered", "partial", "absent", "not applicable"}
+                    or not isinstance(row["evidence"], str) or not isinstance(row["gap_note"], str)
+                    or (row["coverage"] == "not applicable") == row["applicable"]):
+                return False
+            labels.add(match[1])
+        claims, verdicts = result.get("claims"), result.get("verifications")
+        if not isinstance(claims, list) or not claims or not isinstance(verdicts, list):
+            return False
+        ids = [c.get("id") for c in claims if isinstance(c, dict)]
+        verified = [v.get("id") for v in verdicts if isinstance(v, dict)]
+        if (len(ids) != len(claims) or len(verified) != len(verdicts)
+                or any(type(i) is not int for i in ids + verified)
+                or len(set(ids)) != len(ids) or len(ids) != len(verified) or set(ids) != set(verified)):
+            return False
+        return all(v.get("verdict") in {"SUPPORTED", "PARTIALLY SUPPORTED", "CONTRADICTED", "NOT FOUND"}
+                   for v in verdicts)
+    if (not text(result.get("draft"))
+            or result.get("grounding_policy") != "retained_fact_full_quote_source_unit_v1"):
+        return False
+    grounding = result.get("grounding")
+    if not isinstance(grounding, dict):
+        return False
+    for field in ("supported_observations", "unverified_observations", "conflicts",
+                  "suggested_inclusions", "strengthening_questions", "topic_coverage"):
+        if not isinstance(grounding.get(field), list):
+            return False
+    topics = grounding["topic_coverage"]
+    labels = set()
+    for row in topics:
+        if not isinstance(row, dict) or not text(row.get("topic")):
+            return False
+        match = re.match(r"^([A-O])(?:\s*[.():\-–—]|\s|$)", row["topic"])
+        if (not match or match[1] in labels or type(row.get("applicable")) is not bool
+                or type(row.get("covered")) is not bool
+                or (row["covered"] and not row["applicable"])
+                or not isinstance(row.get("prompt_for_witness"), str)
+                or bool(row["prompt_for_witness"].strip()) != (row["applicable"] and not row["covered"])):
+            return False
+        labels.add(match[1])
+    return labels == set("ABCDEFGHIJKLMNO")
 
 
 def check_pointer(pointer: Any, output: dict[str, Any]) -> None:
@@ -236,7 +312,7 @@ def assess(plan: dict[str, Any], agreement: dict[str, Any], results: dict[str, A
     expected = {(c, p, n) for c in cases for p in ("evaluate", "draft")
                 for n in range(1, plan["repetitions"] + 1)}
     runs: dict[tuple[str, str, int], dict[str, Any]] = {}
-    used_profiles: set[str] = set()
+    used_profiles: set[tuple[str, str]] = set()
     request_ids: set[str] = set()
     incomplete_runs = 0
     for run in results["runs"]:
@@ -254,7 +330,8 @@ def assess(plan: dict[str, Any], agreement: dict[str, Any], results: dict[str, A
         output = run["output"]
         require(isinstance(output, dict) and output.get("status") in {"complete", "blocked", "partial", "error"}
                 and isinstance(output.get("result"), dict) and bool(output["result"]), "Complete output or failure evidence required.")
-        if case["origin"] == "actual_provider" and output["status"] != "complete":
+        if case["origin"] == "actual_provider" and (output["status"] != "complete"
+                                                  or not internal_complete(run["pathway"], output["result"])):
             incomplete_runs += 1
         if case["origin"] == "fault_injection":
             require(text(run.get("fault_injection_reference")), "Truncation injection evidence required.")
@@ -265,15 +342,20 @@ def assess(plan: dict[str, Any], agreement: dict[str, Any], results: dict[str, A
             assert profile is not None
             require(request.get("returned_model") == profile["model"]
                     and request.get("version_reference") == profile["version_reference"]
-                    and request.get("parameters") == profile["parameters"], "Effective model/version/settings changed.")
+                    and request.get("parameters") == profile["parameters"]
+                    and request.get("phase") == profile["phase"]
+                    and run["pathway"] in profile["required_pathways"], "Effective model/version/settings/phase changed.")
             require(text(request.get("request_id")) and request["request_id"] not in request_ids,
                     "Missing or reused provider request ID.")
             request_ids.add(request["request_id"])
-            used_profiles.add(profile["id"])
+            used_profiles.add((profile["id"], run["pathway"]))
             for field in ("system", "user", "response"):
                 require(text(request.get(field)), "Full synthetic prompts and responses required.")
         runs[run_key] = run
-    require(set(runs) == expected and used_profiles == set(profiles), "Not all runs or configured model profiles were exercised.")
+    required_profiles = {(profile["id"], pathway) for profile in profiles.values()
+                         for pathway in profile["required_pathways"]}
+    require(set(runs) == expected and used_profiles == required_profiles,
+            "Not all runs or required phase/model profiles were exercised in each pathway.")
     targets = {(c, p, n, check["id"]) for c, p, n in expected for check in cases[c]["checkpoints"]}
     ratings: dict[tuple[str, str, int, str], dict[str, tuple[bool, int, int, int]]] = {}
     for row in review["ratings"]:
