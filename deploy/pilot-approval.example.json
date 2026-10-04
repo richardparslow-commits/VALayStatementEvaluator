@@ -26,6 +26,7 @@
   "participant_notice": "",
   "local_log_retention_days": null,
   "spending_controls": "",
+  "ingestion_security": "",
   "text_export_policy": {
     "enabled": false,
     "formats": ["txt"],

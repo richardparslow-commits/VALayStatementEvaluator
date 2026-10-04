@@ -85,7 +85,7 @@ class ApprovalTests(unittest.TestCase):
         for value in (True, 1.0, "1", None):
             self.write({"schema_version": value})
             self.refused()
-        self.assertEqual(len(pilot.EVIDENCE_FIELDS), 8)
+        self.assertEqual(len(pilot.EVIDENCE_FIELDS), 9)
         for field in pilot.EVIDENCE_FIELDS:
             for value in ("", " ", None, 1):
                 with self.subTest(field=field, value=value):

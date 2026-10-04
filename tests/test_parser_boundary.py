@@ -168,9 +168,7 @@ class ProtocolTests(unittest.TestCase):
         value['label'] = req['label'] = 'records.zip'
         value['documents'][0]['filename'] = 'records/folder/one.txt'
         self.assertEqual(_documents(value, req, IMAGE)[0][0].filename, 'records/folder/one.txt')
-        value['documents'][0]['filename'] = 'records/sub/../record.txt'
-        self.assertEqual(_documents(value, req, IMAGE)[0][0].filename, 'records/sub/../record.txt')
-        for name in ('other/one.txt', 'records//absolute.txt'):
+        for name in ('other/one.txt', 'records//absolute.txt', 'records/sub/../record.txt'):
             value['documents'][0]['filename'] = name
             with self.subTest(name=name), self.assertRaises(wire.ParserRefused):
                 _documents(value, req, IMAGE)

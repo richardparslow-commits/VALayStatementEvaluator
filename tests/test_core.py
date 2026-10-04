@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
+from tests.ingestion_fixtures import CONTENT_TYPES, RELATIONSHIPS
 
 from app.documents import (  # noqa: E402
     ExtractionError,
@@ -53,6 +54,8 @@ class TestExtraction(unittest.TestCase):
         )
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("[Content_Types].xml", CONTENT_TYPES)
+            archive.writestr("_rels/.rels", RELATIONSHIPS)
             archive.writestr("word/document.xml", xml)
             for name, payload in (extra_entries or {}).items():
                 archive.writestr(name, payload)
@@ -87,7 +90,7 @@ class TestExtraction(unittest.TestCase):
 
     def test_docx_rejects_total_uncompressed_size_over_limit(self):
         docx = self._make_docx_bytes(extra_entries={"customXml/item1.xml": b"A" * 300})
-        with patch.object(config, "DOCX_MAX_INTERNAL_FILE_BYTES", 500), patch.object(
+        with patch.object(config, "DOCX_MAX_INTERNAL_FILE_BYTES", 1_000), patch.object(
             config, "DOCX_MAX_TOTAL_UNCOMPRESSED_BYTES", 400
         ):
             with self.assertRaises(ExtractionError) as exc:
@@ -263,6 +266,8 @@ class TestLocalPathLoading(unittest.TestCase):
         )
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("[Content_Types].xml", CONTENT_TYPES)
+            archive.writestr("_rels/.rels", RELATIONSHIPS)
             archive.writestr("word/document.xml", xml)
         return buffer.getvalue()
 

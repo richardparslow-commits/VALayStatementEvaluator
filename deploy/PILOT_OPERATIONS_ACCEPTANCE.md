@@ -45,9 +45,9 @@ to satisfy this checklist. New storage/destinations require separate review.
    effective configuration hashes privately; redacted references go in evidence.
 4. Bind the actual origin, issuer, invited roles, exact approved provider model
    versions, account/region, notice, retention and quota-policy hashes. The
-   runtime manifest has **eight** required references: `provider_terms`,
+   runtime manifest has **nine** required references: `provider_terms`,
    `retention_policy`, `privacy_review`, `legal_review`, `accuracy_validation`,
-   `deployment_validation`, `incident_response`, `spending_controls`.
+   `deployment_validation`, `incident_response`, `spending_controls`, `ingestion_security`.
 5. Verify the approval is an absolute-path regular file owned by root or the
    runtime user, with no group/world write permission. Use an operator-controlled
    read-only mount and protect host parent directories and replacement authority
@@ -91,7 +91,7 @@ The operator must manually verify completeness and authenticity before release.
 | ID | Exercise and acceptance evidence |
 |---|---|
 | O01 | Verify clean source/provenance, locked dependencies, all image scans and actual immutable image identities match the tested release. |
-| O02 | Reconcile the actual origin/access, issuer/roles, account/model versions, effective configuration and all eight accepted evidence references. |
+| O02 | Reconcile the actual origin/access, issuer/roles, account/model versions, effective configuration and all nine accepted evidence references. |
 | O03 | Inspect file ownership/mode, read-only mount, protected host parents and update authority; verify exact SHA and current approval of at most 30 days. |
 | O04 | With synthetic approval copies, exercise missing/expired/mismatched revision, duplicate fields, short SHA, invalid timestamp, symlink and writable file. Admission closes before controls/provider work; restoring a valid file alone does not constitute release approval. |
 | O05 | Cold start with no browser connected. Demonstrate log writers/idle cleanup, exclusive ledger lease and private health initialization. Missing approval/retention/parser dependencies prevent admission. |
@@ -184,6 +184,6 @@ this repository's examples.
 Only after accepted actual results and all other pilot gates are satisfied may
 authorized reviewers sign the exact revision/configuration/evidence decision
 and the operator reference it in `deployment_validation` and `incident_response`.
-Verify both are current and genuine; eight nonblank strings alone are insufficient.
+Verify both are current and genuine; nine nonblank strings alone are insufficient.
 R12 preparation does not close R13 participant accessibility/comprehension or
 authorize public expansion.

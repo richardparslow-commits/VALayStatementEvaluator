@@ -139,7 +139,9 @@ def records_uploader(slot: str) -> list:
         type=["pdf", "txt", "md", "docx", "zip"],
         accept_multiple_files=True,
         key=f"files_{slot}",
-        help="Upload one file at a time. A pilot case can retain up to 32 uploaded files and record versions."
+        help="Upload one file at a time. A pilot case can retain up to 32 uploaded files and record versions. "
+             "Use passive documents and UTF-8 text. PDF/Word files with scripts, attachments, macros, or external links "
+             "are refused; keep the original and upload a passive copy."
              if pilot.enabled() else None,
     )
     # Enforce upload size caps before extraction so the tight 50 MB default

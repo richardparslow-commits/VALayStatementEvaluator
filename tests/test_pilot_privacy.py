@@ -348,6 +348,7 @@ class TestNoticeLifecycle(unittest.TestCase):
     def test_policy_provider_model_and_review_changes_require_fresh_consent(self):
         for field, value in (('local_log_retention_days', 1), ('provider_terms', 'new terms'),
                              ('privacy_review', 'new review'), ('retention_policy', 'new policy'),
+                             ('ingestion_security', 'new ingestion policy review'),
                              ('provider_base_url', 'https://new.example.test'), ('models', ['new-model'])):
             original = self.data[field]
             with self.subTest(field=field):

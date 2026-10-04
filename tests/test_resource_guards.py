@@ -475,6 +475,6 @@ class UiResourceTests(unittest.TestCase):
         skipped = []
         with patch.object(zipfile, "ZipFile", return_value=archive), \
                 patch.object(config, "ZIP_MAX_MEMBER_BYTES", 8), patch.object(config, "ZIP_MAX_TOTAL_UNCOMPRESSED_BYTES", 16):
-            self.assertEqual(list(documents.iter_archive_members("invented.zip", b"", skipped)), [])
+            self.assertEqual(list(documents.iter_archive_members("invented.zip", b"PK\x03\x04", skipped)), [])
         self.assertEqual(len(skipped), 1)
         self.assertIn("actual expansion", skipped[0])
