@@ -128,9 +128,8 @@ class TestFilesystemBlobStore(unittest.TestCase):
         hostile = BlobRef(key="blobs/../etc/passwd", size=0, sha256="", backend="filesystem")
         with self.assertRaises(BlobStoreError):
             self.store.get(hostile)
-        # delete() is deliberately best-effort (it only logs), so the guarantee is
-        # that it does not touch the filesystem — not that it raises.
-        self.store.delete(hostile)
+        with self.assertRaises(BlobStoreError):
+            self.store.delete(hostile)
         self.assertFalse((Path(self._tmp.name).parent / "etc" / "passwd").exists())
 
     def test_keys_outside_the_blob_namespace_are_refused(self):

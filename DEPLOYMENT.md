@@ -575,6 +575,19 @@ retry has fewer expired files to visit. Lock acquisition times out after five
 seconds. Slow filesystem calls still need the orchestrator deadline; failed or
 incomplete passes must be retried and alerted on.
 
+**R16 restriction:** All durable blob factories, cached stores, direct operations
+and cleanup are synthetic-only; controlled-pilot and unknown modes refuse before
+storage contact. Filesystem explicit delete now raises on failure. Legacy S3 delete
+requires a successfully queried never-versioned bucket, rejects marker/version
+responses, checks object absence and rechecks versioning. Enabled/Suspended,
+unknown/unqueryable states, unsupported S3-compatible semantics, denied verification
+and recreated objects refuse or remain unconfirmed. This path requires bucket
+versioning inspection plus object head/delete permissions. It does not purge versions,
+replicas, backups, other cases or provider copies. Raw blob deletion lacks authenticated
+case inventory/tombstones and ownership-aware shared references. Follow the
+[R16 design/acceptance procedure](deploy/PILOT_DELETION_ACCEPTANCE.md) before any
+separate real-information durable storage implementation; no setting enables it here.
+
 Writes perform a rate-limited cleanup, but idle storage needs an independent schedule:
 
 ```bash

@@ -47,6 +47,12 @@ and its `spending_controls` evidence reference stays empty.
   `scripts/queue_review.py` worksheet do not enable queues. Distributed consent,
   shared spending and R16 durable case deletion still require separate implementation
   and actual acceptance before any real-information queue capability.
+- Durable blob factories/cached stores, direct filesystem/S3 access and cleanup
+  refuse non-synthetic modes. Follow the [R16 deletion procedure](deploy/PILOT_DELETION_ACCEPTANCE.md)
+  before any separate durable case release. The current raw blob API is not an
+  authenticated case deletion service; session clearing, TTL and a successful
+  object delete do not establish removal of all retained copies. No setting or
+  worksheet enables durable real-information storage in this release.
 - Record text and model reports render as literal text, preventing embedded
   Markdown images or HTML assets from contacting outside services.
   Pilot status messages use fixed markup with escaped text and alert/status roles.
