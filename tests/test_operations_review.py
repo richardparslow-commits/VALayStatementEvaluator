@@ -24,7 +24,8 @@ class OperationsReviewTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.repo = Path(directory.name) / "source"
         self.repo.mkdir()
-        for name in (*EXTRA, "requirements.lock", "app/pilot.py", "app/knowledge/legal_framework.md"):
+        for name in (*EXTRA, "requirements.lock", "app/pilot.py", "app/knowledge/legal_framework.md",
+                     "run_app.py", "requirements-parser.lock", "scripts/backup_audit_logs.py"):
             target = self.repo / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / name, target)
@@ -71,6 +72,8 @@ class OperationsReviewTests(unittest.TestCase):
         self.assertTrue(set(EXTRA).issubset(fingerprints))
         self.assertIn("app/pilot.py", fingerprints)
         self.assertIn("requirements.lock", fingerprints)
+        for name in ("run_app.py", "requirements-parser.lock", "scripts/backup_audit_logs.py"):
+            self.assertIn(name, fingerprints)
         self.assertEqual(packet, prepare_packet(self.repo))
 
     def test_dirty_or_untracked_source_is_refused(self):
@@ -88,7 +91,8 @@ class OperationsReviewTests(unittest.TestCase):
                     path.unlink()
 
     def test_hidden_index_changes_cannot_escape_source_binding(self):
-        for name in ("app/pilot.py", "deploy/PILOT_OPERATIONS_ACCEPTANCE.md"):
+        for name in ("app/pilot.py", "deploy/PILOT_OPERATIONS_ACCEPTANCE.md", "run_app.py",
+                     "requirements-parser.lock", "scripts/backup_audit_logs.py"):
             with self.subTest(name=name):
                 self.git("update-index", "--assume-unchanged", name)
                 path = self.repo / name
@@ -99,6 +103,18 @@ class OperationsReviewTests(unittest.TestCase):
                     prepare_packet(self.repo)
                 path.write_bytes(raw)
                 self.git("update-index", "--no-assume-unchanged", name)
+
+    def test_binary_build_assets_are_hashed_and_compared_without_text_decoding(self):
+        asset = self.repo / "release-asset.bin"
+        asset.write_bytes(b"\xff\x00INVENTED_BINARY_FIXTURE")
+        self.git("add", "-f", "release-asset.bin")
+        self.git("commit", "-qm", "Invented binary build input")
+        self.assertIn("release-asset.bin", prepare_packet(self.repo)["source"]["file_sha256"])
+        self.git("update-index", "--assume-unchanged", "release-asset.bin")
+        asset.write_bytes(b"\x80\x00INVENTED_CHANGED_ASSET")
+        self.assertEqual(self.git("status", "--porcelain"), "")
+        with self.assertRaises(BenchmarkInvalid):
+            prepare_packet(self.repo)
 
     def test_missing_required_tracked_deployment_file_is_refused(self):
         self.git("rm", "-q", "deploy/monitoring/alertmanager.yml")

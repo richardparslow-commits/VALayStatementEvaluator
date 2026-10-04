@@ -77,7 +77,7 @@ def _approval_bytes(path: Path) -> bytes:
     try:
         before = os.fstat(fd)
         if (not stat.S_ISREG(before.st_mode) or before.st_uid not in (0, os.geteuid())
-                or before.st_mode & 0o022 or before.st_size > _APPROVAL_LIMIT):
+                or before.st_nlink != 1 or before.st_mode & 0o022 or before.st_size > _APPROVAL_LIMIT):
             raise ValueError
         raw = bytearray()
         while len(raw) <= _APPROVAL_LIMIT:
@@ -88,7 +88,7 @@ def _approval_bytes(path: Path) -> bytes:
         after = os.fstat(fd)
         current = path.lstat()
         def identity(value: os.stat_result) -> tuple[int, ...]:
-            return (value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+            return (value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_nlink,
                     value.st_size, value.st_mtime_ns, value.st_ctime_ns)
         if (len(raw) > _APPROVAL_LIMIT or len(raw) != before.st_size
                 or identity(before) != identity(after) or identity(after) != identity(current)):

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -9,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from app.accuracy_benchmark import BenchmarkInvalid, digest, source_snapshot
+from app.accuracy_benchmark import BenchmarkInvalid, digest, require, source_snapshot
 from app.pilot import EVIDENCE_FIELDS
 from scripts.legal_review import committed_text
 
@@ -55,8 +56,27 @@ CHECKS = (
 
 def prepare_packet(repo: Path) -> dict[str, Any]:
     source = source_snapshot(repo)
-    for name in tuple(source["file_sha256"]):
-        committed_text(repo, name, source)
+    tracked = subprocess.check_output(["git", "-C", str(repo), "ls-tree", "-r", "-z", "HEAD"],
+                                      stderr=subprocess.PIPE).split(b"\0")
+    for entry in tracked:
+        if not entry:
+            continue
+        metadata, raw_name = entry.split(b"\t", 1)
+        mode, kind, _ = metadata.split()
+        name = raw_name.decode("utf-8")
+        relative = Path(name)
+        require(mode in (b"100644", b"100755") and kind == b"blob"
+                and not relative.is_absolute() and ".." not in relative.parts,
+                "Every tracked release input must be a regular source file.")
+        path = repo / relative
+        require(path.is_file() and not any(repo.joinpath(*relative.parts[:i]).is_symlink()
+                                          for i in range(1, len(relative.parts) + 1)),
+                "Release inputs must not be linked.")
+        raw = path.read_bytes()
+        committed = subprocess.check_output(["git", "-C", str(repo), "show", f"HEAD:{name}"],
+                                            stderr=subprocess.PIPE)
+        require(raw == committed, "A tracked release input differs from the committed revision.")
+        source["file_sha256"][name] = hashlib.sha256(raw).hexdigest()
     for name in EXTRA:
         committed_text(repo, name, source)
     packet = {

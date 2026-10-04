@@ -52,7 +52,7 @@ to satisfy this checklist. New storage/destinations require separate review.
    runtime user, with no group/world write permission. Use an operator-controlled
    read-only mount and protect host parent directories and replacement authority
    from participants and the application. Runtime checks reject leaf symlinks,
-   nonregular files, oversized/changed reads, duplicate JSON keys, nonfinite
+   hard links, nonregular files, oversized/changed reads, duplicate JSON keys, nonfinite
    numbers, ambiguous identity/model lists, invalid timestamps and short release
    labels. These checks do not authenticate an attestation or secure the host's
    parent directories by themselves.
@@ -71,8 +71,9 @@ mkdir -p operations-evidence
 python scripts/operations_review.py --out operations-evidence/draft.json
 ```
 
-The tool binds tracked application/knowledge/dependency bytes and fixed deployment,
-monitoring and acceptance files. It refuses dirty, missing, linked or changed
+The tool compares and hashes every tracked release file, including binary assets,
+entrypoints, parser lockfiles and scripts copied by Docker, and requires the fixed
+deployment/monitoring/acceptance files. It refuses dirty, missing, linked or changed
 source, including hidden working changes. It reads no operator environment,
 approval file, credentials or records, calls no provider and performs no host
 probe. Existing outputs are preserved rather than overwritten.

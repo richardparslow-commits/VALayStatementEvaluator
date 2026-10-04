@@ -119,17 +119,24 @@ class ApprovalTests(unittest.TestCase):
             self.path.chmod(mode)
             self.refused()
 
+    def test_hardlinked_manifest_is_refused(self):
+        alias = self.path.with_name("writable-alias.json")
+        os.link(self.path, alias)
+        self.refused()
+        alias.unlink()
+        self.assertEqual(pilot.load_approval(), self.data)
+
     def test_foreign_owner_is_refused_and_root_readonly_mount_is_allowed(self):
         real_fstat = os.fstat
         def owner_stat(fd, owner):
             original = real_fstat(fd)
             return SimpleNamespace(**{key: getattr(original, key) for key in (
-                "st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")}, st_uid=owner)
+                "st_dev", "st_ino", "st_mode", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")}, st_uid=owner)
         with patch("os.fstat", side_effect=lambda fd: owner_stat(fd, os.geteuid() + 10000)):
             self.refused()
         original = self.path.lstat()
         root = SimpleNamespace(**{key: getattr(original, key) for key in (
-            "st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")}, st_uid=0)
+            "st_dev", "st_ino", "st_mode", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")}, st_uid=0)
         with patch("os.fstat", side_effect=lambda fd: owner_stat(fd, 0)), patch.object(Path, "lstat", return_value=root):
             self.assertEqual(pilot.load_approval(), self.data)
 
@@ -158,7 +165,7 @@ class ApprovalTests(unittest.TestCase):
         self.path.write_bytes(b" " * 70000)
         original = self.path.stat()
         reported = SimpleNamespace(**{key: getattr(original, key) for key in (
-            "st_dev", "st_ino", "st_mode", "st_uid", "st_mtime_ns", "st_ctime_ns")}, st_size=1)
+            "st_dev", "st_ino", "st_mode", "st_uid", "st_nlink", "st_mtime_ns", "st_ctime_ns")}, st_size=1)
         counts = []
         real_read = os.read
         def read(fd, count):
