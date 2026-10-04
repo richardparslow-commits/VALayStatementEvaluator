@@ -15,13 +15,20 @@ from app.factual_integrity import (FACTUAL_POLICY, MAX_SPANS, attach_review, bui
                                    compare, context_for_result, fingerprint, retained_inputs, review_markdown)
 from app.job_payload import draft_from_json, draft_to_json, evaluation_from_json, evaluation_to_json
 from app.medical_review import MedicalDigest, MedicalFact
-from tests.test_views import _fake_streamlit
+from tests.test_views import _fake_streamlit as _base_fake_streamlit
 from tests.rubric_fixtures import scored_result_fields
 from tests.topic_fixtures import topic_result_fields
 
 
 ACCOUNT = "I observed knee pain around 2020."
 QUOTE = "The patient denied right knee pain in June 2020."
+
+
+def _fake_streamlit():
+    st, session = _base_fake_streamlit()
+    # The full-passage reader uses a real selected source ID, as native widgets do.
+    st.selectbox.side_effect = lambda label, options, **kw: options[kw.get("index", 0)]
+    return st, session
 
 
 def result(account=ACCOUNT, text=None):

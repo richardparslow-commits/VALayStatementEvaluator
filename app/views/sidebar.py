@@ -268,7 +268,7 @@ def _job_queue_panel() -> None:
             blob_label = f"{blob.name} (shared)" if blob.is_shared else blob.name
         except Exception:  # noqa: BLE001
             blob_label = "unavailable"
-        st.dataframe(
+        pilot.dataframe(st,
             [
                 {"Setting": "Backend", "Value": backend.name},
                 {"Setting": "Distributed", "Value": "yes" if distributed else "no"},
@@ -384,7 +384,7 @@ def _audit_backup_panel() -> None:
             , container=st, method="warning")
 
         pending = payload.get("pending_bytes")
-        st.dataframe(
+        pilot.dataframe(st,
             [
                 {"Setting": "Status", "Value": status},
                 {
@@ -558,7 +558,7 @@ def _llm_failover_panel() -> None:
                 ),
             },
         ]
-        st.dataframe(rows, width="stretch", hide_index=True)
+        pilot.dataframe(st, rows, width="stretch", hide_index=True)
         pilot.display(
             "The backup is configured through the environment, not this sidebar: a "
             "worker builds its own client from its environment, so a web-only setting "
@@ -599,7 +599,7 @@ def _record_reading_panel() -> None:
         pilot.display(f"⚠️ {_fallback_warning(status)}", container=st, method="warning")
 
     with st.expander("📄 Record reading — where text comes from", expanded=False):
-        st.dataframe(
+        pilot.dataframe(st,
             [
                 {
                     "Setting": "Reader",
