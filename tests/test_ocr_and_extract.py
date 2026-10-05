@@ -352,11 +352,11 @@ class TestBundle(BundleTestCase):
 
 class TestMain(BundleTestCase):
     def _run(self, argv: list[str]) -> int:
-        return ocr_and_extract.main([str(self.bundle), "--work-dir", str(self.work)] + argv)
+        return ocr_and_extract.main(["--data-class", "synthetic", str(self.bundle), "--work-dir", str(self.work)] + argv)
 
     def test_a_missing_path_is_bad_input(self) -> None:
         self.assertEqual(
-            ocr_and_extract.main([str(self.root / "nope")]), ocr_and_extract.EXIT_BAD_INPUT
+            ocr_and_extract.main(["--data-class", "synthetic", str(self.root / "nope")]), ocr_and_extract.EXIT_BAD_INPUT
         )
 
     def test_a_bundle_with_no_records_reports_nothing_to_do(self) -> None:

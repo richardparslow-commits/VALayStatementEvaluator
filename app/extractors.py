@@ -207,7 +207,7 @@ class CommandBoxRunner:
 
     The command is the operator's, not this app's invention:
 
-        VA_LSE_EXTRACTOR_RUNNER="python scripts/ocr_and_extract.py {work} \\
+        VA_LSE_EXTRACTOR_RUNNER="python scripts/ocr_and_extract.py {work} --data-class synthetic \\
             --out {work}/bundle.json && cat {work}/bundle.json"
 
     The last thing on stdout must be the report JSON (the shape

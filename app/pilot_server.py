@@ -7,6 +7,8 @@ from typing import Sequence
 
 
 def initialize() -> None:
+    from .privacy_logging import install
+    install()  # Before approval, retention, SDK or Streamlit startup logging.
     from . import pilot
     from .log_retention import retention_days
     if not pilot.enabled():

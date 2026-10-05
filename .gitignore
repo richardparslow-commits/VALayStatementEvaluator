@@ -42,6 +42,9 @@ va_gov_download_artifacts
 # `!…​.pdf` re-include is ever added below `*.pdf`.
 *.pdf
 *.ocr.pdf
+.ocr-work-*/
+.ocr-*/
+.ocr-output-*
 
 # macOS “Save As… “ duplicates (foo.py -> “foo 2.py”) and similar stray copies
 * 2.*

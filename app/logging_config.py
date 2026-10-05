@@ -260,6 +260,9 @@ def configure_logging(
     """
     global _CONFIGURED  # noqa: PLW0603
 
+    from .privacy_logging import install
+    install()
+
     from . import pilot
     from .log_retention import PilotLogHandler
     if _CONFIGURED and not force:

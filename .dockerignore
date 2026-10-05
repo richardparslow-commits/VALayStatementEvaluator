@@ -40,6 +40,9 @@
 **/logs/
 **/blobs/
 **/outputs/
+**/.ocr-work-*/
+**/.ocr-*/
+**/.ocr-output-*
 **/usage_history.json
 **/*.log
 #

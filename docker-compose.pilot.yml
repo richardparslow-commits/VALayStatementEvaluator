@@ -42,6 +42,9 @@ services:
       timeout: 5s
       retries: 3
     mem_limit: 3g
+    memswap_limit: 3g
+    ulimits:
+      core: 0
     cpus: 2
     pids_limit: 128
     cap_drop: [ALL]
@@ -70,6 +73,9 @@ services:
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     mem_limit: 512m
+    memswap_limit: 512m
+    ulimits:
+      core: 0
     cpus: 1
     pids_limit: 64
     tmpfs:
@@ -83,9 +89,12 @@ services:
       driver: "none"
     restart: unless-stopped
   nginx:
-    image: nginx:1.27-alpine
+    build:
+      context: .
+      dockerfile: deploy/pilot-proxy.Dockerfile
+    image: va-lse-pilot-proxy:${VA_LSE_BUILD_SHA:?Set the reviewed immutable revision}
     ports:
-      - ${VA_LSE_BIND_IP:?Set the private ingress bind address}:443:443
+      - ${VA_LSE_BIND_IP:?Set the private ingress bind address}:443:8443
     volumes:
       - ./nginx/pilot.conf:/etc/nginx/nginx.conf:ro
       - ${VA_LSE_TLS_CERT:?Set the TLS certificate file}:/run/tls/cert.pem:ro
@@ -94,10 +103,16 @@ services:
       streamlit-web:
         condition: service_healthy
     mem_limit: 512m
+    memswap_limit: 512m
+    ulimits:
+      core: 0
     cpus: 1
     pids_limit: 64
     tmpfs:
-      - /var/cache/nginx:rw,noexec,nosuid,nodev,size=128M,mode=1777
+      - /var/cache/nginx:rw,noexec,nosuid,nodev,size=128M,mode=0700,uid=10001,gid=10001
+      - /run/nginx:rw,noexec,nosuid,nodev,size=1M,mode=0700,uid=10001,gid=10001
+    cap_drop: [ALL]
+    read_only: true
     security_opt: [no-new-privileges:true]
     logging:
       driver: "none"

@@ -521,6 +521,26 @@ jobs:
           assert pathlib.Path('scripts/restore_audit_logs.py').is_file();
           subprocess.run(['python', 'scripts/backup_audit_logs.py', '--status'], check=True)"
 
+  pilot-proxy-privacy:
+    name: Pilot proxy privacy (synthetic probes)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build the non-root pilot proxy
+        run: docker build -f deploy/pilot-proxy.Dockerfile -t va-lse-pilot-proxy:ci .
+      - name: Install test runtime
+        run: pip install --require-hashes -r requirements.lock
+      - name: Probe upload lifetime, volatile storage and crash recovery
+        env:
+          VA_LSE_TEST_PILOT_PROXY_IMAGE: va-lse-pilot-proxy:ci
+        run: python -m unittest tests.test_pilot_proxy_live -v
+
   parser-isolation:
     name: Linux parser isolation (synthetic probes)
     runs-on: ubuntu-latest

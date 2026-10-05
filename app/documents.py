@@ -452,8 +452,8 @@ def _extract_pdf(filename: str, data: bytes) -> ExtractedDocument:
     if not doc.pages or not doc.char_count:
         raise ExtractionError(
             f"{filename}: no extractable text in {doc.total_pages:,} page(s). The PDF "
-            "may be scanned/image-only; run scripts/ocr_records.py on it (or OCR it "
-            "another way) and upload the result."
+            "may be scanned/image-only. Use the operator's reviewed OCR workflow; "
+            "the standalone scripts/ocr_records.py examples accept synthetic data only."
         )
     doc.pages = strip_running_headers(doc.pages)
     return doc

@@ -12,6 +12,7 @@ import json
 import math
 import os
 import re
+import math
 import socket
 import stat
 import threading
@@ -537,9 +538,10 @@ def safe_metadata(data: Mapping[str, Any]) -> dict[str, Any]:
                "chunks", "facts", "attempt", "retries", "tokens_in", "tokens_out",
                "prompt_tokens", "completion_tokens", "total_tokens", "status_code"}
     result: dict[str, Any] = {key: value for key, value in data.items()
-              if key in allowed and isinstance(value, (int, float, bool))}
-    reference = str(data.get("request_id", ""))
-    if re.fullmatch(r"(?:req_[a-f0-9]{12}|[a-f0-9-]{32,36})", reference):
+              if key in allowed and type(value) in (int, float, bool)
+              and (type(value) is not float or math.isfinite(value))}
+    reference = data.get("request_id", "")
+    if isinstance(reference, str) and re.fullmatch(r"(?:req_[a-f0-9]{12}|[a-f0-9-]{32,36})", reference):
         result["request_id"] = reference
     for key, choices in {"action": {"app", "evaluate", "draft"},
                          "status": {"start", "ok", "partial", "error", "timeout", "rejected", "queued", "done"},

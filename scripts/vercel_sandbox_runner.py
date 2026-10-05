@@ -381,6 +381,8 @@ class SandboxCli:
                 BOX_PYTHON,
                 BOX_ENTRYPOINT,
                 str(bundle),
+                "--data-class",
+                "synthetic",
                 "--out",
                 str(report),
                 "--force",
