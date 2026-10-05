@@ -520,6 +520,10 @@ jobs:
           "import os, pathlib, subprocess; assert os.getuid() != 0;
           assert pathlib.Path('scripts/restore_audit_logs.py').is_file();
           subprocess.run(['python', 'scripts/backup_audit_logs.py', '--status'], check=True)"
+      - name: Check private upload tmpfs and spool closure on the actual runtime
+        env:
+          VA_LSE_TEST_UPLOAD_RUNTIME_IMAGE: va-lse-runtime:ci
+        run: python tests/test_upload_temp_live.py -v
 
   pilot-proxy-privacy:
     name: Pilot proxy privacy (synthetic probes)

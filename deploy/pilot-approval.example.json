@@ -54,5 +54,76 @@
       "framing_token_reserve": null,
       "token_bound_evidence": ""
     }
+  },
+  "privacy_acceptance": {
+    "schema_version": 1,
+    "status": "NOT_RUN",
+    "reviewed_at": null,
+    "operator": null,
+    "independent_reviewer": null,
+    "configuration_sha256": null,
+    "images": {
+      "application": null,
+      "parser": null,
+      "parser_launcher": null,
+      "proxy": null
+    },
+    "checks": {
+      "P01": {
+        "status": "NOT_RUN",
+        "evidence_ref": null,
+        "evidence_sha256": null
+      },
+      "P02": {
+        "status": "NOT_RUN",
+        "evidence_ref": null,
+        "evidence_sha256": null
+      },
+      "P03": {
+        "status": "NOT_RUN",
+        "evidence_ref": null,
+        "evidence_sha256": null
+      },
+      "P04": {
+        "status": "NOT_RUN",
+        "evidence_ref": null,
+        "evidence_sha256": null
+      },
+      "P05": {
+        "status": "NOT_RUN",
+        "evidence_ref": null,
+        "evidence_sha256": null
+      },
+      "P06": {
+        "status": "NOT_RUN",
+        "evidence_ref": null,
+        "evidence_sha256": null
+      },
+      "P07": {
+        "status": "NOT_RUN",
+        "evidence_ref": null,
+        "evidence_sha256": null
+      },
+      "P08": {
+        "status": "NOT_RUN",
+        "evidence_ref": null,
+        "evidence_sha256": null
+      },
+      "P09": {
+        "status": "NOT_RUN",
+        "evidence_ref": null,
+        "evidence_sha256": null
+      },
+      "P10": {
+        "status": "NOT_RUN",
+        "evidence_ref": null,
+        "evidence_sha256": null
+      },
+      "P11": {
+        "status": "NOT_RUN",
+        "evidence_ref": null,
+        "evidence_sha256": null
+      }
+    }
   }
 }

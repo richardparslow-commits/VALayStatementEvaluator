@@ -105,7 +105,7 @@ app/
   knowledge/              legal_framework.md, evaluation_rubric.md, drafting_guide.md,
                           topic_checklist.md
 scripts/
-  extract_pdfs.py         Build reference_docs/extracted/*.txt from source PDFs
+  extract_pdfs.py         Explicit synthetic/reviewed-public PDF extraction outside Git
   smoke_test.py           End-to-end pipeline test against the live LLM endpoint
   scale_sim.py            Offline 2,000-page pipeline simulation (no API calls)
   batch_draft.py          Batched, resumable drafting over a local record folder

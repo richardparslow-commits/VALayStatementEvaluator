@@ -223,3 +223,95 @@ Copy and complete this evidence record. All fields deliberately remain empty.
   "retention_policy": ""
 }
 ```
+
+## Enforced acceptance and ingestion privacy (IA-09, IA-10, G-01)
+
+**Actual-host/account acceptance remains NOT RUN / NO-GO.** Passing repository
+or CI tests cannot supply P01–P11 observations. This release closes software
+persistence/cleanup gaps and requires a structured operator attestation before
+admission; it does not certify the truth of that attestation or legal compliance.
+
+The protected approval now requires `privacy_acceptance` with exactly:
+
+- `schema_version: 1`, `status: "ACCEPTED"`, timezone-qualified `reviewed_at`
+  within the previous 30 days, and nonempty distinct `operator` and
+  `independent_reviewer` references. Verify the reviewer's identity, independence
+  and authorization outside the app; distinct strings alone cannot establish them.
+- `configuration_sha256` from `app.privacy_acceptance.configuration_sha256`
+  over the exact reviewed revision, origin/issuer, notice, provider/models/model
+  profiles, log/quota/export policies and privacy/provider/retention/ingestion/spending review references.
+  After any bound change, repeat the affected observations and independent review,
+  then update the record. The entire acceptance record also binds session consent.
+- `images` containing immutable `sha256:` IDs for `application`, `parser`,
+  `parser_launcher` and `proxy`. The parser ID must match configured
+  `VA_LSE_PARSER_IMAGE`. P01/P10 must independently inspect the effective host's
+  other image IDs, region, account and destinations; the app does not introspect
+  or prove them from these manifest strings.
+- `checks` containing exactly P01–P11, each with `status: "OBSERVED_PASS"`,
+  a non-secret `evidence_ref` and the exact private evidence file's
+  `evidence_sha256`. Keep synthetic observations/counts in the evidence, never
+  veteran information. The app validates hashes syntactically and binds the
+  record to consent; reviewers must retrieve and verify the referenced evidence.
+
+Compute only the policy hash locally from the protected approval under review
+(without loading a usable approval or transmitting its contents):
+
+```python
+import json
+from pathlib import Path
+from app.pilot import _approval_bytes
+from app.privacy_acceptance import configuration_sha256
+print(configuration_sha256(json.loads(_approval_bytes(Path('/absolute/private/approval.json')))))
+```
+
+The deliberately incomplete example remains `NOT_RUN`, with null evidence and
+image values. Do not turn it into approval by filling placeholders or copying
+synthetic test fixtures. Existing approvals without complete structured evidence
+now close admission and startup. Other release gates remain independently required.
+
+Pilot upload PUT uses the maintained `app.private_uploads` adapter, reviewed for
+Streamlit 1.63.0 and Starlette 1.6.0. It preserves XSRF, active-session, CORS and
+body/file size checks plus the existing pre-body owner/consent/rate reservations.
+It permits one file, at most four non-file fields of 4 KiB each, and counts
+multi-items rather than collapsing duplicate field names. Every parser-allocated
+spool is explicitly closed on success, refusal, malformed/truncated input,
+read/stream failure or cancellation. Cleanup completes before upload-manager
+insertion and success; a cleanup failure refuses the request and latches subsequent upload/screen
+admission closed until the operator stops and recovers the process. Private parser
+allocation-list integration is release-specific: do not upgrade either dependency
+without rerunning actual-handler lifecycle probes and reviewing that contract.
+This is logical closure/removal, not memory or physical storage zeroization.
+
+All `TMPDIR`, `TEMP` and `TMP` values in the pilot web process must be
+`/run/upload-tmp`. Startup and screen admission verify the effective cached
+Python temporary directory, owner UID/mode 0700, an exact Linux tmpfs mount
+with `noexec,nosuid,nodev`, capacity at most 256 MiB and usable mode-0600
+spooling. Compose provides that mount for UID/GID 65534. Incorrect overrides,
+disk-backed/missing mounts, excess capacity or permissive ownership fail closed.
+The required runtime CI probe verifies actual tmpfs and a rolled spool's closed
+file descriptor. Swap/cgroup/hibernation/snapshot behavior remains P06/P10 actual
+host acceptance; tmpfs alone cannot establish that no persistent copy exists.
+
+`python -m scripts.extract_pdfs` has no default source list or output directory.
+It requires `--data-class synthetic` or `approved-public`, one explicit absolute
+PDF and `--out` for a new TXT in an existing owner-private directory outside all
+Git worktrees. Pilot mode and `sensitive` refuse before file access, including
+programmatic extraction/publication. Public input additionally requires
+`--public-manifest` naming a bounded, protected JSON file:
+
+```json
+{"schema_version": 1, "approved_sha256": ["<reviewed PDF's exact SHA-256>"]}
+```
+
+The manifest is the independent public classification; a declaration does not
+identify PHI or defeat a dishonest operator. Restrict tool/source access and
+approve retention/removal of the retained derivative. Extraction reads a bounded
+stable regular file, uses only the configured isolated parser, requires complete
+readable coverage and refuses parser errors with a fixed message. It does not
+write filenames, paths or raw exceptions into output or diagnostics. Publication
+is owner-only, never overwrites or follows a destination symlink and removes a
+partial file on handled write failure; a host/process kill still needs cleanup
+under the tool's retention policy. Existing tracked reference extracts were not
+reclassified or deleted by this change; inventory and independently review those
+legacy artifacts separately. New files in that legacy directory are ignored as
+secondary accidental-staging protection.

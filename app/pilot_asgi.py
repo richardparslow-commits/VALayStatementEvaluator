@@ -9,6 +9,9 @@ from starlette.middleware import Middleware
 from app.export_routes import routes
 from app.text_exports import STORE
 from app.upload_admission import PilotUploadMiddleware
+from app.private_uploads import install
+
+install()
 
 
 @asynccontextmanager

@@ -25,7 +25,7 @@ from app.documents import ChunkPlan, DocumentPage, iter_page_labelled_chunks
 from streamlit.runtime.memory_uploaded_file_manager import MemoryUploadedFileManager
 from streamlit.runtime.uploaded_file_manager import UploadedFileRec
 from streamlit.web.server.starlette.starlette_app_utils import create_signed_value, generate_xsrf_token_string
-from streamlit.web.server.starlette.starlette_routes import create_upload_routes
+from app.private_uploads import create_upload_routes
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.testclient import TestClient

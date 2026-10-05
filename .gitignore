@@ -70,3 +70,7 @@ accessibility-evidence/
 export-evidence/
 queue-evidence/
 deletion-evidence/
+# New reference derivatives remain outside Git; also prevent accidental staging
+# in this legacy directory. Previously tracked public references are unaffected.
+reference_docs/extracted/*.txt
+privacy-evidence/
