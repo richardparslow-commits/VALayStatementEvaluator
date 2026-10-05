@@ -710,7 +710,11 @@ folders) can be uploaded as they came: members are extracted like standalone upl
 every bound — member count, per-member and total uncompressed size, compression ratio — is
 enforced because an archive is untrusted input. Members that break a bound are skipped with
 a named warning; nested archives are never expanded. Same for a local path, which walks the
-folder or the archive.
+folder or the archive. Hidden filenames and files under `__MACOSX` follow the same
+validation and limits: supported records are read, and unsupported or unreadable
+members receive explicit warnings. OS-looking names alone never justify an
+omission. A controlled pilot refuses any bundle with member refusals; remove
+non-record metadata or supply a readable copy before proceeding.
 
 Tuning: raise `VA_LSE_RECORDS_CONCURRENCY` if your endpoint allows more parallel
 requests; lower `VA_LSE_DIGEST_CHUNK_CHARS` for extra recall on very dense pages (at the

@@ -63,6 +63,31 @@ class ParserContainerTests(unittest.TestCase):
         self.request = {'version': 1, 'label': 'record.txt', 'size': len(self.data),
                         'sha256': hashlib.sha256(self.data).hexdigest(), 'nonce': uuid.uuid4().hex, 'page_limit': 500}
 
+    def test_packaged_parser_preserves_hidden_archive_corrections(self):
+        from tests.ingestion_fixtures import package
+        correction = b'Synthetic correction: symptoms were denied.'
+        members = {'record.txt': self.data, '.correction.txt': correction,
+                   '__MACOSX/notes/.correction.md': correction}
+        data = package(members)
+        request = {**self.request, 'label': 'records.zip', 'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+        docs, skipped = _documents(_unpack_reply(wire.decode(self.runner.run(request, data)), IMAGE), request, IMAGE)
+        self.assertEqual(skipped, [])
+        self.assertEqual([doc.filename for doc in docs], ['records/' + name for name in members])
+        for doc, body in zip(docs, members.values()):
+            self.assertEqual(doc.full_text, body.decode())
+            self.assertEqual(doc.source_sha256, hashlib.sha256(body).hexdigest())
+
+    def test_packaged_parser_names_unreadable_hidden_archive_members(self):
+        from tests.ingestion_fixtures import package
+        data = package({'record.txt': self.data, '.damaged.pdf': b'Synthetic invalid PDF',
+                        '__MACOSX/.DS_Store': b'Synthetic unsupported metadata'})
+        request = {**self.request, 'label': 'records.zip', 'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+        docs, skipped = _documents(_unpack_reply(wire.decode(self.runner.run(request, data)), IMAGE), request, IMAGE)
+        self.assertEqual([doc.filename for doc in docs], ['records/record.txt'])
+        self.assertEqual(len(skipped), 2)
+        for name in ('.damaged.pdf', '__MACOSX/.DS_Store'):
+            self.assertTrue(any(name in message for message in skipped), skipped)
+
     def probe(self, code):
         command = self.runner.command
         def argv(name):

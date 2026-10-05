@@ -13,11 +13,15 @@ from typing import Any
 import streamlit as st
 
 from .. import config
-from ..documents import extract_uploaded_documents, page_limit_message
+from ..documents import ARCHIVE_EXTENSIONS, extract_uploaded_documents, page_limit_message
 from ..error_report import report_failure
 from ..logging_config import get_logger
 
 logger = get_logger("app.views.uploads")
+
+# Earlier archive extractions could silently omit hidden members. Do not reuse
+# those cached results after upgrading the member-accounting policy.
+ARCHIVE_CACHE_POLICY = "all-members-v1"
 
 
 def check_upload_limits(files: Any) -> tuple[list[Any], list[str]]:
@@ -93,7 +97,8 @@ def _upload_cache_key(slot: str, uploaded: Any) -> str | None:
         digest = hashlib.sha256(uploaded.getvalue()).hexdigest()
     except Exception:  # noqa: BLE001 - never fall back to name/size identity
         return None
-    return f"{slot}:{uploaded.name}:{getattr(uploaded, 'size', 0)}:{digest}"
+    archive_policy = f"{ARCHIVE_CACHE_POLICY}:" if str(uploaded.name).lower().endswith(ARCHIVE_EXTENSIONS) else ""
+    return f"{slot}:{archive_policy}{uploaded.name}:{getattr(uploaded, 'size', 0)}:{digest}"
 
 
 def _prune_upload_cache(slot: str, live_keys: set[str]) -> None:
