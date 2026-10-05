@@ -28,12 +28,13 @@ def setup(directory):
     tls.mkdir(mode=0o700)
     server.mkdir(mode=0o700)
     networks = json.loads(call(['docker', 'network', 'inspect', 'bridge']).stdout)
-    address = networks[0]['IPAM']['Config'][0]['Gateway']
+    address = '10.73.0.1'
     application_id = call(['docker', 'info', '--format', '{{.ID}}']).stdout.decode().strip()
-    # Keep the synthetic application bridge reachable even before it has any
-    # containers; the launcher later connects to this private host gateway.
-    bridge = networks[0]['Options'].get('com.docker.network.bridge.name', 'docker0')
-    call(['sudo', 'ip', 'link', 'set', bridge, 'up'])
+    # Do not borrow docker0's gateway as a listener address. Provision an
+    # explicit private test endpoint and only its TLS port on this disposable VM.
+    call(['sudo', 'ip', 'address', 'add', address + '/32', 'dev', 'lo'])
+    for chain in ('INPUT', 'OUTPUT'):
+        call(['sudo', 'iptables', '-I', chain, '-d', address + '/32', '-p', 'tcp', '--dport', '2376', '-j', 'ACCEPT'])
     call(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
           '-subj', '/CN=SyntheticParserCI', '-keyout', str(server / 'ca-key.pem'), '-out', str(server / 'ca.pem')])
     for name, common, extensions in (('server', 'SyntheticParserServer', f'subjectAltName=IP:{address}\nextendedKeyUsage=serverAuth\n'),
@@ -135,6 +136,11 @@ def cleanup(directory):
         path = directory / name
         if path.exists():
             call(['sudo', 'rm', '-rf', '--', str(path)])
+    for chain in ('INPUT', 'OUTPUT'):
+        subprocess.run(['sudo', 'iptables', '-D', chain, '-d', '10.73.0.1/32', '-p', 'tcp',
+                        '--dport', '2376', '-j', 'ACCEPT'], capture_output=True, timeout=10, check=False)
+    subprocess.run(['sudo', 'ip', 'address', 'del', '10.73.0.1/32', 'dev', 'lo'],
+                   capture_output=True, timeout=10, check=False)
 
 
 if __name__ == '__main__':
