@@ -173,6 +173,7 @@ class CompletePilotRecords(unittest.TestCase):
     def variants(self):
         doc = document_from_text("record.txt", QUOTE)
         for fields in ({"total_pages": 2, "unreadable_pages": [2]}, {"coverage_known": False},
+                       {"unreadable_pages": None}, {"unreadable_pages": ""}, {"unreadable_pages": ()},
                        {"coverage_known": 1}, {"total_pages": 0}, {"total_pages": True},
                        {"total_pages": 2}, {"pages": [DocumentPage("record.txt", 2, QUOTE)]},
                        {"pages": [DocumentPage("record.txt", 1, QUOTE, kind="block")]},

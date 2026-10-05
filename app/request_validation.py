@@ -120,7 +120,8 @@ def require_complete_record_coverage(records: list[ExtractedDocument]) -> None:
     seen: set[tuple[str, str]] = set()
     for doc in records:
         identity = (doc.filename, doc.pagination)
-        if (doc.coverage_known is not True or doc.unreadable_pages
+        if (doc.coverage_known is not True or not isinstance(doc.unreadable_pages, list)
+                or doc.unreadable_pages
                 or type(doc.total_pages) is not int or doc.total_pages < 1
                 or doc.total_pages != len(doc.pages) or identity in seen
                 or any(type(page.page) is not int or page.page != index
