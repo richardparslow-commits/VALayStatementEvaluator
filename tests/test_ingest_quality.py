@@ -791,17 +791,19 @@ class TestArchiveUploads(unittest.TestCase):
         self.assertTrue(any("photo.jpg" in message for message in skipped))
         self.assertTrue(any("later.zip" in message and "nested" in message for message in skipped))
 
-    def test_editor_bookkeeping_members_are_ignored_without_a_warning(self) -> None:
+    def test_unreadable_bookkeeping_members_are_reported(self) -> None:
         payload = _zip_bytes(
             {
-                "__MACOSX/._notes.txt": b"junk",
+                "__MACOSX/._notes.txt": b"\x00\x05\x16\x07Synthetic binary sidecar",
                 ".DS_Store": b"junk",
                 "notes.txt": b"Knee pain.",
             }
         )
         documents, skipped = extract_uploaded_documents([_Uploaded("records.zip", payload)])
         self.assertEqual([d.filename for d in documents], ["records/notes.txt"])
-        self.assertEqual(skipped, [])
+        self.assertEqual(len(skipped), 2)
+        self.assertTrue(any("__MACOSX/._notes.txt" in message for message in skipped))
+        self.assertTrue(any(".DS_Store" in message for message in skipped))
 
     def test_a_zip_in_a_local_folder_is_expanded_the_same_way(self) -> None:
         with TemporaryDirectory() as tmp:

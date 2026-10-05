@@ -661,10 +661,9 @@ def iter_archive_members(
         selected: list[tuple[str, str, zipfile.ZipInfo]] = []
         for info in infos:
             relative = info.filename
-            base = Path(relative).name
-            # Editor/OS bookkeeping that ends up in most zips; never record content.
-            if not base or base.startswith(".") or "__MACOSX/" in f"{relative}/":
-                continue
+            # A hidden name or OS-looking directory does not establish that a
+            # file is bookkeeping. Account for every regular member through the
+            # same format/size policy: extract it or report why it was refused.
             label = f"{label_prefix}/{relative}"
             try:
                 policy.validate_label(label)
@@ -721,7 +720,7 @@ def iter_archive_members(
                 yielded = True
                 yield label, bytes(member)
             except ExtractionError as exc:
-                skipped.append(str(exc))
+                skipped.append(f"✖️ {filename}: could not read archive member {relative} ({exc})")
             except Exception as exc:  # noqa: BLE001 - one bad member must not lose the rest
                 skipped.append(f"✖️ {filename}: could not read archive member {relative}.")
         if not yielded and not skipped:
@@ -754,7 +753,7 @@ class InProcessExtractor:
                 try:
                     documents.append(extract_document(member_label, member_bytes))
                 except ExtractionError as exc:
-                    skipped.append(str(exc))
+                    skipped.append(f"✖️ {member_label}: could not extract archive member ({exc})")
             return documents, skipped
         try:
             return [extract_document(label, data)], []

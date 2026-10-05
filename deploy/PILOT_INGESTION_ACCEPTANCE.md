@@ -21,7 +21,7 @@ Changing parser code requires rebuilding and reviewing that immutable image.
 | DOCX | ZIP header, required OPC content types, root office-document relationship and main Word XML. Every non-directory part has an allowed content type and is read with per-part and cumulative actual-byte limits. Only the listed passive XML part types and PNG/JPEG/GIF/BMP/TIFF image signatures are supported. |
 | DOCX active content | Macro/embedded-object/unsupported part types, active or unknown relationships, external targets (including hyperlinks/templates), active Word elements and DDE/include/link/embed field instructions are refused. Internal relative relationships must resolve to an existing part inside the package. |
 | XML inside DOCX | DTD/entity declarations and processing instructions are refused through parser callbacks; malformed XML produces a fixed refusal. Per-part limits are 200,000 elements and 128 levels. These checks complement the byte, CPU, memory and wall-time sandbox limits. |
-| ZIP of records | All member identities checked before any expansion; existing member/count/ratio/declared and actual expansion limits remain. Nested archives are skipped and not recursively expanded. Pilot admission already refuses a batch containing skips. Only stored/deflated, unencrypted regular files/directories are supported. |
+| ZIP of records | All member identities checked before any expansion; existing member/count/ratio/declared and actual expansion limits remain. Hidden filenames and `__MACOSX` paths follow the same policy: supported records are read, and every unreadable/unsupported file has an explicit refusal. Nested archives are skipped and not recursively expanded. Pilot admission refuses a batch containing skips, including cached reruns; legacy archive cache entries are recomputed. Only stored/deflated, unencrypted regular files/directories are supported. |
 | Labels | Bounded relative names with `/` separators; no empty, `.`/`..`, absolute/drive/UNC paths, backslashes, colon/bracket citation delimiters, control/format/surrogate characters or padded components. ZIP NUL truncation, links/special files, duplicate names, case or Unicode-normalization collisions are refused. Safe nested Unicode names are preserved. |
 
 Labels are display/citation identifiers, never destinations for filesystem
@@ -74,6 +74,12 @@ non-secret results. The following checks remain OPEN until observed on that host
 - Submit unsafe/duplicate/NUL/case/Unicode-colliding ZIP names, links, encryption,
   unsupported compression and bounded bomb fixtures. Confirm no member writes,
   cross-owner access, partial pilot analysis or provider attempts.
+- Submit a visible note plus hidden correction, including a supported record under
+  `__MACOSX`. Confirm both contents, hashes and source addresses survive the actual
+  isolated parser. Add an unreadable hidden file or unsupported sidecar; confirm
+  a named refusal blocks pilot use on the first read and cached rerun. Remove the
+  refused member and confirm the corrected bundle can proceed. Rebuild/review the
+  parser image and refresh revision-specific approval before using the new code.
 - Observe CPU, memory and wall-time kill/cleanup on hostile synthetic input using
   the existing resource/isolation acceptance procedure. Verify staging deletion
   after success, refusal and timeout; no document content in host logs.
