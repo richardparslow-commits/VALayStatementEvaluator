@@ -169,6 +169,8 @@ def load_approval() -> dict[str, Any]:
         policy(data)
         from .provider_limits import validate_profiles
         validate_profiles(data)
+        from .privacy_acceptance import validate as validate_privacy_acceptance
+        validate_privacy_acceptance(data)
         return data
     except (KeyError, ValueError, TypeError, OSError, OverflowError, RecursionError) as exc:
         raise PilotBlocked("Pilot admission is closed. The operator must supply current, "
@@ -211,6 +213,10 @@ def validate_configuration() -> dict[str, Any]:
     import sys
     if not sys.platform.startswith("linux") or os.geteuid() == 0:
         raise PilotBlocked("The controlled pilot requires a non-root Linux runtime.")
+    from .upload_temp import validate as validate_upload_temp
+    validate_upload_temp()
+    from .private_uploads import check_cleanup
+    check_cleanup()
     if (not 0 < config.MAX_RECORD_PAGES <= 500 or config.MAX_UPLOAD_BYTES > 50 * 1024 * 1024
             or config.MAX_TOTAL_UPLOAD_BYTES > 200 * 1024 * 1024):
         raise PilotBlocked("Pilot input limits require at most 500 pages, 50 MB per file, and 200 MB total.")
@@ -307,7 +313,7 @@ def notice_binding(owner: str, approval: Mapping[str, Any]) -> str:
             approval["provider_terms"], approval["retention_policy"],
             approval["provider_base_url"], approval["models"], approval["local_log_retention_days"],
             approval["quota_policy"], approval["spending_controls"], approval.get("text_export_policy"),
-            approval["ingestion_security"], approval["model_profiles"]]
+            approval["ingestion_security"], approval["model_profiles"], approval.get("privacy_acceptance")]
     return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
 
 

@@ -23,7 +23,7 @@ _QUOTA_EXPIRY = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
 
 def approval() -> dict:
     now = datetime.now(timezone.utc)
-    return {
+    data = {
         "schema_version": 1, "reviewed_revision": "a" * 40,
         "approved_at": (now - timedelta(minutes=1)).isoformat(),
         "expires_at": (now + timedelta(days=1)).isoformat(),
@@ -39,6 +39,16 @@ def approval() -> dict:
                          "pilot_total_microusd": 250_000_000, "pilot_total_attempts": 250},
         "single_instance": True, **{name: "synthetic evidence" for name in pilot.EVIDENCE_FIELDS},
     }
+    from app.privacy_acceptance import CHECKS, configuration_sha256
+    data["privacy_acceptance"] = {
+        "schema_version": 1, "status": "ACCEPTED", "reviewed_at": now.isoformat(),
+        "operator": "SYNTHETIC OPERATOR ONLY", "independent_reviewer": "SYNTHETIC REVIEWER ONLY",
+        "configuration_sha256": configuration_sha256(data),
+        "images": {role: "sha256:" + "b" * 64 for role in ("application", "parser", "parser_launcher", "proxy")},
+        "checks": {check: {"status": "OBSERVED_PASS", "evidence_ref": "SYNTHETIC FIXTURE ONLY",
+                            "evidence_sha256": "c" * 64} for check in CHECKS},
+    }
+    return data
 
 
 class TestAdmission(unittest.TestCase):
@@ -159,7 +169,7 @@ class TestAdmission(unittest.TestCase):
                 patch.object(config, "SHARED_CACHE_URL", ""), patch.object(config, "SHARED_CACHE_TOKEN", ""), \
                 patch.object(upload_admission, "runtime", side_effect=guarded_test_runtime), \
                 patch("sys.platform", "linux"), patch("os.geteuid", return_value=os.geteuid()), \
-                patch("app.isolated_extract.parser_health"):
+                patch("app.isolated_extract.parser_health"), patch("app.upload_temp.validate"):
             at = AppTest.from_file(str(root / "run_app.py"))
             at.secrets["auth"] = auth
             at.run()

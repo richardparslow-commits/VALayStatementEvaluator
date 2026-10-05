@@ -13,6 +13,10 @@ def initialize() -> None:
     from .log_retention import retention_days
     if not pilot.enabled():
         raise pilot.PilotBlocked("This server launcher requires controlled-pilot mode.")
+    from .upload_temp import validate as validate_upload_temp
+    validate_upload_temp()
+    from .private_uploads import install as install_private_uploads
+    install_private_uploads()
     from importlib.metadata import version
     if version("streamlit") != "1.63.0":
         raise pilot.PilotBlocked("Upload admission requires the reviewed Streamlit release.")

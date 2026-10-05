@@ -330,6 +330,7 @@ with patch.object(pilot, "load_approval", return_value=data), patch.object(st, "
         from unittest.mock import MagicMock
         store = MagicMock()
         with patch.object(text_exports, "STORE", store), patch.object(pilot, "validate_log_policy"), \
+                patch("app.upload_temp.validate"), \
                 patch("app.log_retention.retention_days", return_value=7), \
                 patch("app.pilot_budget.get_ledger"), patch("app.shutdown.install_signal_handlers"), \
                 patch.dict(os.environ, {"VA_LSE_HEALTH_PORT": "0"}):

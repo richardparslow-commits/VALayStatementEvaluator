@@ -28,6 +28,9 @@ services:
       VA_LSE_PILOT_LOG_RETENTION_DAYS: ${VA_LSE_PILOT_LOG_RETENTION_DAYS:?Set the reviewed local log age limit}
       VA_LSE_AUDIT_BACKUP_DESTINATION: none
       VA_LSE_AUDIT_BACKUP_REQUIRED: "0"
+      TMPDIR: /run/upload-tmp
+      TEMP: /run/upload-tmp
+      TMP: /run/upload-tmp
     volumes:
       - ${VA_LSE_PILOT_APPROVAL_HOST_FILE:?Set the reviewed approval file}:/run/pilot/approval.json:ro
       - ${VA_LSE_OIDC_SECRETS_FILE:?Set the OIDC secrets file}:/app/.streamlit/secrets.toml:ro
@@ -53,6 +56,7 @@ services:
     read_only: true
     tmpfs:
       - /tmp:size=256M,mode=1777
+      - /run/upload-tmp:rw,noexec,nosuid,nodev,size=256M,mode=0700,uid=65534,gid=65534
     logging:
       driver: "none"
     restart: unless-stopped

@@ -249,6 +249,7 @@ class TestPolicyAdmission(unittest.TestCase):
         data = approval()
         install_budget(self, data)
         with patch.dict(os.environ, {'VA_LSE_HEALTH_PORT': '0'}), \
+                patch('app.upload_temp.validate'), \
                 patch('streamlit.web.cli.main') as cli, patch.object(sys, 'argv', ['fixture']), \
                 patch.object(pilot, 'load_approval', return_value=data):
             pilot_server.main(['--server.port=8501'])
@@ -263,6 +264,10 @@ from pathlib import Path
 from datetime import datetime, timezone
 from app import pilot_server
 from app import pilot, pilot_budget
+from app import upload_temp
+# Retention test uses an ordinary temporary directory; actual tmpfs is tested
+# separately by the required non-root runtime image probe.
+upload_temp.validate=lambda: None
 from tests.test_controlled_pilot import approval
 root=Path(sys.argv[1])
 os.environ.update({'VA_LSE_MODE':'controlled-pilot','VA_LSE_PILOT_LOG_RETENTION_DAYS':'1','VA_LSE_LOG_DIR':str(root),'VA_LSE_AUDIT_LOG_DIR':str(root),'VA_LSE_RUN_LOG_DIR':str(root),'VA_LSE_HEALTH_PORT':'0'})

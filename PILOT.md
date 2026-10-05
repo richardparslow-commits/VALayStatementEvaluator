@@ -130,7 +130,9 @@ supported controlled-pilot environment.
    retention policy and the exact participant privacy notice. Complete
    [R08 provider/privacy acceptance](deploy/PILOT_PRIVACY_ACCEPTANCE.md) for the
    actual account. The approval must contain `participant_notice` and integer
-   `local_log_retention_days` (1–30); set `VA_LSE_PILOT_LOG_RETENTION_DAYS` to the
+   `local_log_retention_days` (1–30), plus complete structured P01–P11
+   `privacy_acceptance` bound to the exact notice, policy and reviewed revision;
+   set `VA_LSE_PILOT_LOG_RETENTION_DAYS` to the
    same value. Missing or mismatched policy closes admission. The participant
    must consent to this exact notice before case controls appear; changed terms,
    destinations or notice require fresh consent.
