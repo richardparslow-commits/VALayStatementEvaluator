@@ -46,7 +46,9 @@ class UploadTempLiveTests(unittest.TestCase):
         self.assertIn('PRIVATE_TMPFS_AND_CLOSED_ROLLED_SPOOL',result.stdout)
 
     def test_missing_mount_wrong_permissions_capacity_flags_and_root_refuse(self):
-        cases=[('',False),('rw,noexec,nosuid,nodev,size=256M,mode=0777,uid=65534,gid=65534',False),('rw,noexec,nosuid,nodev,size=300M,mode=0700,uid=65534,gid=65534',False),('rw,size=256M,mode=0700,uid=65534,gid=65534',False),('rw,noexec,nosuid,nodev,size=256M,mode=0700,uid=65534,gid=65534',True)]
+        # Docker supplies secure default mount flags when they are omitted.
+        # Explicitly disable them to test an effectively insecure mount.
+        cases=[('',False),('rw,noexec,nosuid,nodev,size=256M,mode=0777,uid=65534,gid=65534',False),('rw,noexec,nosuid,nodev,size=300M,mode=0700,uid=65534,gid=65534',False),('rw,exec,suid,dev,size=256M,mode=0700,uid=65534,gid=65534',False),('rw,noexec,nosuid,nodev,size=256M,mode=0700,uid=65534,gid=65534',True)]
         for mount,root in cases:
             with self.subTest(mount=mount,root=root):
                 result=self.run_probe(mount,root=root)
