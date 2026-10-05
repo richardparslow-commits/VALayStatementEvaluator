@@ -11,7 +11,8 @@ from tests.ingestion_fixtures import docx_parts, package
 from tests.test_parser_boundary import IMAGE, request
 from app import config, documents, pilot
 from app.documents import (ChunkPlan, DocumentPage, ExtractedDocument, ExtractionError,
-                           _blocks_from_text, document_from_text, extract_document)
+                           _blocks_from_text, chunk_page_labelled_text, document_from_text,
+                           extract_document)
 from app.isolated_extract import _documents
 from app.job_payload import (PayloadError, document_from_json, document_to_json,
                             request_documents_from_json)
@@ -73,6 +74,16 @@ class SourceSpanTests(unittest.TestCase):
         self.assert_source(doc, source, 24)
         self.assertEqual(doc.source_sha256, hashlib.sha256(source.encode()).hexdigest())
         self.assertNotEqual(doc.page_labelled_text(), source)
+
+    def test_raw_source_spans_have_identical_streamed_and_joined_model_chunks(self):
+        source = '  \tSynthetic denial.\r\n\r\n' + ('Dose -0.5 mg; no diagnosis.  ' * 190) + '\t '
+        with patch.object(config, 'DOCUMENT_BLOCK_CHARS', 96):
+            doc = document_from_text('record.txt', source)
+        for budget in (1200, 3000):
+            joined = chunk_page_labelled_text(doc.page_labelled_text(), max_chars=budget)
+            streamed = list(ChunkPlan(doc.pages, max_chars=budget))
+            self.assertEqual([(c.text, c.pages) for c in streamed], [(c.text, c.pages) for c in joined])
+        self.assertEqual(doc.full_text, source)
 
     def test_blank_source_spans_survive_parser_and_saved_request_roundtrips(self):
         source = (' \t' * 40) + 'Synthetic final denial.'

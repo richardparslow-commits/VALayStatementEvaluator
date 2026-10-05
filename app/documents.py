@@ -1022,9 +1022,10 @@ class _StreamingCutter:
     single page — never the joined corpus, never a second cleaned copy of it.
 
     Reads see the same *virtual* text the joined implementation would clean:
-    every extractor hands over already-cleaned page text, ``clean_text`` is
-    idempotent, and its three operations are character-, line- and run-local —    so cleaning each ``marker\ntext`` part independently and joining the cleaned
-    parts with ``\n\n`` equals cleaning the one joined string, because each
+    both paths strip body edges for the model view while retained source spans
+    remain untouched. Cleaning each ``marker\ntext`` part independently and
+    joining the cleaned parts with ``\n\n`` equals cleaning the joined string,
+    because the whitespace operations are part-local and each
     part starts and ends with a non-whitespace character and each seam
     (``\n\n``) therefore cannot interact with any ``clean_text`` operation.
     The seams are part of this cutter's virtual text as their own deque
@@ -1050,7 +1051,7 @@ class _StreamingCutter:
         if self._filled > 0:
             self._parts.append("\n\n")
             self._filled += 2
-        part = clean_text(f"{page.marker}\n{page.text}")
+        part = clean_text(f"{page.marker}\n{page.text.strip()}")
         self._parts.append(part)
         self._filled += len(part)
 
