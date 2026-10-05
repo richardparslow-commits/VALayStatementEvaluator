@@ -7,11 +7,13 @@ sent: AppArmor rejects socket creation before any connect call.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import io
 import json
 import os
 import shutil
 import socket
+import ssl
 import subprocess
 import tempfile
 import unittest
@@ -315,7 +317,10 @@ print(json.dumps({'count':len(children), 'bounded':len(children)<32}), flush=Tru
         # Synthetic application daemon starts the launcher; the launcher receives
         # only dedicated-engine TLS credentials, never the application socket.
         def call(args, **kwargs):
-            return subprocess.run([docker, *args], capture_output=True, check=True, timeout=100, **kwargs)
+            result = subprocess.run([docker, *args], capture_output=True, check=False, timeout=100, **kwargs)
+            if result.returncode:
+                self.fail('Synthetic launcher operation failed: ' + result.stderr.decode(errors='replace')[-4096:])
+            return result
         call(['volume', 'create', volume])
         try:
             call(['run', '--detach', '--name', name, '--read-only',
@@ -365,17 +370,33 @@ print(json.dumps({'count':len(children), 'bounded':len(children)<32}), flush=Tru
                 (path / name).chmod(0o400)
             (path / 'ca.pem').unlink()
             shutil.copyfile(path / 'cert.pem', path / 'ca.pem')
-            with self.assertRaises(subprocess.CalledProcessError):
+            # docker info --format may exit zero with an empty server identity
+            # after a TLS error. The launcher must refuse that metadata too.
+            with self.assertRaises((subprocess.CalledProcessError, wire.ParserRefused)):
                 DockerParser(IMAGE, REVISION, docker=self.runner.docker,
                              engine=replace(self.engine, tls_directory=path)).ready()
+            address = self.engine.endpoint.removeprefix('tcp://').removesuffix(':2376')
+            wrong_ca = ssl.create_default_context(cafile=str(path / 'ca.pem'))
+            wrong_ca.load_cert_chain(str(path / 'cert.pem'), str(path / 'key.pem'))
+            connection = http.client.HTTPSConnection(address, 2376, context=wrong_ca, timeout=5)
+            try:
+                with self.assertRaises(ssl.SSLError):
+                    connection.request('GET', '/_ping')
+                    connection.getresponse()
+            finally:
+                connection.close()
             (path / 'ca.pem').unlink()
             shutil.copyfile(self.engine.tls_directory / 'ca.pem', path / 'ca.pem')
             (path / 'cert.pem').unlink()
             (path / 'key.pem').unlink()
-            result = subprocess.run([self.runner.docker, 'info', '--format', '{{.ID}}'],
-                                    env=replace(self.engine, tls_directory=path).environment(),
-                                    capture_output=True, timeout=10)
-            self.assertNotEqual(result.returncode, 0)
+            no_client = ssl.create_default_context(cafile=str(path / 'ca.pem'))
+            connection = http.client.HTTPSConnection(address, 2376, context=no_client, timeout=5)
+            try:
+                with self.assertRaises(OSError):
+                    connection.request('GET', '/_ping')
+                    connection.getresponse()
+            finally:
+                connection.close()
         self.assertTrue(self.runner.ready()['ready'])
 
     def test_dedicated_daemon_identity_and_image_store_differ_from_application(self):

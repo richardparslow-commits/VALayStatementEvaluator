@@ -35,6 +35,11 @@ def setup(directory):
     call(['sudo', 'ip', 'address', 'add', address + '/32', 'dev', 'lo'])
     for chain in ('INPUT', 'OUTPUT'):
         call(['sudo', 'iptables', '-I', chain, '-d', address + '/32', '-p', 'tcp', '--dport', '2376', '-j', 'ACCEPT'])
+    # A second daemon's bridge=none setup can remove the application's docker0.
+    # Give this daemon its own bridge instead; parser containers still use none.
+    call(['sudo', 'ip', 'link', 'add', 'va-parser-ci', 'type', 'bridge'])
+    call(['sudo', 'ip', 'address', 'add', '10.74.0.1/24', 'dev', 'va-parser-ci'])
+    call(['sudo', 'ip', 'link', 'set', 'va-parser-ci', 'up'])
     call(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
           '-subj', '/CN=SyntheticParserCI', '-keyout', str(server / 'ca-key.pem'), '-out', str(server / 'ca.pem')])
     for name, common, extensions in (('server', 'SyntheticParserServer', f'subjectAltName=IP:{address}\nextendedKeyUsage=serverAuth\n'),
@@ -70,7 +75,7 @@ def setup(directory):
                           '--tlscacert=' + str(server / 'ca.pem'), '--tlscert=' + str(server / 'server.pem'),
                           '--tlskey=' + str(server / 'server-key.pem'), '--data-root=' + str(directory / 'data'),
                           '--exec-root=' + str(directory / 'exec'), '--pidfile=' + str(directory / 'daemon.pid'),
-                          '--bridge=none', '--iptables=false', '--ip-masq=false', '--ip-forward=false',
+                          '--bridge=va-parser-ci', '--iptables=false', '--ip-masq=false', '--ip-forward=false',
                           '--label=va-lse-purpose=parser-only'], stdout=log, stderr=log,
                          env={'PATH': os.environ['PATH']}, start_new_session=True)
     deadline = time.monotonic() + 60
@@ -103,6 +108,8 @@ def setup(directory):
             connection.close()
         raise RuntimeError('Synthetic dedicated TLS engine did not start; inspect private CI daemon log.')
     assert engine_id and engine_id != application_id
+    # Fail setup if the independent application bridge was changed/removed.
+    call(['ip', 'link', 'show', networks[0]['Options'].get('com.docker.network.bridge.name', 'docker0')])
     image = call(['docker', 'image', 'inspect', 'va-lse-parser:ci', '--format', '{{.Id}}']).stdout.decode().strip()
     archive = directory / 'parser-image.tar'
     call(['docker', 'save', '-o', str(archive), image])
@@ -141,6 +148,7 @@ def cleanup(directory):
                         '--dport', '2376', '-j', 'ACCEPT'], capture_output=True, timeout=10, check=False)
     subprocess.run(['sudo', 'ip', 'address', 'del', '10.73.0.1/32', 'dev', 'lo'],
                    capture_output=True, timeout=10, check=False)
+    subprocess.run(['sudo', 'ip', 'link', 'delete', 'va-parser-ci'], capture_output=True, timeout=10, check=False)
 
 
 if __name__ == '__main__':

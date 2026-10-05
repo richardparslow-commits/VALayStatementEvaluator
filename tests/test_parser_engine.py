@@ -90,7 +90,8 @@ class EngineTests(unittest.TestCase):
         runner = DockerParser(IMAGE, 'reviewed', engine=ENGINE)
         good = {'ID': ENGINE.identity, 'Labels': ['va-lse-purpose=parser-only'], 'OSType': 'linux',
                 'SecurityOptions': ['name=apparmor', 'name=seccomp,profile=builtin']}
-        for change in ({'ID': ENGINE.application_identity}, {'ID': 'unknown'}, {'Labels': []}):
+        for change in ({'ID': ENGINE.application_identity}, {'ID': 'unknown'}, {'Labels': []},
+                       {'ID': None, 'ServerErrors': ['Synthetic TLS refusal']}, {'ID': ''}):
             with self.subTest(change=change), patch.object(runner, '_command', return_value={**good, **change}), \
                     patch('app.parser_service.subprocess.Popen') as launch, self.assertRaises(wire.ParserRefused):
                 import hashlib
