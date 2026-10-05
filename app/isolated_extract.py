@@ -10,7 +10,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from .documents import DocumentPage, ExtractedDocument, ExtractionError
+from .documents import (DOCUMENT_SCHEMA_VERSION, DocumentPage, ExtractedDocument,
+                        ExtractionError, validate_source_spans)
 from .ingestion_policy import IngestionRefused, validate_label
 from .parser_protocol import (DEADLINE, MAX_HEADER, MAX_INPUT, MAX_OUTPUT, MAX_TEXT, MAX_PAGES,
                               SOCKET_PATH, ParserRefused, decode, encode, frame,
@@ -85,7 +86,7 @@ def _documents(reply: Any, request: dict[str, Any], image: str) -> tuple[list[Ex
                 or not (name == label or (label.lower().endswith(".zip") and member
                     and not member.startswith("/")))
                 or any(ord(c) < 32 or ord(c) == 127 for c in name)
-                or type(item["schema_version"]) is not int or item["schema_version"] != 3
+                or type(item["schema_version"]) is not int or item["schema_version"] != DOCUMENT_SCHEMA_VERSION
                 or not isinstance(item["source_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", item["source_sha256"])
                 or (name == label and item["source_sha256"] != request["sha256"])
                 or item["extraction_method"] not in ("pdf-text-unreviewed", "docx-stories-unreviewed", "strict-unicode")
@@ -104,10 +105,10 @@ def _documents(reply: Any, request: dict[str, Any], image: str) -> tuple[list[Ex
         decoded: list[DocumentPage] = []
         seen = set(unreadable)
         for page in pages:
-            if (not isinstance(page, dict) or set(page) != {"page", "text", "kind", "source_part"}
+            if (not isinstance(page, dict) or set(page) != {"page", "text", "kind", "source_part", "source_start", "source_end"}
                     or type(page["page"]) is not int or not 1 <= page["page"] <= item["total_pages"]
                     or page["page"] in seen or page["kind"] != item["pagination"]
-                    or not isinstance(page["text"], str) or not page["text"].strip()):
+                    or not isinstance(page["text"], str) or not page["text"]):
                 raise ParserRefused("Invalid parser page schema.")
             part = page["source_part"]
             if not isinstance(part, str) or len(part) > 1024:
@@ -121,11 +122,21 @@ def _documents(reply: Any, request: dict[str, Any], image: str) -> tuple[list[Ex
                     raise ParserRefused("Invalid parser source part.")
             seen.add(page["page"])
             chars += len(page["text"])
-            decoded.append(DocumentPage(name, page["page"], page["text"], page["kind"], part))
+            if item["extraction_method"] == "docx-stories-unreviewed" and not part:
+                raise ParserRefused("Missing parser source story identity.")
+            decoded.append(DocumentPage(name, page["page"], page["text"], page["kind"], part,
+                                        page["source_start"], page["source_end"]))
         if len(seen) != item["total_pages"] or total > limit or chars > MAX_TEXT:
             raise ParserRefused("Parser response exceeds coverage or output bounds.")
         if [p.page for p in decoded] != sorted(p.page for p in decoded):
             raise ParserRefused("Parser pages are out of order.")
+        needs_spans = item["extraction_method"] in ("strict-unicode", "docx-stories-unreviewed")
+        try:
+            validate_source_spans(decoded, required=needs_spans)
+        except ExtractionError as exc:
+            raise ParserRefused("Invalid parser source spans.") from exc
+        if not needs_spans and any(p.source_start is not None or p.source_end is not None or not p.text.strip() for p in decoded):
+            raise ParserRefused("Invalid physical-page source metadata.")
         documents.append(ExtractedDocument(name, decoded, item["total_pages"], unreadable,
                                            item["pagination"], True, item["source_sha256"],
                                            item["extraction_method"], item["text_encoding"]))

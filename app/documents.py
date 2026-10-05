@@ -70,6 +70,7 @@ ARCHIVE_EXTENSIONS = (".zip",)
 # "p.1" while the file genuinely has no pages to point at.
 PAGE = "page"
 BLOCK = "block"
+DOCUMENT_SCHEMA_VERSION = 4
 
 # Marker emitted by ``ExtractedDocument.page_labelled_text`` and parsed back out
 # of a chunk to recover which pages a chunk covers. Defined once: the digest's
@@ -147,6 +148,10 @@ class DocumentPage:
     text: str
     kind: str = PAGE  # PAGE for a real page, BLOCK when the source has none
     source_part: str = ""  # DOCX package part; never a filesystem path to open
+    # Half-open Unicode character offsets within decoded text or one DOCX story.
+    # Text is retained only in these slices, not in another whole-source copy.
+    source_start: int | None = None
+    source_end: int | None = None
 
     @property
     def label(self) -> str:
@@ -189,7 +194,18 @@ class ExtractedDocument:
 
     @property
     def full_text(self) -> str:
-        return "\n\n".join(p.text for p in self.pages)
+        parts: list[str] = []
+        previous: DocumentPage | None = None
+        for page in self.pages:
+            contiguous = (previous is not None and page.source_start is not None
+                          and previous.source_end == page.source_start
+                          and previous.source_part == page.source_part
+                          and previous.filename == page.filename)
+            if previous is not None and not contiguous:
+                parts.append("\n\n")
+            parts.append(page.text)
+            previous = page
+        return "".join(parts)
 
     @property
     def char_count(self) -> int:
@@ -254,43 +270,61 @@ def extract_document(filename: str, data: bytes) -> ExtractedDocument:
 def _blocks_from_text(
     filename: str, text: str, block_chars: int | None = None
 ) -> list[DocumentPage]:
-    """Split paged-less text (.txt/.md/.docx) into addressable blocks.
+    """Retain exact, bounded source slices; never cut inside a source token.
 
-    A .txt/.docx has no page numbers, so every fact extracted from one used to be
-    cited "p.1" — provenance that is false for a 200-page document. Long text is
-    split at paragraph boundaries into blocks of roughly
-    ``config.DOCUMENT_BLOCK_CHARS`` and labelled ``b.1``, ``b.2``… (see
-    ``DocumentPage.label``); short text stays a single page so the common case is
-    unchanged.
+    Paragraph boundaries are preferred; whitespace is the fallback. A token
+    larger than the budget is refused rather than fragmented or truncated.
+    Normalized retrieval/model views are built separately from these slices.
     """
     limit = config.DOCUMENT_BLOCK_CHARS if block_chars is None else block_chars
-    text = clean_text(text)
-    if len(text) <= limit:
-        return [DocumentPage(filename, 1, text, PAGE)]
+    if type(limit) is not int or limit < 1:
+        raise ExtractionError("A positive source block limit is required.")
+    pages: list[DocumentPage] = []
+    kind = PAGE if len(text) <= limit else BLOCK
+    start = 0
+    while start < len(text):
+        end = min(start + limit, len(text))
+        if end < len(text):
+            paragraph = text.rfind("\n\n", start, end)
+            if paragraph >= start + limit // 2:
+                end = paragraph + 2
+            elif not (text[end - 1].isspace() or text[end].isspace()):
+                while end > start and not text[end - 1].isspace():
+                    end -= 1
+                if end == start:
+                    raise ExtractionError(f"{filename}: a source token exceeds the block limit. Supply a reviewed readable copy before analysis.")
+        pages.append(DocumentPage(filename, len(pages) + 1, text[start:end], kind,
+                                  source_start=start, source_end=end))
+        start = end
+    return pages
 
-    paragraphs = [part.strip() for part in re.split(r"\n{2,}", text) if part.strip()]
-    blocks: list[str] = []
-    current = ""
-    for paragraph in paragraphs:
-        if current and len(current) + len(paragraph) + 2 > limit:
-            blocks.append(current)
-            current = paragraph
-        else:
-            current = f"{current}\n\n{paragraph}" if current else paragraph
-        # A single oversized paragraph (a table dump, a pasted export) still has to
-        # be cut, or one block would hold the whole file and defeat the point.
-        while len(current) > limit:
-            blocks.append(current[:limit])
-            current = current[limit:]
-    if current:
-        blocks.append(current)
-    return [DocumentPage(filename, i, block, BLOCK) for i, block in enumerate(blocks, start=1)]
+
+def validate_source_spans(pages: Sequence[DocumentPage], *, required: bool = False) -> None:
+    """Refuse gaps, overlaps, reordered/repeated stories and coerced offsets."""
+    if not required and not any(p.source_start is not None or p.source_end is not None for p in pages):
+        return
+    seen: set[str] = set()
+    previous: DocumentPage | None = None
+    for index, page in enumerate(pages, start=1):
+        start, end = page.source_start, page.source_end
+        expected = previous.source_end if previous is not None and previous.source_part == page.source_part else 0
+        if (page.page != index or type(start) is not int or type(end) is not int or start != expected
+                or end <= start or end - start != len(page.text)):
+            raise ExtractionError("Invalid contiguous source span metadata.")
+        if (previous is not None and previous.source_part == page.source_part
+                and (previous.filename != page.filename
+                     or not (previous.text[-1].isspace() or page.text[0].isspace()))):
+            raise ExtractionError("A source span boundary splits a source token.")
+        if previous is None or previous.source_part != page.source_part:
+            if page.source_part in seen:
+                raise ExtractionError("Source stories are out of order.")
+            seen.add(page.source_part)
+        previous = page
 
 
 def document_from_text(filename: str, text: str) -> ExtractedDocument:
     """Create an extracted document from plain text, blocked when it is long."""
-    text = clean_text(text)
-    if not text:
+    if not text.strip():
         raise ExtractionError(f"{filename}: file is empty.")
     pages = _blocks_from_text(filename, text)
     return ExtractedDocument(
@@ -545,7 +579,8 @@ def _extract_docx(filename: str, data: bytes) -> ExtractedDocument:
     pages: list[DocumentPage] = []
     for name, text in sorted(stories, key=lambda s: (s[0] != "word/document.xml", s[0])):
         for block in _blocks_from_text(filename, text):
-            pages.append(DocumentPage(filename, len(pages) + 1, block.text, BLOCK, name))
+            pages.append(DocumentPage(filename, len(pages) + 1, block.text, BLOCK, name,
+                                      block.source_start, block.source_end))
     return ExtractedDocument(
         filename=filename,
         pages=pages,

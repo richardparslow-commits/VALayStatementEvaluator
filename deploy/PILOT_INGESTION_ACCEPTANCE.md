@@ -17,6 +17,7 @@ Changing parser code requires rebuilding and reviewing that immutable image.
 | Input | Required validation and refusal behavior |
 | --- | --- |
 | TXT / MD | Strict UTF-8, optionally UTF-8 BOM, or BOM-declared UTF-16/32. No guessed code page or replacement decoding. Recognized binary signatures, NUL, unsupported control characters and malformed Unicode are refused. Legacy exports must be converted explicitly to UTF-8. |
+| Source blocks | TXT/MD decoded text and each extracted DOCX story retain contiguous half-open Unicode character spans. Blocks prefer paragraph/whitespace boundaries and never split non-whitespace tokens. Reconstruction preserves source characters without inserted separators within a story. Oversized tokens are explicitly refused. Normalized model/retrieval views are separate. Parser document schema 4 and saved-job decoding check span length, continuity, story identity and order; legacy saved blocks have unknown coverage and require a fresh upload. |
 | PDF | Header and strict pypdf structural parse. Password protection, actions (including annotation hyperlinks), JavaScript, file specifications/attachments, XFA, active media and collections are refused before text extraction. A bounded traversal checks dictionaries reachable from the trailer without inflating content streams. |
 | DOCX | ZIP header, required OPC content types, root office-document relationship and main Word XML. Every non-directory part has an allowed content type and is read with per-part and cumulative actual-byte limits. Only the listed passive XML part types and PNG/JPEG/GIF/BMP/TIFF image signatures are supported. |
 | DOCX active content | Macro/embedded-object/unsupported part types, active or unknown relationships, external targets (including hyperlinks/templates), active Word elements and DDE/include/link/embed field instructions are refused. Internal relative relationships must resolve to an existing part inside the package. |
@@ -83,6 +84,13 @@ non-secret results. The following checks remain OPEN until observed on that host
 - Observe CPU, memory and wall-time kill/cleanup on hostile synthetic input using
   the existing resource/isolation acceptance procedure. Verify staging deletion
   after success, refusal and timeout; no document content in host logs.
+- Submit a TXT/MD and DOCX story with an ISO date, signed decimal dose, negation
+  and combining Unicode text crossing the old 4,000-character seam. Confirm exact
+  source reconstruction, original byte identity, intact evidence tokens and
+  sequential span/citation addresses through the actual parser. Confirm a token
+  longer than the configured block limit is explicitly refused. Deploy the same
+  schema-4 application/parser version, rebuild/review the immutable parser image,
+  and refresh revision-specific approval before pilot admission.
 - Remove `ingestion_security` and change it during an existing consent session.
   Confirm respectively closed admission and required renewed consent.
 

@@ -32,7 +32,8 @@ from typing import Any
 from . import config
 from .queue_policy import require_synthetic_queue, synthetic_mode, synthetic_queue
 from .blob_store import BlobRef, BlobStore, BlobStoreError, dumps_documents, loads_documents
-from .documents import DocumentPage, ExtractedDocument
+from .documents import (DOCUMENT_SCHEMA_VERSION, DocumentPage, ExtractedDocument,
+                        ExtractionError, validate_source_spans)
 from .draft import DraftResult
 from .evaluate import EvaluationResult, compute_effectiveness_score, evaluation_report_markdown
 from .evaluation_topics import TOPIC_POLICY, TopicValidationError, normalize_topics, topics_are_complete, evaluation_is_complete, topic_notice
@@ -107,7 +108,7 @@ def _str_map(value: Any) -> dict[str, str]:
 def document_to_json(doc: ExtractedDocument) -> dict[str, Any]:
     return {
         "filename": doc.filename,
-        "schema_version": 3,
+        "schema_version": DOCUMENT_SCHEMA_VERSION,
         "total_pages": doc.total_pages,
         "unreadable_pages": doc.unreadable_pages,
         "pagination": doc.pagination,
@@ -115,7 +116,8 @@ def document_to_json(doc: ExtractedDocument) -> dict[str, Any]:
         "source_sha256": doc.source_sha256,
         "extraction_method": doc.extraction_method,
         "text_encoding": doc.text_encoding,
-        "pages": [{"page": p.page, "text": p.text, "kind": p.kind, "source_part": p.source_part} for p in doc.pages],
+        "pages": [{"page": p.page, "text": p.text, "kind": p.kind, "source_part": p.source_part,
+                   "source_start": p.source_start, "source_end": p.source_end} for p in doc.pages],
     }
 
 
@@ -124,6 +126,14 @@ def document_from_json(raw: Any) -> ExtractedDocument | None:
     filename = _as_str(data.get("filename"))
     if not filename:
         return None
+    if data.get("schema_version") == DOCUMENT_SCHEMA_VERSION:
+        entries = data.get("pages")
+        if (type(data.get("schema_version")) is not int or not isinstance(entries, list)
+                or any(not isinstance(p, dict) or not isinstance(p.get("text"), str) or not p["text"]
+                       or type(p.get("page")) is not int or p["page"] < 1
+                       or not isinstance(p.get("source_part"), str)
+                       or "source_start" not in p or "source_end" not in p for p in entries)):
+            raise PayloadError("Invalid source document pages.")
     pages: list[DocumentPage] = []
     for entry in _dict_items(data.get("pages")):
         text = _as_str(entry.get("text"))
@@ -133,7 +143,8 @@ def document_from_json(raw: Any) -> ExtractedDocument | None:
         if kind not in {"page", "block"}:
             raise PayloadError("Invalid document citation unit.")
         pages.append(DocumentPage(filename, max(1, _as_int(entry.get("page"), 1)), text, kind,
-                                  _as_str(entry.get("source_part"))))
+                                  _as_str(entry.get("source_part")),
+                                  entry.get("source_start"), entry.get("source_end")))
     if not pages:
         return None
     total = _as_int(data.get("total_pages"), 0)
@@ -141,9 +152,19 @@ def document_from_json(raw: Any) -> ExtractedDocument | None:
     pagination = _as_str(data.get("pagination")) or "page"
     if total < 0 or pagination not in {"page", "block"} or any(n < 1 or n > total for n in unreadable):
         raise PayloadError("Invalid document coverage metadata.")
+    try:
+        validate_source_spans(pages, required=data.get("schema_version") == DOCUMENT_SCHEMA_VERSION
+                              and data.get("extraction_method") in ("strict-unicode", "docx-stories-unreviewed"))
+    except ExtractionError as exc:
+        raise PayloadError("Invalid document source spans.") from exc
+    # Legacy block text may already contain separators inserted inside evidence.
+    # Its original coverage cannot be recovered from a saved transformed copy.
+    known = (type(data.get("schema_version")) is int and data.get("schema_version") in (2, 3, DOCUMENT_SCHEMA_VERSION)
+             and data.get("coverage_known", True) is True
+             and (data.get("schema_version") == DOCUMENT_SCHEMA_VERSION or pagination != "block"))
     return ExtractedDocument(filename=filename, pages=pages, total_pages=total,
                              unreadable_pages=unreadable, pagination=pagination,
-                             coverage_known=data.get("schema_version") in (2, 3) and data.get("coverage_known", True) is True,
+                             coverage_known=known,
                              source_sha256=_as_str(data.get("source_sha256")),
                              extraction_method=_as_str(data.get("extraction_method")),
                              text_encoding=_as_str(data.get("text_encoding")))
@@ -163,7 +184,8 @@ def request_documents_from_json(raw: Any) -> list[ExtractedDocument]:
             raise PayloadError("Each medical record needs extractable page text.")
         for page in pages:
             if (not isinstance(page, dict) or not isinstance(page.get("text"), str)
-                    or not page["text"].strip() or type(page.get("page")) is not int or page["page"] < 1):
+                    or not page["text"] or type(page.get("page")) is not int or page["page"] < 1
+                    or (not page["text"].strip() and entry.get("schema_version") != DOCUMENT_SCHEMA_VERSION)):
                 raise PayloadError("Medical record pages must contain text and valid page addresses.")
             if "kind" in page and page["kind"] not in ("page", "block"):
                 raise PayloadError("Medical record citation units must be page or block.")

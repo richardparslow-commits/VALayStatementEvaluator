@@ -716,6 +716,14 @@ members receive explicit warnings. OS-looking names alone never justify an
 omission. A controlled pilot refuses any bundle with member refusals; remove
 non-record metadata or supply a readable copy before proceeding.
 
+TXT/MD source text and extracted DOCX stories are retained as contiguous character
+spans. Block boundaries use paragraph/whitespace boundaries, keeping dates, doses
+and other source tokens intact; reconstruction does not insert paragraph breaks
+inside a story. A non-whitespace token longer than `VA_LSE_DOCUMENT_BLOCK_CHARS`
+(default 4,000 characters) is refused explicitly. Whitespace normalization belongs
+to the model/retrieval view, while source text remains available for verification.
+Saved span metadata is versioned; old block extractions need a fresh upload.
+
 Tuning: raise `VA_LSE_RECORDS_CONCURRENCY` if your endpoint allows more parallel
 requests; lower `VA_LSE_DIGEST_CHUNK_CHARS` for extra recall on very dense pages (at the
 cost of more LLM calls). `scripts/scale_sim.py` runs an offline 2,000-page simulation of

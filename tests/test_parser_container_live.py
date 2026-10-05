@@ -88,6 +88,40 @@ class ParserContainerTests(unittest.TestCase):
         for name in ('.damaged.pdf', '__MACOSX/.DS_Store'):
             self.assertTrue(any(name in message for message in skipped), skipped)
 
+    def test_packaged_parser_preserves_split_source_text_and_offsets(self):
+        source = 'pad ' * 998 + '2020-01-13: no diagnosis; dose -0.5 mg.\r\n\tSynthetic final denial.  '
+        data = source.encode()
+        request = {**self.request, 'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+        docs, skipped = _documents(_unpack_reply(wire.decode(self.runner.run(request, data)), IMAGE), request, IMAGE)
+        self.assertEqual(skipped, [])
+        self.assertGreater(len(docs[0].pages), 1)
+        self.assertEqual(docs[0].full_text, source)
+        for page in docs[0].pages:
+            self.assertEqual(page.text, source[page.source_start:page.source_end])
+            self.assertLessEqual(len(page.text), 4000)
+        self.assertTrue(any('2020-01-13' in p.text for p in docs[0].pages))
+        self.assertEqual(docs[0].source_sha256, request['sha256'])
+
+    def test_packaged_parser_preserves_docx_story_source_spans(self):
+        from tests.ingestion_fixtures import docx_parts, package
+        source = 'pad ' * 998 + '2020-01-13: no diagnosis.'
+        data = package(docx_parts(source))
+        request = {**self.request, 'label': 'record.docx', 'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+        docs, skipped = _documents(_unpack_reply(wire.decode(self.runner.run(request, data)), IMAGE), request, IMAGE)
+        self.assertEqual(skipped, [])
+        self.assertEqual(docs[0].full_text, source)
+        self.assertGreater(len(docs[0].pages), 1)
+        self.assertTrue(all(p.source_part == 'word/document.xml' for p in docs[0].pages))
+        self.assertTrue(any('2020-01-13' in p.text for p in docs[0].pages))
+
+    def test_packaged_parser_explicitly_refuses_an_over_limit_source_token(self):
+        data = b'X' * 4001
+        request = {**self.request, 'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+        docs, skipped = _documents(_unpack_reply(wire.decode(self.runner.run(request, data)), IMAGE), request, IMAGE)
+        self.assertEqual(docs, [])
+        self.assertEqual(len(skipped), 1)
+        self.assertIn('source token', skipped[0])
+
     def probe(self, code):
         command = self.runner.command
         def argv(name):
