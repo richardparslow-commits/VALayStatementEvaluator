@@ -26,7 +26,7 @@ SOURCE = OPENING + " for two years with no falls."
 
 
 def document(text=SOURCE, *, filename="clinic.pdf", page=1):
-    return ExtractedDocument(filename=filename, pages=[DocumentPage(filename, page, text)])
+    return ExtractedDocument(filename=filename, pages=[DocumentPage(filename, page, text)], total_pages=page)
 
 
 def fact(quote=SOURCE, *, filename="clinic.pdf", page=1):
@@ -338,10 +338,12 @@ class TestPilotCitationGate(unittest.TestCase):
         self.assertNotIn("records:summary", llm.phases)
 
     def test_ambiguous_source_blocks_pilot_even_after_page_deduplication(self):
+        from app.request_validation import RequestValidationError
         llm = _SyntheticLLM([fact()])
         with patch("app.pilot.enabled", return_value=True):
-            with self.assertRaisesRegex(pilot.PilotBlocked, "unverified citations"):
+            with self.assertRaisesRegex(RequestValidationError, "coverage is incomplete"):
                 review_medical_records(llm, [document(), document()])
+        self.assertNotIn("records:digest", llm.phases)
         self.assertNotIn("records:summary", llm.phases)
 
     def test_authentic_quote_with_unchanged_description_completes_pilot_record_review(self):

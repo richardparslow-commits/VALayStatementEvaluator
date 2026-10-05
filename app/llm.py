@@ -948,9 +948,15 @@ class LLMParseError(LLMError):
     The model's output is sampled stochastically — the identical prompt can yield
     valid JSON on one call and unparseable text on the next (measured 2026-09-20:
     5 of 149 digest chunks in one run) — so :meth:`LLMClient.chat_json` re-asks
-    once before raising. The failure stays logged with the raw shape for
-    diagnosis, and one re-ask cannot recurse.
+    once before raising. Only phase/count metadata is logged; response content
+    is never part of the error message. A re-ask cannot recurse.
     """
+
+
+class LLMJSONContractError(LLMParseError):
+    """Ambiguous values/resource limits cannot trigger a larger paid re-ask."""
+
+    retriable = False
 
 
 class _ModerationFilteredError(LLMUpstreamError):
@@ -2214,6 +2220,8 @@ class LLMClient:
         try:
             return _parse_json(text)
         except LLMParseError as exc:
+            if isinstance(exc, LLMJSONContractError):
+                raise
             failure = LLMParseError(
                 f"Could not parse JSON for phase '{phase}' (response chars={len(text)})."
             )
@@ -2300,17 +2308,27 @@ def _strip_code_fences(text: str) -> str:
 
 
 def _parse_json(text: str) -> Any:
-    """Parse JSON from a model response, tolerating fences/prose around it."""
-    candidate = _strip_code_fences(text)
+    """Bound and strictly decode each candidate; pilot mode refuses prose rescue."""
+    from . import pilot
+    from .bounded_json import JSONContractError, decode_json, response_bytes
     try:
-        return json.loads(candidate)
-    except json.JSONDecodeError:
-        # Last resort: locate the outermost braces/brackets.
+        response_bytes(text)  # Wrappers cannot hide an oversized response.
+    except JSONContractError:
+        raise LLMJSONContractError("Model JSON violated its response limits.") from None
+    candidate = _strip_code_fences(text)
+    candidates = [candidate]
+    # Preserve legacy non-pilot prose tolerance only for a prose-led response.
+    # Never salvage a valid nested array from an invalid object-led document.
+    if not pilot.enabled() and candidate[:1] not in ("{", "["):
         for opener, closer in (("{", "}"), ("[", "]")):
             start, end = candidate.find(opener), candidate.rfind(closer)
             if start != -1 and end > start:
-                try:
-                    return json.loads(candidate[start : end + 1])
-                except json.JSONDecodeError:
-                    continue
+                candidates.append(candidate[start:end + 1])
+    for value in candidates:
+        try:
+            return decode_json(response_bytes(value))
+        except JSONContractError:
+            raise LLMJSONContractError("Model JSON contained ambiguous values or exceeded its limits.") from None
+        except json.JSONDecodeError:
+            continue
     raise LLMParseError(f"Could not parse JSON from model output (chars={len(text)}).")

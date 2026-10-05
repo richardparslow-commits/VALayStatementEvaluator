@@ -40,6 +40,14 @@ def result(account=ACCOUNT, text=None):
                        factual_inputs=retained_inputs(account, {}, [doc]))
 
 
+def pilot_result(account=ACCOUNT, text=None):
+    """A complete source-bound fixture for pilot review/export UI tests."""
+    r = result(account, text)
+    r.digest.facts[0].description = QUOTE
+    r.digest.facts[0].date = "unknown"
+    return r
+
+
 def reasons(review):
     return " ".join(review["issues"] + [issue for row in review["rows"] for issue in row["issues"]])
 
@@ -594,6 +602,9 @@ class TestExactHumanReview(unittest.TestCase):
 
     def test_owner_change_invalidates_approval(self):
         r = result()
+        # Owner binding is tested on an otherwise pilot-eligible source review.
+        r.digest.facts[0].description = QUOTE
+        r.digest.facts[0].date = "unknown"
         with patch.object(self.view.pilot, "enabled", return_value=True), patch.object(self.view.pilot, "current_owner", return_value="owner-a"):
             self.approve(r)
         with patch.object(self.view.pilot, "enabled", return_value=True), patch.object(self.view.pilot, "current_owner", return_value="owner-b"):

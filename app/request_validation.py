@@ -101,9 +101,38 @@ def validate_records(records: Any) -> tuple[int, int]:
                                      field="records", reason="payload_too_large")
 
     from . import pilot
+    if pilot.enabled():
+        require_complete_record_coverage(records)
     if pilot.enabled() and text_chars > 20 * 1024 * 1024:
         raise RequestValidationError("The pilot record text exceeds its processing limit.", field="records")
     return source_pages, text_bytes
+
+
+RECORD_COVERAGE_POLICY = "complete_readable_source_units_v1"
+
+
+def require_complete_record_coverage(records: list[ExtractedDocument]) -> None:
+    """Full, known extraction coverage; this does not certify OCR/layout accuracy.
+
+    Counts alone do not suffice: duplicate, missing, reordered or wrong-kind
+    page/block addresses must not masquerade as all source units being present.
+    """
+    seen: set[tuple[str, str]] = set()
+    for doc in records:
+        identity = (doc.filename, doc.pagination)
+        if (doc.coverage_known is not True or not isinstance(doc.unreadable_pages, list)
+                or doc.unreadable_pages
+                or type(doc.total_pages) is not int or doc.total_pages < 1
+                or doc.total_pages != len(doc.pages) or identity in seen
+                or any(type(page.page) is not int or page.page != index
+                       or page.kind != doc.pagination or page.filename != doc.filename
+                       or not isinstance(page.text, str) or not page.text.strip()
+                       for index, page in enumerate(doc.pages, 1))):
+            raise RequestValidationError(
+                "Medical record coverage is incomplete or unknown. Review and supply a complete readable copy before a pilot run.",
+                field="records", reason="coverage_incomplete",
+            )
+        seen.add(identity)
 
 
 def validate_evaluation_request(*, statement_text: Any, records: Any, witness: Any = None,
