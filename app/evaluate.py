@@ -605,6 +605,7 @@ def run_evaluation(
     records: list[ExtractedDocument],
     progress: ProgressCallback | None = None,
     witness: dict[str, str] | None = None,
+    statement_source: ExtractedDocument | None = None,
 ) -> EvaluationResult:
     """Execute the full evaluation pipeline.
 
@@ -615,7 +616,8 @@ def run_evaluation(
     pre-intake pipeline.
     """
     from .request_validation import validate_evaluation_request
-    validate_evaluation_request(statement_text=statement_text, records=records, witness=witness)
+    validate_evaluation_request(statement_text=statement_text, records=records, witness=witness,
+                                statement_source=statement_source)
     rid = get_request_id() or "-"
     t0 = time.perf_counter()
     pages = sum(len(d.pages) for d in records)
@@ -633,6 +635,9 @@ def run_evaluation(
     ):
         try:
             result = _run_evaluation(llm, statement_text, records, progress, witness or {})
+            if statement_source is not None:
+                from .job_payload import document_to_json
+                result.factual_inputs["statement_source"] = document_to_json(statement_source)
             duration_ms = int((time.perf_counter() - t0) * 1000)
             logger.info(
                 "evaluate done duration_ms=%d claims=%d verifications=%d contradictions=%d",
@@ -791,27 +796,10 @@ def _run_evaluation(
     # independently of prompt budgets so saved results always carry
     # full provenance.
     result.evidence_source = _pages_to_source(records)
-    # Hard bound for LLM prompts (80k) — the 60k soft limit is enforced in the UI
-    # with a warning + confirmation. Direct callers bypassing the UI still get
-    # bounded prompts and an auditable warning in the report.
-    prompt_statement, removed = _truncate_for_prompt(statement_text, EVALUATE_INTERNAL_MAX_CHARS)
-    result.truncated_chars = removed
-    if removed:
-        result.truncation_warning = (
-            f"Statement was {result.input_chars:,} characters — "
-            f"{removed:,} characters beyond the {EVALUATE_INTERNAL_MAX_CHARS:,} internal prompt limit "
-            f"were truncated and not analyzed. Claims at the end of the statement may have been missed. "
-            f"Split the statement or shorten it and re-run for complete coverage."
-        )
-        # Layer a soft-limit note when the input also exceeded the 60k UI gate
-        if result.input_chars > MAX_STATEMENT_CHARS:
-            result.truncation_warning = (
-                f"Statement was {result.input_chars:,} characters — "
-                f"{result.input_chars - MAX_STATEMENT_CHARS:,} characters over the {MAX_STATEMENT_CHARS:,} "
-                f"recommended limit. {removed:,} characters were truncated for the model prompts; "
-                f"claims at the end (e.g., family impact, caregiver necessity) may have been missed. "
-                f"Split the statement into smaller parts or shorten it and re-run."
-            )
+    # Refuse oversized input before any model call; preserve every accepted character.
+    from .request_validation import validate_text
+    validate_text(statement_text, field="statement_text", label="The lay statement", limit=EVALUATE_INTERNAL_MAX_CHARS)
+    prompt_statement = statement_text
 
     def report(frac: float, msg: str) -> None:
         check_pipeline_cancelled()
@@ -835,7 +823,7 @@ def _run_evaluation(
             claims_data = llm.chat_json(
                 CLAIMS_SYSTEM,
                 CLAIMS_USER.format(
-                    statement=sanitize_for_prompt(prompt_statement, max_chars=EVALUATE_INTERNAL_MAX_CHARS),
+                    statement=sanitize_for_prompt(prompt_statement, max_chars=None),
                     guard_note=GUARD_NOTE,
                 ),
                 phase="claims",
@@ -910,7 +898,7 @@ def _score_rubric(llm: LLMService, result: EvaluationResult, statement: str) -> 
         rubric=load_knowledge("evaluation_rubric.md"), legal=load_knowledge("legal_framework.md")
     )
     prompt = RUBRIC_USER.format(
-        statement=sanitize_for_prompt(statement, max_chars=EVALUATE_INTERNAL_MAX_CHARS),
+        statement=sanitize_for_prompt(statement, max_chars=None),
         verifications=sanitize_for_prompt(_verifications_text(result), max_chars=20_000),
         digest_summary=sanitize_digest_text(
             (result.digest.summary if result.digest else "") or "(no summary)", max_chars=20_000
@@ -979,12 +967,14 @@ def _analyze_topics(
     result.topic_rows = []
     result.topic_critical_gaps = []
     result.topic_notes = ""
-    truncated_statement, _ = _truncate_for_prompt(statement_text, EVALUATE_INTERNAL_MAX_CHARS)
+    from .request_validation import validate_text
+    validate_text(statement_text, field="statement_text", label="The lay statement", limit=EVALUATE_INTERNAL_MAX_CHARS)
+    truncated_statement = statement_text
     system = TOPIC_SYSTEM_TEMPLATE.format(
         checklist=load_knowledge("topic_checklist.md"), legal=load_knowledge("legal_framework.md")
     )
     prompt = TOPIC_USER.format(
-        statement=sanitize_for_prompt(truncated_statement, max_chars=EVALUATE_INTERNAL_MAX_CHARS),
+        statement=sanitize_for_prompt(truncated_statement, max_chars=None),
         verifications=sanitize_for_prompt(_verifications_text(result), max_chars=20_000),
         digest_summary=sanitize_digest_text(
             ((result.digest.summary if result.digest else "") or "(no summary)")[:12000], max_chars=20_000
@@ -1054,12 +1044,14 @@ def _draft_revision(
     else:
         topic_analysis = "(no topic coverage analysis available)"
 
-    truncated_statement, _ = _truncate_for_prompt(statement_text, EVALUATE_INTERNAL_MAX_CHARS)
+    from .request_validation import validate_text
+    validate_text(statement_text, field="statement_text", label="The lay statement", limit=EVALUATE_INTERNAL_MAX_CHARS)
+    truncated_statement = statement_text
     try:
         revise_data = llm.chat_json(
             REVISE_SYSTEM,
             REVISE_USER.format(
-                statement=sanitize_for_prompt(truncated_statement, max_chars=EVALUATE_INTERNAL_MAX_CHARS),
+                statement=sanitize_for_prompt(truncated_statement, max_chars=None),
                 verifications=sanitize_for_prompt(_verifications_text(result), max_chars=20_000),
                 improvements=sanitize_for_prompt(_json.dumps(result.improvements, indent=1)[:6000] or "(none)", max_chars=10_000),
                 omitted_facts=sanitize_for_prompt(_json.dumps(result.omitted_record_facts, indent=1)[:4000] or "(none)", max_chars=10_000),

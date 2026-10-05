@@ -174,7 +174,10 @@ def retained_inputs(account: str, witness: dict[str, str], records: list[Extract
     unavailable = [{"filename": doc.filename, "kind": doc.pagination, "page": number}
                    for doc in records for number in doc.unreadable_pages]
     return {"policy": FACTUAL_POLICY, "account": account, "witness": dict(witness),
-            "unreadable_units": unavailable}
+            "unreadable_units": unavailable,
+            "source_metadata": [{"filename": doc.filename, "source_sha256": doc.source_sha256,
+                                 "extraction_method": doc.extraction_method, "text_encoding": doc.text_encoding,
+                                 "parts": [[p.page, p.source_part] for p in doc.pages]} for doc in records]}
 
 
 def context_for_result(result: Any) -> dict[str, Any] | None:
@@ -210,7 +213,8 @@ def context_for_result(result: Any) -> dict[str, Any] | None:
     # Hash complete source snapshots, including unresolved facts, so changing
     # digest evidence cannot leave an old session approval applicable.
     digest = getattr(result, "digest", None)
-    context["hash"] = fingerprint([context["hash"], [vars(f) for f in digest.facts] if digest else None])
+    context["hash"] = fingerprint([context["hash"], [vars(f) for f in digest.facts] if digest else None,
+                                   raw.get("source_metadata"), raw.get("statement_source")])
     return context
 
 

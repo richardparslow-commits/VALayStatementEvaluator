@@ -240,7 +240,7 @@ def prepare(
             ocr_records.ocr_with_ocrmypdf(source, destination)
         else:
             ocr_records.ocr_with_tesseract(source, destination, dpi=dpi)
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError) as exc:
         report["ocr"] = f"{backend}-failed"
         report["notes"].append(str(exc))
         return data, report

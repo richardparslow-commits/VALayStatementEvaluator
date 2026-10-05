@@ -29,7 +29,9 @@
   "ingestion_security": "",
   "text_export_policy": {
     "enabled": false,
-    "formats": ["txt"],
+    "formats": [
+      "txt"
+    ],
     "evidence_reference": ""
   },
   "quota_policy": {
@@ -42,5 +44,15 @@
     "attempt_charge_microusd": 1000000,
     "pilot_total_microusd": 250000000,
     "pilot_total_attempts": 250
+  },
+  "model_profiles": {
+    "REPLACE_WITH_APPROVED_MODEL": {
+      "model_version": "REPLACE_WITH_APPROVED_MODEL",
+      "context_window_tokens": null,
+      "max_output_tokens": null,
+      "input_tokens_per_utf8_byte": null,
+      "framing_token_reserve": null,
+      "token_bound_evidence": ""
+    }
   }
 }

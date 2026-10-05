@@ -166,6 +166,8 @@ def load_approval() -> dict[str, Any]:
             raise ValueError
         from .pilot_budget import policy
         policy(data)
+        from .provider_limits import validate_profiles
+        validate_profiles(data)
         return data
     except (KeyError, ValueError, TypeError, OSError, OverflowError, RecursionError) as exc:
         raise PilotBlocked("Pilot admission is closed. The operator must supply current, "
@@ -304,7 +306,7 @@ def notice_binding(owner: str, approval: Mapping[str, Any]) -> str:
             approval["provider_terms"], approval["retention_policy"],
             approval["provider_base_url"], approval["models"], approval["local_log_retention_days"],
             approval["quota_policy"], approval["spending_controls"], approval.get("text_export_policy"),
-            approval["ingestion_security"]]
+            approval["ingestion_security"], approval["model_profiles"]]
     return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
 
 

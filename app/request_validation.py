@@ -11,8 +11,8 @@ from . import config
 from .documents import DRAFT_INTERNAL_MAX_CHARS, EVALUATE_INTERNAL_MAX_CHARS, DocumentPage, ExtractedDocument
 from .prompt_sanitize import has_prompt_text, validate_witness_field
 
-MAX_STATEMENT_PAYLOAD_CHARS = EVALUATE_INTERNAL_MAX_CHARS + 40_000
-MAX_OBSERVATIONS_PAYLOAD_CHARS = DRAFT_INTERNAL_MAX_CHARS + 40_000
+MAX_STATEMENT_PAYLOAD_CHARS = EVALUATE_INTERNAL_MAX_CHARS
+MAX_OBSERVATIONS_PAYLOAD_CHARS = DRAFT_INTERNAL_MAX_CHARS
 MAX_FIELD_CHARS = 500
 MAX_INTAKE_CHARS = 4_000
 MAX_WITNESS_FIELDS = 64
@@ -107,8 +107,17 @@ def validate_records(records: Any) -> tuple[int, int]:
 
 
 def validate_evaluation_request(*, statement_text: Any, records: Any, witness: Any = None,
-                                validate_record_set: bool = True) -> None:
+                                validate_record_set: bool = True,
+                                statement_source: ExtractedDocument | None = None) -> None:
     validate_text(statement_text, field="statement_text", label="The lay statement", limit=MAX_STATEMENT_PAYLOAD_CHARS)
+    if statement_source is not None:
+        if (not isinstance(statement_source, ExtractedDocument) or not statement_source.coverage_known
+                or statement_source.unreadable_pages or not statement_source.pages
+                or statement_source.source_page_count != len(statement_source.pages)):
+            raise RequestValidationError("The uploaded statement has incomplete text coverage. Review and supply a complete readable copy.", field="statement_text")
+        original = statement_source.full_text.strip()
+        if not (statement_text.strip() == original or statement_text.strip().startswith(original + "\n")):
+            raise RequestValidationError("The uploaded statement text no longer matches its source.", field="statement_text")
     if validate_record_set:
         validate_records(records)
     validate_witness(witness, optional=True)

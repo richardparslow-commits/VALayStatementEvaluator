@@ -394,13 +394,7 @@ def _render_observations_length_guidance(observations: str) -> None:
         over = n - MAX_OBSERVATIONS_CHARS
         will_truncate = max(0, n - DRAFT_INTERNAL_MAX_CHARS)
         if will_truncate:
-            pilot.display(
-                f"⚠️ Observations are {n:,} characters — {over:,} over the "
-                f"{MAX_OBSERVATIONS_CHARS:,} recommended limit. {will_truncate:,} "
-                f"characters beyond the {DRAFT_INTERNAL_MAX_CHARS:,} internal limit "
-                f"will be truncated and not grounded. Details at the end may be missed. "
-                f"Consider shortening or splitting."
-            , container=st, method="warning")
+            pilot.display(f"Observations exceeds the {DRAFT_INTERNAL_MAX_CHARS:,}-character hard limit. Shorten or split it before running; all accepted text is grounded in full.", container=st, method="warning")
         else:
             pilot.display(
                 f"⚠️ Observations are {n:,} characters — {over:,} over the "
@@ -410,7 +404,7 @@ def _render_observations_length_guidance(observations: str) -> None:
             , container=st, method="warning")
         st.checkbox(
             f"I understand the observations are {over:,} characters over the limit and "
-            "want to proceed anyway (any truncated portion will be noted in the results).",
+            "want to proceed within the hard limit; all accepted text will be analyzed.",
             key="draft_confirm_oversize",
         )
     elif n > int(MAX_OBSERVATIONS_CHARS * 0.85):

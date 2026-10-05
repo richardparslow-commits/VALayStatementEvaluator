@@ -29,9 +29,9 @@ def request():
 
 def response():
     return {**{k: v for k, v in request().items() if k not in ('size', 'page_limit')}, 'image': IMAGE,
-            'documents': [{'filename': 'record.txt', 'schema_version': 2, 'total_pages': 1,
-                           'unreadable_pages': [], 'pagination': 'block', 'coverage_known': True,
-                           'pages': [{'page': 1, 'kind': 'block', 'text': DATA.decode()}]}], 'skipped': []}
+            'documents': [{'filename': 'record.txt', 'schema_version': 3, 'total_pages': 1,
+                           'unreadable_pages': [], 'pagination': 'block', 'coverage_known': True, 'source_sha256': hashlib.sha256(DATA).hexdigest(), 'extraction_method': 'strict-unicode', 'text_encoding': 'utf-8',
+                           'pages': [{'page': 1, 'kind': 'block', 'text': DATA.decode(), 'source_part': ''}]}], 'skipped': []}
 
 
 class ProtocolTests(unittest.TestCase):
@@ -62,7 +62,7 @@ class ProtocolTests(unittest.TestCase):
         req['page_limit'] = 5000
         original = value['documents'][0]
         value['documents'] = [{**original, 'filename': f'records/{n}.txt', 'total_pages': 3,
-                               'pages': [{'page': p, 'kind': 'block', 'text': 'Synthetic observation'} for p in (1,2,3)]}
+                               'pages': [{'page': p, 'kind': 'block', 'text': 'Synthetic observation', 'source_part': ''} for p in (1,2,3)]}
                               for n in range(200)]
         with patch.object(config, 'MAX_RECORD_PAGES', 5000):
             self.assertEqual(len(_documents(value, req, IMAGE)[0]), 200)

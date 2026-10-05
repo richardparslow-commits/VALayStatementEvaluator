@@ -28,8 +28,10 @@ import argparse
 import shutil
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Sequence
+from collections.abc import Iterator
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -97,7 +99,8 @@ def _run(command: list[str], *, what: str) -> None:
 
 def ocr_with_ocrmypdf(source: Path, destination: Path) -> None:
     """Add a text layer with ocrmypdf, leaving pages that already have text alone."""
-    _run(
+    with _atomic_output(source, destination) as temporary:
+        _run(
         [
             "ocrmypdf",
             "--skip-text",  # keep existing text pages untouched, OCR only images
@@ -106,10 +109,29 @@ def ocr_with_ocrmypdf(source: Path, destination: Path) -> None:
             "--output-type",
             "pdf",
             str(source),
-            str(destination),
+            str(temporary),
         ],
         what="ocrmypdf",
-    )
+        )
+
+
+@contextmanager
+def _atomic_output(source: Path, destination: Path) -> Iterator[Path]:
+    """Publish only a fully completed OCR artifact; preserve existing output on failure."""
+    import os
+    import tempfile
+    if source.resolve() == destination.resolve() or (destination.exists() and source.samefile(destination)):
+        raise ValueError("OCR output must be a separate file from the original source.")
+    with tempfile.TemporaryDirectory(prefix=".ocr-", dir=str(destination.parent)) as directory:
+        temporary = Path(directory) / "completed.pdf"
+        yield temporary
+        if not temporary.is_file() or temporary.stat().st_size == 0:
+            raise ValueError("OCR did not produce a complete output file.")
+        before, _ = inspect_pdf(source)
+        after, _ = inspect_pdf(temporary)
+        if after != before:
+            raise ValueError("OCR changed source page coverage; no partial output was published.")
+        os.replace(temporary, destination)
 
 
 def _ocr_page(source: Path, number: int, dpi: int, workdir: Path) -> str | None:
@@ -195,7 +217,7 @@ def ocr_with_tesseract(
     if jobs <= 0:
         jobs = min(8, os.cpu_count() or 4)
     jobs = max(1, min(jobs, max(1, len(image_only))))
-    with tempfile.TemporaryDirectory() as workdir:
+    with _atomic_output(source, destination) as temporary, tempfile.TemporaryDirectory() as workdir:
         work = Path(workdir)
         ocr_results = _ocr_pages_parallel(
             source, image_only, dpi=dpi, workdir=work, jobs=jobs
@@ -203,24 +225,37 @@ def ocr_with_tesseract(
         from pypdf import PdfReader
 
         reader = PdfReader(str(source))
-        pdf = canvas.Canvas(str(destination), pagesize=letter)
+        pdf = canvas.Canvas(str(temporary), pagesize=letter)
         width, height = letter
+        expected: list[str] = []
         for number in range(1, total + 1):
             text = ocr_results.get(number)
             if text is None:
                 text = _page_text(reader.pages[number - 1])
+            expected.append(text)
             _write_text_page(pdf, text, height, width)
         pdf.save()
+        rendered = PdfReader(str(temporary), strict=True)
+        if len(rendered.pages) != len(expected) or any(
+            " ".join(_page_text(page).split()) != " ".join(text.split())
+            for page, text in zip(rendered.pages, expected)
+        ):
+            raise ValueError("OCR transcript could not be extracted without text changes; no partial output was published.")
 
 
 def _write_text_page(pdf: Any, text: str, height: float, width: float) -> None:
-    """Write one page of text at a readable size, wrapping at the page width."""
+    """Write every word or refuse before drawing; never hide overflow or lost glyphs."""
     from reportlab.pdfbase.pdfmetrics import stringWidth
 
     font, size = "Helvetica", 9.0
     line_height = size * 1.35
     max_width = width - 96
     y = height - 72
+    try:
+        text.encode("cp1252", errors="strict")
+    except UnicodeError as exc:
+        raise ValueError("OCR transcript contains characters this PDF font cannot preserve. Use a reviewed OCR backend that retains the original images and Unicode text.") from exc
+    lines: list[str] = []
     for raw_line in (text or "").splitlines() or [""]:
         words = raw_line.split()
         line = ""
@@ -229,17 +264,17 @@ def _write_text_page(pdf: Any, text: str, height: float, width: float) -> None:
             if stringWidth(candidate, font, size) <= max_width:
                 line = candidate
             else:
-                pdf.setFont(font, size)
-                pdf.drawString(48, y, line)
-                y -= line_height
+                if stringWidth(word, font, size) > max_width:
+                    raise ValueError("OCR transcript contains a word wider than the page; no partial output was published.")
+                lines.append(line)
                 line = word
-                if y < 72:  # ran off the page: this path is best-effort, not a renderer
-                    break
+        lines.append(line)
+    if (len(lines) - 1) * line_height > height - 144:
+        raise ValueError("OCR transcript exceeds one source page; no text was dropped. Use an OCR backend that retains original images and aligned text.")
+    for line in lines:
         pdf.setFont(font, size)
         pdf.drawString(48, y, line)
         y -= line_height
-        if y < 72:
-            break
     pdf.showPage()
 
 
@@ -333,7 +368,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ocr_with_ocrmypdf(source, destination)
         else:
             ocr_with_tesseract(source, destination, dpi=args.dpi, jobs=args.jobs)
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError) as exc:
         _out(f"✖ {exc}", err=True)
         return EXIT_BAD_INPUT
 

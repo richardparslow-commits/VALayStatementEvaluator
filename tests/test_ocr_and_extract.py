@@ -244,19 +244,12 @@ class TestPrepare(BundleTestCase):
         self.assertEqual(report["image_only_after"], [1])
         self.assertIn("still image-only", report["notes"][0])
 
-    def test_a_page_of_trivial_text_is_refused_by_the_apps_own_rule(self) -> None:
-        """The box inherits the app's floor (20 extracted characters), rather than
-        inventing a friendlier one — a two-word page must not become a document here
-        and vanish after the upload."""
-        self.write("stub.pdf", _pdf_bytes(["a", "b", "c"]))
-        report = ocr_and_extract.process(
-            [self.bundle / "stub.pdf"], roots=[self.bundle], work_dir=self.work
-        )
-        self.assertEqual(report["documents"], [])
-        self.assertTrue(
-            any("no extractable text" in message for message in report["skipped"]),
-            report["skipped"],
-        )
+    def test_short_source_text_is_preserved_instead_of_dropped(self) -> None:
+        self.write("stub.pdf", _pdf_bytes(["No PTSD.", "No SI.", "Denies pain."]))
+        report = ocr_and_extract.process([self.bundle / "stub.pdf"], roots=[self.bundle], work_dir=self.work, use_ocr=False)
+        self.assertEqual(len(report["documents"]), 1)
+        self.assertEqual([page["text"] for page in report["documents"][0]["pages"]], ["No PTSD.", "No SI.", "Denies pain."])
+        self.assertFalse(report["skipped"])
 
     def test_a_non_pdf_is_passed_through_untouched(self) -> None:
         self.work.mkdir(parents=True, exist_ok=True)

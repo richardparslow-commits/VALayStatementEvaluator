@@ -438,24 +438,21 @@ class TestRunDraftEdgeCases(unittest.TestCase):
 
     @patch("app.draft.review_medical_records")
     @patch("app.draft.load_knowledge", return_value="k")
-    def test_truncation_audit(self, _mk, mock_review):
-        mock_review.return_value = _fake_digest()
-        long = "x" * (DRAFT_INTERNAL_MAX_CHARS + 700)
-        result = run_draft(_FakeLLM(), [_doc()], WITNESS, long, "knee pain", "Service connection")
-        self.assertEqual(result.input_chars, len(long))
-        self.assertEqual(result.truncated_chars, 700)
-        self.assertIn("truncated", result.truncation_warning.lower())
-        md = grounding_markdown(result)
-        self.assertIn("Truncated observations", md)
+    def test_hard_limit_refuses_before_record_review(self, _mk, mock_review):
+        llm = _FakeLLM()
+        with self.assertRaises(DraftingPayloadError):
+            run_draft(llm, [_doc()], WITNESS, "x" * (DRAFT_INTERNAL_MAX_CHARS + 700), "knee pain", "Service connection")
+        mock_review.assert_not_called()
+        self.assertEqual(llm.calls, [])
 
     @patch("app.draft.review_medical_records")
     @patch("app.draft.load_knowledge", return_value="k")
-    def test_truncation_soft_limit_message(self, _mk, mock_review):
+    def test_long_accepted_observations_have_no_truncation(self, _mk, mock_review):
         mock_review.return_value = _fake_digest()
-        long = "x" * (DRAFT_INTERNAL_MAX_CHARS + 50)
-        result = run_draft(_FakeLLM(), [_doc()], WITNESS, long, "cond", "Service connection")
-        # over soft (60k) + hard (80k)
-        self.assertIn("recommended limit", result.truncation_warning)
+        result = run_draft(_FakeLLM(), [_doc()], WITNESS, "x" * DRAFT_INTERNAL_MAX_CHARS, "cond", "Service connection")
+        self.assertEqual(result.input_chars, DRAFT_INTERNAL_MAX_CHARS)
+        self.assertEqual(result.truncated_chars, 0)
+        self.assertFalse(result.truncation_warning)
 
     @patch("app.draft.review_medical_records")
     @patch("app.draft.load_knowledge", return_value="k")
@@ -684,12 +681,10 @@ class TestSelfReviewPreservation(unittest.TestCase):
         self.assertEqual(result.final_statement, self.STATEMENT)
         self.assertEqual(result.review_issues, [])
 
-    def test_input_truncation_warning_survives_skipped_review(self):
+    def test_oversized_observations_refuse_before_skippable_review(self):
         draft = "x" * (REVIEW_MAX_CHARS + 1)
-        result, _ = self._run(draft, {}, observations="x" * (DRAFT_INTERNAL_MAX_CHARS + 1))
-        self.assert_preserved(result, draft)
-        self.assertEqual(result.truncated_chars, 1)
-        self.assertTrue(result.truncation_warning)
+        with self.assertRaises(DraftingPayloadError):
+            self._run(draft, {}, observations="x" * (DRAFT_INTERNAL_MAX_CHARS + 1))
 
 
 class TestRunDraftReviewFailure(unittest.TestCase):

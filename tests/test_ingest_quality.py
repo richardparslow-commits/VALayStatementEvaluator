@@ -620,7 +620,10 @@ class TestVAGovSections(unittest.TestCase):
 class TestDateHygiene(unittest.TestCase):
     def test_page_dates_are_extracted_without_month_prefixes(self) -> None:
         found = _dates_in_text("Visit 2019-04-17. Labs 2020-05 and Jan 2021.")
-        self.assertEqual(found, ["2019-04-17", "2020-05-01", "2021-01-01"])
+        import json
+        anchors = [json.loads(item) for item in found]
+        self.assertEqual([item["normalized"] for item in anchors], ["2019-04-17", "2020-05", "2021-01"])
+        self.assertEqual([item["precision"] for item in anchors], ["day", "month", "month"])
 
     def test_text_without_dates_yields_nothing(self) -> None:
         self.assertEqual(_dates_in_text("No dates on this page at all."), [])

@@ -31,6 +31,31 @@ REVISION = os.environ.get('VA_LSE_TEST_PARSER_REVISION', '')
 
 @unittest.skipUnless(IMAGE and REVISION, 'Opt-in Linux Docker parser image is unset.')
 class ParserContainerTests(unittest.TestCase):
+    def test_packaged_parser_keeps_word_stories_and_block_provenance(self):
+        from tests.ingestion_fixtures import docx_parts, package
+        namespace = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+        parts = docx_parts('No PTSD.')
+        parts['word/header1.xml'] = f'<w:hdr xmlns:w="{namespace}"><w:p><w:r><w:t>HEADER_DENIAL_CANARY</w:t></w:r></w:p></w:hdr>'.encode()
+        parts['word/footnotes.xml'] = f'<w:footnotes xmlns:w="{namespace}"><w:footnote w:id="1"><w:p><w:r><w:t>FOOTNOTE_FINAL_CANARY</w:t></w:r></w:p></w:footnote></w:footnotes>'.encode()
+        data = package(parts)
+        request = {**self.request, 'label': 'statement.docx', 'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+        docs, skipped = _documents(_unpack_reply(wire.decode(self.runner.run(request, data)), IMAGE), request, IMAGE)
+        self.assertFalse(skipped)
+        self.assertIn('HEADER_DENIAL_CANARY', docs[0].full_text)
+        self.assertIn('FOOTNOTE_FINAL_CANARY', docs[0].full_text)
+        self.assertEqual(docs[0].pagination, 'block')
+        self.assertEqual(docs[0].source_sha256, request['sha256'])
+        self.assertTrue(all(page.source_part for page in docs[0].pages))
+
+    def test_packaged_parser_unicode_decoding_carries_original_byte_identity(self):
+        data = 'Élodie denies β pain; −1; 10 mg.'.encode('utf-16')
+        request = {**self.request, 'label': 'unicode.txt', 'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+        docs, skipped = _documents(_unpack_reply(wire.decode(self.runner.run(request, data)), IMAGE), request, IMAGE)
+        self.assertFalse(skipped)
+        self.assertEqual(docs[0].text_encoding, 'utf-16-bom')
+        self.assertEqual(docs[0].source_sha256, request['sha256'])
+        self.assertEqual(docs[0].full_text, data.decode('utf-16'))
+
     def setUp(self):
         self.runner = DockerParser(IMAGE, REVISION, docker=shutil.which('docker') or '/usr/bin/docker')
         self.runner.ready()
