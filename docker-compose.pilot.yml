@@ -18,6 +18,7 @@ services:
       VA_LSE_BLOB_STORE: none
       VA_LSE_EXTRACTOR: isolated
       VA_LSE_PARSER_IMAGE: ${VA_LSE_PARSER_IMAGE:?Set the reviewed parser image ID sha256}
+      VA_LSE_PARSER_ENGINE_ID: ${VA_LSE_PARSER_ENGINE_ID:?Set the reviewed dedicated parser engine ID}
       VA_LSE_TRACING: "0"
       VA_LSE_HEALTH_HOST: 127.0.0.1
       VA_LSE_LOG_JSON: "1"
@@ -63,12 +64,18 @@ services:
       VA_LSE_PARSER_IMAGE: ${VA_LSE_PARSER_IMAGE:?Set the reviewed parser image ID sha256}
       VA_LSE_BUILD_SHA: ${VA_LSE_BUILD_SHA:?Set the reviewed immutable revision}
       VA_LSE_PARSER_MAX_PAGES: "500"
-    group_add:
-      - ${VA_LSE_DOCKER_GID:?Set the Linux daemon socket group ID}
+      VA_LSE_PARSER_ENGINE_ENDPOINT: ${VA_LSE_PARSER_ENGINE_ENDPOINT:?Set the private dedicated parser VM TLS endpoint}
+      VA_LSE_PARSER_ENGINE_ID: ${VA_LSE_PARSER_ENGINE_ID:?Set the reviewed dedicated parser engine ID}
+      VA_LSE_APPLICATION_ENGINE_ID: ${VA_LSE_APPLICATION_ENGINE_ID:?Set the application daemon ID for separation checks}
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+      - type: bind
+        source: ${VA_LSE_PARSER_ENGINE_TLS_DIRECTORY:?Set the private parser-only client TLS directory}
+        target: /run/parser-engine/tls
+        read_only: true
+        bind:
+          create_host_path: false
       - parser-channel:/run/parser
-    network_mode: none
+    networks: [parser-engine]
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
@@ -121,3 +128,7 @@ volumes:
   pilot-logs:
   pilot-control:
   parser-channel:
+networks:
+  # Actual-host firewall must permit only the reviewed parser IP:2376.
+  # Compose alone cannot enforce that destination allowlist.
+  parser-engine:

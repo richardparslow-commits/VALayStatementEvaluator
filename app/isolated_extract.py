@@ -13,6 +13,7 @@ from typing import Any
 from .documents import (DOCUMENT_SCHEMA_VERSION, DocumentPage, ExtractedDocument,
                         ExtractionError, validate_source_spans)
 from .ingestion_policy import IngestionRefused, validate_label
+from .parser_engine import parser_engine_id
 from .parser_protocol import (DEADLINE, MAX_HEADER, MAX_INPUT, MAX_OUTPUT, MAX_TEXT, MAX_PAGES,
                               SOCKET_PATH, ParserRefused, decode, encode, frame,
                               recv_frame, validate_request)
@@ -21,8 +22,9 @@ MAX_OUTPUT_BYTES = MAX_OUTPUT
 
 
 def _unpack_reply(value: Any, image: str) -> dict[str, Any]:
-    if (not isinstance(value, dict) or set(value) != {"image", "response"}
-            or value["image"] != image or not isinstance(value["response"], dict)
+    if (not isinstance(value, dict) or set(value) != {"image", "engine_id", "response"}
+            or value["image"] != image or value["engine_id"] != parser_engine_id()
+            or not isinstance(value["response"], dict)
             or "image" in value["response"]):
         raise ParserRefused("Invalid parser response envelope.")
     return {**value["response"], "image": image}
@@ -37,14 +39,15 @@ def parser_image() -> str:
 
 def parser_health() -> None:
     from . import config
-    image = parser_image()
+    image, engine = parser_image(), parser_engine_id()
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
         connection.settimeout(12)
         connection.connect(SOCKET_PATH)
         connection.sendall(frame(encode({"operation": "health"})))
         reply = decode(recv_frame(connection, MAX_HEADER, time.monotonic() + 12))
-    if (not isinstance(reply, dict) or set(reply) != {"ready", "image", "revision", "max_pages"}
+    if (not isinstance(reply, dict) or set(reply) != {"ready", "image", "revision", "max_pages", "engine_id"}
             or reply["ready"] is not True or reply["image"] != image
+            or reply["engine_id"] != engine
             or reply["revision"] != os.environ.get("VA_LSE_BUILD_SHA", "")
             or type(reply["max_pages"]) is not int
             or not max(1, min(config.MAX_RECORD_PAGES, MAX_PAGES)) <= reply["max_pages"] <= MAX_PAGES):
@@ -151,6 +154,7 @@ class IsolatedExtractor:
         from . import config
         try:
             image = parser_image()
+            parser_engine_id()  # Refuse missing configuration before transferring record bytes.
             if len(data) > min(MAX_INPUT, config.MAX_UPLOAD_BYTES):
                 raise ParserRefused("Upload exceeds the parser input limit.")
             request = validate_request({"version": 1, "label": label, "size": len(data),

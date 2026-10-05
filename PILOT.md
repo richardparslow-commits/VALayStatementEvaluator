@@ -84,8 +84,9 @@ with every actual task `not_run`; real-information admission remains NO-GO pendi
 
 The private parser launcher accepts only a file label, size, hash, random request
 identifier, bounded extraction page limit and bounded bytes. It fixes the image, command, user, network, mounts
-and resource limits. Only the launcher has Docker daemon access; neither the web
-application nor the parser receives the daemon socket. The launcher must be
+and resource limits. The launcher uses private mutual TLS to a dedicated Docker
+engine on a separate Linux host/VM. Neither web, launcher nor parser receives
+the application daemon socket. The launcher must be
 treated as a trusted host administrator because Docker access is powerful. It
 receives no provider/OIDC secrets, approvals, logs or case storage. It serves one
 parse at a time over a private Unix socket and keeps no case files or content
@@ -180,8 +181,11 @@ supported controlled-pilot environment.
    | Variable | Operator-supplied value |
    |---|---|
    | `VA_LSE_BUILD_SHA` | Reviewed immutable revision |
-   | `VA_LSE_PARSER_IMAGE` | Local parser image ID (`sha256:` plus 64 hex digits), built from that revision |
-   | `VA_LSE_DOCKER_GID` | Linux Docker socket group ID; added only to the trusted launcher |
+   | `VA_LSE_PARSER_IMAGE` | Dedicated engine's parser image ID (`sha256:` plus 64 hex digits), built from that revision |
+   | `VA_LSE_PARSER_ENGINE_ENDPOINT` | Reviewed dedicated parser VM private IPv4 TLS endpoint (`tcp://IP:2376`) |
+   | `VA_LSE_PARSER_ENGINE_ID` | Reviewed dedicated parser daemon ID |
+   | `VA_LSE_APPLICATION_ENGINE_ID` | Application daemon ID, which must differ from the parser ID |
+   | `VA_LSE_PARSER_ENGINE_TLS_DIRECTORY` | Protected parser-only client TLS directory; mounted read-only only in launcher |
    | `VA_LSE_PILOT_LOG_RETENTION_DAYS` | Reviewed 1–30 day local log maximum, matching the approval |
    | `VA_LSE_PILOT_ENV_FILE` | Protected provider environment file |
    | `VA_LSE_PILOT_APPROVAL_HOST_FILE` | Absolute path to actual approval JSON |
@@ -197,15 +201,23 @@ supported controlled-pilot environment.
    `deploy/PILOT_PRIVACY_ACCEPTANCE.md` for the required actual-host canary procedure.
 
    ```sh
-   # On the reviewed Linux Docker host with AppArmor and default seccomp enabled:
+   # On the dedicated parser VM with AppArmor and default seccomp enabled:
    sudo apparmor_parser -r deploy/parser.apparmor
    docker build -f deploy/parser.Dockerfile --build-arg VA_LSE_BUILD_SHA="$VA_LSE_BUILD_SHA" -t va-lse-parser:reviewed .
    export VA_LSE_PARSER_IMAGE="$(docker image inspect va-lse-parser:reviewed --format '{{.Id}}')"
-   export VA_LSE_DOCKER_GID="$(stat -c '%g' /var/run/docker.sock)"
-   VA_LSE_TEST_PARSER_IMAGE="$VA_LSE_PARSER_IMAGE" VA_LSE_TEST_PARSER_REVISION="$VA_LSE_BUILD_SHA" python -m unittest tests.test_parser_container_live -v
+   # Configure private mutual TLS, engine IDs and synthetic probe variables using
+   # deploy/PARSER_ENGINE_ACCEPTANCE.md. Record actual host separation/acceptance.
+   # Then, on the application host, with those reviewed variables exported:
    docker compose -f docker-compose.pilot.yml config --quiet
    docker compose -f docker-compose.pilot.yml up --build -d
    ```
+
+   Complete [dedicated parser engine acceptance](deploy/PARSER_ENGINE_ACCEPTANCE.md).
+   The new launcher has no application Docker socket/group. Its client key still
+   authorizes the dedicated parser VM; do not co-locate that daemon with the
+   application or its secrets/data. Compose cannot prove physical separation or
+   enforce the required launcher destination allowlist. Rootless is not a drop-in
+   alternative because it lacks the mandatory AppArmor protection.
 
    The pilot server entrypoint starts cleanup and private health before any
    browser connects. Use this entrypoint on equivalent hosts too; running only

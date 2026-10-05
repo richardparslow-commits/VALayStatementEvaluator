@@ -1,7 +1,8 @@
-"""Trusted, single-flight Docker launcher. Never accepts commands, paths or options.
+"""Single-flight launcher for a dedicated parser VM over private mutual TLS.
 
-Only this service has the daemon socket. It has no application credentials or
-case mounts. The parser gets stdin bytes, a fresh tmpfs, and no bind mounts.
+It has no application daemon socket, application credentials or case mounts.
+Its engine credentials still authorize the parser VM: isolate and review that
+host. The parser gets stdin bytes, a fresh tmpfs, and no bind mounts.
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 from concurrent.futures import ThreadPoolExecutor
+from .parser_engine import ParserEngine
 
 from .parser_protocol import (DEADLINE, MAX_HEADER, MAX_INPUT, MAX_OUTPUT, MAX_PAGES, SOCKET_PATH,
                               ParserRefused, bind_input, decode, encode, frame,
@@ -26,7 +28,8 @@ PROFILE = "va-lse-parser"
 
 
 class DockerParser:
-    def __init__(self, image: str, revision: str, docker: str = "/usr/local/bin/docker", max_pages: int = 500) -> None:
+    def __init__(self, image: str, revision: str, docker: str = "/usr/local/bin/docker", max_pages: int = 500,
+                 *, engine: ParserEngine | None = None) -> None:
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", image) or not revision:
             raise ParserRefused("An immutable reviewed parser image is required.")
         self.image, self.revision, self.docker = image, revision, docker
@@ -34,9 +37,11 @@ class DockerParser:
             raise ParserRefused("Invalid parser deployment page limit.")
         self.max_pages = max_pages
         self.parse_lock = threading.Lock()
-        self.env = {"PATH": os.defpath, "HOME": "/nonexistent", "DOCKER_HOST": "unix:///var/run/docker.sock"}
+        self.engine = engine or ParserEngine.from_environment()
+        self.env = self.engine.environment()
 
     def _command(self, args: list[str]) -> Any:
+        self.engine.verify_credentials()
         result = subprocess.run([self.docker, *args], env=self.env, capture_output=True,
                                 timeout=10, check=True)
         if len(result.stdout) > 65536:
@@ -46,6 +51,9 @@ class DockerParser:
 
     def ready(self) -> dict[str, Any]:
         info = self._command(["info", "--format", "{{json .}}"])
+        if (not isinstance(info, dict) or info.get("ID") != self.engine.identity
+                or "va-lse-purpose=parser-only" not in info.get("Labels", [])):
+            raise ParserRefused("The dedicated parser engine does not match the reviewed identity.")
         security = info.get("SecurityOptions", [])
         if (info.get("OSType") != "linux" or not any("apparmor" in x for x in security)
                 or not any("seccomp" in x and "builtin" in x for x in security)):
@@ -54,7 +62,8 @@ class DockerParser:
         if (not isinstance(images, list) or len(images) != 1 or images[0].get("Id") != self.image
                 or f"VA_LSE_BUILD_SHA={self.revision}" not in images[0].get("Config", {}).get("Env", [])):
             raise ParserRefused("The parser image does not match the reviewed revision.")
-        return {"ready": True, "image": self.image, "revision": self.revision, "max_pages": self.max_pages}
+        return {"ready": True, "image": self.image, "revision": self.revision, "max_pages": self.max_pages,
+                "engine_id": self.engine.identity}
 
     def command(self, name: str) -> list[str]:
         return [self.docker, "run", "--rm", "--pull=never", "--name", name, "--interactive",
@@ -72,6 +81,7 @@ class DockerParser:
     def run(self, request: dict[str, Any], data: bytes) -> bytes:
         validate_request(request)
         bind_input(request, data)
+        self.ready()  # Recheck identity before every launch, including readiness probes.
         name = "va-parser-" + uuid.uuid4().hex
         process = subprocess.Popen(self.command(name), env=self.env, stdin=subprocess.PIPE,
                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -112,7 +122,8 @@ class DockerParser:
             # document output. Bound lexical structure and pass opaque bytes in
             # an image-bound envelope; the web client validates the full schema.
             validate_json_structure(bytes(output))
-            encoded = b'{"image":' + encode(self.image) + b',"response":' + bytes(output) + b'}'
+            encoded = (b'{"image":' + encode(self.image) + b',"engine_id":' + encode(self.engine.identity)
+                       + b',"response":' + bytes(output) + b'}')
             if len(encoded) > MAX_OUTPUT:
                 raise ParserRefused("Parser output exceeds its limit.")
             return encoded

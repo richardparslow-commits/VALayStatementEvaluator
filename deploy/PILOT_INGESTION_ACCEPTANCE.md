@@ -13,6 +13,10 @@ reader and the secret-free, isolated parser child apply it. The child's empty
 environment cannot disable it. Pilot startup continues to require the reviewed
 isolated parser image, private launcher, and existing admission/resource limits.
 Changing parser code requires rebuilding and reviewing that immutable image.
+Complete [dedicated parser engine acceptance](PARSER_ENGINE_ACCEPTANCE.md) too:
+the launcher requires private mutual TLS to a different daemon on a separate
+host/VM, without the application Docker socket or credentials. CI validates TLS
+and daemon/container boundaries; actual host separation remains unverified.
 
 | Input | Required validation and refusal behavior |
 | --- | --- |
