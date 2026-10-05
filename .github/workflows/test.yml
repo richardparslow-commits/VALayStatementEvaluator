@@ -561,10 +561,15 @@ jobs:
           docker build -f deploy/parser.Dockerfile --build-arg VA_LSE_BUILD_SHA=${{ github.sha }} -t va-lse-parser:ci .
           docker build -f deploy/parser-launcher.Dockerfile -t va-lse-parser-launcher:ci .
           echo "VA_LSE_TEST_PARSER_IMAGE=$(docker image inspect va-lse-parser:ci --format '{{.Id}}')" >> "$GITHUB_ENV"
+      - name: Start a separate synthetic mutual-TLS parser daemon
+        run: python scripts/parser_engine_ci.py
       - name: Probe actual filesystem, network, process and resource boundaries
         env:
           VA_LSE_TEST_PARSER_REVISION: ${{ github.sha }}
         run: python -m unittest tests.test_parser_container_live -v
+      - name: Stop the synthetic parser daemon and remove TLS keys
+        if: always()
+        run: python scripts/parser_engine_ci.py --cleanup
 
   sandbox-image:
     name: Build the sandbox image stage

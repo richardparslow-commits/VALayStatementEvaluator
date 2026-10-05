@@ -23,6 +23,7 @@ from unittest.mock import patch
 from tests import hermetic  # noqa: F401
 from app import parser_protocol as wire
 from app.parser_service import DockerParser
+from app.parser_engine import ParserEngine
 from app.isolated_extract import _documents, _unpack_reply
 
 IMAGE = os.environ.get('VA_LSE_TEST_PARSER_IMAGE', '')
@@ -57,7 +58,14 @@ class ParserContainerTests(unittest.TestCase):
         self.assertEqual(docs[0].full_text, data.decode('utf-16'))
 
     def setUp(self):
-        self.runner = DockerParser(IMAGE, REVISION, docker=shutil.which('docker') or '/usr/bin/docker')
+        self.engine = ParserEngine(os.environ['VA_LSE_TEST_PARSER_ENGINE_ENDPOINT'],
+                                   os.environ['VA_LSE_TEST_PARSER_ENGINE_ID'],
+                                   os.environ['VA_LSE_TEST_APPLICATION_ENGINE_ID'],
+                                   Path(os.environ['VA_LSE_TEST_PARSER_ENGINE_TLS_DIRECTORY']))
+        self.engine_env = patch.dict(os.environ, {'VA_LSE_PARSER_ENGINE_ID': self.engine.identity})
+        self.engine_env.start()
+        self.addCleanup(self.engine_env.stop)
+        self.runner = DockerParser(IMAGE, REVISION, docker=shutil.which('docker') or '/usr/bin/docker', engine=self.engine)
         self.runner.ready()
         self.data = b'Synthetic observation of knee pain.'
         self.request = {'version': 1, 'label': 'record.txt', 'size': len(self.data),
@@ -290,7 +298,7 @@ print(json.dumps({'count':len(children), 'bounded':len(children)<32}), flush=Tru
         self.assertTrue(result['bounded'])
         self.assertLess(result['count'], 32)
         running = subprocess.run([self.runner.docker, 'ps', '--filter', 'name=va-parser-', '--format', '{{.Names}}'],
-                                 capture_output=True, check=True, timeout=10)
+                                 env=self.runner.env, capture_output=True, check=True, timeout=10)
         self.assertEqual(running.stdout.strip(), b'')
 
     def test_output_flood_and_timeout_remove_container(self):
@@ -304,18 +312,22 @@ print(json.dumps({'count':len(children), 'bounded':len(children)<32}), flush=Tru
         name = 'va-parser-launcher-ci-' + uuid.uuid4().hex
         volume = 'va-parser-channel-ci-' + uuid.uuid4().hex
         docker = self.runner.docker
-        group = str(os.stat('/var/run/docker.sock').st_gid)
+        # Synthetic application daemon starts the launcher; the launcher receives
+        # only dedicated-engine TLS credentials, never the application socket.
         def call(args, **kwargs):
             return subprocess.run([docker, *args], capture_output=True, check=True, timeout=100, **kwargs)
         call(['volume', 'create', volume])
         try:
-            call(['run', '--detach', '--name', name, '--network=none', '--read-only',
-                  '--cap-drop=ALL', '--security-opt=no-new-privileges:true', '--group-add', group,
+            call(['run', '--detach', '--name', name, '--read-only',
+                  '--cap-drop=ALL', '--security-opt=no-new-privileges:true',
                   '--memory=512m', '--cpus=1', '--pids-limit=64',
                   '--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777',
-                  '--volume=/var/run/docker.sock:/var/run/docker.sock',
+                  '--volume=' + os.environ['VA_LSE_TEST_PARSER_LAUNCHER_TLS_DIRECTORY'] + ':/run/parser-engine/tls:ro',
                   '--volume=' + volume + ':/run/parser',
                   '--env=VA_LSE_PARSER_IMAGE=' + IMAGE, '--env=VA_LSE_BUILD_SHA=' + REVISION,
+                  '--env=VA_LSE_PARSER_ENGINE_ENDPOINT=' + self.engine.endpoint,
+                  '--env=VA_LSE_PARSER_ENGINE_ID=' + self.engine.identity,
+                  '--env=VA_LSE_APPLICATION_ENGINE_ID=' + self.engine.application_identity,
                   'va-lse-parser-launcher:ci'])
             code = ("import time,socket; from app.parser_protocol import *; "
                     "s=socket.socket(socket.AF_UNIX); s.settimeout(90); "
@@ -342,6 +354,35 @@ print(json.dumps({'count':len(children), 'bounded':len(children)<32}), flush=Tru
         finally:
             subprocess.run([docker, 'rm', '--force', name], capture_output=True, timeout=10)
             call(['volume', 'rm', volume])
+
+    def test_tls_server_rejects_untrusted_ca_and_missing_client_certificate(self):
+        from dataclasses import replace
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory).resolve()
+            # Valid certificate text, but not the CA which signed the server.
+            for name in ('ca.pem', 'cert.pem', 'key.pem'):
+                shutil.copyfile(self.engine.tls_directory / name, path / name)
+                (path / name).chmod(0o400)
+            (path / 'ca.pem').unlink()
+            shutil.copyfile(path / 'cert.pem', path / 'ca.pem')
+            with self.assertRaises(subprocess.CalledProcessError):
+                DockerParser(IMAGE, REVISION, docker=self.runner.docker,
+                             engine=replace(self.engine, tls_directory=path)).ready()
+            (path / 'ca.pem').unlink()
+            shutil.copyfile(self.engine.tls_directory / 'ca.pem', path / 'ca.pem')
+            (path / 'cert.pem').unlink()
+            (path / 'key.pem').unlink()
+            result = subprocess.run([self.runner.docker, 'info', '--format', '{{.ID}}'],
+                                    env=replace(self.engine, tls_directory=path).environment(),
+                                    capture_output=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(self.runner.ready()['ready'])
+
+    def test_dedicated_daemon_identity_and_image_store_differ_from_application(self):
+        self.assertNotEqual(self.runner.ready()['engine_id'], self.engine.application_identity)
+        result = subprocess.run([self.runner.docker, 'image', 'inspect', 'va-lse-parser-launcher:ci'],
+                                env=self.runner.env, capture_output=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
 
     def test_pid_one_supervisor_deadline_survives_launcher_loss(self):
         # Same production supervisor, shortened timer, synthetic stalled read.

@@ -17,9 +17,12 @@ from app import parser_protocol as wire
 from app.isolated_extract import IsolatedExtractor, _documents, parser_health
 from app.documents import ExtractionError
 from app.parser_service import DockerParser, handle
+from app.parser_engine import ParserEngine
 
 IMAGE = 'sha256:' + 'a' * 64
 DATA = b'Synthetic observation of knee pain.'
+ENGINE_ID = 'synthetic-parser-engine'
+ENGINE = ParserEngine('tcp://10.73.0.2:2376', ENGINE_ID, 'synthetic-application-engine')
 
 
 def request():
@@ -36,6 +39,10 @@ def response():
 
 
 class ProtocolTests(unittest.TestCase):
+    def setUp(self):
+        self.engine_env = patch.dict(os.environ, {'VA_LSE_PARSER_ENGINE_ID': ENGINE_ID})
+        self.engine_env.start()
+        self.addCleanup(self.engine_env.stop)
     def test_worker_uses_lower_request_and_deployment_page_limit(self):
         from app.parser_worker import extraction_page_limit
         for requested, deployed, expected in ((5000, 500, 500), (500, 5000, 500), (5000, 5000, 5000)):
@@ -202,7 +209,7 @@ class ProtocolTests(unittest.TestCase):
         with patch.dict(os.environ, {'VA_LSE_PARSER_IMAGE': IMAGE, 'VA_LSE_BUILD_SHA': 'reviewed'}), \
                 patch.object(config, 'MAX_RECORD_PAGES', 500), patch('app.isolated_extract.socket.socket'), \
                 patch('app.isolated_extract.recv_frame', return_value=wire.encode(
-                    {'ready': True, 'image': IMAGE, 'revision': 'reviewed', 'max_pages': 500})):
+                    {'ready': True, 'image': IMAGE, 'revision': 'reviewed', 'max_pages': 500, 'engine_id': ENGINE_ID})):
             parser_health()
 
 
@@ -244,13 +251,13 @@ class LauncherTests(unittest.TestCase):
         self.assertFalse(any(t.is_alive() for t in threads))
 
     def test_reap_failure_still_attempts_container_removal(self):
-        runner = DockerParser(IMAGE, 'reviewed')
+        runner = DockerParser(IMAGE, 'reviewed', engine=ENGINE)
         process = subprocess.Popen([os.sys.executable, '-c', "import sys; sys.stdin.buffer.read(); print('{}')"],
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
         try:
             with patch('app.parser_service.subprocess.Popen', return_value=process), \
                     patch.object(process, 'wait', side_effect=[0, subprocess.TimeoutExpired('synthetic', 5)]), \
-                    patch('app.parser_service.subprocess.run') as remove, self.assertRaises(subprocess.TimeoutExpired):
+                    patch('app.parser_service.subprocess.run') as remove, patch.object(runner, 'ready'), self.assertRaises(subprocess.TimeoutExpired):
                 runner.run(request(), DATA)
             self.assertEqual(remove.call_args.args[0][1:3], ['rm', '--force'])
         finally:
@@ -273,9 +280,16 @@ class LauncherTests(unittest.TestCase):
         web, launcher = services['streamlit-web'], services['parser-launcher']
         self.assertFalse(any('docker.sock' in x for x in web['volumes']))
         self.assertNotIn('env_file', launcher)
-        self.assertEqual(launcher['network_mode'], 'none')
-        self.assertEqual(set(launcher['environment']), {'VA_LSE_PARSER_IMAGE', 'VA_LSE_BUILD_SHA', 'VA_LSE_PARSER_MAX_PAGES'})
-        self.assertEqual(launcher['volumes'], ['/var/run/docker.sock:/var/run/docker.sock', 'parser-channel:/run/parser'])
+        self.assertEqual(launcher['networks'], ['parser-engine'])
+        self.assertNotIn('group_add', launcher)
+        self.assertFalse(any('docker.sock' in str(x) for x in launcher['volumes']))
+        self.assertEqual(set(launcher['environment']), {'VA_LSE_PARSER_IMAGE', 'VA_LSE_BUILD_SHA', 'VA_LSE_PARSER_MAX_PAGES',
+                         'VA_LSE_PARSER_ENGINE_ENDPOINT', 'VA_LSE_PARSER_ENGINE_ID', 'VA_LSE_APPLICATION_ENGINE_ID'})
+        credentials = launcher['volumes'][0]
+        self.assertTrue(credentials['read_only'])
+        self.assertFalse(credentials['bind']['create_host_path'])
+        self.assertEqual(credentials['target'], '/run/parser-engine/tls')
+        self.assertFalse(any('parser-engine/tls' in str(x) for x in web['volumes']))
         self.assertIn('parser-channel:/run/parser:ro', web['volumes'])
         parser = (root / 'deploy/parser.Dockerfile').read_text()
         self.assertNotIn('COPY app/ ./app/', parser)
@@ -283,7 +297,7 @@ class LauncherTests(unittest.TestCase):
         self.assertIn('app/documents.py', parser)
 
     def test_launcher_argv_is_fixed_and_excludes_mounts_shell_credentials_and_network(self):
-        runner = DockerParser(IMAGE, 'reviewed')
+        runner = DockerParser(IMAGE, 'reviewed', engine=ENGINE)
         argv = runner.command('va-parser-test')
         for item in ('--network=none', '--cap-drop=ALL', '--read-only', '--ipc=none',
                      '--user=65534:65534', '--security-opt=apparmor=va-lse-parser',
@@ -293,7 +307,9 @@ class LauncherTests(unittest.TestCase):
         self.assertFalse(any(x.startswith(('--mount', '--volume', '--privileged', '--pid', '--env-file'))
                              for x in argv if x != '--pids-limit=32'))
         self.assertNotIn('seccomp=unconfined', ' '.join(argv))
-        self.assertEqual(set(runner.env), {'PATH', 'HOME', 'DOCKER_HOST'})
+        self.assertEqual(runner.env['DOCKER_HOST'], ENGINE.endpoint)
+        self.assertEqual(runner.env['DOCKER_TLS_VERIFY'], '1')
+        self.assertEqual(set(runner.env), {'PATH', 'HOME', 'DOCKER_HOST', 'DOCKER_TLS_VERIFY', 'DOCKER_CERT_PATH'})
         self.assertEqual(argv[-3:], [IMAGE, '-m', 'app.parser_worker'])
 
     def test_mutable_image_and_absent_revision_are_rejected(self):
@@ -302,8 +318,9 @@ class LauncherTests(unittest.TestCase):
                 DockerParser(image, revision)
 
     def test_health_refuses_missing_linux_security_or_mismatched_build(self):
-        runner = DockerParser(IMAGE, 'reviewed')
-        info = {'OSType': 'linux', 'SecurityOptions': ['name=apparmor', 'name=seccomp,profile=builtin']}
+        runner = DockerParser(IMAGE, 'reviewed', engine=ENGINE)
+        info = {'OSType': 'linux', 'SecurityOptions': ['name=apparmor', 'name=seccomp,profile=builtin'],
+                'ID': ENGINE_ID, 'Labels': ['va-lse-purpose=parser-only']}
         image = [{'Id': IMAGE, 'Config': {'Env': ['VA_LSE_BUILD_SHA=reviewed']}}]
         with patch.object(runner, '_command', side_effect=[info, image]):
             self.assertTrue(runner.ready()['ready'])
@@ -348,10 +365,10 @@ class LauncherTests(unittest.TestCase):
         self.assertNotIn('SYNTHETIC_SECRET_CANARY', str(connection.sendall.call_args))
 
     def test_cleanup_is_attempted_when_runtime_exits_without_output(self):
-        runner = DockerParser(IMAGE, 'reviewed')
+        runner = DockerParser(IMAGE, 'reviewed', engine=ENGINE)
         # A real local synthetic child exercises pipe lifecycle without Docker.
         with patch.object(runner, 'command', return_value=[os.sys.executable, '-c', 'import sys; sys.stdin.buffer.read()']), \
-                patch('app.parser_service.subprocess.run') as remove, self.assertRaises(ValueError):
+                patch('app.parser_service.subprocess.run') as remove, patch.object(runner, 'ready'), self.assertRaises(ValueError):
             runner.run(request(), DATA)
         self.assertEqual(remove.call_args.args[0][1:3], ['rm', '--force'])
 
