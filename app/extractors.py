@@ -5,8 +5,9 @@ Why this module exists
 ``app/documents.py`` extracts text and never shells out, and that is on purpose:
 the deployment image must not carry a PDF renderer and an OCR engine, so a page
 that is a *scan* has no text to extract — the uploader counts it
-(``ExtractedDocument.unreadable_pages``), warns the user, and asks them to run
-``scripts/ocr_records.py`` on the file and upload it again. Records from a
+(``ExtractedDocument.unreadable_pages``), warns the user, and directs real-record
+users to an operator-reviewed OCR workflow. ``scripts/ocr_records.py`` accepts
+declared synthetic fixtures only. Records from a
 records request are routinely half scans, so that gap is real.
 
 The sandbox image is the machine that can close it: ``tesseract-ocr``,
@@ -207,7 +208,7 @@ class CommandBoxRunner:
 
     The command is the operator's, not this app's invention:
 
-        VA_LSE_EXTRACTOR_RUNNER="python scripts/ocr_and_extract.py {work} \\
+        VA_LSE_EXTRACTOR_RUNNER="python scripts/ocr_and_extract.py {work} --data-class synthetic \\
             --out {work}/bundle.json && cat {work}/bundle.json"
 
     The last thing on stdout must be the report JSON (the shape

@@ -35,7 +35,7 @@ What one invocation does — one file, one box, removed in a ``finally``:
     sandbox exec <name> -- mkdir -p /work/bundle/<label's directory>
     sandbox copy <work>/<file> <name>:/work/bundle/<label>
     sandbox exec <name> -- python3 /app/scripts/ocr_and_extract.py /work/bundle \\
-        --out /work/report.json --force
+        --data-class synthetic --out /work/report.json --force
     sandbox copy <name>:/work/report.json <work>/report.json
     sandbox remove <name>
 
@@ -381,6 +381,8 @@ class SandboxCli:
                 BOX_PYTHON,
                 BOX_ENTRYPOINT,
                 str(bundle),
+                "--data-class",
+                "synthetic",
                 "--out",
                 str(report),
                 "--force",

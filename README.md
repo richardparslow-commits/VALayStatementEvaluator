@@ -1034,15 +1034,18 @@ never pretends otherwise: the uploader says how many pages could not be read, an
 results carry a **Record coverage & citation check** panel that names the unreadable page count
 against the number of pages the files actually contain (plus the per-file breakdown and a
 citation self-check — see *Reading the results* below). What the app cannot do is read them, so
-OCR happens on your machine, before the upload:
+The standalone OCR tools below require an explicit synthetic-data declaration.
+Sensitive records and controlled-pilot execution are refused before file access.
+Real records require the operator's separately accepted isolated OCR and retention workflow.
+The declaration is an operator assertion, not an automatic PHI detector.
 
 ```bash
 python -m pip install -r requirements-local.txt   # ocrmypdf (preferred backend)
 # or: brew install tesseract poppler             # fallback backend
 
-python scripts/ocr_records.py ~/Desktop/va_medical_records.pdf --report-only
-python scripts/ocr_records.py ~/Desktop/va_medical_records.pdf
-# → ~/Desktop/va_medical_records.ocr.pdf: same pages, now with a text layer
+python scripts/ocr_records.py /work/synthetic_records.pdf --data-class synthetic --report-only
+python scripts/ocr_records.py /work/synthetic_records.pdf --data-class synthetic
+# → /work/synthetic_records.ocr.pdf: private retained output; review against the original
 ```
 
 `--report-only` prints how many pages are image-only without changing anything; the real run
@@ -1059,10 +1062,15 @@ the box ships Tesseract, Poppler, Ghostscript, qpdf and `ocrmypdf`, and
 the app's own reader, under the original file names:
 
 ```bash
-python scripts/ocr_and_extract.py /work/records --out /work/bundle.json
+python scripts/ocr_and_extract.py /work/synthetic_records --data-class synthetic --out /work/bundle.json
 ```
 
-Or let the app do per file what that command does for a whole folder. Point the extractor at
+The bundle CLI removes its private scratch copies on return, including errors;
+`--work-dir` chooses a scratch parent rather than retained copies. `--out` is the explicit
+retained owner-only bundle destination. Original inputs and that final bundle remain.
+Deletion after host/process failure requires its own accepted workflow.
+
+In synthetic mode, let the app do per file what that command does for a whole folder. Point the extractor at
 a Vercel Sandbox and each uploaded file is staged, copied into a fresh ephemeral microVM
 booted from the pushed `va-lse-sandbox` image, read there by the same entrypoint, and mapped
 back through `app/extractors.py` — a file the box cannot read is read in-process instead,

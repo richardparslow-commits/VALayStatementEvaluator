@@ -564,7 +564,7 @@ RECORDS_CONCURRENCY = max(1, _int_env("VA_LSE_RECORDS_CONCURRENCY", 2))
 # must end with the report JSON that scripts/ocr_and_extract.py writes, e.g.
 #
 #   VA_LSE_EXTRACTOR_RUNNER="my-box-run.sh {work}"   # script wraps: sandbox → \
-#                                                    # python scripts/ocr_and_extract.py {work} \
+#                                                    # python scripts/ocr_and_extract.py {work} --data-class synthetic \
 #                                                    #   --out {work}/bundle.json; cat that file
 # ---------------------------------------------------------------------------
 EXTRACTOR_MODE = os.getenv("VA_LSE_EXTRACTOR", "in-process").strip().lower() or "in-process"

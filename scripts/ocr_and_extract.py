@@ -15,7 +15,13 @@ other image — the deployment must not carry them), and a microVM is the right
 place to run a parser and an OCR engine over records that arrived from somewhere
 else. This script is the entrypoint for that box:
 
-    python scripts/ocr_and_extract.py /work/records --out /work/bundle.json
+    python scripts/ocr_and_extract.py /work/records --data-class synthetic --out /work/bundle.json
+
+Standalone use is synthetic-only; controlled-pilot mode and declared sensitive
+inputs refuse before file access. Scratch copies live in a private per-run
+directory and are removed on normal/exceptional return. --out explicitly chooses
+the retained owner-only JSON bundle. Process kill/host crash cleanup and any real
+records require a separately accepted storage/isolation workflow.
 
 What it does per file: if the file is a PDF with pages that yield no text, it OCRs
 those pages (ocrmypdf, or Poppler + Tesseract when ocrmypdf is absent) into a
@@ -51,7 +57,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -70,6 +75,7 @@ from app.documents import (  # noqa: E402
     extract_document,
 )
 from app.job_payload import documents_to_json  # noqa: E402
+from app.synthetic_tools import require_synthetic_tool, temporary_work, write_private  # noqa: E402
 from scripts import ocr_records  # noqa: E402
 
 EXIT_OK = 0
@@ -77,9 +83,8 @@ EXIT_NOTHING_TO_DO = 1
 EXIT_NO_TOOLING = 2
 EXIT_BAD_INPUT = 3
 
-#: Where the OCR copies are written, relative to a bundle directory. Named rather
-#: than random so a second run reuses them instead of re-OCR-ing a large bundle,
-#: and skipped during discovery so the copies are never read as records.
+#: Legacy directory name, still excluded from discovery. New CLI scratch is
+#: private, per invocation and removed; there is no implicit retained work cache.
 WORK_DIR_NAME = ".ocr-work"
 
 RECORD_SUFFIXES = (*SUPPORTED_EXTENSIONS, *ARCHIVE_EXTENSIONS)
@@ -134,26 +139,6 @@ def discover(paths: Sequence[Path], *, work_dir: Path) -> list[Path]:
     return unique
 
 
-def default_work_dir(paths: Sequence[Path]) -> Path:
-    """Where OCR copies go: beside the bundle when it can be written to."""
-    first = next((p for p in paths if p.exists()), PROJECT_ROOT)
-    base = first if first.is_dir() else first.parent
-    target = (base / WORK_DIR_NAME) if base.is_dir() else (base.parent / WORK_DIR_NAME)
-    try:
-        target.mkdir(parents=True, exist_ok=True)
-        probe = target / ".writable"
-        probe.write_text("", encoding="utf-8")
-        probe.unlink()
-        return target
-    except OSError as exc:  # pragma: no cover - a read-only mount
-        fallback = Path(tempfile.mkdtemp(prefix="ocr-work-"))
-        _out(
-            f"! {target} is not writable ({exc}); using {fallback} instead",
-            err=True,
-        )
-        return fallback
-
-
 # ------------------------------------------------------------------ per file
 def _label_for(path: Path, roots: Sequence[Path]) -> str:
     """The document label: relative to its bundle, so two folders cannot collide."""
@@ -192,6 +177,7 @@ def prepare(
     will carry and the name the user will look for. For anything else, or for a
     PDF that is fully readable, the bytes come back untouched.
     """
+    require_synthetic_tool()
     report: dict[str, Any] = {
         "label": label,
         "bytes": len(data),
@@ -208,7 +194,7 @@ def prepare(
 
     work_dir.mkdir(parents=True, exist_ok=True)
     source = work_dir / f"{_safe_stem(label)}.pdf"
-    source.write_bytes(data)
+    write_private(source, data)
     try:
         total, image_only = ocr_records.inspect_pdf(source)
     except Exception as exc:  # noqa: BLE001 - reported verbatim, like the sibling script
@@ -273,6 +259,7 @@ def process(
     on_file: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """OCR and extract *files*, returning the report the CLI writes as JSON."""
+    require_synthetic_tool()
     documents: list[ExtractedDocument] = []
     skipped: list[str] = []
     reports: list[dict[str, Any]] = []
@@ -344,6 +331,8 @@ def build_parser() -> argparse.ArgumentParser:
             "reader, emitting the queue's document JSON."
         )
     )
+    parser.add_argument("--data-class", required=True, choices=("synthetic", "sensitive"),
+                        help="declare the input class; sensitive records require a separately approved workflow")
     parser.add_argument(
         "bundle",
         nargs="+",
@@ -354,13 +343,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--out",
         type=Path,
         default=None,
-        help=f"where to write the JSON (default: <work-dir>/bundle.json)",
+        help="explicit retained JSON destination (required unless --report-only)",
     )
     parser.add_argument(
         "--work-dir",
         type=Path,
         default=None,
-        help=f"where OCR copies are written (default: <bundle>/{WORK_DIR_NAME})",
+        help="scratch parent; this run's private subdirectory is always removed",
     )
     parser.add_argument(
         "--dpi",
@@ -429,14 +418,35 @@ def _summarize(report: dict[str, Any], destination: Path | None) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.data_class != "synthetic":
+        _out("Sensitive records require a separately approved isolated workflow.", err=True)
+        return EXIT_BAD_INPUT
+    try:
+        require_synthetic_tool()
+    except ValueError as exc:
+        _out(str(exc), err=True)
+        return EXIT_BAD_INPUT
     bundle: list[Path] = list(args.bundle)
     missing = [str(path) for path in bundle if not path.exists()]
     if missing:
         _out(f"✖ not found: {', '.join(missing)}", err=True)
         return EXIT_BAD_INPUT
 
-    work_dir: Path = args.work_dir or default_work_dir(bundle)
-    work_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        publication: list[tuple[Path, bytes, bool]] = []
+        with temporary_work(args.work_dir) as work_dir:
+            status = _process_main(args, bundle, work_dir, publication)
+        # Cleanup must succeed before any bundle claims no retained scratch.
+        for destination, payload, overwrite in publication:
+            write_private(destination, payload, overwrite=overwrite)
+        return status
+    except Exception:  # noqa: BLE001 - fixed CLI failure; context removes owned scratch
+        _out("Preprocessing failed; no partial bundle was published.", err=True)
+        return EXIT_BAD_INPUT
+
+
+def _process_main(args: argparse.Namespace, bundle: list[Path], work_dir: Path,
+                  publication: list[tuple[Path, bytes, bool]]) -> int:
     files = discover(bundle, work_dir=work_dir)
     if not files:
         _out(
@@ -446,7 +456,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return EXIT_NOTHING_TO_DO
 
-    destination: Path | None = None if args.report_only else (args.out or work_dir / "bundle.json")
+    destination: Path | None = None if args.report_only else args.out
+    if not args.report_only and destination is None:
+        _out("Pass --out for the retained synthetic bundle, or --report-only.", err=True)
+        return EXIT_BAD_INPUT
+    if destination is not None and (destination.is_symlink() or any(
+        destination.resolve() == path.resolve()
+        or (destination.exists() and destination.samefile(path)) for path in files
+    )):
+        _out("Refusing an output that aliases an input or symbolic destination.", err=True)
+        return EXIT_BAD_INPUT
     if destination is not None and destination.exists() and not args.force:
         _out(f"✖ {destination} exists. Pass --force to overwrite.", err=True)
         return EXIT_BAD_INPUT
@@ -464,11 +483,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         use_ocr=not (args.no_ocr or args.report_only),
         on_file=None,
     )
+    report["work_artifacts_retained"] = False
+    for entry in report["files"]:
+        entry["ocr_output"] = None  # Scratch paths cease to exist when this call returns.
     _summarize(report, destination)
 
     if destination is not None:
         payload = {"version": 1, "bundle": [str(p) for p in bundle], **report}
-        destination.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        publication.append((destination, json.dumps(payload, indent=2).encode("utf-8"), args.force))
     if args.report_only:
         return EXIT_OK
 

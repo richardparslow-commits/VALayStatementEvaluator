@@ -189,6 +189,13 @@ supported controlled-pilot environment.
    | `VA_LSE_BIND_IP` | Private ingress bind address |
    | `VA_LSE_TLS_CERT`, `VA_LSE_TLS_KEY` | TLS certificate and private-key files |
 
+   Build the dedicated proxy image in `deploy/pilot-proxy.Dockerfile` and record its
+   immutable image ID. It runs as UID/GID 10001 on internal TLS port 8443; the private
+   host maps port 443 to it. Provision the key with owner-only read access for that
+   UID, and test the exact mounts. The proxy has a read-only root, private bounded
+   tmpfs, zero core-file limits and no container swap/log persistence. See
+   `deploy/PILOT_PRIVACY_ACCEPTANCE.md` for the required actual-host canary procedure.
+
    ```sh
    # On the reviewed Linux Docker host with AppArmor and default seccomp enabled:
    sudo apparmor_parser -r deploy/parser.apparmor

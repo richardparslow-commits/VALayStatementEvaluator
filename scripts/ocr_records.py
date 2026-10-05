@@ -24,6 +24,9 @@ Exit codes: 0 = wrote an OCR'd copy, 1 = nothing to do, 2 = no OCR tooling,
 """
 from __future__ import annotations
 
+# This standalone tool accepts only explicitly declared synthetic inputs.
+# Real records require a separately accepted isolation/retention workflow.
+
 import argparse
 import shutil
 import subprocess
@@ -38,6 +41,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.documents import _page_text  # noqa: E402  (documented reuse of the app's reader)
+from app.synthetic_tools import require_synthetic_tool  # noqa: E402
 
 EXIT_OK = 0
 EXIT_NOTHING_TO_DO = 1
@@ -55,6 +59,7 @@ def inspect_pdf(path: Path) -> tuple[int, list[int]]:
     Uses the same page reader as the app, so "image-only" here means exactly what
     the app will report after upload.
     """
+    require_synthetic_tool()
     from pypdf import PdfReader
 
     reader = PdfReader(str(path))
@@ -93,8 +98,7 @@ def _run(command: list[str], *, what: str) -> None:
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"{what} exceeded the processing deadline.") from None
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()[:500]
-        raise RuntimeError(f"{what} failed (exit {result.returncode}): {detail}")
+        raise RuntimeError(f"{what} failed (exit {result.returncode}); raw tool output was suppressed.")
 
 
 def ocr_with_ocrmypdf(source: Path, destination: Path) -> None:
@@ -120,6 +124,9 @@ def _atomic_output(source: Path, destination: Path) -> Iterator[Path]:
     """Publish only a fully completed OCR artifact; preserve existing output on failure."""
     import os
     import tempfile
+    require_synthetic_tool()
+    if destination.is_symlink():
+        raise ValueError("Refusing a symbolic OCR output destination.")
     if source.resolve() == destination.resolve() or (destination.exists() and source.samefile(destination)):
         raise ValueError("OCR output must be a separate file from the original source.")
     with tempfile.TemporaryDirectory(prefix=".ocr-", dir=str(destination.parent)) as directory:
@@ -131,6 +138,7 @@ def _atomic_output(source: Path, destination: Path) -> Iterator[Path]:
         after, _ = inspect_pdf(temporary)
         if after != before:
             raise ValueError("OCR changed source page coverage; no partial output was published.")
+        os.chmod(temporary, 0o600)
         os.replace(temporary, destination)
 
 
@@ -187,8 +195,8 @@ def _ocr_pages_parallel(
         ):
             try:
                 results[number] = future.result()
-            except Exception as exc:  # noqa: BLE001 - one page must not stop the run
-                _out(f"  page {number}: {type(exc).__name__}: {exc} — left blank", err=True)
+            except Exception:  # noqa: BLE001 - one page must not stop the run
+                _out(f"  page {number}: OCR failed — left blank", err=True)
                 results[number] = None
     return results
 
@@ -285,6 +293,8 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument("pdf", type=Path, help="the scanned record PDF")
+    parser.add_argument("--data-class", required=True, choices=("synthetic", "sensitive"),
+                        help="declare the input class; sensitive records require a separately approved workflow")
     parser.add_argument(
         "--out",
         type=Path,
@@ -321,6 +331,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.data_class != "synthetic":
+        _out("Sensitive records require a separately approved isolated workflow.", err=True)
+        return EXIT_BAD_INPUT
+    try:
+        require_synthetic_tool()
+    except ValueError as exc:
+        _out(str(exc), err=True)
+        return EXIT_BAD_INPUT
     source: Path = args.pdf
     if not source.is_file():
         _out(f"✖ {source}: not a file", err=True)

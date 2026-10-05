@@ -105,7 +105,7 @@ class TestOutputPath(unittest.TestCase):
 class TestMain(unittest.TestCase):
     def _run(self, argv: list[str]) -> int:
         with patch.object(sys, "argv", ["ocr_records.py"] + argv):
-            return ocr_records.main(argv)
+            return ocr_records.main(["--data-class", "synthetic", *argv])
 
     def test_a_missing_file_is_bad_input(self) -> None:
         self.assertEqual(self._run(["/tmp/definitely-not-here-1234.pdf"]), 3)

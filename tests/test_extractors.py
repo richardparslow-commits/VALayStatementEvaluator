@@ -84,7 +84,7 @@ class ScriptRunner:
 
         self.timeout = timeout
         out = work_dir / "bundle.json"
-        argv = [str(work_dir), "--out", str(out), "--force"]
+        argv = [str(work_dir), "--data-class", "synthetic", "--out", str(out), "--force"]
         if self.no_ocr:
             argv.append("--no-ocr")
         with patch("sys.stdout", io.StringIO()), patch("sys.stderr", io.StringIO()):

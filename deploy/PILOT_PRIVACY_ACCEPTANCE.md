@@ -5,6 +5,61 @@ string, evidence reference, or `store=false` request is not provider or privacy
 approval. Complete this procedure for the actual account and host with synthetic
 canaries before real-information admission. R07, R09–R13 remain separate gates.
 
+## Ingestion privacy controls (A15–A17)
+
+Pilot paragraph/token matching bypasses the process-global source caches. Clearing
+one case does not erase another case's cache; the pilot never populates it.
+Owned workers can retain active arguments until they terminate. Dropping Python
+references is not guaranteed memory zeroization, and case clearing cannot erase
+provider/browser/OS copies.
+
+The pilot proxy is built from `deploy/pilot-proxy.Dockerfile` as UID/GID 10001,
+with a read-only root, no Linux capabilities and no image startup rewrite scripts.
+Its internal TLS port is 8443; private host ingress remains 443. Give the actual
+TLS key owner-only read access for UID 10001 (and verify the certificate mounts),
+without making the key world-readable. Record the built immutable proxy image ID.
+Upload/proxy cache and PID paths use private bounded tmpfs. Request/response
+buffering, proxy caching/storage, URL access logging and raw proxy error logging
+are disabled; upstream buffering headers cannot re-enable buffering. Responses
+use `Cache-Control: no-store`. Browser memory, screenshots and user downloads
+still need their separate policy. Use `scripts/pilot_status.py` and the private
+count-only health endpoints, rather than enabling raw service logs.
+
+All three Compose services set zero core-file limits and equal memory/swap limits.
+Docker documents that equal memory/swap limits prevent container swap when the
+host supports enforcement. Tmpfs alone can otherwise reach swap. Verify the
+actual kernel/cgroup enforcement and host hibernation/crash/snapshot settings;
+this configuration is not a certificate of physical erasure or host compliance.
+
+The process entrypoint installs pilot suppression before standard Python logging
+fans records out to root, application and later-installed library handlers.
+Messages, arguments, exception frames, names/paths and arbitrary extras are
+removed; code-owned severity/time and allowlisted counts/references remain.
+Audit payloads retain their count-only fields. Synthetic mode preserves its
+diagnostics. Custom logging implementations that bypass standard delivery,
+direct stdout/native tools, startup before the reviewed entrypoint and collectors
+outside the process require actual-host canary review; no regex is claimed to
+identify all PHI.
+
+Standalone OCR CLIs require `--data-class synthetic`; `sensitive` and pilot mode
+refuse before file access. Programmatic OCR/extraction entry points also refuse
+pilot mode. Scratch is private and invocation-owned, with automatic cleanup on
+return/errors; final derivatives publish atomically with owner-only permissions.
+The bundle requires an explicit `--out`; the per-file OCR operation retains its
+documented `.ocr.pdf` destination unless `--out` selects another path. Existing legacy OCR files
+are unaffected, and a forced kill/host crash cannot be handled by a Python
+`finally`. These tools are not approved for real records. The declaration cannot
+detect misclassified data; operational access and the approved replacement must
+enforce the policy.
+
+Run actual-host canaries through clear/sign-out/disconnect, success/refusal/abort,
+process kill/restart, host recovery and decommissioning. Inspect every writable
+layer, tmpfs, local log/control volume, swap/core/crash collector, snapshot,
+backup, browser copy and actual provider/account destination. Verify the exact
+image/UID/TLS permissions, no payload logging, deadlines and offline deletion.
+Record independent privacy acceptance and account-specific retention evidence.
+Prepared source/CI evidence does not close these actual-host/account gates.
+
 ## Review the actual service configuration
 
 Record the named operator/controller and privacy/security reviewer; private host,

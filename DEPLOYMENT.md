@@ -790,10 +790,11 @@ Four things about it are deliberate and easy to get wrong by hand:
   is the entrypoint: it OCRs every image-only page in a bundle, then extracts with
   the app's own reader **under the original file names** (citations have to point
   at the record the user has, not at `.ocr.pdf`) and writes the queue's document
-  JSON for the app to consume:
+  JSON for the app to consume. Standalone OCR accepts declared synthetic inputs
+  only and refuses pilot mode. Real records require an operator-reviewed workflow:
 
   ```bash
-  python scripts/ocr_and_extract.py /work/records --out /work/bundle.json
+  python scripts/ocr_and_extract.py /work/synthetic_records --data-class synthetic --out /work/bundle.json
   # --report-only        say which pages need OCR, change nothing
   # --no-ocr             reproduce what the app sees today (all scans unreadable)
   ```
@@ -892,7 +893,7 @@ Four things about it are deliberate and easy to get wrong by hand:
   Per file it runs `sandbox create --name va-lse-ocr-<id> --image va-lse-sandbox:latest
   --timeout 20m --non-persistent --silent`, then `exec … mkdir -p
   /work/bundle/<the label's directory>`, `copy <work>/<file> <name>:/work/bundle/<label>`,
-  `exec … python3 /app/scripts/ocr_and_extract.py /work/bundle --out
+  `exec … python3 /app/scripts/ocr_and_extract.py /work/bundle --data-class synthetic --out
   /work/report.json --force`, `copy <name>:/work/report.json <work>/report.json`, and
   `sandbox remove <name>` in a `finally`. Three details are the load-bearing ones:
   the report comes back as a **file**, because `app/extractors.py` parses the runner's
