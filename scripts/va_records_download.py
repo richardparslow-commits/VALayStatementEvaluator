@@ -365,8 +365,9 @@ def report_download(path: Path, *, manifest_path: Path | None = None) -> list[st
     if ratio < MIN_TEXT_RATIO:
         warnings.append(
             f"{summary['image_only_pages']:,} of {pages:,} pages are image-only, so the app "
-            "cannot read them. OCR the file first: python scripts/ocr_records.py "
-            f"{path.name}"
+            "cannot read them. Real records need an operator-reviewed OCR workflow. "
+            "The standalone scripts/ocr_records.py examples accept synthetic data only; "
+            "see README: Scanned pages and OCR."
         )
     if destination is not None:
         print(f"  Manifest (provenance, page counts, sha256): {destination}")
