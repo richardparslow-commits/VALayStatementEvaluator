@@ -830,6 +830,11 @@ def review_medical_records(
     check_pipeline_cancelled()
     if not documents:
         raise ValueError("No medical records provided.")
+    # Direct record-review callers cannot bypass the public request boundary.
+    from . import pilot
+    if pilot.enabled():
+        from .request_validation import validate_records
+        validate_records(documents)
 
     pages = sum(len(doc.pages) for doc in documents)
     # The cap is measured on the pages the *files* contain, not the pages that
@@ -1459,6 +1464,7 @@ def _file_coverage(doc: ExtractedDocument) -> dict[str, Any]:
         "source_sha256": doc.source_sha256,
         "extraction_method": doc.extraction_method,
         "text_encoding": doc.text_encoding,
+        "coverage_known": doc.coverage_known,
         "source_parts": sorted({p.source_part for p in doc.pages if p.source_part}),
     }
 
@@ -1688,7 +1694,7 @@ def critical_fact_flags(facts: list[MedicalFact]) -> list[dict[str, Any]]:
     flags: list[dict[str, Any]] = []
     for index, fact in enumerate(facts, 1):
         original, derived = features(fact.quote), features(fact.description)
-        changed = [field for field in ("negation", "attribution", "uncertainty", "laterality", "dates/numbers", "diagnosis/nexus")
+        changed = [field for field in original if field != "factual wording"
                    if derived[field] != original[field]]
         if set(derived["factual wording"]) - set(original["factual wording"]):
             changed.append("diagnosis/factual wording")

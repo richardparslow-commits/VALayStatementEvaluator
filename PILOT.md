@@ -264,6 +264,13 @@ terms, container limits, backup restoration, or output accuracy**. Record those
 deployment results in `deployment_validation` and `accuracy_validation`; admission
 must remain closed until the responsible reviewers accept them.
 
+The [parsing and understanding acceptance](deploy/PILOT_PARSING_ACCEPTANCE.md)
+documents strict model JSON, critical association checks, and complete readable
+record coverage. Pilot runs refuse partial/unknown source coverage before quota
+or model work; saved results need current coverage metadata and fresh source
+checks before review approval. These checks do not replace independent clinical
+accuracy review or visible-page/OCR comparison.
+
 ## Case lifecycle and incident procedure
 
 “Clear this case” removes session values and registered uploaded files. Sign-out

@@ -171,12 +171,16 @@ def build_context(account: str, witness: dict[str, str], digest: MedicalDigest |
 
 def retained_inputs(account: str, witness: dict[str, str], records: list[ExtractedDocument]) -> dict[str, Any]:
     """Preserve unavailable source addresses as well as readable page text."""
+    from .request_validation import RECORD_COVERAGE_POLICY
     unavailable = [{"filename": doc.filename, "kind": doc.pagination, "page": number}
                    for doc in records for number in doc.unreadable_pages]
     return {"policy": FACTUAL_POLICY, "account": account, "witness": dict(witness),
             "unreadable_units": unavailable,
             "source_metadata": [{"filename": doc.filename, "source_sha256": doc.source_sha256,
                                  "extraction_method": doc.extraction_method, "text_encoding": doc.text_encoding,
+                                 "coverage_policy": RECORD_COVERAGE_POLICY, "pagination": doc.pagination,
+                                 "total_pages": doc.total_pages, "coverage_known": doc.coverage_known,
+                                 "unreadable_pages": list(doc.unreadable_pages),
                                  "parts": [[p.page, p.source_part] for p in doc.pages]} for doc in records]}
 
 
@@ -209,6 +213,11 @@ def context_for_result(result: Any) -> dict[str, Any] | None:
                 or unit["page"] < 1):
             return None
         records.append(ExtractedDocument(unit["filename"], unreadable_pages=[unit["page"]], pagination=unit["kind"]))
+    from . import pilot
+    if pilot.enabled() and not _pilot_result_sources_complete(result, raw, records):
+        # Saved flags/counts are not approval evidence. Rebuild from the current
+        # source snapshot, refusing legacy manifests or partially readable input.
+        return None
     context = build_context(account, witness, getattr(result, "digest", None), records)
     # Hash complete source snapshots, including unresolved facts, so changing
     # digest evidence cannot leave an old session approval applicable.
@@ -216,6 +225,41 @@ def context_for_result(result: Any) -> dict[str, Any] | None:
     context["hash"] = fingerprint([context["hash"], [vars(f) for f in digest.facts] if digest else None,
                                    raw.get("source_metadata"), raw.get("statement_source")])
     return context
+
+
+def _pilot_result_sources_complete(result: Any, raw: dict[str, Any], records: list[ExtractedDocument]) -> bool:
+    from .request_validation import RECORD_COVERAGE_POLICY, RequestValidationError, validate_records
+    from .medical_review import verify_citations
+    metadata = raw.get("source_metadata")
+    digest = getattr(result, "digest", None)
+    if (not isinstance(metadata, list) or not 1 <= len(metadata) <= config.MAX_RECORD_PAGES
+            or raw.get("unreadable_units") or not isinstance(digest, MedicalDigest)
+            or not digest.facts or digest.unreadable_pages or digest.facts_dropped_by_cap):
+        return False
+    grouped: dict[tuple[str, str], list[DocumentPage]] = {}
+    for doc in records:
+        grouped.setdefault((doc.filename, doc.pagination), []).extend(doc.pages)
+    rebuilt = []
+    for row in metadata:
+        if (not isinstance(row, dict) or row.get("coverage_policy") != RECORD_COVERAGE_POLICY
+                or not isinstance(row.get("filename"), str) or row.get("pagination") not in ("page", "block")
+                or row.get("coverage_known") is not True or row.get("unreadable_pages") != []
+                or type(row.get("total_pages")) is not int):
+            return False
+        key = (row["filename"], row["pagination"])
+        pages = grouped.pop(key, None)
+        if pages is None:
+            return False
+        rebuilt.append(ExtractedDocument(row["filename"], pages, total_pages=row["total_pages"],
+                                         pagination=row["pagination"], coverage_known=True))
+    if grouped:
+        return False
+    try:
+        validate_records(rebuilt)
+    except RequestValidationError:
+        return False
+    check = verify_citations(digest.facts, rebuilt)
+    return not (check["missing"] or check["skipped"] or check["critical_review_flags"])
 
 
 def _structural(text: str) -> bool:

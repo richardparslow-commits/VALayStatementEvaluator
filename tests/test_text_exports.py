@@ -232,7 +232,7 @@ class TextExportTests(unittest.TestCase):
         self.stack.enter_context(patch.object(pilot, "current_owner", return_value=self.owner))
         code = '''
 from app.views.factual_review import render_factual_review
-from tests.test_factual_integrity import result, ACCOUNT
+from tests.test_factual_integrity import pilot_result as result, ACCOUNT
 render_factual_review(result(), ACCOUNT, slot="draft")
 '''
         for action in ("source", "review"):
@@ -405,7 +405,7 @@ import streamlit as st
 from app import pilot
 from app.views.factual_review import render_factual_review
 from app.views.text_export import render_text_export
-from tests.test_factual_integrity import result, ACCOUNT
+from tests.test_factual_integrity import pilot_result as result, ACCOUNT
 text = st.text_area("Candidate", value=ACCOUNT, key="candidate", on_change=pilot.invalidate_exports, args=("draft",))
 confirmed = render_factual_review(result(), text, slot="draft") and pilot.confirm_export(text)
 render_text_export(text, slot="draft", confirmed=confirmed)

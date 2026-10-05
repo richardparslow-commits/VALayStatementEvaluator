@@ -113,7 +113,7 @@ import streamlit as st
 from app import pilot
 from app.accessibility import render_reading_guide
 from app.views.factual_review import render_factual_review
-from tests.test_factual_integrity import result
+from tests.test_factual_integrity import pilot_result as result
 long_passage = "Invented observation " + "long context " * 500 + '<img src="https://outside.invalid/CANARY">'
 r = result(long_passage)
 with patch.object(pilot, "enabled", return_value=True), patch.object(pilot, "current_owner", return_value="fixture-owner"):

@@ -27,7 +27,7 @@ QUOTE = "Patient reports knee pain every morning."
 
 
 def evidence(kind=PAGE, filename="clinic.txt"):
-    doc = ExtractedDocument(filename, [DocumentPage(filename, 1, QUOTE, kind)], pagination=kind)
+    doc = ExtractedDocument(filename, [DocumentPage(filename, 1, QUOTE, kind)], pagination=kind, total_pages=1)
     source = doc.pages[0].label
     digest = MedicalDigest(facts=[MedicalFact("2024-01", "symptom", QUOTE, source, QUOTE,
                                              document=filename, page=1)])

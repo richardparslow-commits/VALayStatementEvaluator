@@ -10,9 +10,7 @@ import time
 from collections.abc import Iterator, Mapping
 from typing import Any
 
-MAX_RESPONSE_BYTES = 2 * 1024 * 1024
-MAX_JSON_DEPTH = 64
-MAX_JSON_ITEMS = 20_000
+from .bounded_json import MAX_RESPONSE_BYTES, decode_json
 
 
 def validate_profiles(approval: Mapping[str, Any]) -> None:
@@ -73,44 +71,9 @@ def validate_response_json(raw: bytes) -> None:
     """Bound JSON structure before the SDK creates its response object graph."""
     from . import pilot
     try:
-        text = raw.decode("utf-8")
-        quoted = escaped = False
-        depth = items = 0
-        for char in text:
-            if quoted:
-                if escaped:
-                    escaped = False
-                elif char == "\\":
-                    escaped = True
-                elif char == '"':
-                    quoted = False
-            elif char == '"':
-                quoted = True
-            elif char in "[{":
-                depth += 1
-                items += 1
-            elif char in "]}":
-                depth -= 1
-            elif char in ",:":
-                items += 1
-            if depth < 0 or depth > MAX_JSON_DEPTH or items > MAX_JSON_ITEMS:
-                raise ValueError
-        if depth or quoted:
-            raise ValueError
-        def pairs(entries: list[tuple[str, Any]]) -> dict[str, Any]:
-            result: dict[str, Any] = {}
-            for key, value in entries:
-                if key in result:
-                    raise ValueError
-                result[key] = value
-            return result
-        def constant(value: str) -> Any:
-            raise ValueError
-        result = json.loads(text, object_pairs_hook=pairs, parse_constant=constant)
-        if not isinstance(result, dict):
-            raise ValueError
-    except (UnicodeError, ValueError, RecursionError) as exc:
-        raise pilot.PilotBlocked("The provider returned an invalid or over-complex response. Its content was not logged or accepted.") from exc
+        decode_json(raw, object_only=True)
+    except (UnicodeError, ValueError, RecursionError):
+        raise pilot.PilotBlocked("The provider returned an invalid or over-complex response. Its content was not logged or accepted.") from None
 
 
 def bounded_transport(deadline_seconds: float, inner: Any = None) -> Any:
