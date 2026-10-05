@@ -7,9 +7,11 @@ No provider credentials, deployment credentials or veteran information are used.
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import shutil
+import ssl
 import subprocess
 import time
 from pathlib import Path
@@ -73,7 +75,7 @@ def setup(directory):
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
         try:
-            result = subprocess.run(['docker', 'info', '--format', '{{.ID}}'], env=env, capture_output=True, timeout=3)
+            result = subprocess.run(['docker', 'info', '--format', '{{.ID}}'], env=env, capture_output=True, timeout=10)
         except subprocess.TimeoutExpired:
             result = None
         if result is not None and result.returncode == 0:
@@ -87,6 +89,17 @@ def setup(directory):
         print((directory / 'containerd.log').read_text(errors='replace')[-3000:])
         if result is not None:
             print(result.stderr.decode(errors='replace')[-2000:])
+        context = ssl.create_default_context(cafile=str(tls / 'ca.pem'))
+        context.load_cert_chain(str(tls / 'cert.pem'), str(tls / 'key.pem'))
+        connection = http.client.HTTPSConnection(address, 2376, timeout=5, context=context)
+        try:
+            connection.request('GET', '/_ping')
+            reply = connection.getresponse()
+            print('Synthetic direct verified TLS ping:', reply.status, reply.read(64).decode(errors='replace'))
+        except (OSError, ssl.SSLError) as exc:
+            print('Synthetic direct verified TLS ping refused:', type(exc).__name__, str(exc))
+        finally:
+            connection.close()
         raise RuntimeError('Synthetic dedicated TLS engine did not start; inspect private CI daemon log.')
     assert engine_id and engine_id != application_id
     image = call(['docker', 'image', 'inspect', 'va-lse-parser:ci', '--format', '{{.Id}}']).stdout.decode().strip()
