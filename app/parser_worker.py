@@ -26,19 +26,20 @@ def child(root: Path) -> None:
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     resource.setrlimit(resource.RLIMIT_AS, (1024 ** 3, 1024 ** 3))
     # Settings imports can only see the parser image and the deliberately empty environment.
-    from .documents import InProcessExtractor
+    from .documents import DOCUMENT_SCHEMA_VERSION, InProcessExtractor
     from .parser_protocol import decode
     request = decode((root / "header").read_bytes())
     docs, skipped = InProcessExtractor().extract(request["label"], (root / "input").read_bytes())
     if sum(len(p.text) for d in docs for p in d.pages) > MAX_TEXT:
         raise ValueError("Parser text exceeds its limit.")
-    documents = [{"filename": d.filename, "schema_version": 3, "total_pages": d.total_pages,
+    documents = [{"filename": d.filename, "schema_version": DOCUMENT_SCHEMA_VERSION, "total_pages": d.total_pages,
                   "unreadable_pages": d.unreadable_pages, "pagination": d.pagination,
                   "coverage_known": d.coverage_known,
                   "source_sha256": d.source_sha256, "extraction_method": d.extraction_method,
                   "text_encoding": d.text_encoding,
                   "pages": [{"page": p.page, "kind": p.kind, "text": p.text,
-                             "source_part": p.source_part} for p in d.pages]}
+                             "source_part": p.source_part, "source_start": p.source_start,
+                             "source_end": p.source_end} for p in d.pages]}
                  for d in docs]
     result = encode({"version": 1, "nonce": request["nonce"], "sha256": request["sha256"],
                      "label": request["label"], "documents": documents, "skipped": skipped})

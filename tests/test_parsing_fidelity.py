@@ -16,7 +16,7 @@ from tests.ingestion_fixtures import docx_parts, package
 from tests.test_controlled_pilot import approval
 from tests.test_extractors import _pdf_bytes
 from app import pilot
-from app.documents import DocumentPage, ExtractedDocument, ExtractionError, extract_document, paragraph_index, search_records
+from app.documents import ChunkPlan, DocumentPage, ExtractedDocument, ExtractionError, extract_document, paragraph_index, search_records
 from app.job_payload import document_to_json, document_from_json, digest_to_json, digest_from_json
 from app.medical_review import MedicalDigest, MedicalFact, _dates_in_text, _regex_extract_date, _summarize, build_timeline_data, retrieve_evidence, summary_sample, verify_citations
 from app.provider_limits import MAX_RESPONSE_BYTES, bounded_transport, check_request, check_response_model, validate_response_json
@@ -85,7 +85,8 @@ class WordStories(unittest.TestCase):
                 entry = f'<w:{child} w:id="7" w:author="Synthetic reviewer" w:date="2024-03-05">{entry}</w:{child}>'
             parts[f"word/{stem}.xml"] = f'<w:{root} xmlns:w="{W}">{entry}</w:{root}>'.encode()
         doc = extract_document("statement.docx", package(parts))
-        self.assertIn("denies pain\nsince 2019", doc.full_text)
+        self.assertIn("denies\tpain\nsince 2019", doc.full_text)
+        self.assertTrue(any("denies pain\nsince 2019" in chunk.text for chunk in ChunkPlan(doc.pages)))
         self.assertIn("No PTSD.", doc.full_text)
         self.assertEqual(doc.pagination, "block")
         self.assertEqual({p.source_part for p in doc.pages}, {n for n in parts if n.startswith("word/")})
