@@ -634,22 +634,9 @@ def _run_draft(
     # produced every digest fact. This store lives independently of
     # prompt budgets so saved results always carry full provenance.
     result.evidence_source = _pages_to_source(records)
-    obs_for_prompt, removed = _truncate_for_prompt(observations, DRAFT_INTERNAL_MAX_CHARS)
-    result.truncated_chars = removed
-    if removed:
-        result.truncation_warning = (
-            f"Observations were {result.input_chars:,} characters — "
-            f"{removed:,} characters beyond the {DRAFT_INTERNAL_MAX_CHARS:,} internal prompt limit "
-            f"were truncated and not grounded. Details at the end may have been missed. "
-            f"Shorten or split the observations and re-run."
-        )
-        if result.input_chars > MAX_OBSERVATIONS_CHARS:
-            result.truncation_warning = (
-                f"Observations were {result.input_chars:,} characters — "
-                f"{result.input_chars - MAX_OBSERVATIONS_CHARS:,} over the {MAX_OBSERVATIONS_CHARS:,} "
-                f"recommended limit. {removed:,} characters were truncated for the model prompts; "
-                f"details at the end may have been missed. Shorten or split and re-run."
-            )
+    from .request_validation import validate_text
+    validate_text(observations, field="observations", label="The witness observations", limit=DRAFT_INTERNAL_MAX_CHARS)
+    obs_for_prompt = observations
 
     def report(frac: float, msg: str) -> None:
         check_pipeline_cancelled()
@@ -683,7 +670,7 @@ def _run_draft(
                         relationship=sanitize_for_prompt(witness.get("relationship", "not specified"), max_chars=500),
                         credentials_block=witness_credentials_block(witness),
                         care_block=care_observation_block(witness),
-                        observations=sanitize_for_prompt(obs_for_prompt, max_chars=DRAFT_INTERNAL_MAX_CHARS),
+                        observations=sanitize_for_prompt(obs_for_prompt, max_chars=None),
                         digest=catalog_text,
                         checklist=load_knowledge("topic_checklist.md"),
                         guard_note=GUARD_NOTE,
@@ -736,7 +723,7 @@ def _run_draft(
                         witnessed_event=sanitize_for_prompt(witness.get("witnessed_event", "unknown"), max_chars=500),
                         credentials_block=witness_credentials_block(witness),
                         care_block=care_observation_block(witness),
-                        observations=sanitize_for_prompt(obs_for_prompt, max_chars=DRAFT_INTERNAL_MAX_CHARS),
+                        observations=sanitize_for_prompt(obs_for_prompt, max_chars=None),
                         grounding=_grounding_for_prompt(result.grounding),
                         digest_summary=sanitize_digest_text(result.digest.summary or "(no summary)", max_chars=20_000),
                         guard_note=GUARD_NOTE,

@@ -157,7 +157,8 @@ def _relationship_target(source: str, target: str) -> str:
     return path
 
 
-def validate_docx(archive: zipfile.ZipFile, read: Callable[[str], bytes]) -> ET.Element:
+def validate_docx(archive: zipfile.ZipFile, read: Callable[[str], bytes],
+                  on_story: Callable[[str, ET.Element], None] | None = None) -> ET.Element:
     """Read each bounded part once; retain only main XML, not all package bodies."""
     validate_zip_entries(archive, package=True)
     names = {i.filename for i in archive.infolist() if not i.is_dir()}
@@ -236,6 +237,9 @@ def validate_docx(archive: zipfile.ZipFile, read: Callable[[str], bytes]) -> ET.
             if root.tag != f"{{{_WORD_NS}}}document":
                 raise IngestionRefused("DOCX main document XML is invalid.")
             main = root
+        story_roots = {"document", "hdr", "ftr", "footnotes", "endnotes", "comments"}
+        if root.tag in {f"{{{_WORD_NS}}}{n}" for n in story_roots} and on_story is not None:
+            on_story(name, root)
     if main is None or not has_main_relationship:
         raise IngestionRefused("DOCX main document relationship is missing.")
     return main

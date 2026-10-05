@@ -293,7 +293,7 @@ class TestBuildReport(unittest.TestCase):
 
     def test_verdict_emoji(self):
         r = EvaluationResult(
-            claims=[{"id": 1, "text": "c1"}, {"id": 2, "text": "c2"}, {"id": 3, "text": "c3"}, {"id": 4, "text": "c4"}],
+            claims=[{"id": i, "text": "Knee pain during service."} for i in range(1, 5)],
             verifications=[
                 {"id": 1, "verdict": "SUPPORTED", "record_reference": "", "note": ""},
                 {"id": 2, "verdict": "PARTIALLY SUPPORTED", "record_reference": "", "note": ""},
@@ -506,7 +506,7 @@ class TestVerifyClaims(unittest.TestCase):
                 {"id": 2, "verdict": "NOT FOUND", "record_reference": "", "note": "No record."},
             ]}
         })
-        claims = [{"id": 1, "text": "c1"}, {"id": 2, "text": "c2"}]
+        claims = [{"id": 1, "text": "Knee pain during service."}, {"id": 2, "text": "Knee pain treatment."}]
         result, gaps = _verify_claims(llm, claims, _fake_digest(), [_doc()], report=lambda f, m: None)
         self.assertEqual(result[0]["verdict"], "CONTRADICTED")
         self.assertEqual(result[1]["verdict"], "NOT FOUND")
@@ -915,7 +915,7 @@ class TestRunEvaluationHappyPath(unittest.TestCase):
         # verify returns one of each verdict
         llm = _FakeLLM(overrides={
             "claims": {"claimed_condition": "PTSD", "writer_role": "veteran", "claims": [
-                {"id": 1, "text": "c1"}, {"id": 2, "text": "c2"}, {"id": 3, "text": "c3"}, {"id": 4, "text": "c4"}
+                {"id": i, "text": "Knee pain during service."} for i in range(1, 5)
             ]},
             "verify": {"verifications": [
                 {"id": 1, "verdict": "SUPPORTED", "record_reference": "a.txt p.1", "note": "ok"},
@@ -996,26 +996,22 @@ class TestRunEvaluationEdgeCases(unittest.TestCase):
 
     @patch("app.evaluate.review_medical_records")
     @patch("app.evaluate.load_knowledge", return_value="k")
-    def test_truncation_audit(self, _mk, mock_review):
-        mock_review.return_value = _fake_digest()
-        long = "x" * (EVALUATE_INTERNAL_MAX_CHARS + 500)
+    def test_hard_limit_refuses_before_record_review(self, _mk, mock_review):
+        from app.request_validation import RequestValidationError
         llm = _FakeLLM()
-        result = run_evaluation(llm, long, [_doc()])
-        self.assertEqual(result.input_chars, len(long))
-        self.assertEqual(result.truncated_chars, 500)
-        self.assertIn("truncated", result.truncation_warning.lower())
-        self.assertIn("Truncated input", result.report_markdown)
+        with self.assertRaises(RequestValidationError):
+            run_evaluation(llm, "x" * (EVALUATE_INTERNAL_MAX_CHARS + 500), [_doc()])
+        mock_review.assert_not_called()
+        self.assertEqual(llm.calls, [])
 
     @patch("app.evaluate.review_medical_records")
     @patch("app.evaluate.load_knowledge", return_value="k")
-    def test_truncation_with_soft_limit_message(self, _mk, mock_review):
+    def test_long_accepted_statement_has_no_truncation(self, _mk, mock_review):
         mock_review.return_value = _fake_digest()
-        # exceed both soft (60k) and hard (80k) → soft-limit branch
-        long = "x" * (EVALUATE_INTERNAL_MAX_CHARS + 100)
-        # ensure it's also over soft limit (60k) – it is by 20k+
-        llm = _FakeLLM()
-        result = run_evaluation(llm, long, [_doc()])
-        self.assertIn("recommended limit", result.truncation_warning)
+        result = run_evaluation(_FakeLLM(), "x" * EVALUATE_INTERNAL_MAX_CHARS, [_doc()])
+        self.assertEqual(result.input_chars, EVALUATE_INTERNAL_MAX_CHARS)
+        self.assertEqual(result.truncated_chars, 0)
+        self.assertFalse(result.truncation_warning)
 
     @patch("app.evaluate.review_medical_records")
     @patch("app.evaluate.load_knowledge", return_value="k")

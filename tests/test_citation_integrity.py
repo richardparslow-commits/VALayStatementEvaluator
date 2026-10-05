@@ -344,13 +344,23 @@ class TestPilotCitationGate(unittest.TestCase):
                 review_medical_records(llm, [document(), document()])
         self.assertNotIn("records:summary", llm.phases)
 
-    def test_authentic_quote_completes_pilot_record_review(self):
-        llm = _SyntheticLLM([fact()])
+    def test_authentic_quote_with_unchanged_description_completes_pilot_record_review(self):
+        original = fact()
+        original.date = "unknown"
+        original.description = SOURCE
+        llm = _SyntheticLLM([original])
         with patch("app.pilot.enabled", return_value=True):
             digest = review_medical_records(llm, [document()])
         self.assertEqual(digest.citation_check["verified"], 1)
         self.assertEqual(digest.citation_check["match_policy"], CITATION_MATCH_POLICY)
         self.assertEqual(digest.summary, "Synthetic summary")
+
+    def test_quote_alone_does_not_approve_changed_meaning_or_unsupported_date(self):
+        llm = _SyntheticLLM([fact()])
+        with patch("app.pilot.enabled", return_value=True):
+            with self.assertRaises(pilot.PilotBlocked):
+                review_medical_records(llm, [document()])
+        self.assertNotIn("records:summary", llm.phases)
 
 
 if __name__ == "__main__":

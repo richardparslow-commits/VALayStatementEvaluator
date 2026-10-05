@@ -52,6 +52,7 @@ from ..job_payload import EvaluateJob
 from ..config import Settings, load_settings
 from ..logging_config import get_logger, get_request_id
 from ..documents import (
+    ExtractedDocument,
     EVALUATE_INTERNAL_MAX_CHARS,
     MAX_STATEMENT_CHARS,
 )
@@ -142,6 +143,7 @@ def render_evaluate_tab() -> None:
         "Statement source", ["Upload file", "Paste text"], key="eval_mode", horizontal=True
     )
     statement_text = ""
+    statement_source = None
     if mode == "Paste text":
         statement_text = st.text_area(
             "Paste the full lay/witness statement", height=260, key="eval_paste"
@@ -170,7 +172,11 @@ def render_evaluate_tab() -> None:
             else:
                 docs = extract_uploads([files], "eval_statement")
             if docs:
-                statement_text = docs[0].full_text
+                statement_source = docs[0]
+                statement_text = statement_source.full_text
+                if (not statement_source.coverage_known or statement_source.unreadable_pages
+                        or statement_source.source_page_count != len(statement_source.pages)):
+                    st.error("The statement has incomplete text coverage. Review the source and upload a complete readable copy before running.")
 
     if statement_text:
         _render_statement_length_guidance(statement_text)
@@ -211,7 +217,7 @@ def render_evaluate_tab() -> None:
 
     run = st.button("🔍 Run exhaustive evaluation", type="primary", key="eval_run")
     if run:
-        _run_evaluation_flow(statement_text, records, collect_aa_answers("eval"))
+        _run_evaluation_flow(statement_text, records, collect_aa_answers("eval"), statement_source=statement_source)
 
     pilot.require_session_access()
 
@@ -241,14 +247,7 @@ def _render_statement_length_guidance(statement_text: str) -> None:
         over = n - MAX_STATEMENT_CHARS
         will_truncate = max(0, n - EVALUATE_INTERNAL_MAX_CHARS)
         if will_truncate:
-            pilot.display(
-                f"⚠️ Statement is {n:,} characters — {over:,} over the {MAX_STATEMENT_CHARS:,} "
-                f"recommended limit. {will_truncate:,} characters beyond the "
-                f"{EVALUATE_INTERNAL_MAX_CHARS:,} internal prompt limit will be "
-                f"truncated and not analyzed. Claims at the end (e.g., family impact, "
-                f"caregiver necessity) may be missed. Consider splitting the statement "
-                f"into smaller parts or shortening it."
-            , container=st, method="warning")
+            pilot.display(f"Statement exceeds the {EVALUATE_INTERNAL_MAX_CHARS:,}-character hard limit. Shorten or split it before running; all accepted text is evaluated in full.", container=st, method="warning")
         else:
             pilot.display(
                 f"⚠️ Statement is {n:,} characters — {over:,} over the {MAX_STATEMENT_CHARS:,} "
@@ -258,7 +257,7 @@ def _render_statement_length_guidance(statement_text: str) -> None:
             , container=st, method="warning")
         st.checkbox(
             f"I understand the statement is {over:,} characters over the limit and "
-            "want to proceed anyway (any truncated portion will be noted in the report).",
+            "want to proceed within the hard limit; all accepted text will be analyzed.",
             key="eval_confirm_oversize",
         )
     elif n > int(MAX_STATEMENT_CHARS * 0.85):
@@ -270,7 +269,8 @@ def _render_statement_length_guidance(statement_text: str) -> None:
 
 def _validate_evaluate_inputs(statement_text: str, records: list, witness: dict[str, str] | None = None,
                               *, validate_record_set: bool = True, confirm_oversize: bool = True,
-                              original_text: str | None = None) -> bool:
+                              original_text: str | None = None,
+                              statement_source: ExtractedDocument | None = None) -> bool:
     """Pre-run validation; shows the specific error and returns False when invalid."""
     # Minted rather than defaulted to "-": each rejection below is written to the
     # run log under this id, and an id the user cannot see is not a reference.
@@ -278,7 +278,7 @@ def _validate_evaluate_inputs(statement_text: str, records: list, witness: dict[
     from ..request_validation import RequestValidationError, validate_evaluation_request, validate_follow_up_prompt_budget
     try:
         validate_evaluation_request(statement_text=statement_text, records=records, witness=witness,
-                                    validate_record_set=validate_record_set)
+                                    validate_record_set=validate_record_set, statement_source=statement_source)
         if original_text is not None:
             validate_follow_up_prompt_budget(original_text, statement_text, field="statement_text",
                                              label="The statement", limit=EVALUATE_INTERNAL_MAX_CHARS)
@@ -310,7 +310,8 @@ def _validate_evaluate_inputs(statement_text: str, records: list, witness: dict[
 
 
 # -------------------------------------------------------------- run pipeline
-def _run_evaluation_flow(statement_text: str, records: list, witness: dict[str, str] | None = None) -> None:
+def _run_evaluation_flow(statement_text: str, records: list, witness: dict[str, str] | None = None,
+                         *, statement_source: ExtractedDocument | None = None) -> None:
     """Mint a run id, gate shutdown, run the pipeline, persist the result.
 
     *witness* carries the structured A&A intake answers (``aa_*`` keys); it
@@ -319,14 +320,15 @@ def _run_evaluation_flow(statement_text: str, records: list, witness: dict[str, 
     pre-intake pipeline.
     """
     pilot.invalidate_exports("eval")
-    if not _validate_evaluate_inputs(statement_text, records, witness):
+    if not _validate_evaluate_inputs(statement_text, records, witness, statement_source=statement_source):
         return
     queued = job_runner.queue_mode_active()
-    _input_key = "" if queued else evaluation_input_key(statement_text, records, witness or {})
+    _input_key = "" if queued else evaluation_input_key(statement_text, records, witness or {}, statement_source)
     submitted_statement = (statement_text if queued else
                            append_follow_up_answers(statement_text.strip(), slot="eval", input_key=_input_key))
     if not _validate_evaluate_inputs(submitted_statement, records, witness, validate_record_set=False,
-                                     confirm_oversize=False, original_text=None if queued else statement_text.strip()):
+                                     confirm_oversize=False, original_text=None if queued else statement_text.strip(),
+                                     statement_source=statement_source):
         return
     # Before anything is spent: a configuration whose every call is rejected is
     # detectable in one request. This is the only entry point into the pipeline, so
@@ -391,6 +393,7 @@ def _run_evaluation_flow(statement_text: str, records: list, witness: dict[str, 
             records,
             progress=update,
             witness=witness or {},
+            statement_source=statement_source,
         )
         pilot.require_session_access()
     except pilot.PilotBlocked:
@@ -1308,6 +1311,14 @@ def _render_record_coverage(eval_result: Any) -> None:
         , container=st, method="caption")
         for line in coverage_lines(digest):
             pilot.display(line, container=st, method="markdown")
+        pilot.display(f"Clinical meaning remains unreviewed for {len(digest.facts):,} extracted facts. "
+                      "Quote matches establish source location only. Reconcile dates, numbers, negation, attribution and diagnoses against the original source.", container=st, method="warning")
+        if check.get("critical_review_flags"):
+            pilot.display("Critical comparison warnings (up to 100 shown):", container=st, method="warning")
+            pilot.dataframe(st, check["critical_review_flags"], width="stretch", hide_index=True)
+        if digest.summary_selection:
+            pilot.display(f"Summary coverage: {len(digest.summary_selection.get('selected_ids', [])):,} facts selected; "
+                          f"{digest.summary_selection.get('omitted', 0):,} omitted. All retained facts remain available in the evidence store.", container=st, method="caption")
         if digest.files:
             pilot.dataframe(st, digest.files, width="stretch", hide_index=True)
         if digest.duplicate_pages:

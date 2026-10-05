@@ -94,7 +94,7 @@ class TestRevocationDuringWork(unittest.TestCase):
             self.wire(lambda **_: MagicMock())
 
     def test_authorized_response_still_completes(self):
-        response = MagicMock()
+        response = MagicMock(model="test-model")
         self.assertEqual(self.wire(lambda **_: response), (response, False))
 
     def test_run_cannot_complete_after_revocation(self):
@@ -263,7 +263,7 @@ class TestRevocationDuringWork(unittest.TestCase):
         service.chat_json.side_effect = refusal
         digest = medical_review.MedicalDigest(facts=[
             medical_review.MedicalFact("", "symptom", "Synthetic knee pain", "record.txt b.1")])
-        with self.assertRaises(pilot.PilotBlocked) as caught:
+        with patch.dict(os.environ, {"VA_LSE_MODE": "synthetic"}), self.assertRaises(pilot.PilotBlocked) as caught:
             medical_review.build_timeline_data(digest, service)
         self.assertIs(caught.exception, refusal)
         service.chat_json.assert_called_once()

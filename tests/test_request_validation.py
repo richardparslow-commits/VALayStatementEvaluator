@@ -276,7 +276,7 @@ class TestUIBoundaries(unittest.TestCase):
                             client.assert_not_called()
                             self.assertEqual(session[f"{slot}_follow_up_saved"], [answer])
 
-    def test_original_long_text_confirmation_still_works_without_saved_answers(self):
+    def test_confirmation_cannot_waive_hard_limit_without_saved_answers(self):
         from app.views import draft_view, evaluate_view, follow_up
         for view, slot in ((draft_view, "draft"), (evaluate_view, "eval")):
             st_mock, session = _fake_streamlit()
@@ -290,7 +290,7 @@ class TestUIBoundaries(unittest.TestCase):
                 else:
                     with patch.object(view, "ensure_request_id", return_value="synthetic"):
                         view._run_evaluation_flow(**{**evaluation_request(), "statement_text": "x" * 80_001})
-            gate.assert_called_once()
+            gate.assert_not_called()
 
     def test_saved_answers_can_cross_recommended_limit_without_missing_checkbox(self):
         from app.views import draft_view, evaluate_view

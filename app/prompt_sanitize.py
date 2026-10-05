@@ -134,7 +134,7 @@ _INJECTION_PATTERNS = (
 # ---------------------------------------------------------------- core
 
 
-def sanitize_for_prompt(text: str, *, max_chars: int) -> str:
+def sanitize_for_prompt(text: str, *, max_chars: int | None) -> str:
     """Sanitize untrusted text before interpolating it into an LLM prompt.
 
     Operations (in order):
@@ -202,9 +202,9 @@ def sanitize_for_prompt(text: str, *, max_chars: int) -> str:
         text = text[:-1] + ("«" if text[-1] == "<" else "»")
 
     # Enforce length bound
-    if max_chars <= 0:
+    if max_chars is not None and max_chars <= 0:
         return ""
-    if len(text) > max_chars:
+    if max_chars is not None and len(text) > max_chars:
         suffix = f"\n… [truncated {len(text) - max_chars} chars by prompt sanitizer]"
         # Keep suffix visible: if max_chars is tiny, prefer suffix over content
         keep = max(0, max_chars - len(suffix))

@@ -3,7 +3,7 @@
 Pipeline:
   documents -> overlapping chunks -> duplicate-chunk skip -> PARALLEL LLM fact
   extraction (with one retry, transient failures only) -> mechanical fact dedup ->
-  hierarchical LLM merge -> capped, ordered digest -> full-coverage narrative summary.
+  complete evidence store -> whole-fact sampled summary with a coverage manifest.
 
 Both pathways (evaluate and draft) rely on this module to build a structured,
 citable digest of every uploaded medical document.
@@ -17,7 +17,7 @@ import re
 from collections import Counter
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import astuple, dataclass, field, replace
+from dataclasses import astuple, dataclass, field
 from functools import lru_cache
 from typing import Any, Callable
 
@@ -108,7 +108,7 @@ Rules:
 
 This chunk covers: {source_hint}
 Record sections present in this chunk: {section_hint}
-Dates printed on these pages: {page_dates}
+Date anchors sampled from these pages (raw wording and precision; unresolved dates must not be inferred): {page_dates}
 
 CHUNK TEXT:
 <<<
@@ -205,6 +205,11 @@ class MedicalFact:
     page: int = 0
     section: str = ""
 
+    @property
+    def meaning_status(self) -> str:
+        """Neither a literal quote match nor model output certifies meaning."""
+        return "unreviewed"
+
 
 @dataclass
 class MedicalDigest:
@@ -241,6 +246,7 @@ class MedicalDigest:
     # ``verify_citations``). A matching quote does not establish that the model's
     # description, date or interpretation of that passage is accurate.
     citation_check: dict[str, Any] = field(default_factory=dict)
+    summary_selection: dict[str, Any] = field(default_factory=dict)
 
     @property
     def coverage_ratio(self) -> float:
@@ -412,7 +418,9 @@ class MedicalDigest:
             entries.sort(key=lambda item: (item[0], item[2]))
         lines = [line for _, line, _ in entries]
         header = selection_header(len(lines), chronological=sort_dates)
-        return (header + "\n" + "\n".join(lines))[:max(0, budget_chars)]
+        if len(header) > budget_chars:
+            return ""
+        return header + "\n" + "\n".join(lines)
 
 
 # "[clinic.pdf — page 7]" / "[clinic.pdf — block 3]" as a whole citation.
@@ -648,6 +656,10 @@ def verify_citations(
         "missing": len(missing),
         "skipped": skipped,
         "examples": missing[:5],
+        "quote_verified": checked - len(missing),
+        "semantic_verified": 0,
+        "semantic_review_required": len(facts),
+        "critical_review_flags": critical_fact_flags(facts),
     }
     if facts:
         # The persisted ratio uses the same denominator as visible coverage;
@@ -859,7 +871,7 @@ def review_medical_records(
             check_pipeline_cancelled()
             dates = _dates_in_text(doc_page.text)
             if dates:
-                page_dates[doc_page.label] = ", ".join(dates)
+                page_dates[doc_page.label] = "\n".join(dates)
             section = sections.get(doc_page.page, "")
             if section:
                 page_sections[doc_page.label] = section
@@ -918,7 +930,7 @@ def review_medical_records(
                             _chunk_sections(chunk, page_sections), max_chars=300
                         ),
                         page_dates=sanitize_for_prompt(
-                            _chunk_dates(chunk, page_dates), max_chars=400
+                            _chunk_dates(chunk, page_dates), max_chars=None
                         ),
                         chunk_text=sanitize_for_prompt(chunk.text, max_chars=1_000_000),
                         guard_note=GUARD_NOTE,
@@ -1249,26 +1261,18 @@ def review_medical_records(
         files=[_file_coverage(doc) for doc in documents],
     )
 
-    with (
-        tracing.phase_span("records:merge", facts=len(all_facts)),
-        PhaseTimer(logger, "records:merge", request_id=rid, facts=len(all_facts)),
-    ):
-        # Model consolidation is a lossy summary view, never the evidence store.
-        summary_facts = _merge_facts(llm, digest, progress)
-    # Both the evidence store and summary view are retained during summarization.
-    try:
-        _mem_cp("records:post_merge")
-    except Exception:  # noqa: BLE001
-        pass
+    # Summaries select whole authoritative facts; lossy model consolidation is
+    # no longer fed into the summary or paid for in the record-review pipeline.
     check_pipeline_cancelled()
     digest.citation_check = verify_citations(digest.facts, documents)
     from . import pilot
     if pilot.enabled() and (not digest.facts or digest.citation_check["missing"]
-                            or digest.citation_check["skipped"]):
+                            or digest.citation_check["skipped"]
+                            or digest.citation_check["critical_review_flags"]):
         raise pilot.PilotBlocked("Record analysis contains unverified citations. "
                                  "No pilot statement can be generated from this analysis.")
     with tracing.phase_span("records:summary"), PhaseTimer(logger, "records:summary", request_id=rid):
-        digest.summary = _summarize(llm, replace(digest, facts=summary_facts))
+        digest.summary = _summarize(llm, digest)
     check_pipeline_cancelled()
     duration_ms = int((time.perf_counter() - _review_t0) * 1000)
     logger.info(
@@ -1452,6 +1456,10 @@ def _file_coverage(doc: ExtractedDocument) -> dict[str, Any]:
         "unreadable_pages": doc.unreadable_count,
         "pagination": doc.pagination,
         "characters": doc.char_count,
+        "source_sha256": doc.source_sha256,
+        "extraction_method": doc.extraction_method,
+        "text_encoding": doc.text_encoding,
+        "source_parts": sorted({p.source_part for p in doc.pages if p.source_part}),
     }
 
 
@@ -1460,10 +1468,10 @@ def _chunk_dates(chunk: Chunk, page_dates: dict[str, str]) -> str:
     found: list[str] = []
     for filename, kind, number in chunk.pages:
         label = f"{filename} {'p.' if kind == 'page' else 'b.'}{number}"
-        for date in page_dates.get(label, "").split(", "):
+        for date in page_dates.get(label, "").splitlines():
             if date and date not in found:
                 found.append(date)
-    return ", ".join(found[:12]) if found else "none detected on these pages"
+    return "\n".join(found[:12]) + ("\n[Additional date anchors omitted; consult full chunk text.]" if len(found) > 12 else "") if found else "none detected on these pages"
 
 
 def _chunk_sections(
@@ -1670,6 +1678,31 @@ def _merge_once(llm: LLMService, facts: list[MedicalFact]) -> list[MedicalFact]:
     return merged
 
 
+def critical_fact_flags(facts: list[MedicalFact]) -> list[dict[str, Any]]:
+    """Conservative lexical warnings, never clinical entailment or approval.
+
+    Every description remains unreviewed even with no flags. False positives
+    require source reconciliation; a flag cannot be waived by a checkbox.
+    """
+    from .factual_integrity import features, fingerprint
+    flags: list[dict[str, Any]] = []
+    for index, fact in enumerate(facts, 1):
+        original, derived = features(fact.quote), features(fact.description)
+        changed = [field for field in ("negation", "attribution", "uncertainty", "laterality", "dates/numbers", "diagnosis/nexus")
+                   if derived[field] != original[field]]
+        if set(derived["factual wording"]) - set(original["factual wording"]):
+            changed.append("diagnosis/factual wording")
+        date_numbers = set(re.findall(r"\d+", fact.date))
+        if date_numbers - set(original["dates/numbers"]):
+            changed.append("date evidence/precision")
+        if changed:
+            flags.append({"fact_id": index, "fact_hash": fingerprint(vars(fact)),
+                          "quote_hash": fingerprint(fact.quote), "fields": changed})
+            if len(flags) >= 100:
+                break  # Display is bounded; any flag closes pilot generation.
+    return flags
+
+
 def _summarize(llm: LLMService, digest: MedicalDigest) -> str:
     """Narrative summary over the timeline — record-derived text, so guarded.
 
@@ -1677,17 +1710,54 @@ def _summarize(llm: LLMService, digest: MedicalDigest) -> str:
     model's reading of untrusted pages, and a summary prompt that carried them
     unguarded is a place an injected sentence could come back as an instruction.
     """
+    sample, manifest = summary_sample(digest.facts)
+    digest.summary_selection = manifest
     return llm.chat(
         "You are a medical-records analyst. Write a concise narrative summary (max 250 words) "
         "of the record set: key diagnoses, treatment history, notable events, and current "
-        "status. Plain text only.\n\n" + GUARD_NOTE,
-        "Extracted facts (sampled evenly across the full timeline):\n"
+        "status only when explicitly documented. This is a bounded sample of unreviewed model descriptions. "
+        "State its omissions; do not imply complete coverage or certified clinical meaning. Plain text only.\n\n" + GUARD_NOTE,
+        "Extracted facts; selection coverage: " + json.dumps(manifest) + "\n"
         + sanitize_for_prompt(
-            digest.condensed_timeline(max_entries=400)[:16000],
+            sample,
             max_chars=DERIVED_TEXT_MAX_CHARS,
         ),
         phase="records:summary",
     )
+
+
+def summary_sample(facts: list[MedicalFact], budget_chars: int = 15_000,
+                   max_entries: int = 400) -> tuple[str, dict[str, Any]]:
+    """Select whole authoritative facts, endpoints first, then every era.
+
+    Stable input indices bind the manifest to the evidence store. Oversized
+    facts remain in that store and are explicitly counted as omitted.
+    """
+    ordered = sorted(range(len(facts)), key=lambda i: _normalize_date_for_sort(facts[i].date))
+    dated = [i for i in ordered if _regex_extract_date(facts[i].date)]
+    priority = ([ordered[0], ordered[-1]] if ordered else []) + ([dated[0], dated[-1]] if dated else [])
+    sample_count = min(len(ordered), max(0, max_entries))
+    if sample_count:
+        priority += [ordered[min(len(ordered) - 1, int(i * len(ordered) / sample_count))] for i in range(sample_count)]
+    selected: set[int] = set()
+    used = 0
+    for index in priority:
+        if index in selected or len(selected) >= max_entries:
+            continue
+        f = facts[index]
+        line = f"[{f.date}] [fact-{index + 1}] ({f.type}) {f.description} — {f.source}"
+        if used + len(line) + 1 > budget_chars:
+            continue
+        selected.add(index)
+        used += len(line) + 1
+    lines = [f"[{facts[i].date}] [fact-{i + 1}] ({facts[i].type}) {facts[i].description} — {facts[i].source}"
+             for i in ordered if i in selected]
+    manifest = {"policy": "whole_authoritative_facts_v1", "total": len(facts),
+                "selected_ids": [i + 1 for i in ordered if i in selected],
+                "omitted": len(facts) - len(selected), "complete": len(facts) == len(selected),
+                "earliest_dated_included": bool(dated) and dated[0] in selected,
+                "latest_dated_included": bool(dated) and dated[-1] in selected}
+    return "\n".join(lines), manifest
 
 
 # ----------------------------------------------------------- relevance search
@@ -1804,10 +1874,9 @@ def _tokens_uncached(text: str) -> frozenset[str]:
     additive: scoring only ever gains overlap, never loses a literal match.
     """
     tokens: set[str] = set()
-    for token in re.findall(r"[a-z0-9]+", text.lower()):
-        if token in _STOPWORDS or len(token) < 2:
-            continue
-        if len(token) == 2 and token not in _SHORT_CLINICAL_TOKENS:
+    from .text_fidelity import words
+    for token in words(text):
+        if token in _STOPWORDS:
             continue
         tokens.add(token)
         stem = _stem(token)
@@ -2139,7 +2208,7 @@ class RetrievedEvidence:
     @property
     def weak(self) -> bool:
         """True when nothing retrieved cleared ``config.EVIDENCE_WEAK_OVERLAP``."""
-        return self.best_overlap < config.EVIDENCE_WEAK_OVERLAP
+        return not self.excerpts or self.best_overlap < config.EVIDENCE_WEAK_OVERLAP
 
 
 def _rank_paragraphs(
@@ -2196,9 +2265,15 @@ def retrieve_evidence(
     ranked, corpus_size = _rank_paragraphs(documents, query_tokens)
     seen: set[str] = set()
     unique: list[str] = []
+    oversized = 0
+    from .text_fidelity import evidence_excerpt
     for _, label, text in ranked:
-        excerpt = f"[{label}]\n{text[:excerpt_chars]}"
-        key = excerpt[:120]
+        passage = evidence_excerpt(text, query, excerpt_chars)
+        if not passage:
+            oversized += 1
+            continue
+        excerpt = f"[{label}]\n{passage}"
+        key = excerpt
         if key in seen:
             continue
         seen.add(key)
@@ -2206,7 +2281,7 @@ def retrieve_evidence(
         if len(unique) >= top_k:
             break
     return RetrievedEvidence(
-        text="\n\n---\n\n".join(unique),
+        text=(f"[Retrieval: {len(unique)} of {corpus_size} source passages selected; {oversized} oversized sentences omitted. This is a bounded selection.]\n" if oversized else "") + "\n\n---\n\n".join(unique),
         excerpts=len(unique),
         best_overlap=ranked[0][0] if ranked else 0.0,
         corpus_size=corpus_size,
@@ -2251,6 +2326,7 @@ _MONTH_ALTERNATION = "|".join(sorted(_MONTH_NAMES, key=len, reverse=True))
 
 _ISO_DAY_RE = re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b")
 _ISO_MONTH_RE = re.compile(r"\b(\d{4})-(\d{1,2})\b")
+_NAMED_DAY_RE = re.compile(rf"\b({_MONTH_ALTERNATION})\.?\s+(\d{{1,2}}),?\s+(\d{{4}})\b", re.I)
 _MONTH_YEAR_RE = re.compile(
     rf"\b({_MONTH_ALTERNATION})\.?\s+(\d{{4}})\b", re.IGNORECASE
 )
@@ -2275,14 +2351,14 @@ _UNDATED_LLM_SYSTEM = (
 # than also yielding a truncated "2019-04" month entry (the precision-specific
 # patterns below each match a prefix of a longer date).
 _ANY_DATE_RE = re.compile(
-    rf"\b(?:\d{{4}}-\d{{1,2}}-\d{{1,2}}|\d{{4}}-\d{{1,2}}|(?:{_MONTH_ALTERNATION})\.?\s+\d{{4}}|"
-    rf"\d{{1,2}}/\d{{1,2}}/\d{{2,4}}|(?:circa|approx\.?|approximately)\s*['’]?\d{{4}})\b",
+    rf"\b(?:(?:circa|c\.|around|approx\.?|approximately)\s*['’]?)?(?:\d{{4}}-\d{{1,2}}-\d{{1,2}}|\d{{4}}-\d{{1,2}}|(?:{_MONTH_ALTERNATION})\.?\s+\d{{1,2}},?\s+\d{{4}}|(?:{_MONTH_ALTERNATION})\.?\s+\d{{4}}|"
+    rf"\d{{1,2}}/\d{{1,2}}/\d{{2,4}}|\d{{4}})\b",
     re.IGNORECASE,
 )
 
 
 def _dates_in_text(text: str, limit: int = 6) -> list[str]:
-    """Distinct ISO dates printed in a page of text (at most ``limit``).
+    """Sampled date anchors with raw spelling, precision and unresolved ambiguity.
 
     Fed to the digest prompt as the dates that actually appear on this chunk's
     pages, so a fact's date is anchored to what the record prints rather than
@@ -2291,15 +2367,27 @@ def _dates_in_text(text: str, limit: int = 6) -> list[str]:
     """
     found: list[str] = []
     for match in _ANY_DATE_RE.finditer(text):
-        parsed = _regex_extract_date(match.group(0))
-        if parsed and parsed[0] not in found:
-            found.append(parsed[0])
+        raw = match.group(0)
+        parsed = _regex_extract_date(raw)
+        normalized = (parsed[0][:4] if parsed[1].endswith("year") else parsed[0][:7] if parsed[1].endswith("month") else parsed[0]) if parsed else None
+        anchor = json.dumps({"raw": raw, "normalized": normalized,
+                             "precision": parsed[1] if parsed else "unresolved",
+                             "approximate": bool(re.match(r"(?:circa|c\.|around|approx\.?|approximately)\s", raw, re.I))}, ensure_ascii=False)
+        if anchor not in found:
+            found.append(anchor)
             if len(found) >= limit:
                 return found
     return found
 
 
 def _regex_extract_date(text: str) -> tuple[str, str] | None:
+    parsed = _literal_extract_date(text)
+    if parsed and parsed[1] != "year" and re.match(r"\s*(?:circa|c\.|around|approx\.?|approximately)\s", text, re.I):
+        return parsed[0], "approximate-" + parsed[1]
+    return parsed
+
+
+def _literal_extract_date(text: str) -> tuple[str, str] | None:
     """Best-effort (iso_date, precision) parsed from free text via regex only.
 
     Tries progressively looser patterns (exact day -> month -> named-month/year
@@ -2308,6 +2396,22 @@ def _regex_extract_date(text: str) -> tuple[str, str] | None:
     """
     if not text:
         return None
+    named = _NAMED_DAY_RE.search(text)
+    if named:
+        try:
+            return datetime.date(int(named.group(3)), _MONTH_NAMES[named.group(1).lower()], int(named.group(2))).isoformat(), "day"
+        except ValueError:
+            return None
+    slash = re.search(r"\b(\d{1,2})/(\d{1,2})/(\d{2,4})\b", text)
+    if slash:
+        first, second, year = (int(v) for v in slash.groups())
+        if len(slash.group(3)) != 4 or (first <= 12 and second <= 12 and first != second):
+            return None  # No approved date order or century: keep raw ambiguity.
+        month, day = (second, first) if first > 12 else (first, second)
+        try:
+            return datetime.date(year, month, day).isoformat(), "day"
+        except ValueError:
+            return None
     match = _ISO_DAY_RE.search(text)
     if match:
         year, month, day = (int(v) for v in match.groups())
@@ -2321,7 +2425,7 @@ def _regex_extract_date(text: str) -> tuple[str, str] | None:
         try:
             return (datetime.date(year, month, 1).isoformat(), "month")
         except ValueError:
-            pass
+            return None
     match = _MONTH_YEAR_RE.search(text)
     if match:
         month_name, month_year = match.groups()
@@ -2529,16 +2633,19 @@ def build_timeline_data(
         undated_facts: list[MedicalFact] = []
 
         for fact in digest.facts:
-            parsed = _regex_extract_date(fact.date) or _regex_extract_date(fact.quote)
+            printed_date = bool(_ANY_DATE_RE.search(fact.date))
+            parsed = _regex_extract_date(fact.date) if printed_date else _regex_extract_date(fact.quote)
             if parsed is None:
-                undated_indices.append(len(events))
-                undated_facts.append(fact)
+                if not printed_date:
+                    undated_indices.append(len(events))
+                    undated_facts.append(fact)
                 events.append(_event_from_fact(fact, iso_date=None, precision="none"))
             else:
                 iso_date, precision = parsed
                 events.append(_event_from_fact(fact, iso_date=iso_date, precision=precision))
 
-        if undated_facts and llm is not None:
+        from . import pilot
+        if undated_facts and llm is not None and not pilot.enabled():
             inferred = _llm_infer_undated(llm, undated_facts)
             for local_index, event_index in enumerate(undated_indices):
                 result = inferred.get(local_index)

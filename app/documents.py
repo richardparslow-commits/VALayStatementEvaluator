@@ -146,6 +146,7 @@ class DocumentPage:
     page: int  # 1-based; "block" documents number synthesized blocks instead
     text: str
     kind: str = PAGE  # PAGE for a real page, BLOCK when the source has none
+    source_part: str = ""  # DOCX package part; never a filesystem path to open
 
     @property
     def label(self) -> str:
@@ -173,6 +174,9 @@ class ExtractedDocument:
     unreadable_pages: list[int] = field(default_factory=list)
     pagination: str = PAGE
     coverage_known: bool = True
+    source_sha256: str = ""
+    extraction_method: str = ""
+    text_encoding: str = ""
 
     @property
     def source_page_count(self) -> int:
@@ -230,14 +234,21 @@ def extract_document(filename: str, data: bytes) -> ExtractedDocument:
         raise ExtractionError(str(exc)) from exc
     lower = filename.lower()
     if lower.endswith(".pdf"):
-        return _extract_pdf(filename, data)
-    if lower.endswith((".txt", ".md")):
-        return document_from_text(filename, _decode_text(data))
-    if lower.endswith(".docx"):
-        return _extract_docx(filename, data)
-    raise ExtractionError(
-        f"{filename}: unsupported file type. Use PDF, TXT, MD, or DOCX."
-    )
+        doc = _extract_pdf(filename, data)
+        doc.extraction_method = "pdf-text-unreviewed"
+    elif lower.endswith((".txt", ".md")):
+        doc = document_from_text(filename, _decode_text(data))
+        doc.extraction_method = "strict-unicode"
+        doc.text_encoding = ("utf-32-bom" if data.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff"))
+                             else "utf-16-bom" if data.startswith((b"\xff\xfe", b"\xfe\xff"))
+                             else "utf-8-sig" if data.startswith(b"\xef\xbb\xbf") else "utf-8")
+    elif lower.endswith(".docx"):
+        doc = _extract_docx(filename, data)
+        doc.extraction_method = "docx-stories-unreviewed"
+    else:
+        raise ExtractionError(f"{filename}: unsupported file type. Use PDF, TXT, MD, or DOCX.")
+    doc.source_sha256 = hashlib.sha256(data).hexdigest()
+    return doc
 
 
 def _blocks_from_text(
@@ -438,7 +449,7 @@ def _extract_pdf(filename: str, data: bytes) -> ExtractedDocument:
         else:
             doc.unreadable_pages.append(index)
 
-    if not doc.pages or doc.char_count < 20:
+    if not doc.pages or not doc.char_count:
         raise ExtractionError(
             f"{filename}: no extractable text in {doc.total_pages:,} page(s). The PDF "
             "may be scanned/image-only; run scripts/ocr_records.py on it (or OCR it "
@@ -449,7 +460,53 @@ def _extract_pdf(filename: str, data: bytes) -> ExtractedDocument:
 
 
 def _extract_docx(filename: str, data: bytes) -> ExtractedDocument:
-    """Minimal DOCX text extraction without external dependencies."""
+    """Extract all supported Word stories as addressable source-part blocks.
+
+    This is text extraction, not Word rendering. Refuse ambiguous revisions,
+    drawings, equations and field-generated text instead of omitting them.
+    """
+    namespace = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    stories: list[tuple[str, str]] = []
+    text_chars = 0
+
+    def read_story(name: str, root: Any) -> None:
+        nonlocal text_chars
+        unsupported = {namespace + n for n in ("drawing", "pict", "sym", "del", "ins", "moveFrom", "moveTo", "instrText", "fldSimple")}
+        if any(n.tag in unsupported or n.tag.endswith("}oMath") or n.tag.endswith("}AlternateContent") for n in root.iter()):
+            raise ExtractionError("DOCX contains visual, revised, or generated content. Export and review a complete text copy before analysis.")
+        paragraphs: list[str] = []
+        units = list(root) if root.tag in (namespace + "footnotes", namespace + "endnotes", namespace + "comments") else [root]
+        for unit in units:
+            if unit is not root:
+                identity = unit.get(namespace + "id", "")
+                author = unit.get(namespace + "author", "")
+                date = unit.get(namespace + "date", "")
+                paragraphs.append(f"[{unit.tag.split('}')[-1]} id={identity}; author={author}; date={date}]")
+            for para in unit.iter(namespace + "p"):
+                paragraphs.append(_word_paragraph_text(para, namespace))
+        text = "\n\n".join(line for line in paragraphs if line)
+        text_chars += len(text)
+        if text_chars > 20 * 1024 * 1024:
+            raise ExtractionError("DOCX extracted text exceeds the processing limit.")
+        if text:
+            stories.append((name, text))
+
+    def _word_paragraph_text(para: Any, namespace: str) -> str:
+        runs: list[str] = []
+        for node in para.iter():
+            if node.tag == namespace + "t":
+                runs.append(node.text or "")
+            elif node.tag == namespace + "tab":
+                runs.append("\t")
+            elif node.tag in (namespace + "br", namespace + "cr"):
+                runs.append("\n")
+            elif node.tag == namespace + "noBreakHyphen":
+                runs.append("\u2011")
+            elif node.tag == namespace + "softHyphen":
+                runs.append("\u00ad")
+            elif node.tag in (namespace + "footnoteReference", namespace + "endnoteReference", namespace + "commentReference"):
+                runs.append(f" [{node.tag.split('}')[1]} {node.get(namespace + 'id', '')}] ")
+        return "".join(runs).strip()
     max_member_bytes = config.DOCX_MAX_INTERNAL_FILE_BYTES
     max_total_bytes = config.DOCX_MAX_TOTAL_UNCOMPRESSED_BYTES
     max_member_count = config.DOCX_MAX_INTERNAL_FILE_COUNT
@@ -475,7 +532,7 @@ def _extract_docx(filename: str, data: bytes) -> ExtractedDocument:
                 expanded += len(body)
                 return body
 
-            root = policy.validate_docx(archive, read_part)
+            policy.validate_docx(archive, read_part, read_story)
     except policy.IngestionRefused as exc:
         raise ExtractionError(str(exc)) from exc
     except ExtractionError:
@@ -483,22 +540,17 @@ def _extract_docx(filename: str, data: bytes) -> ExtractedDocument:
     except Exception as exc:  # noqa: BLE001
         raise ExtractionError("Could not read a structurally valid DOCX package.") from exc
 
-    namespace = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
-    paragraphs: list[str] = []
-    for para in root.iter(f"{namespace}p"):
-        runs = [node.text or "" for node in para.iter(f"{namespace}t")]
-        line = "".join(runs).strip()
-        if line:
-            paragraphs.append(line)
-    text = "\n".join(paragraphs).strip()
-    if not text:
+    if not stories:
         raise ExtractionError(f"{filename}: DOCX contains no readable text.")
-    pages = _blocks_from_text(filename, text)
+    pages: list[DocumentPage] = []
+    for name, text in sorted(stories, key=lambda s: (s[0] != "word/document.xml", s[0])):
+        for block in _blocks_from_text(filename, text):
+            pages.append(DocumentPage(filename, len(pages) + 1, block.text, BLOCK, name))
     return ExtractedDocument(
         filename=filename,
         pages=pages,
         total_pages=len(pages),
-        pagination=pages[0].kind if pages else PAGE,
+        pagination=BLOCK,
     )
 
 
@@ -1194,7 +1246,7 @@ def _cached_paragraph_chars() -> int:
     )
 
 
-def paragraph_index(doc: ExtractedDocument, min_chars: int = 40) -> list[Paragraph]:
+def paragraph_index(doc: ExtractedDocument, min_chars: int = 1) -> list[Paragraph]:
     """Split a document into scannable paragraphs, cached per document.
 
     Large record sets (1,000+ pages) are searched once per claim batch, so the
@@ -1231,7 +1283,7 @@ def paragraph_index(doc: ExtractedDocument, min_chars: int = 40) -> list[Paragra
 _LABEL_PAGE_RE = re.compile(
     r"^(?P<filename>.*) (?P<prefix>[pb])\.(?P<page>\d+)$"
 )
-_TOKEN_RE = re.compile(r"[a-z0-9]+")
+_TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
 _SEARCH_DATE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4})\b")
 SEARCH_RESULT_LIMIT = 20
 SEARCH_EXCERPT_MAX_CHARS = 400
@@ -1249,7 +1301,8 @@ class SearchResult:
 
 
 def _tokenize(text: str) -> list[str]:
-    return _TOKEN_RE.findall(text.lower())
+    import unicodedata
+    return _TOKEN_RE.findall(unicodedata.normalize("NFC", text).casefold())
 
 
 def build_inverted_index(paragraphs: list[Paragraph]) -> dict[str, dict[int, int]]:
@@ -1300,7 +1353,10 @@ def _paragraph_in_date_range(text: str, date_from: date | None, date_to: date | 
 
 def _highlight(text: str, tokens: list[str], max_chars: int = SEARCH_EXCERPT_MAX_CHARS) -> str:
     """Bold every whole-word query-token match in a bounded excerpt (markdown)."""
-    excerpt = text if len(text) <= max_chars else text[:max_chars].rstrip() + "…"
+    from .text_fidelity import evidence_excerpt
+    excerpt = evidence_excerpt(text, " ".join(tokens), max_chars)
+    if not excerpt:
+        return "[Matching source sentence exceeds the excerpt limit; open the complete source.]"
     unique_tokens = sorted({t for t in tokens if len(t) > 1}, key=len, reverse=True)
     for token in unique_tokens:
         excerpt = re.sub(rf"(?i)\b({re.escape(token)})\b", r"**\1**", excerpt)

@@ -48,10 +48,10 @@ def compose_follow_up_appendix(slot: str) -> str:
     return "\n".join(lines) if len(lines) > 1 else ""
 
 
-def evaluation_input_key(statement: str, records: Any, witness: Any) -> str:
+def evaluation_input_key(statement: str, records: Any, witness: Any, statement_source: Any = None) -> str:
     """Session-only binding to exact raw inputs; malformed/legacy inputs fail closed."""
     from ..documents import ExtractedDocument
-    from ..job_payload import documents_to_json
+    from ..job_payload import documents_to_json, document_to_json
 
     if (not isinstance(statement, str) or not isinstance(records, list)
             or not all(isinstance(doc, ExtractedDocument) for doc in records)
@@ -60,6 +60,10 @@ def evaluation_input_key(statement: str, records: Any, witness: Any) -> str:
     try:
         payload = {"statement": statement.strip(), "records": documents_to_json(records),
                    "witness": witness}
+        if statement_source is not None:
+            if not isinstance(statement_source, ExtractedDocument):
+                return ""
+            payload["statement_source"] = document_to_json(statement_source)
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
     except (TypeError, ValueError, AttributeError):
         return ""

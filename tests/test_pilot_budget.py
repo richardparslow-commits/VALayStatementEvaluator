@@ -348,6 +348,8 @@ class TestProviderBudgetIntegration(unittest.TestCase):
     def client(self):
         client=llm.LLMClient.__new__(llm.LLMClient)
         client._client=MagicMock()
+        client._client.chat.completions.create.return_value.model = 'test-model'
+        client._client.responses.create.return_value.model = 'test-model'
         client._settings=MagicMock(base_url=self.data['provider_base_url'],model_main='test-model')
         client.usage=MagicMock()
         client._new_attempt_client=MagicMock(return_value=client._client)
@@ -363,6 +365,7 @@ class TestProviderBudgetIntegration(unittest.TestCase):
         owned = [MagicMock(), MagicMock()]
         for sdk in owned:
             sdk.chat.completions.create.return_value = MagicMock(
+                model='test-model',
                 choices=[MagicMock(message=MagicMock(content="Invented result", refusal=None), finish_reason="stop")],
                 usage=MagicMock(prompt_tokens=2, completion_tokens=2))
         factory = MagicMock(side_effect=owned)
@@ -456,7 +459,7 @@ class TestProviderBudgetIntegration(unittest.TestCase):
         def wait_for_release(**kwargs):
             entered.set()
             if not released.wait(4): raise RuntimeError('Synthetic worker deadline')
-            return MagicMock()
+            return MagicMock(model='test-model')
         client._client.chat.completions.create.side_effect=wait_for_release
         with ThreadPoolExecutor(max_workers=1) as pool:
             try:

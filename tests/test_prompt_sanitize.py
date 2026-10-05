@@ -387,6 +387,10 @@ class TestPromptTemplatesGuardNote(unittest.TestCase):
         llm.chat = lambda s, u, **kw: (seen.append((kw.get("phase", ""), s, u)), "sum")[1]  # type: ignore[method-assign]
         review_medical_records(llm, docs)
 
+        # The public review no longer pays for lossy consolidation. Its standalone
+        # helper must still guard derived facts for synthetic/legacy callers.
+        from app.medical_review import MedicalDigest, MedicalFact, _merge_facts
+        _merge_facts(llm, MedicalDigest(facts=[MedicalFact("unknown", "symptom", payload, "a.txt p.1", payload)]))
         merge = [entry for entry in seen if entry[0] == "records:merge"]
         self.assertTrue(merge, "merge prompt was never issued")
         for _phase, system, user in merge:

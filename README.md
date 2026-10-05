@@ -619,9 +619,10 @@ The reviewer is built for full VA claim files, including bundles of 1,000–2,00
 - **Complete extracted-evidence store** — all extracted facts are retained for
   retrieval, saved results, citation checks, timelines, and exports. Only exact
   repetitions are removed; differing sources, quotes, dates, and fact types remain.
-- **Separate summary view** — hierarchical model merging produces a temporary,
-  potentially lossy view for the narrative summary. It never replaces stored
-  evidence. Summaries use bounded samples, not every fact.
+- **Separate summary view** — whole authoritative facts are sampled within the
+  summary budget, prioritizing the earliest/latest dated evidence. The saved
+  manifest identifies selected facts and counts omissions. Summaries cannot
+  certify complete coverage or clinical meaning; no second prefix cut is used.
 - **Budgets at prompt selection** — claim verification and draft grounding rank
   facts from the entire evidence store, including later records. Fact-count and
   character budgets limit only the selected prompt, and its header reports the

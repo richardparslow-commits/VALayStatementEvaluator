@@ -1159,6 +1159,12 @@ def _normalize_provider_error(exc: Exception) -> LLMError:
     retriable ``LLMUpstreamError``, deterministic rejections →
     non-retriable ``LLMUpstreamError``.
     """
+    from .pilot import PilotBlocked
+    cause: BaseException | None = exc
+    for _ in range(8):
+        if isinstance(cause, PilotBlocked):
+            raise cause  # SDK-wrapped transport refusals must never retry.
+        cause = cause.__cause__ if cause is not None else None
     status_code = _provider_status_code(exc)
     upstream_request_id = _provider_request_id(exc)
     details = _provider_details(exc)
@@ -1364,8 +1370,10 @@ def _pilot_transport(base_url: str) -> dict[str, Any]:
     if not pilot.enabled():
         return {}
     pilot.require_destination(base_url)
+    from .provider_limits import bounded_transport
     return {"http_client": _sdk_name("DefaultHttpxClient")(
         follow_redirects=False, trust_env=False,
+        transport=bounded_transport(_configured_timeout_seconds()),
     )}
 
 
@@ -1573,6 +1581,7 @@ class LLMClient:
             pilot.require_consent(owner)
             pilot.require_destination(self._endpoint_base_url(endpoint), model)
         client = _attempt_client.get() or self._endpoint_client(endpoint)
+        from .provider_limits import check_request
         if _uses_responses_schema(self._endpoint_base_url(endpoint)):
             request: dict[str, Any] = {
                 "model": model,
@@ -1592,6 +1601,7 @@ class LLMClient:
                 request["temperature"] = temperature
             if request_timeout is not NOT_GIVEN:
                 request["timeout"] = request_timeout
+            check_request(model, {k: v for k, v in request.items() if k != "timeout"}, max_tokens)
             if pilot.enabled():
                 pilot.recheck_owner(owner)  # Includes withdrawal during request preparation.
                 ledger, run, number, max_tokens = pilot.reserve_provider_attempt(owner, len(system) + len(user), max_tokens)
@@ -1606,6 +1616,10 @@ class LLMClient:
             responses = True
         else:
             privacy_options: dict[str, Any] = {"store": False} if pilot.enabled() else {}
+            check_request(model, {**privacy_options, "model": model, "temperature": temperature,
+                                  "max_tokens": max_tokens, "messages": [
+                                      {"role": "system", "content": system},
+                                      {"role": "user", "content": user}]}, max_tokens)
             if pilot.enabled():
                 pilot.recheck_owner(owner)
                 ledger, run, number, max_tokens = pilot.reserve_provider_attempt(owner, len(system) + len(user), max_tokens)
@@ -1628,6 +1642,8 @@ class LLMClient:
                     ledger.complete_attempt(run, number)
             responses = False
         if pilot.enabled():
+            from .provider_limits import check_response_model
+            check_response_model(model, response)
             tokens = _responses_usage_tokens(response) if responses else _usage_tokens(response)
             ledger.reconcile(run, number, *tokens)
             # A request already sent cannot be recalled. Its response must not

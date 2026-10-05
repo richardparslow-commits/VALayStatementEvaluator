@@ -107,12 +107,15 @@ def _str_map(value: Any) -> dict[str, str]:
 def document_to_json(doc: ExtractedDocument) -> dict[str, Any]:
     return {
         "filename": doc.filename,
-        "schema_version": 2,
+        "schema_version": 3,
         "total_pages": doc.total_pages,
         "unreadable_pages": doc.unreadable_pages,
         "pagination": doc.pagination,
         "coverage_known": doc.coverage_known,
-        "pages": [{"page": p.page, "text": p.text, "kind": p.kind} for p in doc.pages],
+        "source_sha256": doc.source_sha256,
+        "extraction_method": doc.extraction_method,
+        "text_encoding": doc.text_encoding,
+        "pages": [{"page": p.page, "text": p.text, "kind": p.kind, "source_part": p.source_part} for p in doc.pages],
     }
 
 
@@ -129,7 +132,8 @@ def document_from_json(raw: Any) -> ExtractedDocument | None:
         kind = _as_str(entry.get("kind")) or "page"
         if kind not in {"page", "block"}:
             raise PayloadError("Invalid document citation unit.")
-        pages.append(DocumentPage(filename, max(1, _as_int(entry.get("page"), 1)), text, kind))
+        pages.append(DocumentPage(filename, max(1, _as_int(entry.get("page"), 1)), text, kind,
+                                  _as_str(entry.get("source_part"))))
     if not pages:
         return None
     total = _as_int(data.get("total_pages"), 0)
@@ -139,7 +143,10 @@ def document_from_json(raw: Any) -> ExtractedDocument | None:
         raise PayloadError("Invalid document coverage metadata.")
     return ExtractedDocument(filename=filename, pages=pages, total_pages=total,
                              unreadable_pages=unreadable, pagination=pagination,
-                             coverage_known=data.get("schema_version") == 2 and data.get("coverage_known", True) is True)
+                             coverage_known=data.get("schema_version") in (2, 3) and data.get("coverage_known", True) is True,
+                             source_sha256=_as_str(data.get("source_sha256")),
+                             extraction_method=_as_str(data.get("extraction_method")),
+                             text_encoding=_as_str(data.get("text_encoding")))
 
 
 def request_documents_from_json(raw: Any) -> list[ExtractedDocument]:
@@ -210,6 +217,7 @@ def digest_to_json(digest: MedicalDigest | None) -> dict[str, Any] | None:
         "corroborated_pages": list(digest.corroborated_pages),
         "files": list(digest.files),
         "citation_check": dict(digest.citation_check),
+        "summary_selection": dict(digest.summary_selection),
         "facts_dropped_by_cap": digest.facts_dropped_by_cap,
     }
 
@@ -245,6 +253,7 @@ def digest_from_json(raw: Any) -> MedicalDigest | None:
         corroborated_pages=_dict_items(raw.get("corroborated_pages")),
         files=_dict_items(raw.get("files")),
         citation_check=_as_dict(raw.get("citation_check")),
+        summary_selection=_as_dict(raw.get("summary_selection")),
         facts_dropped_by_cap=_as_int(raw.get("facts_dropped_by_cap")),
     )
 

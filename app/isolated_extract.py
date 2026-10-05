@@ -69,7 +69,8 @@ def _documents(reply: Any, request: dict[str, Any], image: str) -> tuple[list[Ex
     total, chars = 0, 0
     for item in raw:
         if (not isinstance(item, dict) or set(item) != {"filename", "schema_version", "total_pages",
-                "unreadable_pages", "pagination", "coverage_known", "pages"}):
+                "unreadable_pages", "pagination", "coverage_known", "pages",
+                "source_sha256", "extraction_method", "text_encoding"}):
             raise ParserRefused("Invalid parser document schema.")
         name = item["filename"]
         try:
@@ -84,7 +85,11 @@ def _documents(reply: Any, request: dict[str, Any], image: str) -> tuple[list[Ex
                 or not (name == label or (label.lower().endswith(".zip") and member
                     and not member.startswith("/")))
                 or any(ord(c) < 32 or ord(c) == 127 for c in name)
-                or type(item["schema_version"]) is not int or item["schema_version"] != 2
+                or type(item["schema_version"]) is not int or item["schema_version"] != 3
+                or not isinstance(item["source_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", item["source_sha256"])
+                or (name == label and item["source_sha256"] != request["sha256"])
+                or item["extraction_method"] not in ("pdf-text-unreviewed", "docx-stories-unreviewed", "strict-unicode")
+                or item["text_encoding"] not in ("", "utf-8", "utf-8-sig", "utf-16-bom", "utf-32-bom")
                 or item["coverage_known"] is not True
                 or item["pagination"] not in ("page", "block")
                 or type(item["total_pages"]) is not int or not 0 < item["total_pages"] <= limit):
@@ -99,20 +104,31 @@ def _documents(reply: Any, request: dict[str, Any], image: str) -> tuple[list[Ex
         decoded: list[DocumentPage] = []
         seen = set(unreadable)
         for page in pages:
-            if (not isinstance(page, dict) or set(page) != {"page", "text", "kind"}
+            if (not isinstance(page, dict) or set(page) != {"page", "text", "kind", "source_part"}
                     or type(page["page"]) is not int or not 1 <= page["page"] <= item["total_pages"]
                     or page["page"] in seen or page["kind"] != item["pagination"]
                     or not isinstance(page["text"], str) or not page["text"].strip()):
                 raise ParserRefused("Invalid parser page schema.")
+            part = page["source_part"]
+            if not isinstance(part, str) or len(part) > 1024:
+                raise ParserRefused("Invalid parser source part.")
+            if part:
+                try:
+                    validate_label(part)
+                except IngestionRefused as exc:
+                    raise ParserRefused("Invalid parser source part.") from exc
+                if not name.lower().endswith(".docx") or not part.startswith("word/") or not part.endswith(".xml"):
+                    raise ParserRefused("Invalid parser source part.")
             seen.add(page["page"])
             chars += len(page["text"])
-            decoded.append(DocumentPage(name, page["page"], page["text"], page["kind"]))
+            decoded.append(DocumentPage(name, page["page"], page["text"], page["kind"], part))
         if len(seen) != item["total_pages"] or total > limit or chars > MAX_TEXT:
             raise ParserRefused("Parser response exceeds coverage or output bounds.")
         if [p.page for p in decoded] != sorted(p.page for p in decoded):
             raise ParserRefused("Parser pages are out of order.")
         documents.append(ExtractedDocument(name, decoded, item["total_pages"], unreadable,
-                                           item["pagination"], True))
+                                           item["pagination"], True, item["source_sha256"],
+                                           item["extraction_method"], item["text_encoding"]))
     return documents, skipped
 
 

@@ -32,10 +32,13 @@ def child(root: Path) -> None:
     docs, skipped = InProcessExtractor().extract(request["label"], (root / "input").read_bytes())
     if sum(len(p.text) for d in docs for p in d.pages) > MAX_TEXT:
         raise ValueError("Parser text exceeds its limit.")
-    documents = [{"filename": d.filename, "schema_version": 2, "total_pages": d.total_pages,
+    documents = [{"filename": d.filename, "schema_version": 3, "total_pages": d.total_pages,
                   "unreadable_pages": d.unreadable_pages, "pagination": d.pagination,
                   "coverage_known": d.coverage_known,
-                  "pages": [{"page": p.page, "kind": p.kind, "text": p.text} for p in d.pages]}
+                  "source_sha256": d.source_sha256, "extraction_method": d.extraction_method,
+                  "text_encoding": d.text_encoding,
+                  "pages": [{"page": p.page, "kind": p.kind, "text": p.text,
+                             "source_part": p.source_part} for p in d.pages]}
                  for d in docs]
     result = encode({"version": 1, "nonce": request["nonce"], "sha256": request["sha256"],
                      "label": request["label"], "documents": documents, "skipped": skipped})
