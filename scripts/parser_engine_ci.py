@@ -54,13 +54,20 @@ def setup(directory):
                           '--bridge=none', '--iptables=false', '--ip-masq=false', '--ip-forward=false',
                           '--label=va-lse-purpose=parser-only'], stdout=log, stderr=log,
                          env={'PATH': os.environ['PATH']}, start_new_session=True)
-    for attempt in range(60):
-        result = subprocess.run(['docker', 'info', '--format', '{{.ID}}'], env=env, capture_output=True, timeout=3)
-        if result.returncode == 0:
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        try:
+            result = subprocess.run(['docker', 'info', '--format', '{{.ID}}'], env=env, capture_output=True, timeout=3)
+        except subprocess.TimeoutExpired:
+            result = None
+        if result is not None and result.returncode == 0:
             engine_id = result.stdout.decode().strip()
             break
         time.sleep(.5)
     else:
+        # Daemon setup uses only synthetic credentials/data. Bounded diagnostics
+        # contain no key contents; expose the reason instead of blind retries.
+        print((directory / 'daemon.log').read_text(errors='replace')[-8000:])
         raise RuntimeError('Synthetic dedicated TLS engine did not start; inspect private CI daemon log.')
     assert engine_id and engine_id != application_id
     image = call(['docker', 'image', 'inspect', 'va-lse-parser:ci', '--format', '{{.Id}}']).stdout.decode().strip()

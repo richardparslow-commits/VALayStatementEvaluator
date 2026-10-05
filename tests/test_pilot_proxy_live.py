@@ -77,7 +77,10 @@ class PilotProxyTests(unittest.TestCase):
         environment = {**os.environ, "VA_LSE_BUILD_SHA": "0"*40,
             "VA_LSE_PILOT_ENV_FILE": str(empty), "VA_LSE_PILOT_APPROVAL_HOST_FILE": str(empty),
             "VA_LSE_OIDC_SECRETS_FILE": str(empty), "VA_LSE_PARSER_IMAGE": "sha256:"+"0"*64,
-            "VA_LSE_PILOT_LOG_RETENTION_DAYS": "1", "VA_LSE_DOCKER_GID": "0",
+            "VA_LSE_PILOT_LOG_RETENTION_DAYS": "1",
+            "VA_LSE_PARSER_ENGINE_ENDPOINT": "tcp://10.73.0.2:2376",
+            "VA_LSE_PARSER_ENGINE_ID": "synthetic-parser", "VA_LSE_APPLICATION_ENGINE_ID": "synthetic-application",
+            "VA_LSE_PARSER_ENGINE_TLS_DIRECTORY": str(cls.work),
             "VA_LSE_BIND_IP": "127.0.0.1", "VA_LSE_TLS_CERT": str(cert), "VA_LSE_TLS_KEY": str(key)}
         result = subprocess.run(["docker", "compose", "-f", str(ROOT/"docker-compose.pilot.yml"), "config", "--format", "json"],
                                 env=environment, text=True, capture_output=True, timeout=30, check=True)

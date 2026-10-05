@@ -3,6 +3,12 @@
 For real veteran information, use the restricted [controlled-pilot guide](PILOT.md).
 The general deployment examples are synthetic-data scaffolding until separately reviewed.
 
+Controlled-pilot ingestion requires the [dedicated parser engine boundary](deploy/PARSER_ENGINE_ACCEPTANCE.md)
+on a separate reviewed Linux host/VM with private mutual TLS. The CI-only helper
+`scripts/parser_engine_ci.py` provisions and tears down a synthetic second daemon
+on a disposable runner; it is not a production provisioning procedure or proof of
+host separation. It exits nonzero when TLS-engine startup/import fails.
+
 This document covers running the app in production at scale, including
 multi-instance deployment behind a load balancer, running the pipeline on a
 worker pool, and graceful failover. For single-user local setup, see

@@ -90,7 +90,7 @@ demonstrate a parser escape, supply an antivirus/CDR service, attest host invent
 or eliminate hypervisor/kernel risk. The existing passive-file/malware decision,
 privacy and actual-release acceptance gates continue to apply.
 
-CI starts a second daemon on a disposable runner with its own data/exec roots,
+CI's `scripts/parser_engine_ci.py` starts a second daemon on a disposable runner with its own data/exec roots,
 engine ID and one-day synthetic TLS credentials, then imports only the parser
 image. It runs the actual launcher over TLS without an application socket and
 tests certificate refusals and the original parser protections. **Both CI
