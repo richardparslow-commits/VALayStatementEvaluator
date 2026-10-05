@@ -71,7 +71,7 @@ def close_spools(files: Iterable[Any]) -> None:
 
 def create_upload_routes(runtime: Any, upload_mgr: Any, base_url: str | None) -> list[BaseRoute]:
     verify_runtime()
-    from streamlit import config
+    from . import config
     from streamlit.runtime.uploaded_file_manager import UploadedFileRec
     from streamlit.web.server.starlette import starlette_routes as upstream
     routes = upstream.create_upload_routes(runtime, upload_mgr, base_url)
@@ -85,7 +85,7 @@ def create_upload_routes(runtime: Any, upload_mgr: Any, base_url: str | None) ->
         session, file_id = request.path_params["session_id"], request.path_params["file_id"]
         if not runtime.is_active_session(session):
             raise HTTPException(400, "Invalid upload session")
-        maximum = config.get_option("server.maxUploadSize") * 1024 * 1024
+        maximum = min(config.MAX_UPLOAD_BYTES, 50 * 1024 * 1024)
         length = request.headers.get("content-length")
         if length is not None:
             try:

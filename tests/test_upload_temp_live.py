@@ -1,7 +1,12 @@
 """Required runtime-image probe of effective upload tmpfs; synthetic bytes only."""
 import os
+import sys
 import subprocess
 import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tests import hermetic  # noqa: E402,F401
 
 IMAGE=os.environ.get('VA_LSE_TEST_UPLOAD_RUNTIME_IMAGE','')
 PROBE='''

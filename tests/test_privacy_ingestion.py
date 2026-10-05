@@ -193,6 +193,13 @@ class ReferencePrivacyTests(unittest.TestCase):
         self.assertIn(CANARY,self.output.read_text())
         self.parser.return_value.extract.assert_called_once_with('reference.pdf',b'%PDF-synthetic')
 
+    def test_invalid_cli_arguments_do_not_echo_private_values(self):
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
+            with self.assertRaises(SystemExit):
+                references.main(['--data-class',CANARY,'--out',str(self.output),str(self.source)])
+        self.assertEqual(stderr.getvalue().strip(),references.REFUSAL)
+        self.parser.assert_not_called()
+
     def test_public_requires_exact_hash_in_protected_manifest(self):
         manifest=self.root/'public.json'
         manifest.write_text(json.dumps({'schema_version':1,'approved_sha256':[hashlib.sha256(self.source.read_bytes()).hexdigest()]}))

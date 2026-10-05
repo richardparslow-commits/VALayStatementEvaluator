@@ -20,6 +20,12 @@ REPOSITORY = Path(__file__).resolve().parent.parent
 REFUSAL = "Reference extraction refused; no derivative was published."
 
 
+class PrivateArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        # argparse's default unknown-argument errors can echo private filenames.
+        self.exit(2, REFUSAL + "\n")
+
+
 def require_class(data_class: str) -> None:
     # Before ALL source/manifest/output access, including programmatic entry.
     # A declaration cannot detect misclassification; restrict operator access.
@@ -115,7 +121,7 @@ def publish(path: Path, payload: bytes, *, data_class: str) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = PrivateArgumentParser(description=__doc__)
     parser.add_argument("--data-class", required=True, choices=("synthetic", "approved-public", "sensitive"))
     parser.add_argument("--public-manifest", type=Path)
     parser.add_argument("--out", required=True, type=Path, help="new retained TXT in an existing private directory outside Git")
