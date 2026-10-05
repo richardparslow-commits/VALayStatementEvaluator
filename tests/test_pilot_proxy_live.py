@@ -94,7 +94,11 @@ class PilotProxyTests(unittest.TestCase):
         for capability in p["cap_drop"]: args.extend(["--cap-drop", capability])
         for option in p["security_opt"]: args.extend(["--security-opt", option])
         for mount in p["tmpfs"]: args.extend(["--tmpfs", mount])
-        for name, limits in p["ulimits"].items(): args.extend(["--ulimit", f"{name}={limits['soft']}:{limits['hard']}"])
+        for name, limits in p["ulimits"].items():
+            # Compose JSON can omit zero values, or retain the scalar as single.
+            soft = limits.get("soft", limits.get("single", 0))
+            hard = limits.get("hard", limits.get("single", 0))
+            args.extend(["--ulimit", f"{name}={soft}:{hard}"])
         for source, target in ((self.configuration, "/etc/nginx/nginx.conf"), (self.work/"cert.pem", "/run/tls/cert.pem"), (self.work/"key.pem", "/run/tls/key.pem")):
             args.extend(["--mount", f"type=bind,source={source},target={target},readonly"])
         args.append(IMAGE)
