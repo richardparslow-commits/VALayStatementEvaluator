@@ -704,13 +704,131 @@ def _normalize_claim_id(value: Any) -> int:
     raise LLMParseError("Claim ids must be positive integers or decimal integer strings.")
 
 
+_CLAIM_TYPE_ALIASES: dict[str, str] = {
+    "diagnosis": "diagnosis_reference",
+    "diagnosed": "diagnosis_reference",
+    "condition": "diagnosis_reference",
+    "medical_diagnosis": "diagnosis_reference",
+    "tentative_diagnosis": "diagnosis_reference",
+    "suspected_diagnosis": "diagnosis_reference",
+    "treatment": "treatment_reference",
+    "medication": "treatment_reference",
+    "test_result": "treatment_reference",
+    "hospitalization": "treatment_reference",
+    "provider_visit": "treatment_reference",
+    "medical_visit": "treatment_reference",
+    "visit": "treatment_reference",
+    "exam": "treatment_reference",
+    "examination": "treatment_reference",
+    "scan": "treatment_reference",
+    "imaging": "treatment_reference",
+    "therapy": "treatment_reference",
+    "surgery": "treatment_reference",
+    "procedure": "treatment_reference",
+    "assistive_device": "treatment_reference",
+    "device": "treatment_reference",
+    "cane": "treatment_reference",
+    "care": "treatment_reference",
+    "functional_limitation": "functional_impact",
+    "observable_behavior": "functional_impact",
+    "limitation": "functional_impact",
+    "impairment": "functional_impact",
+    "daily_life": "functional_impact",
+    "work": "functional_impact",
+    "work_impact": "functional_impact",
+    "missed_work": "functional_impact",
+    "occupational": "functional_impact",
+    "social": "functional_impact",
+    "caregiver": "functional_impact",
+    "aid_and_attendance": "functional_impact",
+    "adl": "functional_impact",
+    "mobility": "functional_impact",
+    "fall": "functional_impact",
+    "near_fall": "functional_impact",
+    "date": "date_or_place",
+    "place": "date_or_place",
+    "location": "date_or_place",
+    "time": "date_or_place",
+    "timeline": "date_or_place",
+    "chronology": "date_or_place",
+    "when": "date_or_place",
+    "where": "date_or_place",
+    "service_event": "in_service_event",
+    "in_service": "in_service_event",
+    "stressor": "in_service_event",
+    "hazard": "in_service_event",
+    "exposure": "in_service_event",
+    "injury": "in_service_event",
+    "incident": "in_service_event",
+    "event": "in_service_event",
+    "trauma": "in_service_event",
+    "combat": "in_service_event",
+    "progression": "continuity",
+    "worsening": "continuity",
+    "chronicity": "continuity",
+    "history": "continuity",
+    "course": "continuity",
+    "flare_up": "continuity",
+    "frequency": "continuity",
+    "duration": "continuity",
+    "persistence": "continuity",
+    "ongoing": "continuity",
+    "initial_onset": "onset",
+    "first_symptom": "onset",
+    "start": "onset",
+    "beginning": "onset",
+    "origin": "onset",
+    "uncertain_onset": "onset",
+    "pain": "symptom",
+    "sign": "symptom",
+    "complaint": "symptom",
+    "swelling": "symptom",
+    "tinnitus": "symptom",
+    "ringing": "symptom",
+    "limp": "symptom",
+    "limping": "symptom",
+    "negation": "symptom",
+    "absence": "symptom",
+    "no_symptom": "symptom",
+}
+
+
+def _normalize_claim_type(value: Any) -> str:
+    """Normalize a claim's category label to ``CLAIM_TYPES``, degrading unknown strings to ``"other"``.
+
+    Non-string, non-null values (lists, dicts, numbers, booleans) still raise
+    ``LLMParseError`` for schema validation, while model-invented string labels or
+    medical-digest fact types (such as ``"diagnosis"``, ``"treatment"``, or
+    ``"functional_limitation"``) map to their canonical ``CLAIM_TYPES`` entry or
+    ``"other"`` so an unexpected category label never aborts an evaluation after
+    the records have already been digested.
+    """
+    if value is None:
+        return "other"
+    if not isinstance(value, str):
+        raise LLMParseError("Claim extraction is incomplete: invalid claim type.")
+    raw = value.strip().lower()
+    if not raw:
+        return "other"
+    candidates = [raw]
+    if "|" in raw or "/" in raw:
+        candidates.extend(part.strip() for part in re.split(r"[|/]", raw) if part.strip())
+    for candidate in candidates:
+        cleaned = re.sub(r"[\s\-]+", "_", candidate)
+        if cleaned in CLAIM_TYPES:
+            return cleaned
+        if cleaned in _CLAIM_TYPE_ALIASES:
+            return _CLAIM_TYPE_ALIASES[cleaned]
+    return "other"
+
+
 def _normalize_claim_basis(value: Any) -> str:
     """The claim's basis of knowledge, or ``UNKNOWN_CLAIM_BASIS`` if unrecognised.
 
     Deliberately lenient: the basis sharpens how a claim is weighed downstream, but a
     missing or invented label must never invalidate an evaluation whose records have
     already been read, so anything unexpected degrades to a neutral value instead of
-    raising the way a malformed id, text or type does.
+    raising the way a malformed id or text does.
     """
     if isinstance(value, str) and value.strip().lower() in CLAIM_BASES:
         return value.strip().lower()
@@ -729,15 +847,13 @@ def _normalize_claims(data: Any) -> list[dict]:
         if claim_id in seen:
             raise LLMParseError("Claim extraction is incomplete: duplicate claim ids.")
         text = item.get("text")
-        claim_type = item.get("type", "other")
         if not isinstance(text, str) or not text.strip():
             raise LLMParseError("Claim extraction is incomplete: a claim has no valid text.")
-        if not isinstance(claim_type, str) or claim_type.strip().lower() not in CLAIM_TYPES:
-            raise LLMParseError("Claim extraction is incomplete: invalid claim type.")
+        claim_type = _normalize_claim_type(item.get("type", "other"))
         normalized.append({
             "id": claim_id,
             "text": text.strip(),
-            "type": claim_type.strip().lower(),
+            "type": claim_type,
             "basis": _normalize_claim_basis(item.get("basis")),
         })
         seen.add(claim_id)
@@ -842,10 +958,11 @@ def _run_evaluation(
                 raise LLMParseError("Claim extraction is incomplete: expected a JSON object.")
             result.claims = _normalize_claims(claims_data.get("claims"))
             for key in ("claimed_condition", "writer_role"):
-                if not isinstance(claims_data.get(key, ""), str):
+                val = claims_data.get(key, "")
+                if val is not None and not isinstance(val, str):
                     raise LLMParseError("Claim extraction returned invalid condition or writer metadata.")
-            result.claimed_condition = claims_data.get("claimed_condition", "").strip()
-            result.writer_role = claims_data.get("writer_role", "").strip()
+            result.claimed_condition = (claims_data.get("claimed_condition") or "").strip()
+            result.writer_role = (claims_data.get("writer_role") or "").strip()
             logger.info(
                 "claims extracted count=%d condition=%s role=%s",
                 len(result.claims), result.claimed_condition[:80] if result.claimed_condition else "-",
