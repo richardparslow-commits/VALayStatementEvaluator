@@ -159,7 +159,10 @@ knows the fact — not from how strong it sounds. If one sentence holds both wha
 observed and what someone reported, emit two claims, one per basis. Number ids sequentially.
 Set a basis whenever the text shows one; if the sentence genuinely does not show how the writer
 knows the fact, omit the field rather than guess — the tool records an omitted basis as unknown,
-and a guessed basis would be weighed as if the witness had actually said it.
+and a guessed basis would be weighed as if the witness had actually said it. Do not split a single
+sentence that shares the same basis into clause-by-clause fragments; keep related clauses of a
+sentence together unless the sentence mixes two different bases, and resolve relative time anchors
+in brackets using the statement's own dates (for example, "since leaving [December 2018]").
 
 STATEMENT:
 <<<
@@ -173,12 +176,24 @@ factual claim from a lay statement against (1) a structured digest of the vetera
 records and (2) raw record excerpts. Be rigorous but fair:
 - SUPPORTED: a record entry clearly supports the claim.
 - PARTIALLY SUPPORTED: supported in substance but with a discrepancy (e.g., date off by a
-  year, different facility name).
+  year, different facility name, or a procedure/injection count mismatch before vs. after a
+  milestone date — such as claiming two back injections after leaving work in December 2018 when
+  the records document the first injection on 08/22/2017 before leaving and only 1 post-2018
+  injection on 11/03/2023, explicitly labeled "Second left L5 transforaminal epidural steroid
+  injection"; always state the exact documented count — e.g., 1 post-2018 injection, not 2 — and
+  quote the exact record phrase in note).
 - CONTRADICTED: a record entry AFFIRMATIVELY states the opposite — a dated normal finding, \
   "denies pain", "no tenderness", "gait normal", the other side, an incompatible date or \
   facility. A contradiction is an affirmative finding, so it MUST name the conflicting record \
   entry in record_reference. If you cannot point to that specific record text, the verdict is \
   NOT FOUND, not CONTRADICTED; an uncited evidence-based verdict is invalid.
+Witness vs. veteran identity: a lay/witness statement is often written by a third-party witness \
+(coworker, spouse, friend, family, fellow servicemember) in the first person ("My name is Mike \
+Doe", "I worked alongside John Sample", "Phone: ..."). The medical records identify the \
+veteran/patient, NOT the third-party witness. Never mark a witness's self-identification, \
+name, relationship, employment history, or contact details CONTRADICTED because the medical \
+record names the veteran as the patient; mark witness-identity claims NOT FOUND unless a record \
+entry specifically names and contradicts the witness.
 - NOT FOUND: nothing in the records confirms or denies it. This is the correct verdict for \
   silence, and it is not an accuracy failure. Absence of evidence on a question is not \
   substantive negative evidence against a claimant (Buczynski v. Shinseki; Horn v. Shinseki; \
@@ -202,8 +217,16 @@ respect it:
   corroboration of the medicine.
 - reported: verify the fact that it was said, not a third person's inner state. A record entry \
   documenting the veteran's own complaint SUPPORTS that he said it, even where the examiner's \
-  own findings were normal. Only a dated, specific entry about the same symptom can CONTRADICT \
-  it.
+  own findings were normal — and a record entry documenting the veteran's reported treatment \
+  response (such as "approximately 60% relief of the leg pain" after an injection) SUPPORTS a \
+  reported claim that the treatment helped without requiring the clinic note to mention the \
+  witness's private conversation. Where a reported count of procedures after a milestone date \
+  differs from the dated procedures in the records (for example, claiming 2 back shots since \
+  leaving in December 2018 when 08/22/2017 was before leaving and 11/03/2023 is the "Second \
+  left L5 transforaminal epidural steroid injection", leaving only 1 post-2018 injection), mark \
+  it PARTIALLY SUPPORTED and state the exact count discrepancy (1 post-2018 injection, not 2) \
+  with the exact record quote in note. Only a dated, specific entry about the same symptom can \
+  CONTRADICT it.
 - provider_statement: SUPPORTED only where a record entry documents the provider saying or \
   doing that; the clinical fact behind it is not thereby established, so record that in the \
   note. Where the record shows the same conversation differently, that is a discrepancy in what \
@@ -347,7 +370,12 @@ before signing MUST be wrapped in [Confirm: ...] placeholders.
 - Claims verified CONTRADICTED must be corrected to match the medical records (use the record \
 fact noted for them). If the witness might genuinely remember it differently, correct to the \
 record and append a [Confirm: ...] note.
-- Claims PARTIALLY SUPPORTED: align the disputed detail (date, place, name) with the records.
+- Claims PARTIALLY SUPPORTED: align the disputed detail (date, place, name, or procedure count) \
+with the records, stating the exact documented count, date, and verbatim record quote inside a \
+[Confirm: ...] placeholder (for example, if two post-departure injections were claimed after \
+December 2018 but the records document the first on 08/22/2017 and only 1 post-2018 injection on \
+11/03/2023 — "Second left L5 transforaminal epidural steroid injection" — state that 1 post-2018 \
+injection on 11/03/2023 is documented rather than 2 and quote that exact record phrase).
 - Claims NOT FOUND: KEEP them — absence from records is not negative evidence (Horn v. \
 Shinseki; M21-1 V.ii.1.A; Buchanan v. Nicholson). You may sharpen their wording but must not \
 delete firsthand observations merely because the records are silent, and you must not describe \
@@ -417,7 +445,9 @@ is the sentence that now carries the claim and whose `reason` quotes the words t
 witness's basis of knowledge ("I watched him stop", "he told me the pain was a 9"). Those entries
 are how the witness checks, before signing, that an unverified claim reads as their own account
 rather than as a diagnosis — and if the original sentence already stated the basis, say so in the
-reason and change nothing about it.
+reason and change nothing about it. When multiple NOT FOUND claims belong to the same sentence or
+paragraph, group them into a single concise lay_attribution entry (1 short sentence per field) so
+the JSON output stays compact and never truncates.
 
 ORIGINAL STATEMENT:
 <<<
@@ -1108,10 +1138,83 @@ def _analyze_topics(
         ), guard_note=GUARD_NOTE,
     )
     retry_note = ""
+    def _repair_llm_topic_quirks(raw_obj: Any) -> Any:
+        if not isinstance(raw_obj, dict) or raw_obj.keys() != {"claim_focus", "topics", "critical_gaps", "notes"}:
+            return raw_obj
+        rows = raw_obj.get("topics")
+        if not isinstance(rows, list) or len(rows) != 15:
+            return raw_obj
+        repaired_rows = []
+        valid_weak: set[str] = set()
+        for row in rows:
+            if not isinstance(row, dict) or row.keys() != {"topic", "applicable", "coverage", "evidence", "gap_note"}:
+                return raw_obj
+            if type(row.get("applicable")) is not bool:
+                return raw_obj
+            cov = row.get("coverage")
+            if not isinstance(cov, str) or cov.strip() not in {"covered", "partial", "absent", "not applicable"}:
+                return raw_obj
+            cov_clean = cov.strip()
+            app = row["applicable"]
+            if app == (cov_clean == "not applicable"):
+                return raw_obj
+            topic_str = row.get("topic")
+            if not isinstance(topic_str, str):
+                return raw_obj
+            m = re.match(r"^(?:Topic\s+)?([A-O])(?:\s*[.():\-–—]|\s|$)", topic_str.strip())
+            if not m:
+                return raw_obj
+            letter = m.group(1)
+            ev = row.get("evidence")
+            gap = row.get("gap_note")
+            if not isinstance(ev, str) or not isinstance(gap, str):
+                return raw_obj
+            ev_clean = ev.strip()
+            gap_clean = gap.strip()
+            if not app or cov_clean == "absent":
+                if ev_clean.casefold() in {"none", "n/a", "not applicable", "not mentioned", "absent", "-"}:
+                    ev_clean = ""
+            if not app or cov_clean == "covered":
+                gap_clean = ""
+            if app and cov_clean in {"partial", "absent"}:
+                valid_weak.add(letter)
+            repaired_rows.append({
+                "topic": letter,
+                "applicable": app,
+                "coverage": cov_clean,
+                "evidence": ev_clean,
+                "gap_note": gap_clean,
+            })
+        raw_gaps = raw_obj.get("critical_gaps")
+        if not isinstance(raw_gaps, list):
+            return raw_obj
+        repaired_gaps: list[str] = []
+        seen_gap_letters: set[str] = set()
+        for g in raw_gaps:
+            if not isinstance(g, str) or not g.strip():
+                return raw_obj
+            gm = re.match(r"^(?:Topic\s+)?([A-O])(?:\s*[.():\-–—]\s*|\s+)(.+)$", g.strip())
+            if not gm:
+                return raw_obj
+            g_letter, g_rest = gm.group(1), gm.group(2).strip()
+            if g_letter in valid_weak and g_letter not in seen_gap_letters and len(g_rest) >= 4:
+                seen_gap_letters.add(g_letter)
+                repaired_gaps.append(f"{g_letter}. {g_rest}")
+        return {
+            "claim_focus": raw_obj["claim_focus"],
+            "topics": repaired_rows,
+            "critical_gaps": repaired_gaps[:5],
+            "notes": raw_obj["notes"],
+        }
+
     for attempt in range(1, TOPIC_MAX_ATTEMPTS + 1):
         check_pipeline_cancelled()
         try:
-            data = normalize_topics(llm.chat_json(system, prompt + retry_note, phase="topic"))
+            raw_topic = llm.chat_json(system, prompt + retry_note, phase="topic")
+            try:
+                data = normalize_topics(raw_topic)
+            except TopicValidationError:
+                data = normalize_topics(_repair_llm_topic_quirks(raw_topic))
         except (LLMAuthError, LLMConfigurationError):
             raise
         except (TopicValidationError, LLMError):
@@ -1186,7 +1289,7 @@ def _draft_revision(
                 topic_analysis=sanitize_for_prompt(topic_analysis, max_chars=25_000),
                 guard_note=GUARD_NOTE,
             ),
-            max_tokens=6000,
+            max_tokens=12000,
             phase="revision",
         )
     except LLMError as exc:
@@ -1216,7 +1319,9 @@ def _draft_revision(
     report(0.94, "Improvement suggestions drafted.")
 
 
-def _contradiction_downgrade_reason(verification: dict, evidence_absent: bool) -> str:
+def _contradiction_downgrade_reason(
+    verification: dict, evidence_absent: bool, claim_text: str = ""
+) -> str:
     """Why a CONTRADICTED verdict cannot stand, or ``""`` when it can.
 
     A contradiction is an affirmative finding about the record, so it has to point at the
@@ -1245,6 +1350,16 @@ def _contradiction_downgrade_reason(verification: dict, evidence_absent: bool) -
         return (
             "no conflicting record entry was cited, and a contradiction must point at the "
             "record text that makes it, so it is a record-coverage gap."
+        )
+    note_text = str(verification.get("note", ""))
+    if (
+        claim_text
+        and re.search(r"\b(?:my name is|i am (?:the|a|his|her)|phone\s*:|i certify that)\b", claim_text, re.IGNORECASE)
+        and re.search(r"\b(?:patient|veteran)\b.*\bnot\b|\bidentifies the patient as\b", note_text, re.IGNORECASE)
+    ):
+        return (
+            "the medical record identifies the veteran/patient, which does not conflict "
+            "with a third-party witness's own name or self-identification."
         )
     return ""
 
@@ -1397,7 +1512,9 @@ def _verify_claims(
                 )
         for item in verified:
             claim_id = item["id"]
-            downgrade_reason = _contradiction_downgrade_reason(item, evidence_absent)
+            downgrade_reason = _contradiction_downgrade_reason(
+                item, evidence_absent, claim_text=claim_text_by_id.get(claim_id, "")
+            )
             if downgrade_reason:
                 item = dict(item)
                 item["verdict"] = "NOT FOUND"
@@ -2150,10 +2267,15 @@ def build_report(
             if isinstance(row.get("text"), str):
                 lines.append(f"> Unlinked retained claim: {row['text']}")
         lines.append("")
+    claim_basis_by_id = {
+        row["id"]: str(row.get("basis") or UNKNOWN_CLAIM_BASIS)
+        for row in result.claims
+        if isinstance(row, dict) and type(row.get("id")) is int and row["id"] > 0
+    }
     lines.append("## Claim-by-Claim Verification")
     lines.append("")
-    lines.append("| # | Claim | Verdict | Record Reference | Note |")
-    lines.append("|---|-------|---------|------------------|------|")
+    lines.append("| # | Claim | Verdict | Record Reference | Note | Basis |")
+    lines.append("|---|-------|---------|------------------|------|-------|")
     for v in result.verifications:
         verdict = str(v.get("verdict") or "NOT FOUND")
         emoji = _VERDICT_EMOJI.get(verdict, "⚪")
@@ -2161,7 +2283,9 @@ def build_report(
         text = (claim_text.get(claim_id, "") if type(claim_id) is int else "").replace("|", "/")[:120]
         ref = str(v.get("record_reference") or "—").replace("|", "/")[:80]
         note = str(v.get("note") or "").replace("|", "/")[:120]
-        lines.append(f"| {v.get('id')} | {text} | {emoji} {verdict} | {ref} | {note} |")
+        raw_basis = claim_basis_by_id.get(claim_id, UNKNOWN_CLAIM_BASIS) if type(claim_id) is int else UNKNOWN_CLAIM_BASIS
+        basis_cell = raw_basis if raw_basis != UNKNOWN_CLAIM_BASIS else "—"
+        lines.append(f"| {v.get('id')} | {text} | {emoji} {verdict} | {ref} | {note} | {basis_cell} |")
     lines.append("")
     lines.append(
         "_⚪ NOT FOUND is not a failure — lay facts like home symptoms or undocumented events "

@@ -604,6 +604,17 @@ class TestContradictionDowngradeReason(unittest.TestCase):
                     _contradiction_downgrade_reason({"verdict": verdict}, False), ""
                 )
 
+    def test_witness_identity_compared_to_patient_name_is_downgraded(self):
+        item = {
+            "verdict": "CONTRADICTED",
+            "record_reference": "sample_medical_records.txt b.1",
+            "note": "The record identifies the patient as John Q. Sample, not Mike Doe.",
+        }
+        reason = _contradiction_downgrade_reason(
+            item, evidence_absent=False, claim_text="My name is Mike Doe."
+        )
+        self.assertIn("veteran/patient", reason)
+
 
 class TestVerifyPromptContract(unittest.TestCase):
     """What the prompt must say for the code's rule to be followable.
