@@ -78,3 +78,33 @@ References checked 2026-10-23:
 - https://docs.archil.com/compute/serverless-execution
 - https://docs.archil.com/compute/sandboxes/introduction
 - https://docs.archil.com/concepts/branches-and-checkpoints
+
+## Verified setup state (2026-10-23 Central)
+
+The named API key was created by the account owner and used outside the evaluation
+sandbox. The public reference release was uploaded and verified; serverless
+`readonly-smoke-ok` confirms the knowledge mount rejects writes. A separate
+serverless results-disk run wrote `synthetic/mount-smoke.txt` successfully.
+
+**Persistent attachment is blocked by Archil startup errors.** Both starting the
+existing sandbox with attached disks and creating a new mounted sandbox failed
+while attaching `valay-eval-runs`. A root-only start of the original sandbox
+succeeds. Do not assume `/mnt/kb` or `/mnt/results` is available in that sandbox.
+The failed diagnostic sandbox is `01a16b44-addb-7953-a4ee-81cd3ead9d97`
+(`valay-evaluator-mounted`); retain it for vendor diagnosis. It contains no
+veteran records. No failed resources were deleted.
+
+The original sandbox was updated to integration commit
+`8ac8178833288ae85a586778f57befdb4189543a`; the three targeted tests pass there.
+A private native Archil service uses this command (the working directory is
+required so Streamlit reads the committed hardening configuration):
+
+```
+archil services create valay-ui --dir /opt/valay --tcp-port 8080 \
+  --env VA_LSE_MODE=synthetic -- python -m streamlit run run_app.py \
+  --server.address=0.0.0.0 --server.port=8080
+```
+
+This service uses bundled rules until persistent mount attachment is repaired.
+No model key or GitHub Actions secret was configured. The manual smoke workflow
+still needs `ARCHIL_API_KEY` in its environment secret before it can run in CI.
