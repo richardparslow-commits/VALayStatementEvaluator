@@ -1210,6 +1210,15 @@ def review_medical_records(
     conditions: Counter[str] = Counter()
     providers: Counter[str] = Counter()
     chunks_without_facts = 0
+    page_text_lookup: dict[tuple[str, int], str] = {}
+    ambiguous_page_keys: set[tuple[str, int]] = set()
+    for doc in documents:
+        for doc_page in doc.pages:
+            pkey = (doc.filename, doc_page.page)
+            if pkey in page_text_lookup:
+                ambiguous_page_keys.add(pkey)
+            page_text_lookup[pkey] = " ".join(doc_page.text.casefold().split())
+
     chunks_by_index = {chunk.index: Chunk(chunk.index, chunk.total, "", chunk.pages) for chunk in chunks}
     for index in sorted(results):
         check_pipeline_cancelled()
@@ -1227,6 +1236,22 @@ def review_medical_records(
                 raw, fallback, document=document, page=page, section=section
             )
             if fact:
+                if chunk is not None and len(chunk.pages) > 1 and fact.quote:
+                    probe = _citation_probe(fact.quote)
+                    cur_text = page_text_lookup.get((fact.document, fact.page), "")
+                    if probe and (not cur_text or not _citation_quote_present(probe, cur_text)):
+                        matches = [
+                            (p_doc, p_kind, p_num)
+                            for p_doc, p_kind, p_num in chunk.pages
+                            if (p_doc, p_num) not in ambiguous_page_keys
+                            and _citation_quote_present(probe, page_text_lookup.get((p_doc, p_num), ""))
+                        ]
+                        if len(matches) == 1:
+                            m_doc, m_kind, m_num = matches[0]
+                            fact.document = m_doc
+                            fact.page = m_num
+                            if not re.search(r"[pb]\.\d+\s*[-–]\s*[pb]\.\d+", fact.source, re.IGNORECASE):
+                                fact.source = f"{m_doc} {m_kind}.{m_num}"
                 all_facts.append(fact)
                 facts_in_chunk += 1
         if facts_in_chunk == 0:
