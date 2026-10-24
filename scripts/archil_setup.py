@@ -68,11 +68,11 @@ def main() -> int:
             if box.status not in {"stopped", "exited"}:
                 parser.error("Stop the sandbox in the console before changing mounts")
             box.start(mounts=[
-                archil.SandboxMountSpec(disk=KB_DISK, path="/mnt/kb", read_only=True,
-                                       subdirectory=f"releases/{release}"),
+                archil.SandboxMountSpec(disk=KB_DISK, path="/mnt/kb", read_only=True),
                 archil.SandboxMountSpec(disk=RUNS_DISK, path="/mnt/results"),
             ])
-            print("Private sandbox started with pinned read-only knowledge and separate results")
+            print("Private sandbox started with read-only knowledge and separate results")
+            print(f"VA_LSE_KNOWLEDGE_DIR=/mnt/kb/releases/{release}/app/knowledge")
         else:
             # No LLM calls, no user files, no main-disk writes. Tests mount semantics.
             result = client.exec(disks={"kb": archil.ExecMountSpec(KB_DISK, read_only=True,
