@@ -683,7 +683,10 @@ class TestStreamlitSecrets(unittest.TestCase):
 
     def test_missing_secrets_file_is_not_an_error(self):
         """Local runs (no .streamlit/secrets.toml) must not crash on import-time reads."""
-        import streamlit as st
+        try:
+            import streamlit as st
+        except ModuleNotFoundError:
+            self.skipTest("streamlit is not installed")
 
         broken = MagicMock()
         broken.to_dict.side_effect = RuntimeError("no secrets file")

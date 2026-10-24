@@ -59,6 +59,18 @@ class TestTelemetryEventShape(unittest.TestCase):
         self.assertEqual(event["featureId"], "feature-123")
         self.assertEqual(event["metadata"]["records_fetched"], 2)
 
+    def test_error_events_scrub_exception_message_to_class_name(self):
+        captured = []
+        secret = "SSN 123-45-6789 sensitive clinical excerpt"
+        with patch.object(telemetry, "_dispatch", side_effect=lambda e: captured.append(e)):
+            telemetry.track_feature_error("feature-123", ValueError(secret), stage="digest")
+            telemetry.track_app_error(RuntimeError(secret))
+        self.assertEqual(len(captured), 2)
+        self.assertEqual(captured[0]["metadata"]["errorMessage"], "ValueError")
+        self.assertNotIn(secret, str(captured[0]))
+        self.assertEqual(captured[1]["metadata"]["errorMessage"], "RuntimeError")
+        self.assertNotIn(secret, str(captured[1]))
+
     def test_track_feature_error_never_raises(self):
         with patch.object(telemetry, "_send", side_effect=RuntimeError("network down")):
             try:

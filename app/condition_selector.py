@@ -16,7 +16,24 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-import streamlit as st
+try:
+    import streamlit as st
+except ImportError:  # pragma: no cover - headless worker/sandbox without streamlit
+    class _MissingStreamlit:
+        """Fails clearly if this UI module is used without Streamlit installed.
+
+        Importing must keep working, so that a headless worker can import the rest
+        of the package; *rendering* the selector needs a real script context, where
+        a named error beats ``'NoneType' object has no attribute``.
+        """
+
+        def __getattr__(self, name: str) -> Any:
+            raise RuntimeError(
+                "app.condition_selector needs Streamlit to render this widget "
+                f"({name!r}); it has no headless behaviour"
+            )
+
+    st = _MissingStreamlit()  # type: ignore[assignment]
 
 from .agiloop_telemetry import track_feature_error, track_goal, track_impression, track_interaction
 

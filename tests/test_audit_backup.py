@@ -471,7 +471,7 @@ class TestHealth(_BackupCase):
         self.assertIn("below_floor", status)
 
     def test_disk_floor_flags_a_degraded_volume(self) -> None:
-        config.DISK_MIN_FREE_BYTES = 10**18  # more free space than exists
+        config.DISK_MIN_FREE_BYTES = audit_backup.disk_status()["free_bytes"] + 1
         status = audit_backup.disk_status()
         self.assertTrue(status["below_floor"])
 

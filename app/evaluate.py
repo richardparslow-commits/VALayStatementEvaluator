@@ -9,7 +9,17 @@ import re
 import time
 from typing import Any
 
-import streamlit as st
+
+try:
+    import streamlit as st
+except ImportError:  # pragma: no cover - headless worker/sandbox without streamlit
+    class _HeadlessSessionState(dict):
+        pass
+
+    class _HeadlessStreamlit:
+        session_state = _HeadlessSessionState()
+
+    st = _HeadlessStreamlit()  # type: ignore[assignment]
 
 from .agiloop_telemetry import track_feature_error, track_goal
 from .config import load_knowledge

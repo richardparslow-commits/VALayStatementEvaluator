@@ -132,6 +132,10 @@ scripts/
                           Read one staged file on a Vercel Sandbox and print the
                           report JSON — the VA_LSE_EXTRACTOR_RUNNER command for
                           VA_LSE_EXTRACTOR=sandbox (see *Scanned pages and OCR*)
+  archil_sandbox_runner.py
+                          Read one staged file on an Archil Serverless microVM / CoW disk
+                          and print the report JSON — alternative VA_LSE_EXTRACTOR_RUNNER
+                          for VA_LSE_EXTRACTOR=sandbox (see DEPLOYMENT.md §6)
   va_records_download.py  Walk VA.gov's records-download wizard locally (you sign
                           in); writes a provenance manifest beside the PDF
 tests/                    Offline unit tests (no API key required)

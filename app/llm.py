@@ -59,6 +59,55 @@ if TYPE_CHECKING:
     from openai import NOT_GIVEN, OpenAI
 
 
+class _FallbackNotGiven:
+    """Sentinel used when the optional ``openai`` wheel is absent in headless/test runs."""
+    def __bool__(self) -> bool:
+        return False
+    def __repr__(self) -> str:
+        return "NOT_GIVEN"
+
+
+class _FallbackHttpxClient:
+    """Lightweight placeholder for ``openai.DefaultHttpxClient`` when ``openai`` is absent."""
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.args = args
+        self.kwargs = kwargs
+
+
+class _FallbackCompletions:
+    def create(self, *args: Any, **kwargs: Any) -> Any:
+        raise ModuleNotFoundError("No module named 'openai'")
+
+
+class _FallbackChat:
+    def __init__(self) -> None:
+        self.completions = _FallbackCompletions()
+
+
+class _FallbackResponses:
+    def create(self, *args: Any, **kwargs: Any) -> Any:
+        raise ModuleNotFoundError("No module named 'openai'")
+
+
+class _FallbackOpenAI:
+    """Lightweight placeholder for ``openai.OpenAI`` when ``openai`` is absent in headless/test runs."""
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.args = args
+        self.kwargs = kwargs
+        self.chat = _FallbackChat()
+        self.responses = _FallbackResponses()
+
+    def with_options(self, **_kwargs: Any) -> "_FallbackOpenAI":
+        return self
+
+
+_FALLBACK_SDK_OBJECTS: dict[str, Any] = {
+    "OpenAI": _FallbackOpenAI,
+    "NOT_GIVEN": _FallbackNotGiven(),
+    "DefaultHttpxClient": _FallbackHttpxClient,
+}
+
+
 def _sdk_name(name: str) -> Any:
     """Resolve ``OpenAI``/``NOT_GIVEN`` through the module global, lazily.
 
@@ -74,9 +123,14 @@ def _sdk_name(name: str) -> Any:
     """
     value = globals().get(name)
     if value is None:
-        import openai
+        try:
+            import openai
 
-        value = getattr(openai, name)
+            value = getattr(openai, name)
+        except ModuleNotFoundError:
+            if name not in _FALLBACK_SDK_OBJECTS:
+                raise
+            value = _FALLBACK_SDK_OBJECTS[name]
         globals()[name] = value
     return value
 
