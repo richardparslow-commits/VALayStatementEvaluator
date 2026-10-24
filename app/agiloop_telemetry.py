@@ -26,7 +26,7 @@ from typing import Any
 try:
     import streamlit as st
 except ImportError:  # pragma: no cover - headless worker/sandbox without streamlit
-    class _HeadlessSessionState(dict):
+    class _HeadlessSessionState(dict):  # type: ignore[type-arg]
         pass
 
     class _HeadlessStreamlit:

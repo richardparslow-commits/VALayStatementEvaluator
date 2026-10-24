@@ -27,13 +27,14 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from . import config
 from .queue_policy import require_synthetic_queue, synthetic_mode, synthetic_queue
 from .blob_store import BlobRef, BlobStore, BlobStoreError, dumps_documents, loads_documents
 from .documents import (DOCUMENT_SCHEMA_VERSION, DocumentPage, ExtractedDocument,
                         ExtractionError, validate_source_spans)
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .draft import DraftResult
@@ -707,12 +708,9 @@ def _documents_from_ref(raw: Any, blob_store: BlobStore | None) -> list[Extracte
 
 @synthetic_queue
 def encode_result(run: RunResult) -> str:
-    """Encode a finished run for the queue (best-effort — never loses the run)."""
-    # Imported here, not at module scope: app.evaluate and app.draft pull in the
-    # pipelines (and Streamlit), and this module is deliberately stdlib-only so a
-    # headless worker can import it. The other result helpers do the same.
     from .draft import DraftResult
     from .evaluate import EvaluationResult
+    """Encode a finished run for the queue (best-effort — never loses the run)."""
     body: dict[str, Any] = {
         "version": PAYLOAD_VERSION,
         "kind": run.kind,
