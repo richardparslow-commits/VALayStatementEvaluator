@@ -40,12 +40,12 @@ Stop the sandbox in the console before attaching disks:
 python scripts/archil_setup.py mount
 ```
 
-This mounts a pinned release at `/mnt/kb` read-only and the outputs disk at
+This mounts the knowledge disk root at `/mnt/kb` read-only and the outputs disk at
 `/mnt/results` read-write. Verify the current plan's release exists first.
 For the UI, launch from `/opt/valay` with:
 
 ```
-VA_LSE_MODE=synthetic VA_LSE_KNOWLEDGE_DIR=/mnt/kb/app/knowledge \
+VA_LSE_MODE=synthetic VA_LSE_KNOWLEDGE_DIR=/mnt/kb/releases/<release>/app/knowledge \
   python -m streamlit run run_app.py --server.address=0.0.0.0 --server.port=8080
 ```
 
@@ -108,3 +108,14 @@ archil services create valay-ui --dir /opt/valay --tcp-port 8080 \
 This service uses bundled rules until persistent mount attachment is repaired.
 No model key or GitHub Actions secret was configured. The manual smoke workflow
 still needs `ARCHIL_API_KEY` in its environment secret before it can run in CI.
+
+
+## Retry diagnosis
+
+A later console retry returned a precise error: `Invalid disk ID format` with
+the release subdirectory appended to the knowledge disk ID. Persistent mounts
+now omit `subdirectory` and mount the KB root read-only. Set the app knowledge
+path to `/mnt/kb/releases/<release>/app/knowledge`, using the release from
+`archil_setup.py plan`. The serverless read-only smoke retains its independently
+verified subdirectory support. The persistent root-mount correction still needs
+a live retry with an operator API credential.
