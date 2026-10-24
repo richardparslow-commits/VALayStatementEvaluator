@@ -179,9 +179,13 @@ records and (2) raw record excerpts. Be rigorous but fair:
 - PARTIALLY SUPPORTED: supported in substance but with a discrepancy (e.g., date off by a
   year, different facility name, or a procedure/treatment count mismatch before vs. after a
   stated milestone date — whenever a claim asserts N procedures before or after a milestone
-  date, compare each documented procedure date against that milestone date, state the exact
-  pre- vs. post-milestone count vs. the claimed count, and quote the record's exact ordinal or
-  procedure description in note).
+  date, compare each documented procedure date against that milestone date, counting only
+  entries that document the procedure itself (not follow-up visits or calls about it, and not
+  discussions of whether to repeat it), state the exact pre- vs. post-milestone count vs. the
+  claimed count, and quote the record's exact ordinal or procedure description in note. An
+  ordinal ("second") labels that procedure's place in the series; it is not an extra undated
+  entry, and the documented count is the number of dated procedure entries — never invent one
+  to match the claim.
 - CONTRADICTED: a record entry AFFIRMATIVELY states the opposite — a dated normal finding, \
   "denies pain", "no tenderness", "gait normal", the other side, an incompatible date or \
   facility. A contradiction is an affirmative finding, so it MUST name the conflicting record \
@@ -223,9 +227,12 @@ respect it:
   note to mention the witness's private conversation. Where a reported count of procedures \
   before or after a stated milestone date differs from the dated procedures in the records \
   (because one or more documented procedures occurred before the milestone date and only a \
-  smaller number occurred after it), mark it PARTIALLY SUPPORTED, state the exact documented \
-  post-milestone count vs. the claimed count (e.g., "1 post-<milestone> procedure on <date>, \
-  not <claimed count>"), and quote the record's exact ordinal/procedure description in note. \
+  smaller number occurred after it, counting only entries that document the procedure itself — \
+  a follow-up visit that reports the result is not another procedure, and an ordinal such as \
+  "second" is not a separate dated procedure), mark it PARTIALLY SUPPORTED, state the exact \
+  documented post-milestone count vs. the claimed count (e.g., "1 post-<milestone> procedure \
+  on <date>, not <claimed count>"), and quote the record's exact ordinal/procedure description \
+  in note. Never invent an undated procedure to reconcile the claimed count. \
   Only a dated, specific entry about the same symptom can CONTRADICT it.
 - provider_statement: SUPPORTED only where a record entry documents the provider saying or \
   doing that; the clinical fact behind it is not thereby established, so record that in the \
@@ -372,8 +379,10 @@ fact noted for them). If the witness might genuinely remember it differently, co
 record and append a [Confirm: ...] note.
 - Claims PARTIALLY SUPPORTED: align the disputed detail (date, place, name, or procedure count \
 before vs. after a milestone date) with the records, stating the exact documented post-milestone \
-count, procedure dates, and verbatim record quote inside a [Confirm: ...] placeholder rather than \
-repeating the unverified count or softening it to a vague plural.
+count (counting only dated entries that document the procedure itself, not follow-up visits or \
+an ordinal, and never inventing a missing entry), procedure dates, and verbatim record quote \
+inside a [Confirm: ...] placeholder rather than repeating the unverified count or softening it \
+to a vague plural.
 - Claims NOT FOUND: KEEP them — absence from records is not negative evidence (Horn v. \
 Shinseki; M21-1 V.ii.1.A; Buchanan v. Nicholson). You may sharpen their wording but must not \
 delete firsthand observations merely because the records are silent, and you must not describe \
