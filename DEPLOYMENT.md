@@ -845,6 +845,13 @@ Four things about it are deliberate and easy to get wrong by hand:
   VA_LSE_EXTRACTOR_RUNNER="python scripts/vercel_sandbox_runner.py {work}"
   ```
 
+  Or for Archil Serverless Execution / copy-on-write disks (`https://console.archil.com/`), use `scripts/archil_sandbox_runner.py`:
+
+  ```bash
+  VA_LSE_EXTRACTOR=sandbox
+  VA_LSE_EXTRACTOR_RUNNER="python scripts/archil_sandbox_runner.py {work}"
+  ```
+
   That line works on a host that has no `python` on `PATH`. The runner is spawned as a
   subprocess, so the command is only as good as its first word — and macOS ships
   `python3` with no `python`, while Streamlit started from a virtualenv puts neither on

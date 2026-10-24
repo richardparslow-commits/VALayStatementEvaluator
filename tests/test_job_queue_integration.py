@@ -23,8 +23,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 
-from test_job_queue import _FakeRedisClient
-from log_isolation import isolate_app_logs  # noqa: E402
+try:
+    from tests.test_job_queue import _FakeRedisClient
+    from tests.log_isolation import isolate_app_logs
+except ImportError:
+    from test_job_queue import _FakeRedisClient  # type: ignore[no-redef]
+    from log_isolation import isolate_app_logs  # type: ignore[no-redef]
 
 from app import config  # noqa: E402
 from app import shutdown  # noqa: E402

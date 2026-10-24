@@ -524,6 +524,9 @@ class AuditHealthTest(unittest.TestCase):
                 the write the test is about.
                 """
 
+                def seek(self, _offset: int, _whence: int = 0) -> int:
+                    return 0
+
                 def tell(self) -> int:
                     return 0
 
