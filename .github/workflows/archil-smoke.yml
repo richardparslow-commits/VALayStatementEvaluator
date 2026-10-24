@@ -1,0 +1,21 @@
+name: Archil reference smoke (manual)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: archil-synthetic
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install -r requirements-archil.txt
+      - name: Verify pinned public references in a read-only microVM mount
+        env:
+          ARCHIL_API_KEY: ${{ secrets.ARCHIL_API_KEY }}
+          VA_LSE_MODE: synthetic
+        run: python scripts/archil_setup.py smoke

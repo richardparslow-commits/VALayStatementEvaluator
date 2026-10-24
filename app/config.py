@@ -434,7 +434,11 @@ def _perplexity_preset_setting(from_secrets: set[str]) -> str:
 
 def load_knowledge(name: str) -> str:
     """Read a knowledge-base markdown file by file name."""
-    path = KNOWLEDGE_DIR / name
+    # Resolve at call time so mounted reference releases can be configured by env.
+    root = Path(os.getenv("VA_LSE_KNOWLEDGE_DIR", "").strip() or KNOWLEDGE_DIR)
+    if Path(name).name != name or name in {"", ".", ".."}:
+        raise ValueError("Knowledge name must be a single file name")
+    path = root / name
     if not path.exists():
         raise FileNotFoundError(f"Knowledge file missing: {path}")
     return path.read_text(encoding="utf-8")
