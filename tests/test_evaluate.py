@@ -655,6 +655,16 @@ class TestVerifyPromptContract(unittest.TestCase):
         self.assertIn("use PARTIALLY SUPPORTED", VERIFY_SYSTEM)
         self.assertIn("competence rather than accuracy is the issue", VERIFY_SYSTEM)
 
+    def test_a_follow_up_visit_is_not_another_procedure(self):
+        """The milestone count must not turn a follow-up visit into a second procedure."""
+        self.assertIn("counting only entries that document the procedure itself", VERIFY_SYSTEM)
+        self.assertIn(
+            "a follow-up visit that reports the result is not another procedure", VERIFY_SYSTEM
+        )
+        self.assertIn("never invent one", VERIFY_SYSTEM)
+        self.assertIn("Never invent an undated procedure", VERIFY_SYSTEM)
+        self.assertIn("counting only dated entries that document the procedure itself", REVISE_SYSTEM)
+
 
 class TestClaimsPromptContract(unittest.TestCase):
     """Extraction must not launder how the writer knows a fact.
