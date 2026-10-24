@@ -830,14 +830,37 @@ class TestClaimSchemaBoundary(unittest.TestCase):
     def test_invalid_claim_shapes_and_ids_fail_before_verification(self):
         invalid = [None, {}, "claims", [None], [{"id": 1}],
                    [{"id": 1, "text": " "}], [{"id": 1, "text": []}],
-                   [{"id": 1, "text": "Pain.", "type": "unknown"}],
                    [{"id": 1, "text": "Pain.", "type": []}],
+                   [{"id": 1, "text": "Pain.", "type": {}}],
+                   [{"id": 1, "text": "Pain.", "type": 123}],
+                   [{"id": 1, "text": "Pain.", "type": True}],
                    [{"id": 1, "text": "First."}, {"id": "01", "text": "Second."}]]
         invalid.extend([{ "id": value, "text": "Pain."}]
                        for value in (True, False, 1.0, 1.5, 0, -1, "1.0", "-1", None, [], {}))
         for claims in invalid:
             with self.subTest(claims=claims), self.assertRaises(LLMParseError):
                 _normalize_claims(claims)
+
+    def test_aliased_and_unrecognised_claim_types_normalize_without_failing(self):
+        cases = [
+            ("diagnosis", "diagnosis_reference"),
+            ("treatment", "treatment_reference"),
+            ("medication", "treatment_reference"),
+            ("hospitalization", "treatment_reference"),
+            ("provider_visit", "treatment_reference"),
+            ("functional_limitation", "functional_impact"),
+            ("observable_behavior", "functional_impact"),
+            ("date", "date_or_place"),
+            ("service_event", "in_service_event"),
+            ("progression", "continuity"),
+            ("unknown", "other"),
+            ("", "other"),
+            (None, "other"),
+        ]
+        for raw_type, expected in cases:
+            with self.subTest(raw_type=raw_type):
+                normalized = _normalize_claims([{"id": 1, "text": "Pain.", "type": raw_type}])
+                self.assertEqual(normalized[0]["type"], expected)
 
     def test_valid_claims_keep_their_unique_ids_and_normalize_types(self):
         self.assertEqual(_normalize_claims([{"id": " 07 ", "text": " Pain. ", "type": " Symptom "}]),
