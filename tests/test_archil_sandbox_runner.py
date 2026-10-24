@@ -100,6 +100,10 @@ if cmd == "exec":
     if subcmd[:2] == ["mkdir", "-p"]:
         (box_root / subcmd[2].lstrip("/")).mkdir(parents=True, exist_ok=True)
         sys.exit(0)
+    if subcmd[:2] == ["rm", "-rf"]:
+        for target_rel in subcmd[2:]:
+            shutil.rmtree(box_root / target_rel.lstrip("/"), ignore_errors=True)
+        sys.exit(0)
     mapped = []
     for tok in subcmd:
         if tok == "/app/scripts/ocr_and_extract.py":

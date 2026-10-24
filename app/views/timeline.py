@@ -285,7 +285,11 @@ def render_timeline_in_results(digest: medical_review.MedicalDigest) -> None:
     display_events = events[:20]
 
     pilot.display("### Key Medical Events", container=st, method="markdown")
-    pilot.display(f"Showing first 20 of {len(events)} events. View full timeline for all events.", container=st, method="caption")
+    shown_count = len(display_events)
+    if len(events) > shown_count:
+        pilot.display(f"Showing first {shown_count} of {len(events)} events. View full timeline for all events.", container=st, method="caption")
+    else:
+        pilot.display(f"Showing {shown_count} of {len(events)} event(s).", container=st, method="caption")
 
     # Compact timeline as a table
     rows = []

@@ -712,7 +712,7 @@ def _restore_citations(
 
 
 def _norm_key(text: str) -> str:
-    """Whitespace-collapsed, case-folded comparison key.
+    r"""Whitespace-collapsed, case-folded comparison key.
 
     ``" ".join(text.split())`` rather than ``re.sub(r"\s+", " ", text).strip()``:
     identical output for every whitespace class (checked against NBSP, thin space,

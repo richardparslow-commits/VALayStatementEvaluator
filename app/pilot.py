@@ -12,7 +12,6 @@ import json
 import math
 import os
 import re
-import math
 import socket
 import stat
 import threading
@@ -229,6 +228,7 @@ def validate_configuration() -> dict[str, Any]:
     # The disabled services need a separate privacy/ownership release review.
     if (config.JOB_QUEUE_ENABLED or config.BLOB_STORE_MODE != "none"
             or config.TRACING_ENABLED or config.SHARED_CACHE_URL or config.SHARED_CACHE_TOKEN
+            or os.getenv("VA_LSE_KNOWLEDGE_DIR", "").strip()
             or config.EXTRACTOR_MODE not in ("isolated", "in-process")):
         raise PilotBlocked("Pilot configuration requires no queue, no blob storage, "
                            "no tracing, and the protected parser service.")

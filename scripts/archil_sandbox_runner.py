@@ -375,7 +375,24 @@ class ArchilCli:
         )
 
     def remove_branch(self, branch_name: str) -> None:
-        """Best-effort cleanup of the ephemeral CoW branch."""
+        """Best-effort cleanup of staged files and the ephemeral CoW branch."""
+        try:
+            self._run(
+                [
+                    "exec",
+                    *self.common(),
+                    "--disk",
+                    f"{self.settings.disk}:{branch_name}",
+                    "--",
+                    "rm",
+                    "-rf",
+                    str(REMOTE_BUNDLE),
+                    str(REMOTE_REPORT),
+                ],
+                f"wipe staged files on {branch_name}",
+            )
+        except SandboxError:
+            pass
         try:
             self._run(
                 ["branch", "delete", *self.common(), self.settings.disk, branch_name, "--force"],

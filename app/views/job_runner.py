@@ -148,6 +148,12 @@ def _hydrate(slot: str, run: RunResult) -> None:
         # Recovery cannot bind new questions to the current form inputs. Keep
         # earlier answers and their own binding, but block collection into it.
         st.session_state["eval_follow_up_questions_bound"] = False
+        st.session_state["eval_revised_statement"] = getattr(run.result, "revised_statement", "") or ""
+        st.session_state.pop("export_facts_files", None)
+        st.session_state.pop("export_facts_sig", None)
+    elif slot == "draft":
+        st.session_state["draft_edited"] = getattr(run.result, "output_statement", "") or ""
+        st.session_state.pop("draft_show_full_timeline", None)
     st.session_state[result_key] = run.result
     st.session_state[usage_key] = run.usage
     st.session_state[rid_key] = run.request_id or st.session_state.get(rid_key, "")

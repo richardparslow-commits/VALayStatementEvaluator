@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from .. import pilot
 
+import re
 from typing import Any
 
 import streamlit as st
@@ -166,7 +167,10 @@ def records_uploader(slot: str) -> list:
         pilot.display(page_limit_message(total_pages, config.MAX_RECORD_PAGES), container=st, method="error")
         return []
     render_record_volume_warning(documents, slot=slot)
-    remember_source_records(slot, "Upload", documents)
+    if documents:
+        remember_source_records(slot, "Upload", documents)
+    else:
+        st.session_state.get(f"source_records_{slot}", {}).pop("Upload", None)
     _label_detected_va_gov_exports(slot, documents)
     return documents
 
@@ -179,13 +183,29 @@ def _label_detected_va_gov_exports(slot: str, documents: list[Any]) -> None:
     honest about where those pages came from.
     """
     exports, names = va_gov_export.split_va_gov_exports(documents)
+    st.session_state[f"_uploaded_va_gov_exports_{slot}"] = list(exports)
     if not exports:
+        if not st.session_state.get(f"va_gov_fetch_{slot}"):
+            st.session_state.get(f"source_records_{slot}", {}).pop("VA.gov", None)
         return
     remember_source_records(slot, "VA.gov", exports)
     pilot.display(
         f"🔎 Detected a VA.gov medical-records export ({', '.join(names)}) — labelled as "
         "the **VA.gov** source so the merged records summary shows where it came from."
     , container=st, method="caption")
+
+
+def _safe_doc_pages(documents: list[Any]) -> int:
+    total = 0
+    for d in documents:
+        spc = getattr(d, "source_page_count", None)
+        if type(spc) is int:
+            total += spc
+        else:
+            pages = getattr(d, "pages", None)
+            if isinstance(pages, (list, tuple)):
+                total += len(pages)
+    return total
 
 
 def _local_records(slot: str) -> list:
@@ -231,6 +251,12 @@ def _local_records(slot: str) -> list:
         , container=st, method="warning")
     cached_any: Any = st.session_state.get(import_key, [])
     cached_records: list[Any] = cached_any if isinstance(cached_any, list) else []
+    total_pages = _safe_doc_pages(cached_records)
+    if cached_records and total_pages > config.MAX_RECORD_PAGES:
+        pilot.display(page_limit_message(total_pages, config.MAX_RECORD_PAGES), container=st, method="error")
+        remember_source_records(slot, "Local folder / file", [])
+        return []
+    render_record_volume_warning(cached_records, slot=slot)
     remember_source_records(slot, "Local folder / file", cached_records)
     return cached_records
 
@@ -262,6 +288,12 @@ def _fetch_records(slot: str) -> list[Any]:
             st.session_state[import_key] = records
     records_any2: Any = st.session_state.get(import_key, [])
     records2: list[Any] = records_any2 if isinstance(records_any2, list) else []
+    total_pages = _safe_doc_pages(records2)
+    if records2 and total_pages > config.MAX_RECORD_PAGES:
+        pilot.display(page_limit_message(total_pages, config.MAX_RECORD_PAGES), container=st, method="error")
+        remember_source_records(slot, "Fetch Sandbox", [])
+        return []
+    render_record_volume_warning(records2, slot=slot)
     remember_source_records(slot, "Fetch Sandbox", records2)
     return records2
 
@@ -309,12 +341,17 @@ def _va_gov_records(slot: str) -> list[Any]:
         "blob storage may retain copies until expiry; the analysis provider has its own retention policy.",
         key=f"va_gov_consent_{slot}",
     )
+    user_key = f"va_gov_user_{slot}"
+    user_backup_key = f"_va_gov_user_saved_{slot}"
+    if user_key not in st.session_state and user_backup_key in st.session_state:
+        st.session_state[user_key] = st.session_state[user_backup_key]
     authed = bool(st.session_state.get(f"va_gov_authed_{slot}"))
     with st.expander("🔒 VA.gov secure login", expanded=not authed):
         pilot.display(
             "Sandbox/simulator credentials — not your VA.gov password."
         , container=st, method="caption")
-        username = st.text_input("Sandbox username", key=f"va_gov_user_{slot}")
+        username = st.text_input("Sandbox username", key=user_key)
+        st.session_state[user_backup_key] = username
         password = st.text_input(
             "Sandbox password", type="password", key=f"va_gov_pass_{slot}"
         )
@@ -332,6 +369,16 @@ def _va_gov_records(slot: str) -> list[Any]:
                 "consent_given": consent,
             },
         )
+        st.session_state.pop(f"va_gov_fetch_{slot}", None)
+        st.session_state.pop(f"va_gov_session_{slot}", None)
+        st.session_state.pop(f"va_gov_authed_{slot}", None)
+        st.session_state.pop(f"va_gov_accept_partial_{slot}", None)
+        st.session_state.pop(f"va_gov_confirm_{slot}", None)
+        uploaded_exports = list(st.session_state.get(f"_uploaded_va_gov_exports_{slot}", []) or [])
+        if uploaded_exports:
+            remember_source_records(slot, "VA.gov", uploaded_exports)
+        else:
+            st.session_state.get(f"source_records_{slot}", {}).pop("VA.gov", None)
         if not consent:
             pilot.display("Consent is required before VA.gov records can be fetched.", container=st, method="warning")
         else:
@@ -343,34 +390,45 @@ def _va_gov_records(slot: str) -> list[Any]:
                 st.session_state[f"va_gov_session_{slot}"] = session
                 st.session_state[f"va_gov_authed_{slot}"] = True
                 st.session_state[f"va_gov_fetch_{slot}"] = va_gov_client.fetch_va_records(session)
-                st.session_state.pop(f"va_gov_accept_partial_{slot}", None)
 
     result = st.session_state.get(f"va_gov_fetch_{slot}")
     if result is None:
         return []
 
-    if result.error_message:
-        pilot.display(
-            f"VA.gov fetch problem: {result.error_message} "
-            f"(retrieved {result.retrieved} of {result.expected} expected record(s))."
-        , container=st, method="error")
+    has_fetch_problem = bool(result.partial or result.error_message)
+    if has_fetch_problem:
+        err_text = result.error_message or (
+            f"Incomplete VA.gov record set: retrieved {result.retrieved} of {result.expected} expected record(s)."
+        )
+        if result.expected > 0:
+            msg = f"VA.gov fetch problem: {err_text} (retrieved {result.retrieved} of {result.expected} expected record(s))."
+        else:
+            msg = f"VA.gov fetch problem: {err_text}"
+        pilot.display(msg, container=st, method="error")
         col_retry, col_continue = st.columns(2)
         if col_retry.button("Retry VA.gov fetch", key=f"va_gov_retry_{slot}"):
             session_any: Any = st.session_state.get(f"va_gov_session_{slot}")
             if session_any is not None:
                 st.session_state[f"va_gov_fetch_{slot}"] = va_gov_client.fetch_va_records(session_any)
+                st.session_state.pop(f"va_gov_accept_partial_{slot}", None)
+                st.session_state.pop(f"va_gov_confirm_{slot}", None)
                 st.rerun()
-        if col_continue.button(
+        if result.documents and col_continue.button(
             "Continue with available VA.gov records", key=f"va_gov_continue_{slot}"
         ):
             st.session_state[f"va_gov_accept_partial_{slot}"] = True
 
     if not result.documents:
         return []
-    if result.error_message and not st.session_state.get(f"va_gov_accept_partial_{slot}"):
+    if has_fetch_problem and not st.session_state.get(f"va_gov_accept_partial_{slot}"):
         return []
 
-    remember_source_records(slot, "VA.gov", result.documents)
+    uploaded_exports = list(st.session_state.get(f"_uploaded_va_gov_exports_{slot}", []) or [])
+    combined_va_docs = list(uploaded_exports) + [
+        d for d in result.documents
+        if getattr(d, "filename", "") not in {getattr(u, "filename", "") for u in uploaded_exports}
+    ]
+    remember_source_records(slot, "VA.gov", combined_va_docs)
     other_sources = dict(st.session_state.get(f"source_records_{slot}", {}))
     merged = va_gov_client.merge_records(other_sources)
 
@@ -396,6 +454,11 @@ def _va_gov_records(slot: str) -> list[Any]:
             "confirmed": confirmed,
         },
     )
+    total_pages = _safe_doc_pages(merged.documents)
+    if merged.documents and total_pages > config.MAX_RECORD_PAGES:
+        pilot.display(page_limit_message(total_pages, config.MAX_RECORD_PAGES), container=st, method="error")
+        return []
+    render_record_volume_warning(merged.documents, slot=slot)
     if not confirmed:
         return []
     return merged.documents
@@ -430,38 +493,57 @@ def render_record_search(slot: str, documents: list[Any]) -> None:
         provider = col_provider.text_input("Provider (optional)", key=f"search_provider_{slot}")
 
         results_key = f"search_results_{slot}"
-        if st.button("Search", key=f"search_submit_{slot}") and query.strip():
-            try:
-                results = search_records(
-                    documents,
-                    query,
-                    date_from=date_from or None,
-                    date_to=date_to or None,
-                    provider=provider or None,
-                )
-            except Exception as exc:  # noqa: BLE001 - search must never crash the UI
+        search_clicked = st.button("Search", key=f"search_submit_{slot}")
+        if search_clicked:
+            if not query.strip():
+                st.session_state[results_key] = []
+            else:
                 try:
-                    track_feature_error(SEARCH_FEATURE_ID, exc, stage="search")
-                except Exception:  # noqa: BLE001
+                    results = search_records(
+                        documents,
+                        query,
+                        date_from=date_from or None,
+                        date_to=date_to or None,
+                        provider=provider or None,
+                    )
+                except Exception as exc:  # noqa: BLE001 - search must never crash the UI
+                    try:
+                        track_feature_error(SEARCH_FEATURE_ID, exc, stage="search")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    pilot.display(
+                        report_failure(f"Search failed: {exc}", phase="record_search", exc=exc)
+                    , container=st, method="error")
+                    results = []
+                st.session_state[results_key] = results
+                try:
+                    track_interaction(
+                        SEARCH_FEATURE_ID,
+                        action="search",
+                        has_date_filter=bool(date_from or date_to),
+                        has_provider_filter=bool(provider),
+                        result_count=len(results),
+                    )
+                except Exception:  # noqa: BLE001 - telemetry must never break the UI
                     pass
-                pilot.display(
-                    report_failure(f"Search failed: {exc}", phase="record_search", exc=exc)
-                , container=st, method="error")
-                results = []
-            st.session_state[results_key] = results
-            try:
-                track_interaction(
-                    SEARCH_FEATURE_ID,
-                    action="search",
-                    has_date_filter=bool(date_from or date_to),
-                    has_provider_filter=bool(provider),
-                    result_count=len(results),
-                )
-            except Exception:  # noqa: BLE001 - telemetry must never break the UI
-                pass
 
+        loaded_filenames = {
+            fn for d in documents
+            if isinstance((fn := getattr(d, "filename", None)), str) and fn
+        }
         results_any: Any = st.session_state.get(results_key, [])
-        results_list: list[SearchResult] = results_any if isinstance(results_any, list) else []
+        raw_results: list[SearchResult] = results_any if isinstance(results_any, list) else []
+        if loaded_filenames:
+            results_list = [
+                r for r in raw_results
+                if not isinstance(getattr(r, "filename", None), str)
+                or not r.filename
+                or r.filename in loaded_filenames
+            ]
+            if len(results_list) != len(raw_results):
+                st.session_state[results_key] = results_list
+        else:
+            results_list = raw_results
         if not results_list:
             if query.strip():
                 pilot.display("No matching passages found.", container=st, method="caption")
@@ -471,10 +553,19 @@ def render_record_search(slot: str, documents: list[Any]) -> None:
         _render_citation_index_export(slot)
 
 
+def _sanitize_search_excerpt_for_display(excerpt: str) -> str:
+    # Neutralize Markdown images ![alt](url) so record text cannot trigger browser fetches
+    return re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"[image: \1]", excerpt)
+
+
+def _clean_citation_excerpt(excerpt: str) -> str:
+    return excerpt.replace("**", "")
+
+
 def _render_search_results(slot: str, results: list[SearchResult]) -> None:
     for i, result in enumerate(results):
         pilot.display(f"**{result.label}**", container=st, method="markdown")
-        pilot.display(result.excerpt, container=st, method="markdown")
+        pilot.display(_sanitize_search_excerpt_for_display(result.excerpt), container=st, method="markdown")
         if st.button("➕ Export excerpt", key=f"search_export_{slot}_{i}"):
             citation = {"excerpt": result.excerpt, "source": result.label}
             index_any: Any = st.session_state.setdefault(CITATION_INDEX_KEY, [])

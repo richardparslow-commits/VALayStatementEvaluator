@@ -74,7 +74,10 @@ _SOURCE_PATTERNS = (
     ),
     # "filename p.3" / "filename b.2" (app.documents.DocumentPage.label), plus
     # the chunk-span form the digest now emits: "clinic.pdf p.3-p.9".
-    re.compile(r"^(?P<doc>.+?)\s+[pb]\.(?P<pages>[\d,\-]+)$", re.IGNORECASE),
+    re.compile(
+        r"^(?P<doc>.+?)\s+[pb]\.(?P<pages>\d+(?:\s*-\s*(?:[pb]\.)?\d+|\s*,\s*(?:[pb]\.)?\d+)*)$",
+        re.IGNORECASE,
+    ),
 )
 
 
@@ -97,9 +100,21 @@ def parse_source(source: str) -> tuple[str, str]:
         match = pattern.match(text)
         if match:
             doc = match.group("doc").strip(" [")
-            pages = re.sub(r"\s+", "", match.group("pages")).replace(",", ", ")
+            raw_pages = re.sub(r"\s+", "", match.group("pages"))
+            pages = re.sub(r"[pb]\.", "", raw_pages, flags=re.IGNORECASE).replace(",", ", ")
             return doc, pages
     return text, ""
+
+
+def _fact_doc_and_pages(fact: MedicalFact) -> tuple[str, str]:
+    """Return `(document_name, pages)` preferring resolved `fact.document`/`fact.page`."""
+    doc_name, pages = parse_source(fact.source)
+    if not pages:
+        if getattr(fact, "document", ""):
+            doc_name = fact.document
+        if getattr(fact, "page", 0) and fact.page > 0:
+            pages = str(fact.page)
+    return doc_name, pages
 
 
 # ------------------------------------------------------------------- filtering
@@ -174,7 +189,7 @@ def export_facts_csv(facts: list[MedicalFact], digest: MedicalDigest) -> bytes:
         ]
     )
     for fact in facts:
-        doc_name, pages = parse_source(fact.source)
+        doc_name, pages = _fact_doc_and_pages(fact)
         writer.writerow(
             [
                 _csv_formula_guard(fact.date),
@@ -211,7 +226,7 @@ def export_facts_markdown(facts: list[MedicalFact], digest: MedicalDigest) -> by
         "|" + "|".join(["---"] * len(FACT_COLUMNS)) + "|",
     ]
     for fact in facts:
-        doc_name, pages = parse_source(fact.source)
+        doc_name, pages = _fact_doc_and_pages(fact)
         cells = [fact.date, fact.type, fact.description, fact.quote, pages, doc_name]
         lines.append("| " + " | ".join(_md_escape(c) for c in cells) + " |")
     return ("\n".join(lines) + "\n").encode("utf-8")
@@ -273,7 +288,7 @@ def export_facts_pdf(facts: list[MedicalFact], digest: MedicalDigest) -> bytes:
         for column in FACT_COLUMNS:
             header_row.cell(column)
         for fact in facts:
-            doc_name, pages = parse_source(fact.source)
+            doc_name, pages = _fact_doc_and_pages(fact)
             row = table.row()
             for value in (fact.date, fact.type, fact.description, fact.quote, pages, doc_name):
                 row.cell(_pdf_safe_text(value or ""))
