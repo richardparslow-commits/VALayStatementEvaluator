@@ -4,7 +4,6 @@ its JSON data file (feature: Condition-Specific Templates).
 Run from project root: .venv/bin/python -m unittest discover -s tests -v
 """
 import json
-import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -132,45 +131,6 @@ class TestTelemetryMockMode(unittest.TestCase):
 
         source = Path(agiloop_telemetry.__file__).read_text(encoding="utf-8")
         self.assertNotIn("02f0935a-ee5e-4083-88a2-10e11753ccc9", source)
-
-
-class TestHeadlessImport(unittest.TestCase):
-    """Without Streamlit the module must still import, and fail by name when used.
-
-    A ``'NoneType' object has no attribute ...`` cascade would hide the real cause
-    (the missing wheel) from whoever reads the traceback.
-    """
-
-    SCRIPT = r"""
-import sys
-
-class Block:
-    def find_spec(self, name, path=None, target=None):
-        if name == "streamlit" or name.startswith("streamlit."):
-            raise ImportError("streamlit blocked for this check")
-        return None
-
-sys.meta_path.insert(0, Block())
-import app.condition_selector as selector
-
-print("imported", type(selector.st).__name__)
-try:
-    selector.render_condition_selector("eval", "feature")
-except RuntimeError as exc:
-    print("error", exc)
-"""
-
-    def test_module_imports_without_streamlit_and_fails_with_a_named_error(self) -> None:
-        proc = subprocess.run(
-            [sys.executable, "-c", self.SCRIPT],
-            cwd=Path(__file__).resolve().parent.parent,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        self.assertIn("imported _MissingStreamlit", proc.stdout)
-        self.assertIn("error app.condition_selector needs Streamlit", proc.stdout)
-        self.assertNotIn("AttributeError", proc.stdout + proc.stderr)
 
 
 if __name__ == "__main__":

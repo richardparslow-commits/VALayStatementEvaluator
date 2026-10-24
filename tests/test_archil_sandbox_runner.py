@@ -145,11 +145,7 @@ class TestArchilSandboxRunner(unittest.TestCase):
         return base
 
     def test_llm_keys_in_archil_token_slot_are_refused_by_name(self) -> None:
-        # Built from parts: a literal provider-key prefix here is refused by the
-        # repository's pre-commit secret scan, which cannot tell a test fixture
-        # from a real key and must not be taught to.
-        for prefix in ("pplx-", "sk-", "vck_", "vcg_"):
-            bad_key = f"{prefix}12345"
+        for bad_key in ("pplx-12345", "sk-proj-12345", "vck_12345", "vcg_12345"):
             with patch.dict(os.environ, {"VA_LSE_ARCHIL_TOKEN": bad_key}, clear=False):
                 with self.assertRaises(archil_runner.SandboxError) as ctx:
                     archil_runner.Settings.from_env()
