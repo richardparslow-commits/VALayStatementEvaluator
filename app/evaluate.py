@@ -162,7 +162,8 @@ knows the fact, omit the field rather than guess — the tool records an omitted
 and a guessed basis would be weighed as if the witness had actually said it. Do not split a single
 sentence that shares the same basis into clause-by-clause fragments; keep related clauses of a
 sentence together unless the sentence mixes two different bases, and resolve relative time anchors
-in brackets using the statement's own dates (for example, "since leaving [December 2018]").
+("since leaving", "after that transfer", "the following year") in brackets using the milestone
+date stated earlier in the statement (for example, "since leaving [<stated departure date>]").
 
 STATEMENT:
 <<<
@@ -176,12 +177,11 @@ factual claim from a lay statement against (1) a structured digest of the vetera
 records and (2) raw record excerpts. Be rigorous but fair:
 - SUPPORTED: a record entry clearly supports the claim.
 - PARTIALLY SUPPORTED: supported in substance but with a discrepancy (e.g., date off by a
-  year, different facility name, or a procedure/injection count mismatch before vs. after a
-  milestone date — such as claiming two back injections after leaving work in December 2018 when
-  the records document the first injection on 08/22/2017 before leaving and only 1 post-2018
-  injection on 11/03/2023, explicitly labeled "Second left L5 transforaminal epidural steroid
-  injection"; always state the exact documented count — e.g., 1 post-2018 injection, not 2 — and
-  quote the exact record phrase in note).
+  year, different facility name, or a procedure/treatment count mismatch before vs. after a
+  stated milestone date — whenever a claim asserts N procedures before or after a milestone
+  date, compare each documented procedure date against that milestone date, state the exact
+  pre- vs. post-milestone count vs. the claimed count, and quote the record's exact ordinal or
+  procedure description in note).
 - CONTRADICTED: a record entry AFFIRMATIVELY states the opposite — a dated normal finding, \
   "denies pain", "no tenderness", "gait normal", the other side, an incompatible date or \
   facility. A contradiction is an affirmative finding, so it MUST name the conflicting record \
@@ -218,15 +218,15 @@ respect it:
 - reported: verify the fact that it was said, not a third person's inner state. A record entry \
   documenting the veteran's own complaint SUPPORTS that he said it, even where the examiner's \
   own findings were normal — and a record entry documenting the veteran's reported treatment \
-  response (such as "approximately 60% relief of the leg pain" after an injection) SUPPORTS a \
-  reported claim that the treatment helped without requiring the clinic note to mention the \
-  witness's private conversation. Where a reported count of procedures after a milestone date \
-  differs from the dated procedures in the records (for example, claiming 2 back shots since \
-  leaving in December 2018 when 08/22/2017 was before leaving and 11/03/2023 is the "Second \
-  left L5 transforaminal epidural steroid injection", leaving only 1 post-2018 injection), mark \
-  it PARTIALLY SUPPORTED and state the exact count discrepancy (1 post-2018 injection, not 2) \
-  with the exact record quote in note. Only a dated, specific entry about the same symptom can \
-  CONTRADICT it.
+  response at follow-up (such as documented percentage relief or symptom improvement after a \
+  procedure) SUPPORTS a reported claim that the treatment helped without requiring the clinic \
+  note to mention the witness's private conversation. Where a reported count of procedures \
+  before or after a stated milestone date differs from the dated procedures in the records \
+  (because one or more documented procedures occurred before the milestone date and only a \
+  smaller number occurred after it), mark it PARTIALLY SUPPORTED, state the exact documented \
+  post-milestone count vs. the claimed count (e.g., "1 post-<milestone> procedure on <date>, \
+  not <claimed count>"), and quote the record's exact ordinal/procedure description in note. \
+  Only a dated, specific entry about the same symptom can CONTRADICT it.
 - provider_statement: SUPPORTED only where a record entry documents the provider saying or \
   doing that; the clinical fact behind it is not thereby established, so record that in the \
   note. Where the record shows the same conversation differently, that is a discrepancy in what \
@@ -370,12 +370,10 @@ before signing MUST be wrapped in [Confirm: ...] placeholders.
 - Claims verified CONTRADICTED must be corrected to match the medical records (use the record \
 fact noted for them). If the witness might genuinely remember it differently, correct to the \
 record and append a [Confirm: ...] note.
-- Claims PARTIALLY SUPPORTED: align the disputed detail (date, place, name, or procedure count) \
-with the records, stating the exact documented count, date, and verbatim record quote inside a \
-[Confirm: ...] placeholder (for example, if two post-departure injections were claimed after \
-December 2018 but the records document the first on 08/22/2017 and only 1 post-2018 injection on \
-11/03/2023 — "Second left L5 transforaminal epidural steroid injection" — state that 1 post-2018 \
-injection on 11/03/2023 is documented rather than 2 and quote that exact record phrase).
+- Claims PARTIALLY SUPPORTED: align the disputed detail (date, place, name, or procedure count \
+before vs. after a milestone date) with the records, stating the exact documented post-milestone \
+count, procedure dates, and verbatim record quote inside a [Confirm: ...] placeholder rather than \
+repeating the unverified count or softening it to a vague plural.
 - Claims NOT FOUND: KEEP them — absence from records is not negative evidence (Horn v. \
 Shinseki; M21-1 V.ii.1.A; Buchanan v. Nicholson). You may sharpen their wording but must not \
 delete firsthand observations merely because the records are silent, and you must not describe \
