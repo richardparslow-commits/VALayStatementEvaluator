@@ -136,6 +136,8 @@ scripts/
                           Read one staged file on an Archil Serverless microVM / CoW disk
                           and print the report JSON — alternative VA_LSE_EXTRACTOR_RUNNER
                           for VA_LSE_EXTRACTOR=sandbox (see DEPLOYMENT.md §6)
+  archil_setup.py         Provision and check the Archil sandbox workspace: `plan`,
+                          `upload-kb`, `mount` and `smoke` (see docs/ARCHIL.md)
   va_records_download.py  Walk VA.gov's records-download wizard locally (you sign
                           in); writes a provenance manifest beside the PDF
 tests/                    Offline unit tests (no API key required)
@@ -1054,6 +1056,11 @@ The standalone OCR tools below require an explicit synthetic-data declaration.
 Sensitive records and controlled-pilot execution are refused before file access.
 Real records require the operator's separately accepted isolated OCR and retention workflow.
 The declaration is an operator assertion, not an automatic PHI detector.
+
+Archil disks carry the sandbox workspace that pairs with `scripts/archil_sandbox_runner.py`.
+`scripts/archil_setup.py plan|upload-kb|mount|smoke` provisions the disks and the knowledge
+release and runs the smoke check; `docs/ARCHIL.md` records the created resources and the
+operator credential step.
 
 ```bash
 python -m pip install -r requirements-local.txt   # ocrmypdf (preferred backend)

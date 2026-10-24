@@ -852,6 +852,10 @@ Four things about it are deliberate and easy to get wrong by hand:
   VA_LSE_EXTRACTOR_RUNNER="python scripts/archil_sandbox_runner.py {work}"
   ```
 
+  The disks, the knowledge release and the operator credential come from
+  `scripts/archil_setup.py` (`plan`, `upload-kb`, `mount`, `smoke`); `docs/ARCHIL.md`
+  records the resources it created and the credential step.
+
   That line works on a host that has no `python` on `PATH`. The runner is spawned as a
   subprocess, so the command is only as good as its first word — and macOS ships
   `python3` with no `python`, while Streamlit started from a virtualenv puts neither on
