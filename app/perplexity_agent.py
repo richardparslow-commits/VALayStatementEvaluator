@@ -594,6 +594,7 @@ def research(
     domains: list[str] | None = None,
     schema: dict[str, Any] | None = None,
     context_size: str = "medium",
+    preset: str | None = None,
 ) -> GroundedAnswer:
     """Run one web-grounded research request and return the answer plus its sources.
 
@@ -628,7 +629,8 @@ def research(
     # A preset supplies model, tools, and limits, and is the documented way to inherit
     # Perplexity's improvements without a code change. An explicit PERPLEXITY_MODEL
     # freezes the model while keeping the rest of the preset's configuration.
-    preset = configured_preset(settings)
+    chosen_preset = (preset or "").strip()
+    preset = chosen_preset if chosen_preset in PERPLEXITY_PRESETS else configured_preset(settings)
     request["preset"] = preset
     model_override = settings.perplexity_model.strip()
     if model_override:

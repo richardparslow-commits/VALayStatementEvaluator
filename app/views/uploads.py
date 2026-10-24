@@ -172,8 +172,8 @@ def _render_skip_summary(files: Any, documents: list[Any], skipped: list[str]) -
     """Show a loaded-vs-skipped summary under an uploader when any file failed."""
     if not files or not skipped:
         return
-    total = len(files)
     loaded = len(documents)
+    total = max(len(files), loaded + len(skipped))
     pilot.display(
         f"Loaded {loaded} of {total} file(s) — {len(skipped)} skipped (listed below)."
     , container=st, method="caption")

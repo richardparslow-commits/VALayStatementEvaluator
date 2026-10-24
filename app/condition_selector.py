@@ -155,7 +155,8 @@ def render_condition_selector(slot: str, feature_id: str) -> dict[str, Any]:
 
     st.markdown("##### Claimed condition")
     st.caption(
-        "Select the body system, then the specific condition(s), so the app can "          "pre-select the relevant topics from the lettered topic checklist."
+        "Select the body system, then the specific condition(s), so the app can "
+        "pre-select the relevant topics from the lettered topic checklist."
     )
 
     try:
@@ -216,7 +217,11 @@ def render_condition_selector(slot: str, feature_id: str) -> dict[str, Any]:
     conditions_pairs = [(body_system, condition) for condition in selected] if body_system else []
     preselected_topics, forced_topics = get_preselected_topics(conditions_pairs, aa_toggle)
 
+    adjust_key = f"cs_adjusted_topics_{slot}"
+    last_preselected_key = f"cs_last_preselected_{slot}"
     if not preselected_topics:
+        st.session_state.pop(last_preselected_key, None)
+        st.session_state.pop(adjust_key, None)
         return {
             "conditions": conditions_pairs,
             "aa_toggle": aa_toggle,
@@ -237,10 +242,17 @@ def render_condition_selector(slot: str, feature_id: str) -> dict[str, Any]:
                 + ", ".join(f"{topic} — {TOPIC_LABELS[topic]}" for topic in forced_topics)
             )
 
-        adjust_key = f"cs_adjusted_topics_{slot}"
+        if st.session_state.get(last_preselected_key) != preselected_topics:
+            st.session_state[last_preselected_key] = list(preselected_topics)
+            if adjust_key in st.session_state:
+                st.session_state[adjust_key] = [
+                    t for t in all_topics if t in set(preselected_topics) | set(forced_topics)
+                ]
         default_value = st.session_state.get(adjust_key, preselected_topics)
         # Keep forced topics present in the default even after manual edits.
         merged_default = [t for t in all_topics if t in set(default_value) | set(forced_topics)]
+        if adjust_key in st.session_state and set(forced_topics) - set(st.session_state[adjust_key]):
+            st.session_state[adjust_key] = merged_default
         adjusted = st.multiselect(
             "Adjust pre-selected topics",
             all_topics,

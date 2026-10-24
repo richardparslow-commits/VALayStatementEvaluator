@@ -142,19 +142,25 @@ def _dispatch(event: dict[str, Any]) -> None:
         "userId": _user_id,
         "sessionId": _session_id,
     }
-    thread = threading.Thread(target=_send, args=(payload,), daemon=True)
+    def _safe_send() -> None:
+        try:
+            _send(payload)
+        except Exception:  # noqa: BLE001 - daemon thread must never crash interpreter shutdown
+            logger.debug("telemetry send failed", exc_info=True)
+
+    thread = threading.Thread(target=_safe_send, daemon=True)
     thread.start()
 
 
 def _send(payload: dict[str, Any]) -> None:
-    from . import pilot
-    if pilot.enabled():
-        return
-    configured, _reason = _inspect_configured()
-    if not configured:
-        logger.debug("telemetry (mock, dropped): %s", payload.get("type"))
-        return
     try:
+        from . import pilot
+        if pilot.enabled():
+            return
+        configured, _reason = _inspect_configured()
+        if not configured:
+            logger.debug("telemetry (mock, dropped): %s", payload.get("type"))
+            return
         api_key = _env("AGILOOP_INSPECT_API_KEY")
         project_id = _env("AGILOOP_PROJECT_ID")
         base_url = _env("AGILOOP_INSPECT_URL") or DEFAULT_INSPECT_URL

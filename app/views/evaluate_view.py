@@ -145,9 +145,12 @@ def render_evaluate_tab() -> None:
     statement_text = ""
     statement_source = None
     if mode == "Paste text":
+        if "eval_paste" not in st.session_state and "_eval_paste_saved" in st.session_state:
+            st.session_state["eval_paste"] = st.session_state["_eval_paste_saved"]
         statement_text = st.text_area(
             "Paste the full lay/witness statement", height=260, key="eval_paste"
         )
+        st.session_state["_eval_paste_saved"] = statement_text
     else:
         files = st.file_uploader(
             "Upload the statement (PDF, TXT, MD, DOCX)",
@@ -184,11 +187,17 @@ def render_evaluate_tab() -> None:
     st.subheader("Step 2 — Provide the medical records")
     records = records_uploader("eval")
     if records:
-        total_pages = sum(len(d.pages) for d in records)
+        total_pages = sum(getattr(d, "source_page_count", len(getattr(d, "pages", []))) for d in records)
+        unreadable_pages = sum(getattr(d, "unreadable_count", 0) for d in records)
         pilot.display(
             f"Loaded {len(records)} record file(s), {total_pages:,} page(s): "
             + ", ".join(d.filename for d in records)
         , container=st, method="success")
+        if unreadable_pages:
+            pilot.display(
+                f"⚠️ {unreadable_pages:,} of {total_pages:,} page(s) had no extractable text "
+                "(blank or image-only scans) and will not be analyzed unless OCR is run."
+            , container=st, method="warning")
         if total_pages > 200:
             pilot.display(
                 "Large record set: chunks are digested in parallel with duplicate pages "
@@ -602,6 +611,9 @@ def _run_evaluation_flow(statement_text: str, records: list, witness: dict[str, 
     st.session_state.eval_result = result
     st.session_state.eval_usage = llm.usage
     st.session_state.eval_request_id = rid
+    st.session_state["eval_revised_statement"] = getattr(result, "revised_statement", "") or ""
+    st.session_state.pop("export_facts_files", None)
+    st.session_state.pop("export_facts_sig", None)
     if evaluation_is_complete(result):
         mark_follow_up_answers_consumed("eval")
     record_watchdog_run(llm.usage)
@@ -698,7 +710,10 @@ def _render_pdf_export(statement_text: str, *, entry_point: str) -> None:
             pass
         st.session_state[impression_key] = True
 
-    condition = audit_condition_for_slot(entry_point) or ""
+    slot_key = "eval" if entry_point in ("eval", "evaluate") else entry_point
+    eval_res = st.session_state.get("eval_result")
+    fallback_cond = str(getattr(eval_res, "claimed_condition", "") or "").strip() if eval_res is not None else ""
+    condition = audit_condition_for_slot(slot_key) or fallback_cond
     try:
         pdf_bytes = generate_statement_pdf(statement_text, condition, witness_role="")
     except Exception as exc:  # noqa: BLE001 - PDF generation is best-effort in the UI
@@ -883,7 +898,10 @@ def _render_fact_export_section(eval_result: Any) -> None:
             pass
         st.session_state[impression_key] = True
 
-    with st.expander("📑 Medical record digest — export fact citations", expanded=False):
+    has_exported_files = bool(st.session_state.get("export_facts_files")) or bool(
+        st.session_state.get("export_facts_expanded")
+    )
+    with st.expander("📑 Medical record digest — export fact citations", expanded=has_exported_files):
         pilot.display(
             f"{len(digest.facts):,} facts extracted from {digest.pages_reviewed:,} pages "
             f"({digest.chunks_reviewed} chunk(s), {digest.duplicates_skipped} duplicate "
@@ -901,8 +919,19 @@ def _render_fact_export_section(eval_result: Any) -> None:
             key="export_facts_only_positive",
         )
 
+        current_export_sig = (
+            _result_reference(),
+            len(digest.facts),
+            bool(only_rubric),
+            bool(only_positive),
+        )
+        if st.session_state.get("export_facts_sig") not in (None, current_export_sig):
+            st.session_state.pop("export_facts_files", None)
+
         rid = get_request_id() or "-"
         if st.button("📤 Export Facts", key="export_facts_button"):
+            st.session_state["export_facts_expanded"] = True
+            st.session_state["export_facts_sig"] = current_export_sig
             try:
                 track_interaction(
                     EXPORT_FACTS_FEATURE_ID,

@@ -79,9 +79,10 @@ class TestTelemetryEventShape(unittest.TestCase):
                 self.fail(f"track_feature_error must never raise, got: {exc}")
 
     def test_init_telemetry_is_idempotent(self):
-        telemetry.init_telemetry("user@example.com")
-        first_session = telemetry._session_id
-        telemetry.init_telemetry("user@example.com")
+        with patch.object(telemetry, "_dispatch"):
+            telemetry.init_telemetry("user@example.com")
+            first_session = telemetry._session_id
+            telemetry.init_telemetry("user@example.com")
         self.assertEqual(first_session, telemetry._session_id)
 
 

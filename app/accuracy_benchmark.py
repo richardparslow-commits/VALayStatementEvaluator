@@ -77,16 +77,18 @@ def source_snapshot(repo: Path) -> dict[str, Any]:
     require(not git("status", "--porcelain", "--untracked-files=all"),
             "Freeze a clean committed source revision first.")
     revision, tree = git("rev-parse", "HEAD"), git("rev-parse", "HEAD^{tree}")
-    names = git("ls-tree", "-r", "--name-only", "HEAD", "app", "requirements.lock").splitlines()
+    entries = git("ls-tree", "-r", "HEAD", "app", "requirements.lock").splitlines()
     fingerprints = {}
-    for name in names:
+    for entry in entries:
+        meta, _, name = entry.partition("\t")
+        parts = meta.split()
+        blob_sha1 = parts[2] if len(parts) >= 3 else ""
         if name.startswith("app/") or name == "requirements.lock":
             path = repo / name
             require(path.is_file() and not path.is_symlink(), "Source file is missing or linked.")
             raw = path.read_bytes()
-            committed = subprocess.check_output(["git", "-C", str(repo), "show", f"HEAD:{name}"],
-                                                stderr=subprocess.PIPE)
-            require(raw == committed, "Working source differs from the frozen Git objects.")
+            actual_sha1 = hashlib.sha1(f"blob {len(raw)}\0".encode() + raw).hexdigest()
+            require(actual_sha1 == blob_sha1, "Working source differs from the frozen Git objects.")
             fingerprints[name] = hashlib.sha256(raw).hexdigest()
     require(bool(fingerprints) and any(n.startswith("app/knowledge/") for n in fingerprints),
             "Application and knowledge snapshot required.")

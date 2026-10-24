@@ -124,6 +124,7 @@ def apply_step_answers(
     st.session_state[_step_key(prefix)] = min(
         int(st.session_state.get(_step_key(prefix), 0) or 0) + 1, len(_STEPS) - 1
     )
+    st.session_state[f"{prefix}_{KEY_PREFIX}expanded"] = True
     return store
 
 
@@ -132,6 +133,7 @@ def _goto_step(prefix: str, step: int) -> "Callable[[], None]":
 
     def _cb() -> None:
         st.session_state[_step_key(prefix)] = step
+        st.session_state[f"{prefix}_{KEY_PREFIX}expanded"] = True
 
     return _cb
 
@@ -150,7 +152,8 @@ def render_aa_intake_wizard(prefix: str, *, expanded: bool = False) -> None:
         if answered
         else "Aid & Attendance intake — 16 questions (optional, but they make the statement stronger)"
     )
-    with st.expander(pilot.text_label(label), expanded=expanded):
+    is_expanded = expanded or bool(st.session_state.get(f"{prefix}_{KEY_PREFIX}expanded")) or bool(answered)
+    with st.expander(pilot.text_label(label), expanded=is_expanded):
         pilot.display(_INTRO, container=st, method="caption")
 
         step_index = max(0, min(int(st.session_state.get(_step_key(prefix), 0) or 0), len(_STEPS) - 1))

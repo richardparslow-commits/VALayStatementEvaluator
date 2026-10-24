@@ -110,7 +110,7 @@ fi
 
 # Look for staged lines that assign an API key with a non-empty value.
 # Empty assignments (OPENAI_API_KEY=) are allowed — they carry no secret.
-if echo "$STAGED_DIFF_FOR_SECRETS" | grep -E -q '^\+\s*(OPENAI_API_KEY|FETCH_SANDBOX_API_KEY|AGILOOP_INSPECT_API_KEY|VA_GOV_API_BASE_URL|API_KEY)\s*=\s*[^[:space:]#]' 2>/dev/null; then
+if echo "$STAGED_DIFF_FOR_SECRETS" | grep -E -q '^\+\s*(OPENAI_API_KEY|PERPLEXITY_API|ARCHIL_API_KEY|VA_LSE_ARCHIL_TOKEN|ARCHIL_TOKEN|FETCH_SANDBOX_API_KEY|AGILOOP_INSPECT_API_KEY|VA_GOV_API_BASE_URL|API_KEY)\s*=\s*[^[:space:]#]' 2>/dev/null; then
   echo "✖  Blocked: staged diff contains an API key assignment (e.g. OPENAI_API_KEY=...)." >&2
   echo "   Use .env (git-ignored) or a secret store; never commit keys to tracked files." >&2
   FAIL=1

@@ -486,6 +486,11 @@ def _normalize_records_payload(payload: Any) -> VaGovFetchResult:
     for index, item in enumerate(items, start=1):
         documents.append(_normalize_record_item(item, index))
 
+    if partial and not error_message:
+        error_message = (
+            f"Incomplete VA.gov record set: retrieved {len(documents)} of "
+            f"{max(expected, len(documents))} expected record(s)."
+        )
     return VaGovFetchResult(
         documents=documents,
         retrieved=len(documents),

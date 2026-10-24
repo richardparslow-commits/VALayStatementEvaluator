@@ -496,6 +496,7 @@ def _run(
                 instructions=_instructions(structured, context=context),
                 domains=domains,
                 schema=schema,
+                preset=preset,
             )
         except Exception as exc:  # noqa: BLE001 - every failure path gets a reference
             _record_failure(exc, rid=rid, preset=preset, structured=structured)
@@ -589,9 +590,9 @@ def _render_last_result() -> None:
 
 def _render_answer(answer: GroundedAnswer) -> None:
     """Render prose, structured findings, and the sources — in that order."""
-    pilot.display(answer.text, container=st, method="markdown")
-
-    if answer.findings:
+    if not answer.findings:
+        pilot.display(answer.text, container=st, method="markdown")
+    else:
         _render_findings(answer.findings)
 
     if answer.citations:

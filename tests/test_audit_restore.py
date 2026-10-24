@@ -544,6 +544,85 @@ class TestRestore(_RestoreCase):
         self.assertTrue(forced.ok, forced.error)
         self.assertEqual((out_dir / "restored.jsonl").read_bytes(), first + second)
 
+    def test_forced_restore_with_throttled_object_preserves_prior_restoration_and_manifest(
+        self,
+    ) -> None:
+        """Regression (s7-forced-restore-throttled-object-replaces-restoration):
+        A forced restore that hits a download error (e.g. S3 503 SlowDown) must
+        not truncate the existing restored.jsonl or overwrite manifest.json.
+        """
+        first_five = b"".join(self.line(i) for i in range(5))
+        second_five = b"".join(self.line(i) for i in range(5, 10))
+        self.put_window(0, first_five)
+        second_key = self.put_window(len(first_five), second_five)
+
+        out_dir = self.root / "restored"
+        initial = audit_restore.restore_backup(self.dest(), target=out_dir)
+        self.assertTrue(initial.ok, initial.error)
+        stream_path = out_dir / "restored.jsonl"
+        manifest_path = out_dir / "manifest.json"
+        self.assertEqual(stream_path.read_bytes().count(b"\n"), 10)
+        manifest_before = manifest_path.read_text(encoding="utf-8")
+
+        real_get = audit_backup.FilesystemDestination.get_object
+
+        def throttled_get(inner_self: audit_backup.FilesystemDestination, key: str) -> bytes:
+            if key == second_key:
+                raise audit_backup.BackupError(
+                    f"could not download {key}: ClientError: An error occurred (SlowDown) "
+                    "when calling the GetObject operation (reached max retries: 4)"
+                )
+            return real_get(inner_self, key)
+
+        for verify_flag in (True, False):
+            with self.subTest(verify=verify_flag):
+                with mock.patch.object(
+                    audit_backup.FilesystemDestination, "get_object", throttled_get
+                ):
+                    forced = audit_restore.restore_backup(
+                        self.dest(), target=out_dir, verify=verify_flag, force=True
+                    )
+                self.assertFalse(forced.ok)
+                self.assertEqual(len(forced.skipped), 1)
+                self.assertEqual(stream_path.read_bytes(), first_five + second_five)
+                self.assertEqual(stream_path.read_bytes().count(b"\n"), 10)
+                self.assertEqual(manifest_path.read_text(encoding="utf-8"), manifest_before)
+
+    def test_restore_object_key_with_traversal_is_rejected_and_not_written(self) -> None:
+        """Regression (s5-restore-object-key-escapes-target):
+        An object key whose filename contains path separators or .. must be rejected
+        by parse_object_key and never write outside the restore target directory.
+        """
+        self.assertIsNone(
+            audit_restore.parse_object_key(
+                "audit/2026/10/24/rotated-../../escaped-10-0123456789ab.jsonl"
+            )
+        )
+        self.assertIsNone(
+            audit_restore.parse_object_key(
+                "audit/2026/10/24/live-../escaped-gaaaabbbbcccc-0-10-0123456789ab.jsonl"
+            )
+        )
+
+    def test_unverified_restore_against_unlistable_destination_fails(self) -> None:
+        """Regression (s1-unverified-restore-unlistable-bucket-reports-success):
+        restore_backup(..., verify=False) must fail when list_objects raises BackupError.
+        """
+        class Unlistable(audit_backup.BackupDestination):
+            name = "s3"
+
+            def list_objects(self, prefix: str = "") -> list[audit_backup.RemoteObject]:
+                raise audit_backup.BackupError("AccessDenied: ListObjectsV2 forbidden")
+
+            def describe(self) -> dict[str, object]:
+                return {"backend": "s3"}
+
+        out_dir = self.root / "restored_unverified"
+        report = audit_restore.restore_backup(Unlistable(), target=out_dir, verify=False)
+        self.assertFalse(report.ok)
+        self.assertIn("AccessDenied", report.error)
+        self.assertFalse((out_dir / "restored.jsonl").exists())
+
     def test_no_hash_restore_still_writes_the_rotated_snapshots(self) -> None:
         """Regression: skipping the downloads dropped the snapshots from the restore.
 

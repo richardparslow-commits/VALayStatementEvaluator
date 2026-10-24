@@ -62,21 +62,45 @@ def effective_credit_rates() -> tuple[dict[str, float | None], str]:
     effective blended rate learned by the watchdog (if it has enough data).
     Returns (rates_by_model, source_label).
     """
-    rates = {
-        config.DEFAULT_MODEL_MAIN: config.CREDITS_PER_1M_MAIN,
-        config.DEFAULT_MODEL_FAST: config.CREDITS_PER_1M_FAST,
-    }
-    if all(value is not None for value in rates.values()):
+    main_models = {config.DEFAULT_MODEL_MAIN}
+    fast_models = {config.DEFAULT_MODEL_FAST}
+    try:
+        cfg_settings = config.load_settings()
+        if cfg_settings.model_main:
+            main_models.add(cfg_settings.model_main)
+        if cfg_settings.model_fast:
+            fast_models.add(cfg_settings.model_fast)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        sess_settings = st.session_state.get("settings")
+        if sess_settings is not None:
+            if getattr(sess_settings, "model_main", ""):
+                main_models.add(sess_settings.model_main)
+            if getattr(sess_settings, "model_fast", ""):
+                fast_models.add(sess_settings.model_fast)
+    except Exception:  # noqa: BLE001
+        pass
+    rates: dict[str, float | None] = {}
+    for m in main_models:
+        rates[m] = config.CREDITS_PER_1M_MAIN
+    for m in fast_models:
+        rates.setdefault(m, config.CREDITS_PER_1M_FAST)
+        if m not in main_models:
+            rates[m] = config.CREDITS_PER_1M_FAST
+    if config.CREDITS_PER_1M_MAIN is not None and config.CREDITS_PER_1M_FAST is not None:
         return rates, "configured in .env"
     fit = watchdog.fit_effective_rate(load_usage_history())
     if fit.any_rate():  # pragma: no branch - guarded
         label = "estimated by the usage watchdog"
         # Fill only the rates missing from .env; never overwrite an explicit
         # value the user configured for one model.
-        if rates[config.DEFAULT_MODEL_MAIN] is None and fit.main_rate is not None:
-            rates[config.DEFAULT_MODEL_MAIN] = fit.main_rate
-        if rates[config.DEFAULT_MODEL_FAST] is None and fit.fast_rate is not None:
-            rates[config.DEFAULT_MODEL_FAST] = fit.fast_rate
+        for m in main_models:
+            if rates.get(m) is None and fit.main_rate is not None:
+                rates[m] = fit.main_rate
+        for m in fast_models:
+            if rates.get(m) is None and fit.fast_rate is not None:
+                rates[m] = fit.fast_rate
         return rates, label
     return rates, "entry"
 

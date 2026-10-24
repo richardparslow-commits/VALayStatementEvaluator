@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -103,6 +104,14 @@ class ObjectRef:
         return max(0, self.end - self.start)
 
 
+def _safe_restore_filename(filename: str) -> bool:
+    if not filename or filename in {".", ".."}:
+        return False
+    if "/" in filename or "\\" in filename or ".." in filename or "\x00" in filename:
+        return False
+    return Path(filename).name == filename
+
+
 def parse_object_key(key: str) -> ObjectRef | None:
     """Parse a backup object key, or return None when it is not one of ours.
 
@@ -112,6 +121,8 @@ def parse_object_key(key: str) -> ObjectRef | None:
     """
     match = _ROTATED_RE.match(key)
     if match:
+        if not _safe_restore_filename(match.group("filename")):
+            return None
         size = int(match.group("size"))
         return ObjectRef(
             key=key,
@@ -128,6 +139,8 @@ def parse_object_key(key: str) -> ObjectRef | None:
     # ``g<tag>`` segment into the filename), so the tagged pattern is tried first.
     match = _LIVE_RE.match(key)
     if match:
+        if not _safe_restore_filename(match.group("filename")):
+            return None
         start = int(match.group("start"))
         end = int(match.group("end"))
         return ObjectRef(
@@ -143,6 +156,8 @@ def parse_object_key(key: str) -> ObjectRef | None:
         )
     legacy = _LIVE_LEGACY_RE.match(key)
     if legacy:
+        if not _safe_restore_filename(legacy.group("filename")):
+            return None
         start = int(legacy.group("start"))
         end = int(legacy.group("end"))
         return ObjectRef(
@@ -700,51 +715,122 @@ def restore_backup(
         target=str(root), manifest_path=str(root / "manifest.json"), verify=report
     )
 
+    if report is not None and report.unreadable:
+        for unreadable_check in report.unreadable:
+            out.skipped.append({"key": unreadable_check.key, "reason": unreadable_check.error})
+        out.error = (
+            f"could not read {len(report.unreadable)} backup object(s); "
+            "existing restoration was left untouched"
+        )
+        out.manifest_path = ""
+        return out
+
     if report is not None:
         windows = report.plan.windows
         rotated_keys = [ref.key for ref in report.rotated_refs]
     else:
-        windows, rotated_keys = _list_for_restore(dest)
+        windows, rotated_keys, list_err = _list_for_restore_checked(dest)
+        if list_err:
+            out.error = list_err
+            out.manifest_path = ""
+            return out
 
     stream = root / "restored.jsonl"
+    tmp_stream = root / f".restored.jsonl.{os.getpid()}.tmp"
+    wrote_bytes = 0
+    wrote_lines = 0
+    included: list[str] = []
     try:
-        with stream.open("wb") as handle:
+        with tmp_stream.open("wb") as handle:
             for window in windows:
-                data = _read_for_restore(dest, window.key, out)
+                cached = (
+                    report.checks.get(window.key)
+                    if report is not None and report.hashed
+                    else None
+                )
+                if cached is not None and cached.data is not None:
+                    data: bytes | None = cached.data
+                else:
+                    data = _read_for_restore(dest, window.key, out)
                 if data is None:
                     continue
                 handle.write(data)
-                out.wrote_bytes += len(data)
-                out.wrote_lines += data.count(b"\n")
-                out.included.append(window.key)
+                wrote_bytes += len(data)
+                wrote_lines += data.count(b"\n")
+                included.append(window.key)
     except OSError as exc:
+        tmp_stream.unlink(missing_ok=True)
         out.error = f"could not write {stream}: {exc}"
+        out.manifest_path = ""
         return out
-    out.stream_path = str(stream)
 
     rotated_dir = root / "rotated"
+    staged_rotated: list[tuple[Path, Path, str]] = []
     for key in rotated_keys:
         ref = parse_object_key(key)
-        data = _read_for_restore(dest, key, out)
+        cached_rot = (
+            report.checks.get(key)
+            if report is not None and report.hashed
+            else None
+        )
+        if cached_rot is not None and cached_rot.data is not None:
+            data = cached_rot.data
+        else:
+            data = _read_for_restore(dest, key, out)
         if data is None or ref is None:
             continue
         # Named by content so two snapshots of one filename (before and after it
         # rotated) cannot overwrite each other in the restored output.
         path = rotated_dir / f"{ref.filename}-{ref.size}-{ref.sha12}.jsonl"
+        tmp_rot = rotated_dir / f".{ref.filename}-{ref.size}-{ref.sha12}.{os.getpid()}.tmp"
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(data)
+            tmp_rot.write_bytes(data)
         except OSError as exc:
+            tmp_rot.unlink(missing_ok=True)
             out.skipped.append({"key": key, "reason": str(exc)})
             continue
-        out.rotated_paths.append(str(path))
-        out.included.append(key)
+        staged_rotated.append((tmp_rot, path, key))
+
+    if out.skipped:
+        tmp_stream.unlink(missing_ok=True)
+        for tmp_rot, _final_path, _key in staged_rotated:
+            tmp_rot.unlink(missing_ok=True)
+        out.error = (
+            f"could not read {len(out.skipped)} backup object(s); "
+            "existing restoration was left untouched"
+        )
+        out.manifest_path = ""
+        return out
 
     try:
-        (root / "manifest.json").write_text(
+        os.replace(tmp_stream, stream)
+        for tmp_rot, final_path, key in staged_rotated:
+            os.replace(tmp_rot, final_path)
+            out.rotated_paths.append(str(final_path))
+            included.append(key)
+    except OSError as exc:
+        tmp_stream.unlink(missing_ok=True)
+        for tmp_rot, _final_path, _key in staged_rotated:
+            tmp_rot.unlink(missing_ok=True)
+        out.error = f"could not finalize {stream}: {exc}"
+        out.manifest_path = ""
+        return out
+
+    out.wrote_bytes = wrote_bytes
+    out.wrote_lines = wrote_lines
+    out.included = included
+    out.stream_path = str(stream)
+
+    manifest_file = root / "manifest.json"
+    tmp_manifest = root / f".manifest.json.{os.getpid()}.tmp"
+    try:
+        tmp_manifest.write_text(
             json.dumps(out.to_json(), indent=2, sort_keys=True), encoding="utf-8"
         )
+        os.replace(tmp_manifest, manifest_file)
     except OSError as exc:
+        tmp_manifest.unlink(missing_ok=True)
         logger.warning("could not write restore manifest: %s", exc)
         out.manifest_path = ""
     return out
@@ -760,9 +846,9 @@ def _read_for_restore(
         return None
 
 
-def _list_for_restore(
+def _list_for_restore_checked(
     destination: BackupDestination,
-) -> tuple[list[ObjectRef], list[str]]:
+) -> tuple[list[ObjectRef], list[str], str]:
     """Planless path used by ``verify=False``: order by upload time alone."""
     refs: list[ObjectRef] = []
     rotated: list[str] = []
@@ -770,7 +856,7 @@ def _list_for_restore(
         listed = destination.list_objects("")
     except (BackupError, OSError) as exc:
         logger.warning("could not list the destination: %s", exc)
-        return [], []
+        return [], [], f"{type(exc).__name__}: {exc}"
     for obj in listed:
         ref = parse_object_key(obj.key)
         if ref is None:
@@ -781,7 +867,15 @@ def _list_for_restore(
         else:
             refs.append(ref)
     plan = plan_stream(refs)
-    return plan.windows, rotated
+    return plan.windows, rotated, ""
+
+
+def _list_for_restore(
+    destination: BackupDestination,
+) -> tuple[list[ObjectRef], list[str]]:
+    windows, rotated, _ = _list_for_restore_checked(destination)
+    return windows, rotated
+
 
 
 # ------------------------------------------------------------------- rendering

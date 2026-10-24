@@ -191,6 +191,7 @@ HOSTILE_ENVIRONMENT: dict[str, str] = {
     "VA_GOV_API_BASE_URL": "https://hostile.invalid",
     "VA_GOV_MAX_RESPONSE_BYTES": "16",
     "VA_LSE_ALLOW_LOCAL_PATHS": "0",
+    "VA_LSE_KNOWLEDGE_DIR": "/tmp/va-lse-hostile-knowledge",
     "AZURE_STORAGE_CONNECTION_STRING": "hostile-azure-connection-string",
 }
 

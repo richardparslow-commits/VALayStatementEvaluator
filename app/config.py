@@ -435,11 +435,21 @@ def _perplexity_preset_setting(from_secrets: set[str]) -> str:
 def load_knowledge(name: str) -> str:
     """Read a knowledge-base markdown file by file name."""
     # Resolve at call time so mounted reference releases can be configured by env.
-    root = Path(os.getenv("VA_LSE_KNOWLEDGE_DIR", "").strip() or KNOWLEDGE_DIR)
-    if Path(name).name != name or name in {"", ".", ".."}:
+    override = os.getenv("VA_LSE_KNOWLEDGE_DIR", "").strip()
+    if override and os.getenv("VA_LSE_MODE", "synthetic").strip().lower() == "controlled-pilot":
+        raise ValueError("VA_LSE_KNOWLEDGE_DIR is not permitted in controlled-pilot mode")
+    root = Path(override) if override else KNOWLEDGE_DIR
+    if (
+        "/" in name
+        or "\\" in name
+        or Path(name).name != name
+        or name in {"", ".", ".."}
+    ):
         raise ValueError("Knowledge name must be a single file name")
     path = root / name
-    if not path.exists():
+    if root.is_symlink() or path.is_symlink():
+        raise ValueError("Knowledge symlinks are not accepted")
+    if not path.is_file():
         raise FileNotFoundError(f"Knowledge file missing: {path}")
     return path.read_text(encoding="utf-8")
 

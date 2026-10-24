@@ -222,11 +222,17 @@ def render_draft_tab() -> None:
     st.subheader("Step 1 — Upload the veteran's medical records")
     records = records_uploader("draft")
     if records:
-        total_pages = sum(len(d.pages) for d in records)
+        total_pages = sum(getattr(d, "source_page_count", len(getattr(d, "pages", []))) for d in records)
+        unreadable_pages = sum(getattr(d, "unreadable_count", 0) for d in records)
         pilot.display(
             f"Loaded {len(records)} record file(s), {total_pages:,} page(s): "
             + ", ".join(d.filename for d in records)
         , container=st, method="success")
+        if unreadable_pages:
+            pilot.display(
+                f"⚠️ {unreadable_pages:,} of {total_pages:,} page(s) had no extractable text "
+                "(blank or image-only scans) and will not be analyzed unless OCR is run."
+            , container=st, method="warning")
         if total_pages > 200:
             pilot.display(
                 "Large record set: chunks are digested in parallel with duplicate pages "
@@ -238,10 +244,15 @@ def render_draft_tab() -> None:
     st.subheader("Step 2 — Claim details")
     col1, col2 = st.columns(2)
     veteran_name = col1.text_input("Veteran's name", key="draft_vet_name")
+    selector_condition = audit_condition_for_slot("draft")
+    if selector_condition and not str(st.session_state.get("draft_condition", "") or "").strip():
+        st.session_state["draft_condition"] = selector_condition
     condition = col2.text_input(
         "Condition the statement supports (e.g., PTSD, lumbar strain, tinnitus)",
         key="draft_condition",
     )
+    if not condition.strip() and selector_condition:
+        condition = selector_condition
     col3, col4 = st.columns(2)
     claim_type = col3.selectbox("Claim type", CLAIM_TYPES, key="draft_claim_type")
     relationship = col4.selectbox("Witness relationship", RELATIONSHIPS, key="draft_rel")
@@ -735,6 +746,8 @@ def _finish_draft_run(
     st.session_state.draft_result = result
     st.session_state.draft_usage = llm.usage
     st.session_state.draft_request_id = rid
+    st.session_state["draft_edited"] = getattr(result, "output_statement", "") or ""
+    st.session_state.pop("draft_show_full_timeline", None)
     mark_follow_up_answers_consumed("draft")
     record_watchdog_run(llm.usage)
 
@@ -756,7 +769,7 @@ def _render_pdf_export(statement_text: str) -> None:
             pass
         st.session_state[impression_key] = True
 
-    condition = str(st.session_state.get("draft_condition", "") or "")
+    condition = str(st.session_state.get("draft_condition", "") or "").strip() or audit_condition_for_slot("draft")
     witness_role = str(st.session_state.get("draft_rel", "") or "")
     try:
         pdf_bytes = generate_statement_pdf(statement_text, condition, witness_role)
@@ -884,11 +897,12 @@ def _render_draft_results(draft_result: Any) -> None:
         # Add timeline tab
         timeline_tab, _ = st.columns([1, 3])
         with timeline_tab:
-            if st.button("🗓️ Open Full Timeline", type="secondary"):
-                # Store digest in session state for the timeline tab
+            if st.button("🗓️ Open Full Timeline", type="secondary", key="draft_open_full_timeline"):
                 st.session_state.timeline_digest = draft_result.digest
-                st.switch_page("/timeline")
+                st.session_state["draft_show_full_timeline"] = True
 
-        # Compact inline timeline preview
-        from .timeline import render_timeline_in_results
-        render_timeline_in_results(draft_result.digest)
+        from .timeline import render_timeline_in_results, render_timeline_tab
+        if st.session_state.get("draft_show_full_timeline"):
+            render_timeline_tab(draft_result.digest)
+        else:
+            render_timeline_in_results(draft_result.digest)
