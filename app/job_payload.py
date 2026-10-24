@@ -34,8 +34,11 @@ from .queue_policy import require_synthetic_queue, synthetic_mode, synthetic_que
 from .blob_store import BlobRef, BlobStore, BlobStoreError, dumps_documents, loads_documents
 from .documents import (DOCUMENT_SCHEMA_VERSION, DocumentPage, ExtractedDocument,
                         ExtractionError, validate_source_spans)
-from .draft import DraftResult
-from .evaluate import EvaluationResult, compute_effectiveness_score, evaluation_report_markdown
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .draft import DraftResult
+    from .evaluate import EvaluationResult
 from .evaluation_topics import TOPIC_POLICY, TopicValidationError, normalize_topics, topics_are_complete, evaluation_is_complete, topic_notice
 from .rubric_validation import RUBRIC_POLICY, RubricValidationError, normalize_rubric, rubric_is_complete
 from .medical_review import MedicalDigest, MedicalFact
@@ -282,6 +285,7 @@ def digest_from_json(raw: Any) -> MedicalDigest | None:
 
 # ---------------------------------------------------------------- results
 def evaluation_to_json(result: EvaluationResult) -> dict[str, Any]:
+    from .evaluate import compute_effectiveness_score, evaluation_report_markdown
     complete = rubric_is_complete(result)
     topics_complete = topics_are_complete(result)
     all_complete = evaluation_is_complete(result)
@@ -337,6 +341,7 @@ def evaluation_to_json(result: EvaluationResult) -> dict[str, Any]:
 
 
 def evaluation_from_json(raw: Any) -> EvaluationResult:
+    from .evaluate import EvaluationResult, compute_effectiveness_score
     data = _as_dict(raw)
     result = EvaluationResult(
         factual_inputs=_as_dict(data.get("factual_inputs")),
@@ -424,6 +429,7 @@ def draft_to_json(result: DraftResult) -> dict[str, Any]:
 
 
 def draft_from_json(raw: Any) -> DraftResult:
+    from .draft import DraftResult
     data = _as_dict(raw)
     result = DraftResult(
         factual_inputs=_as_dict(data.get("factual_inputs")),
@@ -702,6 +708,8 @@ def _documents_from_ref(raw: Any, blob_store: BlobStore | None) -> list[Extracte
 
 @synthetic_queue
 def encode_result(run: RunResult) -> str:
+    from .draft import DraftResult
+    from .evaluate import EvaluationResult
     """Encode a finished run for the queue (best-effort — never loses the run)."""
     body: dict[str, Any] = {
         "version": PAYLOAD_VERSION,

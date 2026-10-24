@@ -264,17 +264,15 @@ def fit_effective_rate(history: UsageHistory) -> FitResult:
     elif result.main_rate == result.fast_rate:
         result.multiline_note = (
             f"Fitted from {result.observed_tokens:,} tokens and "
-            f"{result.observed_credits:,.0f} credits across {
-                result.intervals
-            } intervals, but the data couldn't separate the two models "
+            f"{result.observed_credits:,.0f} credits across "
+            f"{result.intervals} intervals, but the data couldn't separate the two models "
             "(same rate applied to both). Add runs where main and fast mix "
             "differs to split them."
         )
     else:
         result.multiline_note = (
             f"Fitted from {result.observed_tokens:,} tokens and "
-            f"{result.observed_credits:,.0f} credits across {
-                result.intervals
-            } intervals for two separate model rates."
+            f"{result.observed_credits:,.0f} credits across "
+            f"{result.intervals} intervals for two separate model rates."
         )
     return result

@@ -169,12 +169,12 @@ def is_active() -> bool:
 
 def unavailable_reason() -> str:
     """Why tracing is not active — for ``/health`` and the ops panel."""
-    if _IMPORT_ERROR is not None:
-        return f"opentelemetry packages not importable ({_IMPORT_ERROR}); install requirements-otel.txt"
     if not config.TRACING_ENABLED:
         return "disabled (set VA_LSE_TRACING=1 to enable)"
     if os.getenv("OTEL_SDK_DISABLED", "").strip().lower() in ("1", "true", "yes", "on"):
         return "disabled by OTEL_SDK_DISABLED"
+    if _IMPORT_ERROR is not None:
+        return f"opentelemetry packages not importable ({_IMPORT_ERROR}); install requirements-otel.txt"
     if _setup_error:
         return f"setup failed: {_setup_error}"
     if _provider is None:

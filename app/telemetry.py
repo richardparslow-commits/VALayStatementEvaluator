@@ -109,13 +109,14 @@ def track_interaction(feature_id: str, metadata: dict[str, Any] | None = None) -
 
 def track_feature_error(feature_id: str, error: BaseException, **metadata: Any) -> None:
     """Track a feature-scoped error. Never raises."""
-    payload_metadata: dict[str, Any] = {"errorMessage": str(error), **metadata}
+    # Never forward raw str(error), which can embed record or statement fragments.
+    payload_metadata: dict[str, Any] = {"errorMessage": type(error).__name__, **metadata}
     _dispatch({"type": "feature.error", "featureId": feature_id, "metadata": payload_metadata})
 
 
 def track_app_error(error: BaseException) -> None:
     """Track an app-level (root error boundary) error. Never raises."""
-    _dispatch({"type": "app.error", "metadata": {"errorMessage": str(error)}})
+    _dispatch({"type": "app.error", "metadata": {"errorMessage": type(error).__name__}})
 
 
 def track_goal(goal_description: str, feature_id: str | None = None) -> None:

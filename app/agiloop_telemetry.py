@@ -23,7 +23,16 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-import streamlit as st
+try:
+    import streamlit as st
+except ImportError:  # pragma: no cover - headless worker/sandbox without streamlit
+    class _HeadlessSessionState(dict):  # type: ignore[type-arg]
+        pass
+
+    class _HeadlessStreamlit:
+        session_state = _HeadlessSessionState()
+
+    st = _HeadlessStreamlit()  # type: ignore[assignment]
 
 from . import telemetry_proxy
 

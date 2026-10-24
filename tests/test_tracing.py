@@ -255,9 +255,8 @@ class TestErrors(unittest.TestCase):
         self.addCleanup(tracing.reset_tracing_for_tests)
 
     def test_failure_marks_the_span_and_still_propagates(self) -> None:
-        from opentelemetry.trace import StatusCode
-
         with _tracing_on() as exporter:
+            from opentelemetry.trace import StatusCode
             with self.assertRaises(ValueError):
                 with tracing.phase_span("claims"):
                     raise ValueError("model returned junk")
@@ -268,6 +267,8 @@ class TestErrors(unittest.TestCase):
         self.assertEqual(_attrs(span)["error.class"], "ValueError")
 
     def test_setup_failure_degrades_to_no_op(self) -> None:
+        if _in_memory_exporter() is None:
+            self.skipTest("opentelemetry-sdk is not installed")
         with (
             patch.object(config, "TRACING_ENABLED", True),
             patch.dict(os.environ, {"OTEL_SDK_DISABLED": ""}),

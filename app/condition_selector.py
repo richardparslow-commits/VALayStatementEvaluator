@@ -16,7 +16,10 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-import streamlit as st
+try:
+    import streamlit as st
+except ImportError:  # pragma: no cover - headless worker/sandbox without streamlit
+    st = None  # type: ignore[assignment]
 
 from .agiloop_telemetry import track_feature_error, track_goal, track_impression, track_interaction
 

@@ -9,7 +9,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tests import hermetic  # noqa: E402,F401  (hermetic test session; see tests/hermetic.py)
 
 from app import config, job_queue
-import test_job_queue as queue_tests
+try:
+    from tests import test_job_queue as queue_tests
+except ImportError:
+    import test_job_queue as queue_tests  # type: ignore[no-redef]
 
 
 def interrupted_script(index, after):

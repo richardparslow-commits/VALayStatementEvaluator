@@ -106,6 +106,10 @@ class TestLazySdkImport(unittest.TestCase):
         self.assertIn("openai_loaded= False", proc.stdout)
 
     def test_first_use_loads_the_sdk_and_caches_the_name(self) -> None:
+        try:
+            import openai  # noqa: F401
+        except ModuleNotFoundError:
+            self.skipTest("openai is not installed")
         import subprocess
 
         code = (
@@ -142,7 +146,10 @@ class TestLazySdkImport(unittest.TestCase):
     def test_not_given_sentinel_is_the_sdk_object(self) -> None:
         """NOT_GIVEN comparisons at runtime must see the SDK's real sentinel,
         or a timeout would be silently dropped from every request."""
-        import openai
+        try:
+            import openai
+        except ModuleNotFoundError:
+            self.skipTest("openai is not installed")
 
         self.assertIs(app_llm.NOT_GIVEN, openai.NOT_GIVEN)
 
