@@ -213,6 +213,27 @@ class TestSubmitAndPoll(unittest.TestCase):
         self.assertEqual(outcome.error_class, "LLMError")
         self.assertNotIn("va_lse_pending_job_eval", st.session_state)
 
+    def test_in_flight_rejection_keeps_its_warning_box_in_this_session(self):
+        backend = _PresetBackend(finish=False)
+        record = backend.enqueue(
+            KIND_EVALUATE, encode_job(KIND_EVALUATE, _job()), owner_id=pilot.current_owner()
+        )
+        st.session_state["va_lse_pending_job_eval"] = record.job_id
+        st.session_state[job_runner._pending_input_key("eval")] = job_runner._job_input_signature(
+            KIND_EVALUATE, _job()
+        )
+
+        with patch.object(job_runner, "get_job_backend", return_value=backend), patch.object(
+            config, "JOB_QUEUE_UI_POLL_SECONDS", 0.01
+        ):
+            outcome = self._submit(backend)
+
+        self.assertIsNone(outcome)
+        # The placeholder must belong to this session: a module-level registry would
+        # let another browser session clear this warning out from under the user.
+        self.assertIn(job_runner._warn_box_key("eval"), st.session_state)
+        self.assertEqual(st.session_state.get("va_lse_pending_job_eval"), record.job_id)
+
     def test_expired_result_is_explained_not_crashed(self):
         backend = _PresetBackend()
         original = backend.get_result
@@ -420,6 +441,21 @@ class TestResume(unittest.TestCase):
             job_runner.resume_pending_job("eval", action_label="Evaluation")
 
         self.assertEqual(st.session_state.get("va_lse_pending_job_eval"), record.job_id)
+
+    def test_in_flight_resume_consumes_the_sessions_warning_box(self):
+        backend = _PresetBackend(finish=False)
+        record = backend.enqueue(
+            KIND_EVALUATE, encode_job(KIND_EVALUATE, _job()), owner_id=pilot.current_owner()
+        )
+        st.session_state["va_lse_pending_job_eval"] = record.job_id
+        st.session_state[job_runner._warn_box_key("eval")] = MagicMock()
+
+        with patch.object(config, "JOB_QUEUE_ENABLED", True), patch.object(
+            job_runner, "get_job_backend", return_value=backend
+        ), patch.object(job_runner.st, "button", return_value=False):
+            job_runner.resume_pending_job("eval", action_label="Evaluation")
+
+        self.assertNotIn(job_runner._warn_box_key("eval"), st.session_state)
 
     def test_status_lookup_failure_never_breaks_the_tab(self):
         st.session_state["va_lse_pending_job_eval"] = "job_x"
