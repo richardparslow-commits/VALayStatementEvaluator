@@ -8,6 +8,9 @@ from unittest.mock import MagicMock, patch
 from concurrent.futures import ThreadPoolExecutor
 
 from tests import hermetic  # noqa: F401
+
+import streamlit as st  # noqa: E402
+
 from app import config, job_queue
 from app.job_queue import JobQueueError
 
@@ -384,6 +387,42 @@ class TestBrowserSubmissionRetry(unittest.TestCase):
                     backend.claim(['evaluate'], worker_id='worker')
                     fresh, payload = backend.claim(['evaluate'], worker_id='worker')
                     self.assertEqual((fresh.request_id, payload), ('new-reference', _submission_payload('changed payload')))
+
+    def test_queued_run_snapshots_citations_at_submission_time(self):
+        from app.documents import document_from_text
+        from app.views import evaluate_view, job_runner
+        doc = document_from_text('visit.txt', 'Knee pain noted in 2014.')
+        captured: dict = {}
+
+        def capture(**kwargs):  # noqa: ANN003, ANN202
+            captured['job'] = kwargs['job']
+            return job_runner.QueueOutcome(ok=False)
+
+        st.session_state['citation_index'] = [
+            {'source': 'visit.txt p.1', 'excerpt': 'Knee pain noted in 2014.'},
+            {'source': 'removed.pdf p.2', 'excerpt': 'Knee pain noted in 2014.'},
+        ]
+        self.addCleanup(st.session_state.pop, 'citation_index', None)
+        with patch.object(evaluate_view, 'check_shutdown_gate', return_value=True), \
+                patch.object(evaluate_view, 'audit_record_meta', return_value=(['Upload'], 1, 1)), \
+                patch.object(evaluate_view, 'audit_condition_for_slot', return_value=None), \
+                patch.object(evaluate_view, 'run_log_event'), \
+                patch.object(job_runner, 'worker_config_error', return_value=''), \
+                patch.object(job_runner, 'submit_job', side_effect=capture):
+            evaluate_view._run_evaluation_queued('My knee has hurt since 2014.', [doc], {})
+
+        job = captured['job']
+        # The snapshot is filtered against the records being evaluated, at the moment
+        # the user submits — not when the worker eventually picks the job up.
+        self.assertEqual(
+            job.citations,
+            [{'source': 'visit.txt p.1', 'excerpt': 'Knee pain noted in 2014.'}],
+        )
+        # A citation exported while the run waits must not join the submitted job.
+        st.session_state['citation_index'].append(
+            {'source': 'visit.txt p.1', 'excerpt': 'Knee pain noted in 2014.'}
+        )
+        self.assertEqual(len(job.citations), 1)
 
     def test_completed_callers_show_the_confirmed_reference(self):
         from app.views import job_runner, evaluate_view, draft_view
