@@ -713,28 +713,51 @@ def restore_backup(
                 ),
                 verify=report,
             )
-        try:
-            lock_fd = os.open(
-                str(claim_lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
-            )
-            os.close(lock_fd)
-            claimed_lock = True
-        except FileExistsError:
-            return RestoreReport(
-                target=str(root),
-                refused=True,
-                error=(
-                    f"{root / 'restored.jsonl'} already exists; pass --force to replace it, "
-                    "or restore into an empty directory"
-                ),
-                verify=report,
-            )
-        except OSError as exc:
-            return RestoreReport(
-                target=str(root),
-                error=f"could not create {claim_lock}: {exc}",
-                verify=report,
-            )
+        for _lock_attempt in range(2):
+            try:
+                lock_fd = os.open(
+                    str(claim_lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+                )
+                try:
+                    os.write(lock_fd, f"{os.getpid()}\n".encode("ascii"))
+                finally:
+                    os.close(lock_fd)
+                claimed_lock = True
+                break
+            except FileExistsError:
+                stale_lock = False
+                try:
+                    raw_pid = claim_lock.read_text(encoding="utf-8", errors="ignore").strip()
+                    if raw_pid.isdigit():
+                        pid_val = int(raw_pid)
+                        if pid_val > 0 and pid_val != os.getpid():
+                            try:
+                                os.kill(pid_val, 0)
+                            except ProcessLookupError:
+                                stale_lock = True
+                            except PermissionError:
+                                stale_lock = False
+                except OSError:
+                    stale_lock = False
+                if stale_lock and _lock_attempt == 0 and not (root / "restored.jsonl").exists():
+                    claim_lock.unlink(missing_ok=True)
+                    continue
+                return RestoreReport(
+                    target=str(root),
+                    refused=True,
+                    error=(
+                        f"an earlier restore was interrupted or is in progress ({claim_lock}); "
+                        f"if {root / 'restored.jsonl'} already exists, pass --force to replace it "
+                        f"or remove {claim_lock}"
+                    ),
+                    verify=report,
+                )
+            except OSError as exc:
+                return RestoreReport(
+                    target=str(root),
+                    error=f"could not create {claim_lock}: {exc}",
+                    verify=report,
+                )
         if (root / "restored.jsonl").exists():
             claim_lock.unlink(missing_ok=True)
             return RestoreReport(
@@ -841,52 +864,6 @@ def restore_backup(
             return out
 
         manifest_file = root / "manifest.json"
-        prev_stream_bytes = (
-            stream.read_bytes() if stream.exists() and stream.is_file() else None
-        )
-        prev_manifest_bytes = (
-            manifest_file.read_bytes()
-            if manifest_file.exists() and manifest_file.is_file()
-            else None
-        )
-        prev_rotated: dict[Path, bytes] = {}
-        if rotated_dir.exists() and rotated_dir.is_dir():
-            for entry in rotated_dir.iterdir():
-                if entry.is_file() and not entry.name.startswith("."):
-                    try:
-                        prev_rotated[entry] = entry.read_bytes()
-                    except OSError:
-                        pass
-
-        def _rollback_finalization() -> None:
-            if prev_stream_bytes is not None:
-                try:
-                    stream.write_bytes(prev_stream_bytes)
-                except OSError:
-                    pass
-            elif stream.exists() and stream.is_file():
-                stream.unlink(missing_ok=True)
-            if prev_manifest_bytes is not None:
-                try:
-                    manifest_file.write_bytes(prev_manifest_bytes)
-                except OSError:
-                    pass
-            elif manifest_file.exists() and manifest_file.is_file():
-                manifest_file.unlink(missing_ok=True)
-            if rotated_dir.exists() and rotated_dir.is_dir():
-                for _t, final_path, _k in staged_rotated:
-                    if (
-                        final_path not in prev_rotated
-                        and final_path.exists()
-                        and final_path.is_file()
-                    ):
-                        final_path.unlink(missing_ok=True)
-                for old_path, old_bytes in prev_rotated.items():
-                    try:
-                        old_path.write_bytes(old_bytes)
-                    except OSError:
-                        pass
-
         if not force:
             # Atomic exclusive creation of restored.jsonl when not --force so concurrent
             # callers that raced before or during _load_objects cannot both succeed.
@@ -907,16 +884,69 @@ def restore_backup(
                 out.manifest_path = ""
                 return out
 
+        pid = os.getpid()
+        backup_stream = root / f".restored.jsonl.{pid}.bak"
+        backup_manifest = root / f".manifest.json.{pid}.bak"
+        had_prev_stream = False
+        had_prev_manifest = False
+        moved_rotated: list[tuple[Path, Path]] = []
+        placed_rotated: list[Path] = []
+        new_rotated_set = {final_path for _t, final_path, _k in staged_rotated}
+
+        def _cleanup_backups() -> None:
+            backup_stream.unlink(missing_ok=True)
+            backup_manifest.unlink(missing_ok=True)
+            for bak_rot, _orig in moved_rotated:
+                bak_rot.unlink(missing_ok=True)
+
+        def _rollback_finalization() -> None:
+            for placed in placed_rotated:
+                if placed.exists() and placed.is_file():
+                    placed.unlink(missing_ok=True)
+            for bak_rot, orig_path in moved_rotated:
+                if bak_rot.exists():
+                    try:
+                        os.replace(bak_rot, orig_path)
+                    except OSError:
+                        pass
+            if had_prev_stream and backup_stream.exists():
+                try:
+                    os.replace(backup_stream, stream)
+                except OSError:
+                    pass
+            elif stream.exists() and stream.is_file():
+                stream.unlink(missing_ok=True)
+            if had_prev_manifest and backup_manifest.exists():
+                try:
+                    os.replace(backup_manifest, manifest_file)
+                except OSError:
+                    pass
+            elif not had_prev_manifest and manifest_file.exists() and manifest_file.is_file():
+                manifest_file.unlink(missing_ok=True)
+            _cleanup_backups()
+
         try:
-            new_rotated_set = {final_path for _t, final_path, _k in staged_rotated}
+            if force and stream.exists() and stream.is_file():
+                os.replace(stream, backup_stream)
+                had_prev_stream = True
+            if manifest_file.exists() and manifest_file.is_file():
+                os.replace(manifest_file, backup_manifest)
+                had_prev_manifest = True
+            if rotated_dir.exists() and rotated_dir.is_dir():
+                for entry in list(rotated_dir.iterdir()):
+                    if (
+                        entry.is_file()
+                        and not entry.name.startswith(".")
+                        and (force or entry in new_rotated_set)
+                    ):
+                        bak_rot = rotated_dir / f".{entry.name}.{pid}.bak"
+                        os.replace(entry, bak_rot)
+                        moved_rotated.append((bak_rot, entry))
             for tmp_rot, final_path, key in staged_rotated:
                 os.replace(tmp_rot, final_path)
+                placed_rotated.append(final_path)
                 out.rotated_paths.append(str(final_path))
                 included.append(key)
-            if force and rotated_dir.exists() and rotated_dir.is_dir():
-                for old_path in list(prev_rotated):
-                    if old_path not in new_rotated_set and old_path.exists():
-                        old_path.unlink()
             os.replace(tmp_stream, stream)
         except OSError as exc:
             tmp_stream.unlink(missing_ok=True)
@@ -933,7 +963,7 @@ def restore_backup(
         out.included = included
         out.stream_path = str(stream)
 
-        tmp_manifest = root / f".manifest.json.{os.getpid()}.tmp"
+        tmp_manifest = root / f".manifest.json.{pid}.tmp"
         try:
             tmp_manifest.write_text(
                 json.dumps(out.to_json(), indent=2, sort_keys=True), encoding="utf-8"
@@ -950,8 +980,13 @@ def restore_backup(
             out.stream_path = ""
             out.manifest_path = ""
             out.error = f"could not write {manifest_file}: {exc}"
+            return out
+
+        _cleanup_backups()
         return out
     finally:
+        # Only a lock this run created may be removed: a --force run never claims
+        # one, and unlinking here would release a concurrent restore's live lock.
         if claimed_lock:
             claim_lock.unlink(missing_ok=True)
 

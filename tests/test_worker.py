@@ -34,6 +34,7 @@ from app.job_payload import (  # noqa: E402
     KIND_EVALUATE,
     DraftJob,
     EvaluateJob,
+    decode_job,
     decode_result,
     encode_job,
 )
@@ -647,6 +648,26 @@ class TestWorkerCli(_WorkerCase):
             code = worker.main(["--once"])
         self.assertEqual(code, 0)
         self.assertEqual(self.backend.depth(), 1)
+
+    def test_evaluate_job_payload_round_trips_submitted_citations(self):
+        # The web pod snapshots the citation index; the worker must receive the same
+        # rows, or the queued report loses every source the user had collected.
+        doc = document_from_text("str.pdf", "Service treatment record: chronic right knee pain noted in 2018.")
+        citations = [
+            {
+                "source": "str.pdf p.1",
+                "excerpt": "Service treatment record: chronic right knee pain noted in 2018.",
+            }
+        ]
+        job = EvaluateJob(
+            request_id="req_cit",
+            statement_text="My right knee has hurt since 2018.",
+            records=[doc],
+            citations=citations,
+        )
+        decoded_job = decode_job(KIND_EVALUATE, encode_job(KIND_EVALUATE, job))
+        self.assertIsInstance(decoded_job, EvaluateJob)
+        self.assertEqual(decoded_job.citations, citations)
 
 
 class TestWorkerIdentity(unittest.TestCase):

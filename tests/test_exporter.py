@@ -212,6 +212,20 @@ class TestExportFactsEntryPoint(unittest.TestCase):
             self.assertEqual(args[0], exporter.FEATURE_ID)
             self.assertIsInstance(args[1], RuntimeError)
 
+    def test_excerpt_matcher_matches_markdown_emphasis_and_omission_markers(self) -> None:
+        from app.documents import document_from_text
+        doc = document_from_text("str.pdf", "Encounter note: **chronic bilateral knee pain** after field march.")
+        matcher = exporter.build_record_excerpt_matcher([doc])
+        self.assertIsNotNone(matcher)
+        assert matcher is not None
+        self.assertTrue(
+            matcher(
+                "str.pdf",
+                1,
+                "[Earlier text omitted] … Encounter note: chronic bilateral **knee** pain after field march. … [Later text omitted]",
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

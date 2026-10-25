@@ -208,7 +208,11 @@ class SourceSpanTests(unittest.TestCase):
                     result = uploads.extract_uploads([uploaded], 'eval')
                 self.assertEqual(result[0].full_text, source)
                 self.assertNotIn(old_key, state)
-                self.assertEqual(len(state), 1)
+                cache_entries = [
+                    key for key in state
+                    if isinstance(key, str) and uploads.EXTRACTION_CACHE_POLICY in key
+                ]
+                self.assertEqual(len(cache_entries), 1)
 
 
 if __name__ == '__main__':

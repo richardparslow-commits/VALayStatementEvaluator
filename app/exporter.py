@@ -106,6 +106,18 @@ def parse_source(source: str) -> tuple[str, str]:
     return text, ""
 
 
+_EXCERPT_OMISSION_RE = re.compile(
+    r"\[(?:Earlier text omitted|Later text omitted|"
+    r"Matching source sentence exceeds the excerpt limit; open the complete source\.)\]"
+)
+
+
+def _normalize_excerpt_text(text: str) -> str:
+    cleaned = _EXCERPT_OMISSION_RE.sub(" ", str(text or ""))
+    cleaned = re.sub(r"\*\*|__", "", cleaned).strip().strip("…").strip()
+    return " ".join(cleaned.lower().split())
+
+
 def build_record_excerpt_matcher(
     documents: Sequence[Any],
 ) -> Callable[[str, int | None, str], bool] | None:
@@ -132,13 +144,13 @@ def build_record_excerpt_matcher(
         all_parts: list[str] = []
         for p in pages_iter:
             pnum = getattr(p, "page", None)
-            ptxt = str(getattr(p, "text", "") or "")
+            ptxt = _normalize_excerpt_text(str(getattr(p, "text", "") or ""))
             if isinstance(pnum, int):
-                pages_map[pnum] = f"{pages_map.get(pnum, '')}\n{ptxt}" if pnum in pages_map else ptxt
+                pages_map[pnum] = f"{pages_map.get(pnum, '')} {ptxt}".strip() if pnum in pages_map else ptxt
             if ptxt:
                 all_parts.append(ptxt)
-        combined = full_txt or "\n".join(all_parts)
-        doc_full[fname] = f"{doc_full.get(fname, '')}\n{combined}" if fname in doc_full else combined
+        combined = _normalize_excerpt_text(full_txt) if full_txt else " ".join(all_parts)
+        doc_full[fname] = f"{doc_full.get(fname, '')} {combined}".strip() if fname in doc_full else combined
 
     if documents and not doc_full:
         return None
@@ -146,7 +158,7 @@ def build_record_excerpt_matcher(
     def _matches(fname: str, page_num: int | None, raw_excerpt: str) -> bool:
         if fname not in doc_full:
             return False
-        plain = re.sub(r"\*\*|__", "", str(raw_excerpt or "")).strip().strip("…").strip()
+        plain = _normalize_excerpt_text(raw_excerpt)
         if not plain:
             return True
         if isinstance(page_num, int) and page_num in doc_pages.get(fname, {}):
@@ -155,7 +167,7 @@ def build_record_excerpt_matcher(
             haystack = doc_full.get(fname, "")
         if not haystack:
             return True
-        return " ".join(plain.lower().split()) in " ".join(haystack.lower().split())
+        return plain in haystack
 
     return _matches
 

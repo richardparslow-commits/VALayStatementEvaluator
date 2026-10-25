@@ -863,6 +863,68 @@ class TestRenderRecordSearch(unittest.TestCase):
                 [{"excerpt": "shoulder pain only", "source": "clinic.pdf p.2"}],
             )
 
+    def test_rendered_panel_and_uploader_prune_stale_results_and_citations_end_to_end(self) -> None:
+        from types import SimpleNamespace
+        from app.documents import DocumentPage, ExtractedDocument
+
+        doc_v1 = ExtractedDocument(
+            filename="visit.pdf",
+            pages=[DocumentPage("visit.pdf", 1, "Knee pain after lifting in 2014.")],
+        )
+        doc_v2 = ExtractedDocument(
+            filename="visit.pdf",
+            pages=[DocumentPage("visit.pdf", 1, "Updated note: shoulder impingement only.")],
+        )
+
+        # Step 1: Run search + export through the rendered search panel on doc_v1.
+        records, st_mock, session, _SearchResult = self._widget_mock(
+            "knee", {"search_submit_eval": True, "search_export_eval_0": True}
+        )
+        with _patch_st(records, st_mock), patch.object(
+            records, "track_impression"
+        ), patch.object(records, "track_interaction"):
+            records.render_record_search("eval", [doc_v1])
+
+        self.assertEqual(len(session["search_results_eval"]), 1)
+        self.assertEqual(len(session["citation_index"]), 1)
+        self.assertEqual(session["citation_index"][0]["source"], "visit.pdf p.1")
+        self.assertIn("Knee", session["citation_index"][0]["excerpt"])
+        captions_v1 = [str(c.args[0]) for c in st_mock.caption.call_args_list if c.args]
+        self.assertTrue(any("Citation index: 1 excerpt(s)" in c for c in captions_v1))
+
+        session["eval_result"] = SimpleNamespace(
+            report_citations=list(session["citation_index"])
+        )
+
+        # Step 2: Replace visit.pdf with doc_v2 via records_uploader("eval") and re-render the panel.
+        uploaded_v2 = _UploadedFile("visit.pdf", 1024)
+        st_mock.file_uploader.return_value = [uploaded_v2]
+        st_mock.radio.return_value = "Upload files"
+        st_mock.button.side_effect = lambda _label, key="": False
+        st_mock.text_input.return_value = ""
+        st_mock.markdown.reset_mock()
+        st_mock.caption.reset_mock()
+        with _patch_st(records, st_mock), patch.object(
+            records, "check_upload_limits", return_value=([uploaded_v2], [])
+        ), patch.object(
+            records, "extract_uploads", return_value=[doc_v2]
+        ), patch.object(
+            records, "track_impression"
+        ), patch.object(
+            records, "track_interaction"
+        ):
+            loaded_docs = records.records_uploader("eval")
+            records.render_record_search("eval", loaded_docs)
+
+        self.assertEqual(loaded_docs, [doc_v2])
+        self.assertEqual(session["search_results_eval"], [])
+        self.assertEqual(session["citation_index"], [])
+        self.assertEqual(session["eval_result"].report_citations, [])
+        rendered_md = " ".join(str(c.args[0]) for c in st_mock.markdown.call_args_list if c.args)
+        self.assertNotIn("Knee", rendered_md)
+        captions_v2 = [str(c.args[0]) for c in st_mock.caption.call_args_list if c.args]
+        self.assertFalse(any("Citation index:" in c for c in captions_v2))
+
 
 class TestRenderCitationIndexExport(unittest.TestCase):
     """F2.S2 — CSV/JSON download buttons for the accumulated citation index."""
@@ -3182,6 +3244,49 @@ class TestRecordReadingPanel(unittest.TestCase):
         st_mock.error.assert_called_once()
         self.assertIn("no status", str(st_mock.error.call_args[0][0]))
         st_mock.caption.assert_not_called()
+
+    def test_audit_condition_for_slot_preserves_full_multi_condition_string(self) -> None:
+        from app.views import shared as shared_view
+        st_mock, session = _fake_streamlit()
+        long_names = [
+            "Lumbar degenerative disc disease with radiculopathy",
+            "Bilateral sensorineural hearing loss and tinnitus",
+            "Post-traumatic stress disorder with chronic insomnia",
+        ]
+        session["selected_conditions_draft"] = [(f"id_{i}", n) for i, n in enumerate(long_names)]
+        with _patch_st(shared_view, st_mock):
+            full = shared_view.audit_condition_for_slot("draft")
+        self.assertEqual(full, ", ".join(long_names))
+        self.assertGreater(len(full), 120)
+
+    def test_reconcile_search_and_citations_preserves_other_loaded_sources_and_report_snapshot(self) -> None:
+        from app.documents import document_from_text
+        from app.evaluate import EvaluationResult
+        from app.views import records as rec_view
+        st_mock, session = _fake_streamlit()
+        va_doc = document_from_text("va_record.pdf", "VA problem list: chronic lumbar strain noted.")
+        up_doc = document_from_text("upload.pdf", "Private clinic: bilateral ankle sprain noted.")
+        session["source_records_eval"] = {"VA.gov": [va_doc], "Upload": [up_doc]}
+        session["citation_index"] = [
+            {"source": "va_record.pdf p.1", "excerpt": "VA problem list: chronic lumbar strain noted."},
+            {"source": "upload.pdf p.1", "excerpt": "Private clinic: bilateral ankle sprain noted."},
+        ]
+        eval_res = EvaluationResult(
+            writer_role="veteran",
+            report_citations=[
+                {"source": "va_record.pdf p.1", "excerpt": "VA problem list: chronic lumbar strain noted."}
+            ],
+        )
+        session["eval_result"] = eval_res
+        with _patch_st(rec_view, st_mock):
+            # Calling reconcile with [] (e.g. empty Upload panel) still sees VA.gov + Upload in source_records_eval
+            rec_view._reconcile_search_and_citations("eval", [])
+            self.assertEqual(len(session["citation_index"]), 2)
+            # And eval_res.report_citations does NOT adopt upload.pdf p.1 from citation_index
+            self.assertEqual(
+                [c["source"] for c in eval_res.report_citations],
+                ["va_record.pdf p.1"],
+            )
 
 
 if __name__ == "__main__":

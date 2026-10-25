@@ -677,7 +677,9 @@ def research(
                 waited += step
             continue
 
-        answer = _answer_from_response(response, preset=preset, started=started)
+        answer = _answer_from_response(
+            response, preset=preset, started=started, structured=schema is not None
+        )
         breaker.record_success()
         logger.info(
             "perplexity research ok",
@@ -698,7 +700,9 @@ def research(
     raise last_error
 
 
-def _answer_from_response(response: Any, *, preset: str, started: float) -> GroundedAnswer:
+def _answer_from_response(
+    response: Any, *, preset: str, started: float, structured: bool = False
+) -> GroundedAnswer:
     """Assemble a :class:`GroundedAnswer` from an SDK response object."""
     text = _as_str(_field(response, "output_text"))
     status = _as_str(_field(response, "status"))
@@ -710,7 +714,7 @@ def _answer_from_response(response: Any, *, preset: str, started: float) -> Grou
             f"The research run did not complete (status: {status}).",
             retriable=False,
         )
-    findings = _parse_findings(text) if text.strip().startswith("{") else None
+    findings = _parse_findings(text) if structured else None
     return GroundedAnswer(
         text=text,
         citations=_collect_citations(response),

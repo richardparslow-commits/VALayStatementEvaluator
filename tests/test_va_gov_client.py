@@ -206,6 +206,14 @@ class TestMergeRecords(unittest.TestCase):
         self.assertEqual(merged.sources_merged, 0)
         self.assertEqual(merged.documents, [])
 
+    def test_many_same_titled_records_receive_sequential_suffixes_linearly(self):
+        docs = [document_from_text("Note.txt", f"Encounter {i}") for i in range(5)]
+        merged = merge_records({"VA.gov": docs})
+        self.assertEqual(
+            [d.filename for d in merged.documents],
+            ["Note.txt", "VA.gov/Note.txt", "VA.gov/Note.txt (2)", "VA.gov/Note.txt (3)", "VA.gov/Note.txt (4)"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

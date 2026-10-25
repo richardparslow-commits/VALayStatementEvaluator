@@ -135,8 +135,12 @@ class ArchiveAccountingTests(unittest.TestCase):
                 patch("app.upload_admission.claim_documents"):
             for _ in range(2):
                 self.assertEqual(uploads.extract_uploads([uploaded], "eval"), [])
-        self.assertEqual(len(state), 1)
-        self.assertEqual(len(next(iter(state.values()))["skipped"]), 1)
+        cache_entries = [
+            key for key in state
+            if isinstance(key, str) and uploads.EXTRACTION_CACHE_POLICY in key
+        ]
+        self.assertEqual(len(cache_entries), 1)
+        self.assertEqual(len(state[cache_entries[0]]["skipped"]), 1)
 
     def test_legacy_archive_cache_is_recomputed_and_pruned(self):
         uploaded = Uploaded(package({"record.txt": VISIBLE, ".correction.txt": CORRECTION}))
@@ -151,7 +155,11 @@ class ArchiveAccountingTests(unittest.TestCase):
             result = uploads.extract_uploads([uploaded], "eval")
         self.assertEqual([doc.full_text for doc in result], [VISIBLE.decode(), CORRECTION.decode()])
         self.assertNotIn(legacy_key, state)
-        self.assertEqual(len(state), 1)
+        cache_entries = [
+            key for key in state
+            if isinstance(key, str) and uploads.EXTRACTION_CACHE_POLICY in key
+        ]
+        self.assertEqual(len(cache_entries), 1)
         claimed.assert_called_once()
 
 

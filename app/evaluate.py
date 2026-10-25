@@ -36,7 +36,8 @@ from .rubric_validation import (
     normalize_rubric, rubric_is_complete, scoring_notice, validate_scores,
 )
 from .evaluation_topics import (
-    TOPIC_POLICY, TOPIC_MAX_ATTEMPTS, TopicValidationError, normalize_topics,
+    TOPIC_POLICY, TOPIC_MAX_ATTEMPTS, TopicValidationError, _label as _topic_label,
+    normalize_topics,
     topics_are_complete, evaluation_is_complete, topic_notice,
 )
 from .source_validation import build_source_index, source_reference_key
@@ -653,6 +654,7 @@ def run_evaluation(
     progress: ProgressCallback | None = None,
     witness: dict[str, str] | None = None,
     statement_source: ExtractedDocument | None = None,
+    citations: list[dict[str, str]] | None = None,
 ) -> EvaluationResult:
     """Execute the full evaluation pipeline.
 
@@ -681,7 +683,7 @@ def run_evaluation(
         "evaluate", files=len(records), pages=pages, chars=len(statement_text)
     ):
         try:
-            result = _run_evaluation(llm, statement_text, records, progress, witness or {})
+            result = _run_evaluation(llm, statement_text, records, progress, witness or {}, citations=citations)
             if statement_source is not None:
                 from .job_payload import document_to_json
                 result.factual_inputs["statement_source"] = document_to_json(statement_source)
@@ -951,6 +953,7 @@ def _run_evaluation(
     records: list[ExtractedDocument],
     progress: ProgressCallback | None,
     witness: dict[str, str],
+    citations: list[dict[str, str]] | None = None,
 ) -> EvaluationResult:
     result = EvaluationResult(factual_inputs=retained_inputs(statement_text, witness, records))
     result.input_chars = len(statement_text)
@@ -1047,7 +1050,7 @@ def _run_evaluation(
     with tracing.phase_span("report"), PhaseTimer(logger, "report", request_id=rid):
         with phase_timer("report"):
             report(0.96, "Step 8/8 — Building the report…")
-            result.report_citations = _citation_index_snapshot(records)
+            result.report_citations = _citation_index_snapshot(records, citations=citations)
             result.report_markdown = build_report(result, statement_text)
     report(1.0, "Evaluation complete." if evaluation_is_complete(result)
            else "Partial evaluation retained — scoring or topic analysis incomplete.")
@@ -1098,18 +1101,24 @@ def _score_rubric(llm: LLMService, result: EvaluationResult, statement: str) -> 
         return
 
 
-def _citation_index_snapshot(records: list[Any] | None = None) -> list[dict[str, str]]:
-    """Best-effort read of ``citation_index`` from session state.
+def _citation_index_snapshot(
+    records: list[Any] | None = None,
+    citations: list[dict[str, str]] | None = None,
+) -> list[dict[str, str]]:
+    """Best-effort read of ``citation_index`` from explicit payload or session state.
 
     When ``records`` is supplied, filters out stale citations whose source document
     or excerpt is not present in ``records``. Guarded because this pipeline can run
     outside an active Streamlit script context (e.g. offline tests, CLI usage)
     where ``st.session_state`` raises instead of returning a default.
     """
-    try:
-        citations = st.session_state.get("citation_index", [])
-    except Exception:  # noqa: BLE001 - session state may be unavailable
-        return []
+    if citations is None or not citations:
+        try:
+            session_citations = st.session_state.get("citation_index", [])
+        except Exception:  # noqa: BLE001 - session state may be unavailable
+            session_citations = []
+        if isinstance(session_citations, list) and session_citations:
+            citations = session_citations
     if not isinstance(citations, list):
         return []
     rows = [
@@ -1174,10 +1183,11 @@ def _analyze_topics(
             topic_str = row.get("topic")
             if not isinstance(topic_str, str):
                 return raw_obj
-            m = re.match(r"^(?:Topic\s+)?([A-O])(?:\s*[.():\-–—]|\s|$)", topic_str.strip())
-            if not m:
+            cleaned_topic = re.sub(r"^Topic\s+", "", topic_str.strip(), flags=re.IGNORECASE)
+            try:
+                letter = _topic_label(cleaned_topic)
+            except TopicValidationError:
                 return raw_obj
-            letter = m.group(1)
             ev = row.get("evidence")
             gap = row.get("gap_note")
             if not isinstance(ev, str) or not isinstance(gap, str):
@@ -1396,7 +1406,12 @@ def source_reference_notice(result: EvaluationResult) -> str:
     return LEGACY_REFERENCE_NOTICE
 
 
-def evaluation_report_markdown(result: EvaluationResult, *, include_rewrite: bool = True) -> str:
+_UNSET_CONTEXT = object()
+
+
+def evaluation_report_markdown(
+    result: EvaluationResult, *, include_rewrite: bool = True, context: Any = _UNSET_CONTEXT
+) -> str:
     """Rebuild from retained fields; cached prose cannot grant factual approval."""
     if not include_rewrite and (result.revised_statement or result.revision_changes):
         # A report download is independent of exact edited-statement approval.
@@ -1409,9 +1424,11 @@ def evaluation_report_markdown(result: EvaluationResult, *, include_rewrite: boo
     if not evaluation_is_complete(result):
         # Rebuild from retained review data; a historical cached report may carry
         # invalid grades or a rewrite that predates the validation policy.
-        return build_report(result, "", emit_telemetry=False)
+        return build_report(result, "", emit_telemetry=False, context=context)
     original = result.factual_inputs.get("account", "")
-    report = build_report(result, original if isinstance(original, str) else "", emit_telemetry=False)
+    report = build_report(
+        result, original if isinstance(original, str) else "", emit_telemetry=False, context=context
+    )
     if (
         getattr(result, "verification_policy", "") != SOURCE_REFERENCE_POLICY
         and LEGACY_REFERENCE_NOTICE not in report
@@ -2202,6 +2219,7 @@ def build_report(
     statement_text: str,
     citations: list[dict[str, str]] | None = None,
     *, emit_telemetry: bool = True,
+    context: Any = _UNSET_CONTEXT,
 ) -> str:
     """Render the full markdown evaluation report.
 
@@ -2410,11 +2428,17 @@ def build_report(
             lines.append(result.revised_statement)
             lines.append("```")
             lines.append("")
-            attach_review(result, result.revised_statement)
+            if context is _UNSET_CONTEXT:
+                attach_review(result, result.revised_statement)
+            else:
+                attach_review(result, result.revised_statement, context=context)
             lines.append(review_markdown(result.factual_review))
             lines.append("")
         elif result.revision_changes:
-            attach_review(result, "")
+            if context is _UNSET_CONTEXT:
+                attach_review(result, "")
+            else:
+                attach_review(result, "", context=context)
             lines.append(review_markdown(result.factual_review))
             lines.append("")
 

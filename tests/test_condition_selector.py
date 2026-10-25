@@ -132,6 +132,28 @@ class TestTelemetryMockMode(unittest.TestCase):
         source = Path(agiloop_telemetry.__file__).read_text(encoding="utf-8")
         self.assertNotIn("02f0935a-ee5e-4083-88a2-10e11753ccc9", source)
 
+    def test_proceed_preserves_custom_typed_draft_condition(self):
+        from app import condition_selector as cs
+        from unittest.mock import MagicMock
+        fake_session = {
+            "_draft_condition_prefilled": "Tinnitus",
+            "draft_condition": "Bilateral Tinnitus with hyperacusis",
+        }
+        col_proceed = MagicMock()
+        col_proceed.button.return_value = True
+        col_adjust = MagicMock()
+        col_adjust.button.return_value = False
+        with patch.object(cs, "st") as mock_st, patch.object(cs, "track_interaction"), patch.object(
+            cs, "track_impression"
+        ), patch.object(cs, "track_goal"):
+            mock_st.session_state = fake_session
+            mock_st.radio.return_value = "Ear & Hearing"
+            mock_st.multiselect.side_effect = [["Tinnitus"], ["A", "B"]]
+            mock_st.checkbox.return_value = False
+            mock_st.columns.return_value = (col_proceed, col_adjust)
+            cs.render_condition_selector("draft", "feat-id")
+        self.assertEqual(fake_session["draft_condition"], "Bilateral Tinnitus with hyperacusis")
+
 
 if __name__ == "__main__":
     unittest.main()

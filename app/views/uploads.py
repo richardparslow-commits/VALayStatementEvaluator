@@ -84,6 +84,9 @@ def check_upload_limits(files: Any) -> tuple[list[Any], list[str]]:
     return accepted, rejected_msgs
 
 
+_UPLOAD_DIGESTS_KEY = "_va_lse_upload_digests"
+
+
 def _upload_cache_key(slot: str, uploaded: Any) -> str | None:
     """Cache key for one upload: slot, name, size **and content hash**.
 
@@ -93,11 +96,58 @@ def _upload_cache_key(slot: str, uploaded: Any) -> str | None:
     session — the failure looks like the app ignoring their correction.
     Unreadable bytes have no trustworthy cache identity.
     """
+    name = getattr(uploaded, "name", "")
+    size = getattr(uploaded, "size", 0)
+    file_id = getattr(uploaded, "file_id", None)
+    has_file_id = isinstance(file_id, str) and bool(file_id)
+
+    digest_map: dict[tuple[str, str, str, int], str] | None = None
+    try:
+        raw_map = st.session_state.get(_UPLOAD_DIGESTS_KEY)
+        if isinstance(raw_map, dict):
+            digest_map = raw_map
+    except Exception:  # noqa: BLE001
+        digest_map = None
+
+    if has_file_id and digest_map is not None:
+        cached_digest = digest_map.get((slot, str(file_id), str(name), int(size or 0)))
+        if isinstance(cached_digest, str) and cached_digest:
+            candidate_key = f"{slot}:{EXTRACTION_CACHE_POLICY}:{name}:{size}:{cached_digest}"
+            try:
+                if candidate_key in st.session_state:
+                    return candidate_key
+            except Exception:  # noqa: BLE001
+                pass
+    else:
+        cached_obj_digest = getattr(uploaded, "_va_lse_sha256", None)
+        if isinstance(cached_obj_digest, str) and cached_obj_digest:
+            candidate_key = f"{slot}:{EXTRACTION_CACHE_POLICY}:{name}:{size}:{cached_obj_digest}"
+            try:
+                if candidate_key in st.session_state:
+                    return candidate_key
+            except Exception:  # noqa: BLE001
+                pass
+
     try:
         digest = hashlib.sha256(uploaded.getvalue()).hexdigest()
     except Exception:  # noqa: BLE001 - never fall back to name/size identity
         return None
-    return f"{slot}:{EXTRACTION_CACHE_POLICY}:{uploaded.name}:{getattr(uploaded, 'size', 0)}:{digest}"
+    cache_key = f"{slot}:{EXTRACTION_CACHE_POLICY}:{name}:{size}:{digest}"
+    try:
+        if digest_map is None:
+            digest_map = {}
+            st.session_state[_UPLOAD_DIGESTS_KEY] = digest_map
+        if has_file_id:
+            digest_map[(slot, str(file_id), str(name), int(size or 0))] = digest
+        else:
+            digest_map[(slot, f"obj:{id(uploaded)}", str(name), int(size or 0))] = digest
+            try:
+                setattr(uploaded, "_va_lse_sha256", digest)
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+    return cache_key
 
 
 def _prune_upload_cache(slot: str, live_keys: set[str]) -> None:
@@ -111,6 +161,20 @@ def _prune_upload_cache(slot: str, live_keys: set[str]) -> None:
         ]
         for key in stale:
             del state[key]
+        raw_map = state.get(_UPLOAD_DIGESTS_KEY)
+        if isinstance(raw_map, dict):
+            stale_digests = [
+                dkey
+                for dkey, dval in list(raw_map.items())
+                if isinstance(dkey, tuple)
+                and len(dkey) == 4
+                and dkey[0] == slot
+                and f"{slot}:{EXTRACTION_CACHE_POLICY}:{dkey[2]}:{dkey[3]}:{dval}" not in live_keys
+            ]
+            for dkey in stale_digests:
+                raw_map.pop(dkey, None)
+            if not raw_map:
+                state.pop(_UPLOAD_DIGESTS_KEY, None)
     except Exception:  # noqa: BLE001 - session state is best-effort here
         return
 

@@ -62,6 +62,8 @@ logger = get_logger("app.views.job_runner")
 # results renderer reads (kept in sync with evaluate_view/draft_view).
 _PENDING_KEY = "va_lse_pending_job_{slot}"
 _REQUEST_ID_KEY = "va_lse_pending_request_{slot}"
+_INPUT_SIG_KEY = "_va_lse_pending_input_sig_{slot}"
+_IN_FLIGHT_WARN_BOXES: dict[str, Any] = {}
 _RESULT_KEYS: dict[str, tuple[str, str, str]] = {
     "eval": ("eval_result", "eval_usage", "eval_request_id"),
     "draft": ("draft_result", "draft_usage", "draft_request_id"),
@@ -92,6 +94,53 @@ def _pending_key(slot: str) -> str:
 
 def _pending_request_key(slot: str) -> str:
     return _REQUEST_ID_KEY.format(slot=slot)
+
+
+def _pending_input_key(slot: str) -> str:
+    return _INPUT_SIG_KEY.format(slot=slot)
+
+
+def _job_input_signature(kind: str, job: EvaluateJob | DraftJob | None) -> str | None:
+    if job is None:
+        return None
+    from ..factual_integrity import fingerprint
+
+    recs = [
+        (
+            getattr(d, "filename", ""),
+            getattr(d, "pagination", ""),
+            getattr(d, "total_pages", 0),
+            list(getattr(d, "unreadable_pages", []) or []),
+            [
+                (getattr(pg, "page", 0), getattr(pg, "kind", ""), getattr(pg, "text", ""))
+                for pg in (getattr(d, "pages", []) or [])
+            ],
+        )
+        for d in (getattr(job, "records", []) or [])
+    ]
+    if isinstance(job, EvaluateJob):
+        return fingerprint(
+            [
+                kind,
+                job.statement_text,
+                dict(job.witness or {}),
+                list(job.record_sources or []),
+                recs,
+            ]
+        )
+    if isinstance(job, DraftJob):
+        return fingerprint(
+            [
+                kind,
+                job.observations,
+                job.condition,
+                job.claim_type,
+                dict(job.witness or {}),
+                list(job.record_sources or []),
+                recs,
+            ]
+        )
+    return None
 
 
 def queue_mode_active() -> bool:
@@ -338,6 +387,7 @@ def submit_job(
     # the UI stops waiting, so the guard has to be explicit: otherwise a user who
     # gives up on a slow run and clicks again queues a second digest over the
     # same records, doubling the LLM spend for one report.
+    current_sig = _job_input_signature(kind, job)
     existing = st.session_state.get(_pending_key(slot))
     if isinstance(existing, str) and existing:
         try:
@@ -347,7 +397,14 @@ def submit_job(
             require_synthetic_queue()
             record_in_flight = None
         checking_confirmed = isinstance(pending, dict) and pending.get("confirmed_job_id") == existing
-        if record_in_flight is not None and not record_in_flight.is_terminal and not checking_confirmed:
+        prev_sig = st.session_state.get(_pending_input_key(slot))
+        same_inputs = prev_sig is None or current_sig is None or current_sig == prev_sig
+        if (
+            record_in_flight is not None
+            and not record_in_flight.is_terminal
+            and not checking_confirmed
+            and same_inputs
+        ):
             run_log_event(
                 kind,
                 "rejected",
@@ -355,10 +412,15 @@ def submit_job(
                 error=f"run {existing} already in progress",
                 reason="already_running",
             )
-            pilot.display(
-                "A run is already in progress for these inputs — wait for it above, or "
-                "reload this page. Only one run per tab is submitted at a time."
-            , container=st, method="warning")
+            warn_box = st.empty()
+            with warn_box.container():
+                pilot.display(
+                    "A run is already in progress for these inputs — wait for it above, or "
+                    "reload this page. Only one run per tab is submitted at a time.",
+                    container=st,
+                    method="warning",
+                )
+            _IN_FLIGHT_WARN_BOXES[slot] = warn_box
             st.session_state[f"_va_lse_resume_wait_{slot}"] = existing
             return None
 
@@ -384,6 +446,9 @@ def submit_job(
             else:
                 if job is None:
                     raise PayloadError("No earlier submission is available to check.")
+                if isinstance(job, EvaluateJob) and not job.citations:
+                    from ..evaluate import _citation_index_snapshot
+                    job.citations = _citation_index_snapshot(job.records)
                 payload = _encode_payload(kind, job)
                 st.session_state[submission_key] = {
                     "payload": payload, "request_id": request_id, "owner_id": owner,
@@ -431,6 +496,8 @@ def submit_job(
         st.session_state[submission_key]["confirmed_job_id"] = record.job_id
     st.session_state[_pending_key(slot)] = record.job_id
     st.session_state[_pending_request_key(slot)] = request_id
+    if current_sig is not None:
+        st.session_state[_pending_input_key(slot)] = current_sig
     if not record.recovery_available:
         pilot.display(
             "This run is confirmed, but its recovery reference could not be restored. "
@@ -465,6 +532,7 @@ def submit_job(
         # Terminal (done or failed): nothing left to resume.
         st.session_state.pop(_pending_key(slot), None)
         st.session_state.pop(_pending_request_key(slot), None)
+        st.session_state.pop(_pending_input_key(slot), None)
     if not outcome.ok:
         _render_failure(outcome, action_label)
     return outcome
@@ -564,16 +632,22 @@ def resume_pending_job(slot: str, *, action_label: str) -> None:
         outcome = _fetch_outcome(get_job_backend(), record, slot)
         st.session_state.pop(_pending_key(slot), None)
         st.session_state.pop(_pending_request_key(slot), None)
+        st.session_state.pop(_pending_input_key(slot), None)
         if not outcome.ok:
             _render_failure(outcome, action_label)
         return
     auto_wait = st.session_state.pop(f"_va_lse_resume_wait_{slot}", None) == job_id
-    pilot.display(
-        f"A run you started earlier is still in progress on a worker "
-        f"({record.progress * 100:.0f}% — {record.message or 'running'}). "
-        f"Reference: `{record.request_id or job_id}`."
-    , container=st, method="info")
-    wait_clicked = st.button("⏳ Wait for it to finish", key=f"resume_{slot}")
+    warn_box = _IN_FLIGHT_WARN_BOXES.pop(slot, None)
+    notice_box = st.empty()
+    wait_clicked = False
+    if not auto_wait:
+        with notice_box.container():
+            pilot.display(
+                f"A run you started earlier is still in progress on a worker "
+                f"({record.progress * 100:.0f}% — {record.message or 'running'}). "
+                f"Reference: `{record.request_id or job_id}`."
+            , container=st, method="info")
+            wait_clicked = bool(st.button("⏳ Wait for it to finish", key=f"resume_{slot}"))
     if auto_wait or wait_clicked:
         outcome = _poll(
             get_job_backend(),
@@ -584,9 +658,13 @@ def resume_pending_job(slot: str, *, action_label: str) -> None:
         if outcome.ok or not outcome.still_running:
             st.session_state.pop(_pending_key(slot), None)
             st.session_state.pop(_pending_request_key(slot), None)
+            st.session_state.pop(_pending_input_key(slot), None)
+            notice_box.empty()
+            if warn_box is not None and hasattr(warn_box, "empty"):
+                warn_box.empty()
         if not outcome.ok:
             _render_failure(outcome, action_label)
-        elif wait_clicked:
+        else:
             st.rerun()
 
 

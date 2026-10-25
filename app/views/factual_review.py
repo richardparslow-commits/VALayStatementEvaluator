@@ -9,8 +9,11 @@ from .. import pilot
 from ..factual_integrity import compare, context_for_result, fingerprint, review_notice
 
 
-def render_factual_review(result: Any, text: str, *, slot: str) -> bool:
-    context = context_for_result(result)
+_UNSET = object()
+
+
+def render_factual_review(result: Any, text: str, *, slot: str, context: Any = _UNSET) -> bool:
+    context = context_for_result(result) if context is _UNSET else context
     initial = compare(text, context)
     pilot.display(review_notice(initial), container=st, method="info")
     sources = {s["id"]: s for s in context["sources"]} if context else {}

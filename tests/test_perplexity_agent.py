@@ -244,7 +244,9 @@ class TestConfiguredPath(unittest.TestCase):
     # ------------------------------------------------------------- request shape
 
     def test_posts_to_responses_alias_with_documented_fields(self) -> None:
-        transport = _Transport([_ok(_payload())])
+        # A schema request demands structured output; prose is a parse error, so the
+        # stub returns a JSON object body like a conforming model would.
+        transport = _Transport([_ok(_payload(text=json.dumps({"summary": "Answer text."})))])
         self._run(transport, domains=["va.gov"], schema=condition_audit_schema())
 
         self.assertEqual(len(transport.requests), 1)
@@ -577,6 +579,17 @@ class TestSecretHygiene(unittest.TestCase):
         reason = unavailable_reason(_settings(perplexity_api_key="   ")) or ""
         self.assertIn("PERPLEXITY_API_KEY", reason)
         self.assertNotIn("None", reason)
+
+    def test_unstructured_prose_starting_with_brace_keeps_findings_none(self) -> None:
+        from types import SimpleNamespace
+        from app.perplexity_agent import _answer_from_response
+        fake_resp = SimpleNamespace(
+            output_text="{Note} According to 38 CFR 3.303, lay evidence is competent for observable symptoms.",
+            output=[],
+        )
+        ans = _answer_from_response(fake_resp, preset="pro-search", started=0.0, structured=False)
+        self.assertIsNone(ans.findings)
+        self.assertTrue(ans.text.startswith("{Note}"))
 
 
 if __name__ == "__main__":

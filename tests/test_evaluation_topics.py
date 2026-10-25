@@ -471,3 +471,27 @@ class TestTopicUI(unittest.TestCase):
             self.assertEqual(view._case_topic_letters(result), ["A"])
             result.topic_rows[0]["applicable"] = "false"
             self.assertEqual(view._case_topic_letters(result), [])
+
+    def test_analyze_topics_rejects_mismatched_topic_label(self):
+        from app.evaluate import EvaluationResult, _analyze_topics
+        from app.evaluation_topics import TOPIC_LABELS
+        bad_payload = {
+            "claim_focus": "Direct service connection",
+            "topics": [
+                {
+                    "topic": f"Topic A — {TOPIC_LABELS['B']}" if letter == "A" else f"Topic {letter} — {label}",
+                    "applicable": True,
+                    "coverage": "covered",
+                    "evidence": "Documented in statement.",
+                    "gap_note": "",
+                }
+                for letter, label in TOPIC_LABELS.items()
+            ],
+            "critical_gaps": [],
+            "notes": "Summary note.",
+        }
+        llm = MagicMock()
+        llm.chat_json.return_value = bad_payload
+        res = EvaluationResult()
+        _analyze_topics(llm, res, "My knee started hurting in service.", lambda *_: None)
+        self.assertEqual(res.topic_status, "incomplete")

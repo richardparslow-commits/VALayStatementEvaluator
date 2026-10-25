@@ -655,3 +655,14 @@ render_factual_review(result(), ACCOUNT, slot="eval")
         at = AppTest.from_string(code, default_timeout=20).run()
         self.assertFalse(at.exception)
         self.assertEqual(len(at.checkbox), 2)
+
+    def test_compare_reuses_cached_source_index_across_proposed_edits(self):
+        from app import factual_integrity as fi
+        from app.documents import document_from_text
+        ctx = fi.build_context(ACCOUNT, {}, None, [document_from_text("str.txt", "June 2018 right knee pain noted.")])
+        with unittest.mock.patch.object(fi, "_key", wraps=fi._key) as spy_key:
+            fi.compare("My right knee started hurting in June 2018.", ctx)
+            first_calls = spy_key.call_count
+            fi.compare("Wait, it still aches on stairs.", ctx)
+            second_calls = spy_key.call_count - first_calls
+        self.assertLess(second_calls, first_calls)
