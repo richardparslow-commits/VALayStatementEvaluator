@@ -23,7 +23,7 @@ import io
 import logging
 import re
 from dataclasses import dataclass
-from typing import Iterable, Literal
+from typing import Any, Callable, Iterable, Literal, Sequence
 import unicodedata
 
 from fpdf import FPDF
@@ -104,6 +104,83 @@ def parse_source(source: str) -> tuple[str, str]:
             pages = re.sub(r"[pb]\.", "", raw_pages, flags=re.IGNORECASE).replace(",", ", ")
             return doc, pages
     return text, ""
+
+
+def build_record_excerpt_matcher(
+    documents: Sequence[Any],
+) -> Callable[[str, int | None, str], bool] | None:
+    """Build a per-page, whitespace-normalized excerpt matcher over ``documents``.
+
+    Returns ``None`` when ``documents`` is non-empty but contains only placeholder
+    objects with no string filename (such as unit-test ``MagicMock`` instances), so
+    callers leave synthetic test state untouched.
+    """
+    doc_pages: dict[str, dict[int, str]] = {}
+    doc_full: dict[str, str] = {}
+    for candidate in documents or []:
+        if isinstance(candidate, dict):
+            fname = candidate.get("filename") or candidate.get("name") or ""
+            full_txt = str(candidate.get("full_text") or candidate.get("text") or "")
+            pages_iter: list[Any] = []
+        else:
+            fname = getattr(candidate, "filename", "")
+            full_txt = str(getattr(candidate, "full_text", "") or "")
+            pages_iter = list(getattr(candidate, "pages", []) or [])
+        if not isinstance(fname, str) or not fname:
+            continue
+        pages_map = doc_pages.setdefault(fname, {})
+        all_parts: list[str] = []
+        for p in pages_iter:
+            pnum = getattr(p, "page", None)
+            ptxt = str(getattr(p, "text", "") or "")
+            if isinstance(pnum, int):
+                pages_map[pnum] = f"{pages_map.get(pnum, '')}\n{ptxt}" if pnum in pages_map else ptxt
+            if ptxt:
+                all_parts.append(ptxt)
+        combined = full_txt or "\n".join(all_parts)
+        doc_full[fname] = f"{doc_full.get(fname, '')}\n{combined}" if fname in doc_full else combined
+
+    if documents and not doc_full:
+        return None
+
+    def _matches(fname: str, page_num: int | None, raw_excerpt: str) -> bool:
+        if fname not in doc_full:
+            return False
+        plain = re.sub(r"\*\*|__", "", str(raw_excerpt or "")).strip().strip("…").strip()
+        if not plain:
+            return True
+        if isinstance(page_num, int) and page_num in doc_pages.get(fname, {}):
+            haystack = doc_pages[fname][page_num]
+        else:
+            haystack = doc_full.get(fname, "")
+        if not haystack:
+            return True
+        return " ".join(plain.lower().split()) in " ".join(haystack.lower().split())
+
+    return _matches
+
+
+def filter_grounded_citations(
+    citations: Sequence[dict[str, str]],
+    documents: Sequence[Any],
+) -> list[dict[str, str]]:
+    """Keep only ``citation_index`` rows grounded in ``documents``."""
+    matcher = build_record_excerpt_matcher(documents)
+    if matcher is None:
+        return list(citations)
+    kept: list[dict[str, str]] = []
+    for item in citations:
+        if not isinstance(item, dict):
+            continue
+        src_label = str(item.get("source", "") or "")
+        c_doc, c_pages = parse_source(src_label)
+        if not c_doc:
+            continue
+        c_page_int = int(c_pages) if c_pages and c_pages.isdigit() else None
+        c_excerpt = str(item.get("excerpt", "") or "")
+        if matcher(c_doc, c_page_int, c_excerpt):
+            kept.append(item)
+    return kept
 
 
 def _fact_doc_and_pages(fact: MedicalFact) -> tuple[str, str]:

@@ -115,49 +115,12 @@ def _forget_source_records(slot: str, label: str) -> None:
 
 def _reconcile_search_and_citations(slot: str, documents: list[Any]) -> None:
     """Prune stale search results and citation_index entries when records change."""
-    real_docs: list[Any] = []
-    for candidate in documents or []:
-        candidate_name = getattr(candidate, "filename", "")
-        if isinstance(candidate_name, str) and candidate_name:
-            real_docs.append(candidate)
-    if documents and not real_docs:
+    from ..exporter import build_record_excerpt_matcher, filter_grounded_citations
+
+    matcher = build_record_excerpt_matcher(documents or [])
+    if matcher is None:
         # Unit-test MagicMock placeholder documents: do not filter by content.
         return
-
-    doc_pages: dict[str, dict[int, str]] = {}
-    doc_full: dict[str, str] = {}
-    for d in real_docs:
-        fname = d.filename
-        pages_map = doc_pages.setdefault(fname, {})
-        all_parts: list[str] = []
-        for p in getattr(d, "pages", []) or []:
-            pnum = getattr(p, "page", None)
-            ptxt = str(getattr(p, "text", "") or "")
-            if isinstance(pnum, int):
-                pages_map[pnum] = f"{pages_map.get(pnum, '')}\n{ptxt}" if pnum in pages_map else ptxt
-            if ptxt:
-                all_parts.append(ptxt)
-        full_txt = str(getattr(d, "full_text", "") or "") or "\n".join(all_parts)
-        doc_full[fname] = f"{doc_full.get(fname, '')}\n{full_txt}" if fname in doc_full else full_txt
-
-    def _excerpt_matches(fname: str, page_num: int | None, raw_excerpt: str) -> bool:
-        if fname not in doc_full:
-            return False
-        plain = _clean_citation_excerpt(str(raw_excerpt or "")).strip()
-        if plain.startswith("…"):
-            plain = plain[1:].strip()
-        if plain.endswith("…"):
-            plain = plain[:-1].strip()
-        if not plain:
-            return True
-        haystack = ""
-        if isinstance(page_num, int) and page_num in doc_pages.get(fname, {}):
-            haystack = doc_pages[fname][page_num]
-        else:
-            haystack = doc_full.get(fname, "")
-        if not haystack:
-            return True
-        return " ".join(plain.lower().split()) in " ".join(haystack.lower().split())
 
     results_key = f"search_results_{slot}"
     results_any: Any = st.session_state.get(results_key)
@@ -166,35 +129,21 @@ def _reconcile_search_and_citations(slot: str, documents: list[Any]) -> None:
         for r in results_any:
             fname = getattr(r, "filename", None)
             if not isinstance(fname, str) or not fname:
-                if real_docs:
+                if documents:
                     kept_results.append(r)
                 continue
             r_page = getattr(r, "page", None)
             r_excerpt = str(getattr(r, "excerpt", "") or "")
-            if _excerpt_matches(fname, r_page if isinstance(r_page, int) else None, r_excerpt):
+            if matcher(fname, r_page if isinstance(r_page, int) else None, r_excerpt):
                 kept_results.append(r)
         if len(kept_results) != len(results_any):
             st.session_state[results_key] = kept_results
 
     if slot == "eval" or not st.session_state.get("source_records_eval"):
-        from ..exporter import parse_source
-
         index_any: Any = st.session_state.get(CITATION_INDEX_KEY)
         if isinstance(index_any, list) and index_any:
-            kept_citations: list[dict[str, str]] = []
-            for item in index_any:
-                if not isinstance(item, dict):
-                    continue
-                src_label = str(item.get("source", "") or "")
-                c_doc, c_pages = parse_source(src_label)
-                if not c_doc:
-                    continue
-                c_page_int: int | None = None
-                if c_pages and c_pages.isdigit():
-                    c_page_int = int(c_pages)
-                c_excerpt = str(item.get("excerpt", "") or "")
-                if _excerpt_matches(c_doc, c_page_int, c_excerpt):
-                    kept_citations.append(item)
+            valid_dicts = [item for item in index_any if isinstance(item, dict)]
+            kept_citations = filter_grounded_citations(valid_dicts, documents or [])
             if len(kept_citations) != len(index_any):
                 st.session_state[CITATION_INDEX_KEY] = kept_citations
                 eval_res = st.session_state.get("eval_result")
@@ -650,10 +599,6 @@ def render_record_search(slot: str, documents: list[Any]) -> None:
 def _sanitize_search_excerpt_for_display(excerpt: str) -> str:
     # Neutralize Markdown images ![alt](url) so record text cannot trigger browser fetches
     return re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"[image: \1]", excerpt)
-
-
-def _clean_citation_excerpt(excerpt: str) -> str:
-    return excerpt.replace("**", "")
 
 
 def _render_search_results(slot: str, results: list[SearchResult]) -> None:

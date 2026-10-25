@@ -1001,6 +1001,34 @@ class TestRunEvaluationHappyPath(unittest.TestCase):
             self.assertIn(expected, phases)
 
     @patch("app.evaluate.review_medical_records")
+    @patch("app.evaluate.load_knowledge", return_value="knowledge")
+    def test_run_evaluation_prunes_stale_session_citations_end_to_end(self, _mock_knowledge, mock_review):
+        mock_review.return_value = _fake_digest()
+        llm = _FakeLLM()
+        docs = [_doc("Knee pain noted during service.", name="a.txt")]
+        session_citations = [
+            {"source": "a.txt p.1", "excerpt": "**Knee** pain noted during service."},
+            {"source": "a.txt p.1", "excerpt": "obsolete excerpt from prior upload"},
+            {"source": "removed.pdf p.2", "excerpt": "Knee pain noted during service."},
+        ]
+        with patch("app.evaluate.st") as mock_st:
+            mock_st.session_state.get.return_value = session_citations
+            result = run_evaluation(
+                llm,
+                "I saw knee injury during lifting. Daily pain observed.",
+                docs,
+                progress=None,
+            )
+        self.assertEqual(
+            result.report_citations,
+            [{"source": "a.txt p.1", "excerpt": "**Knee** pain noted during service."}],
+        )
+        self.assertIn("## Sources", result.report_markdown)
+        self.assertIn("**a.txt p.1**: **Knee** pain noted during service.", result.report_markdown)
+        self.assertNotIn("obsolete excerpt from prior upload", result.report_markdown)
+        self.assertNotIn("removed.pdf", result.report_markdown)
+
+    @patch("app.evaluate.review_medical_records")
     @patch("app.evaluate.load_knowledge", return_value="k")
     def test_verdict_assignment_matches_digest(self, _mk, mock_review):
         mock_review.return_value = _fake_digest()
