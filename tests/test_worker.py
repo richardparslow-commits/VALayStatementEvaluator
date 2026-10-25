@@ -217,6 +217,26 @@ class TestExecuteJobSuccess(_WorkerCase):
         self.assertNotIn("obsolete line from a previous upload", run.result.report_markdown)
         self.assertNotIn("gone.pdf", run.result.report_markdown)
 
+    def test_evaluate_job_without_citations_stores_no_sources_section(self):
+        """A run that collected nothing must not ship a bare Sources heading.
+
+        The heading is only worth showing when a citation sits under it, and older
+        payloads without the key must keep decoding to the same empty report.
+        """
+        job = _evaluate_job()
+        self.assertEqual(job.citations, [])
+        encoded = encode_job(KIND_EVALUATE, job)
+        self.assertNotIn("citations", json.loads(encoded))
+        record = self.backend.enqueue(KIND_EVALUATE, encoded, request_id=job.request_id)
+        claimed = self.backend.claim([KIND_EVALUATE], worker_id="w1")
+
+        ok = worker.execute_job(claimed[0], claimed[1], self.backend, llm=_UsageStub())
+
+        self.assertTrue(ok)
+        run = decode_result(self.backend.get_result(record.job_id))
+        self.assertEqual(run.result.report_citations, [])
+        self.assertNotIn("## Sources", run.result.report_markdown)
+
     def test_draft_job_stores_a_decodable_result(self):
         job = _draft_job()
         record = self.backend.enqueue(KIND_DRAFT, encode_job(KIND_DRAFT, job), request_id=job.request_id)
