@@ -64,6 +64,13 @@ def _event_row(event: dict[str, Any]) -> dict[str, str]:
 def render_run_log_tail(limit: int = _RUN_LOG_LIMIT) -> None:
     """Show the latest run-log events (newest last, like the file itself)."""
     if not pilot.operator_allowed():
+        if not pilot.enabled():
+            pilot.display(
+                "Operator diagnostics are switched off on this deployment "
+                "(set `VA_LSE_OPERATOR_DIAGNOSTICS=1` to enable the live run log).",
+                container=st,
+                method="caption",
+            )
         return
     path = _resolve_log_path()
     events: list[dict[str, Any]] = []

@@ -53,6 +53,23 @@ class TestParseSource(unittest.TestCase):
     def test_empty_source(self) -> None:
         self.assertEqual(exporter.parse_source(""), ("", ""))
 
+    def test_multi_file_source_is_not_split(self) -> None:
+        self.assertEqual(
+            exporter.parse_source("a.txt p.1; b.txt p.1"),
+            ("a.txt p.1; b.txt p.1", ""),
+        )
+
+    def test_free_text_source_preserved_in_export(self) -> None:
+        fact = _fact(
+            source="Progress note, Dr. Smith",
+            document="clinic.pdf",
+            page=1,
+        )
+        self.assertEqual(
+            exporter._fact_doc_and_pages(fact),
+            ("Progress note, Dr. Smith", ""),
+        )
+
 
 class TestFilterFacts(unittest.TestCase):
     def test_no_filters_returns_all_facts(self) -> None:

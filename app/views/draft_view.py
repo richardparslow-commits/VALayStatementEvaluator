@@ -245,8 +245,12 @@ def render_draft_tab() -> None:
     col1, col2 = st.columns(2)
     veteran_name = col1.text_input("Veteran's name", key="draft_vet_name")
     selector_condition = audit_condition_for_slot("draft")
-    if selector_condition and not str(st.session_state.get("draft_condition", "") or "").strip():
-        st.session_state["draft_condition"] = selector_condition
+    if selector_condition:
+        current_cond = str(st.session_state.get("draft_condition", "") or "").strip()
+        prev_prefilled = str(st.session_state.get("_draft_condition_prefilled", "") or "").strip()
+        if not current_cond or current_cond == prev_prefilled:
+            st.session_state["draft_condition"] = selector_condition
+            st.session_state["_draft_condition_prefilled"] = selector_condition
     condition = col2.text_input(
         "Condition the statement supports (e.g., PTSD, lumbar strain, tinnitus)",
         key="draft_condition",

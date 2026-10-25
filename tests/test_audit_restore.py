@@ -14,6 +14,7 @@ trust what the backup says:
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -835,6 +836,54 @@ class TestRestoreCli(_RestoreCase):
                 code = self.cli.main(["--verify", "--no-hash"])
         self.assertEqual(code, 0)
         self.assertEqual(calls["n"], 0)
+
+
+class TestRestoreAtomicAndConcurrency(unittest.TestCase):
+    def test_forced_restore_prunes_stale_rotated_and_rolls_back_on_manifest_error(self) -> None:
+        with tempfile.TemporaryDirectory() as src_dir, tempfile.TemporaryDirectory() as dst_dir:
+            dest = audit_backup.FilesystemDestination(src_dir)
+            line1 = b'{"ts":"2026-01-01T00:00:00Z","action":"a"}\n'
+            sha1 = hashlib.sha256(line1).hexdigest()[:12]
+            rot_key = f"audit/2026/01/01/rotated-audit.log.1-0-{len(line1)}-{sha1}.jsonl"
+            live_key = f"audit/2026/01/01/live-audit.log-0-{len(line1)}-{sha1}.jsonl"
+            dest.put_object(rot_key, line1)
+            dest.put_object(live_key, line1)
+
+            r1 = audit_restore.restore_backup(dest, target=dst_dir)
+            self.assertEqual(r1.error, "")
+            rot_files = list((Path(dst_dir) / "rotated").glob("*.jsonl"))
+            self.assertEqual(len(rot_files), 1)
+
+            # Remove rotated object from backup and run forced restore: stale rotated file must be removed
+            (Path(src_dir) / rot_key).unlink()
+            r2 = audit_restore.restore_backup(dest, target=dst_dir, force=True)
+            self.assertEqual(r2.error, "")
+            self.assertEqual(list((Path(dst_dir) / "rotated").glob("*.jsonl")), [])
+
+            # If manifest.json is a directory so writing it fails, restore must report an error and roll back
+            line2 = b'{"ts":"2026-01-01T00:00:00Z","action":"a"}\n{"ts":"2026-01-01T00:01:00Z","action":"b"}\n'
+            sha2 = hashlib.sha256(line2).hexdigest()[:12]
+            (Path(src_dir) / live_key).unlink()
+            live_key2 = f"audit/2026/01/01/live-audit.log-0-{len(line2)}-{sha2}.jsonl"
+            dest.put_object(live_key2, line2)
+            manifest_path = Path(dst_dir) / "manifest.json"
+            manifest_path.unlink()
+            manifest_path.mkdir()
+            r3 = audit_restore.restore_backup(dest, target=dst_dir, force=True)
+            self.assertNotEqual(r3.error, "")
+            self.assertEqual((Path(dst_dir) / "restored.jsonl").read_bytes(), line1)
+
+    def test_concurrent_unforced_restore_is_refused_when_lock_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as src_dir, tempfile.TemporaryDirectory() as dst_dir:
+            dest = audit_backup.FilesystemDestination(src_dir)
+            line1 = b'{"ts":"2026-01-01T00:00:00Z","action":"a"}\n'
+            sha1 = hashlib.sha256(line1).hexdigest()[:12]
+            live_key = f"audit/2026/01/01/live-audit.log-0-{len(line1)}-{sha1}.jsonl"
+            dest.put_object(live_key, line1)
+            (Path(dst_dir) / ".restore.lock").write_text("locked", encoding="utf-8")
+            rep = audit_restore.restore_backup(dest, target=dst_dir, force=False)
+            self.assertTrue(rep.refused)
+            self.assertNotEqual(rep.error, "")
 
 
 if __name__ == "__main__":

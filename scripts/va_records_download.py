@@ -636,13 +636,20 @@ class VaGovDownloader:
         except Exception:  # noqa: BLE001 - the driver only needs a best-effort name
             suggested = ""
         target = self._out_dir / safe_pdf_name(suggested)
-        download.save_as(str(target))
-        if not looks_like_pdf(target):
+        save_path = (
+            self._out_dir / f"{target.stem}.failed{target.suffix}"
+            if target.exists()
+            else target
+        )
+        download.save_as(str(save_path))
+        if not looks_like_pdf(save_path):
             raise DownloadError(
                 f"VA.gov produced a file that is not a PDF ({target.name}). That usually "
                 "means the session was signed out or the report errored — the file was "
-                f"kept at {target} so you can inspect it, and you can retry the run."
+                f"kept at {save_path} so you can inspect it, and you can retry the run."
             )
+        if save_path != target:
+            os.replace(save_path, target)
         return target
 
     # -- internals -----------------------------------------------------------

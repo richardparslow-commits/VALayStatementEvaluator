@@ -713,9 +713,10 @@ def _render_pdf_export(statement_text: str, *, entry_point: str) -> None:
     slot_key = "eval" if entry_point in ("eval", "evaluate") else entry_point
     eval_res = st.session_state.get("eval_result")
     fallback_cond = str(getattr(eval_res, "claimed_condition", "") or "").strip() if eval_res is not None else ""
+    writer_role = str(getattr(eval_res, "writer_role", "") or "").strip() if eval_res is not None else ""
     condition = audit_condition_for_slot(slot_key) or fallback_cond
     try:
-        pdf_bytes = generate_statement_pdf(statement_text, condition, witness_role="")
+        pdf_bytes = generate_statement_pdf(statement_text, condition, witness_role=writer_role)
     except Exception as exc:  # noqa: BLE001 - PDF generation is best-effort in the UI
         pilot.display(
             report_failure(

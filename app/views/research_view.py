@@ -23,6 +23,8 @@ nobody can diagnose.
 """
 from __future__ import annotations
 
+import re
+
 from .. import pilot
 
 import streamlit as st
@@ -588,20 +590,39 @@ def _render_last_result() -> None:
         _render_answer(answer)
 
 
+_MD_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)]*)\)")
+_HTML_IMG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
+
+
+def _defang_markdown_images(text: object) -> str:
+    """Neutralize Markdown/HTML image embeds so untrusted answers cannot auto-fetch URLs."""
+    if text is None:
+        return ""
+    raw = str(text)
+    if not raw:
+        return ""
+    cleaned = _MD_IMAGE_RE.sub(
+        lambda m: f"[image: {m.group(1) or 'external'}]", raw
+    )
+    cleaned = _HTML_IMG_RE.sub("[image]", cleaned)
+    return cleaned
+
+
 def _render_answer(answer: GroundedAnswer) -> None:
     """Render prose, structured findings, and the sources — in that order."""
     if not answer.findings:
-        pilot.display(answer.text, container=st, method="markdown")
+        pilot.display(_defang_markdown_images(answer.text), container=st, method="markdown")
     else:
         _render_findings(answer.findings)
 
     if answer.citations:
         with st.expander(pilot.text_label(f"Sources ({answer.citation_count})"), expanded=True):
             for index, citation in enumerate(answer.citations, start=1):
-                date = f" — {citation.date}" if citation.date else ""
-                pilot.display(f"{index}. [{citation.label()}]({citation.url}){date}", container=st, method="markdown")
+                date = f" — {_defang_markdown_images(citation.date)}" if citation.date else ""
+                safe_label = _defang_markdown_images(citation.label()).replace("[", "(").replace("]", ")")
+                pilot.display(f"{index}. [{safe_label}]({citation.url}){date}", container=st, method="markdown")
                 if citation.snippet:
-                    pilot.display(citation.snippet[:280], container=st, method="caption")
+                    pilot.display(_defang_markdown_images(citation.snippet[:280]), container=st, method="caption")
     else:
         pilot.display(
             "No sources were returned for this answer. Treat it as unverified: the "
@@ -623,6 +644,22 @@ def _render_findings(findings: dict[str, object]) -> None:
     checklist mapping — which is the part that answers "is the app's committed framework
     still right for this condition?".
     """
+    missing_fields: list[str] = []
+    for req_key, req_label in (
+        ("condition", "condition"),
+        ("summary", "summary"),
+        ("rating_criteria", "rating criteria"),
+    ):
+        req_val = findings.get(req_key)
+        if not isinstance(req_val, str) or not req_val.strip():
+            missing_fields.append(req_label)
+    if missing_fields:
+        pilot.display(
+            f"Structured audit is incomplete: missing {', '.join(missing_fields)}.",
+            container=st,
+            method="warning",
+        )
+
     with st.expander("Structured audit", expanded=True):
         for key, label in (
             ("condition", "Condition"),
@@ -632,7 +669,11 @@ def _render_findings(findings: dict[str, object]) -> None:
         ):
             value = findings.get(key)
             if isinstance(value, str) and value.strip():
-                pilot.display(f"**{label}:** {value}", container=st, method="markdown")
+                pilot.display(
+                    f"**{label}:** {_defang_markdown_images(value)}",
+                    container=st,
+                    method="markdown",
+                )
 
         for key, label in (
             ("evidence_expectations", "Evidence the rater will expect"),
@@ -643,7 +684,11 @@ def _render_findings(findings: dict[str, object]) -> None:
             if isinstance(values, list) and values:
                 pilot.display(f"**{label}**", container=st, method="markdown")
                 for item in values:
-                    pilot.display(f"- {item}", container=st, method="markdown")
+                    pilot.display(
+                        f"- {_defang_markdown_images(item)}",
+                        container=st,
+                        method="markdown",
+                    )
 
         rows = findings.get("framework_findings")
         if isinstance(rows, list) and rows:

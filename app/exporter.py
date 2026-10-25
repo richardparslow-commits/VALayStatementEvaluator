@@ -69,13 +69,13 @@ _SOURCE_PATTERNS = (
     # "[filename — page 3]" / "filename — page 3" / "filename - pages 3-4"
     # and the block-addressed form for .txt/.md/.docx ("filename — block 2").
     re.compile(
-        r"^\[?(?P<doc>.+?)\s*[—-]\s*(?:pages?|blocks?)\s*(?P<pages>[\d,\-\s]+)\]?$",
+        r"^\[?(?P<doc>[^;]+?)\s*[—-]\s*(?:pages?|blocks?)\s*(?P<pages>[\d,\-\s]+)\]?$",
         re.IGNORECASE,
     ),
     # "filename p.3" / "filename b.2" (app.documents.DocumentPage.label), plus
     # the chunk-span form the digest now emits: "clinic.pdf p.3-p.9".
     re.compile(
-        r"^(?P<doc>.+?)\s+[pb]\.(?P<pages>\d+(?:\s*-\s*(?:[pb]\.)?\d+|\s*,\s*(?:[pb]\.)?\d+)*)$",
+        r"^(?P<doc>[^;]+?)\s+[pb]\.(?P<pages>\d+(?:\s*-\s*(?:[pb]\.)?\d+|\s*,\s*(?:[pb]\.)?\d+)*)$",
         re.IGNORECASE,
     ),
 )
@@ -107,9 +107,9 @@ def parse_source(source: str) -> tuple[str, str]:
 
 
 def _fact_doc_and_pages(fact: MedicalFact) -> tuple[str, str]:
-    """Return `(document_name, pages)` preferring resolved `fact.document`/`fact.page`."""
+    """Return `(document_name, pages)` preserving explicit `fact.source` when present."""
     doc_name, pages = parse_source(fact.source)
-    if not pages:
+    if not doc_name:
         if getattr(fact, "document", ""):
             doc_name = fact.document
         if getattr(fact, "page", 0) and fact.page > 0:

@@ -359,6 +359,7 @@ def submit_job(
                 "A run is already in progress for these inputs — wait for it above, or "
                 "reload this page. Only one run per tab is submitted at a time."
             , container=st, method="warning")
+            st.session_state[f"_va_lse_resume_wait_{slot}"] = existing
             return None
 
     # The submit span is what the worker's run span hangs off: it wraps encoding
@@ -463,6 +464,7 @@ def submit_job(
     if outcome.ok or not outcome.still_running:
         # Terminal (done or failed): nothing left to resume.
         st.session_state.pop(_pending_key(slot), None)
+        st.session_state.pop(_pending_request_key(slot), None)
     if not outcome.ok:
         _render_failure(outcome, action_label)
     return outcome
@@ -561,15 +563,18 @@ def resume_pending_job(slot: str, *, action_label: str) -> None:
     if record.is_terminal:
         outcome = _fetch_outcome(get_job_backend(), record, slot)
         st.session_state.pop(_pending_key(slot), None)
+        st.session_state.pop(_pending_request_key(slot), None)
         if not outcome.ok:
             _render_failure(outcome, action_label)
         return
+    auto_wait = st.session_state.pop(f"_va_lse_resume_wait_{slot}", None) == job_id
     pilot.display(
         f"A run you started earlier is still in progress on a worker "
         f"({record.progress * 100:.0f}% — {record.message or 'running'}). "
         f"Reference: `{record.request_id or job_id}`."
     , container=st, method="info")
-    if st.button("⏳ Wait for it to finish", key=f"resume_{slot}"):
+    wait_clicked = st.button("⏳ Wait for it to finish", key=f"resume_{slot}")
+    if auto_wait or wait_clicked:
         outcome = _poll(
             get_job_backend(),
             job_id,
@@ -578,9 +583,10 @@ def resume_pending_job(slot: str, *, action_label: str) -> None:
         )
         if outcome.ok or not outcome.still_running:
             st.session_state.pop(_pending_key(slot), None)
+            st.session_state.pop(_pending_request_key(slot), None)
         if not outcome.ok:
             _render_failure(outcome, action_label)
-        else:
+        elif wait_clicked:
             st.rerun()
 
 
@@ -624,6 +630,7 @@ def recover_job_by_request_id(
         return None
     if record is None:
         st.session_state.pop(_pending_key(slot), None)
+        st.session_state.pop(_pending_request_key(slot), None)
         return None
     if not pilot.owns(record):
         st.session_state.pop(_pending_key(slot), None)
@@ -633,6 +640,7 @@ def recover_job_by_request_id(
     if record.is_terminal:
         outcome = _fetch_outcome(get_job_backend(), record, slot)
         st.session_state.pop(_pending_key(slot), None)
+        st.session_state.pop(_pending_request_key(slot), None)
         if not outcome.ok:
             _render_failure(outcome, action_label)
         return outcome
@@ -645,6 +653,7 @@ def recover_job_by_request_id(
     )
     if outcome.ok or not outcome.still_running:
         st.session_state.pop(_pending_key(slot), None)
+        st.session_state.pop(_pending_request_key(slot), None)
     if not outcome.ok:
         _render_failure(outcome, action_label)
     return outcome

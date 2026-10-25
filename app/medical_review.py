@@ -1250,7 +1250,14 @@ def review_medical_records(
                             m_doc, m_kind, m_num = matches[0]
                             fact.document = m_doc
                             fact.page = m_num
-                            if not re.search(r"[pb]\.\d+\s*[-–]\s*[pb]\.\d+", fact.source, re.IGNORECASE):
+                            if (
+                                fact.source == fallback
+                                or fact.source.startswith(m_doc)
+                            ) and not re.search(
+                                r"[pb]\.\d+\s*[-–]\s*[pb]\.\d+",
+                                fact.source,
+                                re.IGNORECASE,
+                            ):
                                 fact.source = f"{m_doc} {m_kind}.{m_num}"
                 all_facts.append(fact)
                 facts_in_chunk += 1

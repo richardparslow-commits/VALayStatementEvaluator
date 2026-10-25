@@ -700,140 +700,260 @@ def restore_backup(
     except OSError as exc:
         return RestoreReport(target=str(root), error=f"could not create {root}: {exc}")
 
-    if not force and (root / "restored.jsonl").exists():
-        return RestoreReport(
-            target=str(root),
-            refused=True,
-            error=(
-                f"{root / 'restored.jsonl'} already exists; pass --force to replace it, "
-                "or restore into an empty directory"
-            ),
-            verify=report,
-        )
+    claim_lock = root / ".restore.lock"
+    claimed_lock = False
+    if not force:
+        if (root / "restored.jsonl").exists():
+            return RestoreReport(
+                target=str(root),
+                refused=True,
+                error=(
+                    f"{root / 'restored.jsonl'} already exists; pass --force to replace it, "
+                    "or restore into an empty directory"
+                ),
+                verify=report,
+            )
+        try:
+            lock_fd = os.open(
+                str(claim_lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+            )
+            os.close(lock_fd)
+            claimed_lock = True
+        except FileExistsError:
+            return RestoreReport(
+                target=str(root),
+                refused=True,
+                error=(
+                    f"{root / 'restored.jsonl'} already exists; pass --force to replace it, "
+                    "or restore into an empty directory"
+                ),
+                verify=report,
+            )
+        except OSError as exc:
+            return RestoreReport(
+                target=str(root),
+                error=f"could not create {claim_lock}: {exc}",
+                verify=report,
+            )
+        if (root / "restored.jsonl").exists():
+            claim_lock.unlink(missing_ok=True)
+            return RestoreReport(
+                target=str(root),
+                refused=True,
+                error=(
+                    f"{root / 'restored.jsonl'} already exists; pass --force to replace it, "
+                    "or restore into an empty directory"
+                ),
+                verify=report,
+            )
 
     out = RestoreReport(
         target=str(root), manifest_path=str(root / "manifest.json"), verify=report
     )
 
-    if report is not None and report.unreadable:
-        for unreadable_check in report.unreadable:
-            out.skipped.append({"key": unreadable_check.key, "reason": unreadable_check.error})
-        out.error = (
-            f"could not read {len(report.unreadable)} backup object(s); "
-            "existing restoration was left untouched"
-        )
-        out.manifest_path = ""
-        return out
-
-    if report is not None:
-        windows = report.plan.windows
-        rotated_keys = [ref.key for ref in report.rotated_refs]
-    else:
-        windows, rotated_keys, list_err = _list_for_restore_checked(dest)
-        if list_err:
-            out.error = list_err
+    try:
+        if report is not None and report.unreadable:
+            for unreadable_check in report.unreadable:
+                out.skipped.append({"key": unreadable_check.key, "reason": unreadable_check.error})
+            out.error = (
+                f"could not read {len(report.unreadable)} backup object(s); "
+                "existing restoration was left untouched"
+            )
             out.manifest_path = ""
             return out
 
-    stream = root / "restored.jsonl"
-    tmp_stream = root / f".restored.jsonl.{os.getpid()}.tmp"
-    wrote_bytes = 0
-    wrote_lines = 0
-    included: list[str] = []
-    try:
-        with tmp_stream.open("wb") as handle:
-            for window in windows:
-                cached = (
-                    report.checks.get(window.key)
-                    if report is not None and report.hashed
-                    else None
-                )
-                if cached is not None and cached.data is not None:
-                    data: bytes | None = cached.data
-                else:
-                    data = _read_for_restore(dest, window.key, out)
-                if data is None:
-                    continue
-                handle.write(data)
-                wrote_bytes += len(data)
-                wrote_lines += data.count(b"\n")
-                included.append(window.key)
-    except OSError as exc:
-        tmp_stream.unlink(missing_ok=True)
-        out.error = f"could not write {stream}: {exc}"
-        out.manifest_path = ""
-        return out
+        if report is not None:
+            windows = report.plan.windows
+            rotated_keys = [ref.key for ref in report.rotated_refs]
+        else:
+            windows, rotated_keys, list_err = _list_for_restore_checked(dest)
+            if list_err:
+                out.error = list_err
+                out.manifest_path = ""
+                return out
 
-    rotated_dir = root / "rotated"
-    staged_rotated: list[tuple[Path, Path, str]] = []
-    for key in rotated_keys:
-        ref = parse_object_key(key)
-        cached_rot = (
-            report.checks.get(key)
-            if report is not None and report.hashed
+        stream = root / "restored.jsonl"
+        tmp_stream = root / f".restored.jsonl.{os.getpid()}.tmp"
+        wrote_bytes = 0
+        wrote_lines = 0
+        included: list[str] = []
+        try:
+            with tmp_stream.open("wb") as handle:
+                for window in windows:
+                    cached = (
+                        report.checks.get(window.key)
+                        if report is not None and report.hashed
+                        else None
+                    )
+                    if cached is not None and cached.data is not None:
+                        data: bytes | None = cached.data
+                    else:
+                        data = _read_for_restore(dest, window.key, out)
+                    if data is None:
+                        continue
+                    handle.write(data)
+                    wrote_bytes += len(data)
+                    wrote_lines += data.count(b"\n")
+                    included.append(window.key)
+        except OSError as exc:
+            tmp_stream.unlink(missing_ok=True)
+            out.error = f"could not write {stream}: {exc}"
+            out.manifest_path = ""
+            return out
+
+        rotated_dir = root / "rotated"
+        staged_rotated: list[tuple[Path, Path, str]] = []
+        for key in rotated_keys:
+            ref = parse_object_key(key)
+            cached_rot = (
+                report.checks.get(key)
+                if report is not None and report.hashed
+                else None
+            )
+            if cached_rot is not None and cached_rot.data is not None:
+                data = cached_rot.data
+            else:
+                data = _read_for_restore(dest, key, out)
+            if data is None or ref is None:
+                continue
+            # Named by content so two snapshots of one filename (before and after it
+            # rotated) cannot overwrite each other in the restored output.
+            path = rotated_dir / f"{ref.filename}-{ref.size}-{ref.sha12}.jsonl"
+            tmp_rot = rotated_dir / f".{ref.filename}-{ref.size}-{ref.sha12}.{os.getpid()}.tmp"
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                tmp_rot.write_bytes(data)
+            except OSError as exc:
+                tmp_rot.unlink(missing_ok=True)
+                out.skipped.append({"key": key, "reason": str(exc)})
+                continue
+            staged_rotated.append((tmp_rot, path, key))
+
+        if out.skipped:
+            tmp_stream.unlink(missing_ok=True)
+            for tmp_rot, _final_path, _key in staged_rotated:
+                tmp_rot.unlink(missing_ok=True)
+            out.error = (
+                f"could not read {len(out.skipped)} backup object(s); "
+                "existing restoration was left untouched"
+            )
+            out.manifest_path = ""
+            return out
+
+        manifest_file = root / "manifest.json"
+        prev_stream_bytes = (
+            stream.read_bytes() if stream.exists() and stream.is_file() else None
+        )
+        prev_manifest_bytes = (
+            manifest_file.read_bytes()
+            if manifest_file.exists() and manifest_file.is_file()
             else None
         )
-        if cached_rot is not None and cached_rot.data is not None:
-            data = cached_rot.data
-        else:
-            data = _read_for_restore(dest, key, out)
-        if data is None or ref is None:
-            continue
-        # Named by content so two snapshots of one filename (before and after it
-        # rotated) cannot overwrite each other in the restored output.
-        path = rotated_dir / f"{ref.filename}-{ref.size}-{ref.sha12}.jsonl"
-        tmp_rot = rotated_dir / f".{ref.filename}-{ref.size}-{ref.sha12}.{os.getpid()}.tmp"
+        prev_rotated: dict[Path, bytes] = {}
+        if rotated_dir.exists() and rotated_dir.is_dir():
+            for entry in rotated_dir.iterdir():
+                if entry.is_file() and not entry.name.startswith("."):
+                    try:
+                        prev_rotated[entry] = entry.read_bytes()
+                    except OSError:
+                        pass
+
+        def _rollback_finalization() -> None:
+            if prev_stream_bytes is not None:
+                try:
+                    stream.write_bytes(prev_stream_bytes)
+                except OSError:
+                    pass
+            elif stream.exists() and stream.is_file():
+                stream.unlink(missing_ok=True)
+            if prev_manifest_bytes is not None:
+                try:
+                    manifest_file.write_bytes(prev_manifest_bytes)
+                except OSError:
+                    pass
+            elif manifest_file.exists() and manifest_file.is_file():
+                manifest_file.unlink(missing_ok=True)
+            if rotated_dir.exists() and rotated_dir.is_dir():
+                for _t, final_path, _k in staged_rotated:
+                    if (
+                        final_path not in prev_rotated
+                        and final_path.exists()
+                        and final_path.is_file()
+                    ):
+                        final_path.unlink(missing_ok=True)
+                for old_path, old_bytes in prev_rotated.items():
+                    try:
+                        old_path.write_bytes(old_bytes)
+                    except OSError:
+                        pass
+
+        if not force:
+            # Atomic exclusive creation of restored.jsonl when not --force so concurrent
+            # callers that raced before or during _load_objects cannot both succeed.
+            try:
+                excl_fd = os.open(
+                    str(stream), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+                )
+                os.close(excl_fd)
+            except FileExistsError:
+                tmp_stream.unlink(missing_ok=True)
+                for tmp_rot, _final_path, _key in staged_rotated:
+                    tmp_rot.unlink(missing_ok=True)
+                out.refused = True
+                out.error = (
+                    f"{stream} already exists; pass --force to replace it, "
+                    "or restore into an empty directory"
+                )
+                out.manifest_path = ""
+                return out
+
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_rot.write_bytes(data)
+            new_rotated_set = {final_path for _t, final_path, _k in staged_rotated}
+            for tmp_rot, final_path, key in staged_rotated:
+                os.replace(tmp_rot, final_path)
+                out.rotated_paths.append(str(final_path))
+                included.append(key)
+            if force and rotated_dir.exists() and rotated_dir.is_dir():
+                for old_path in list(prev_rotated):
+                    if old_path not in new_rotated_set and old_path.exists():
+                        old_path.unlink()
+            os.replace(tmp_stream, stream)
         except OSError as exc:
-            tmp_rot.unlink(missing_ok=True)
-            out.skipped.append({"key": key, "reason": str(exc)})
-            continue
-        staged_rotated.append((tmp_rot, path, key))
+            tmp_stream.unlink(missing_ok=True)
+            for tmp_rot, _final_path, _key in staged_rotated:
+                tmp_rot.unlink(missing_ok=True)
+            _rollback_finalization()
+            out.rotated_paths = []
+            out.error = f"could not finalize {stream}: {exc}"
+            out.manifest_path = ""
+            return out
 
-    if out.skipped:
-        tmp_stream.unlink(missing_ok=True)
-        for tmp_rot, _final_path, _key in staged_rotated:
-            tmp_rot.unlink(missing_ok=True)
-        out.error = (
-            f"could not read {len(out.skipped)} backup object(s); "
-            "existing restoration was left untouched"
-        )
-        out.manifest_path = ""
+        out.wrote_bytes = wrote_bytes
+        out.wrote_lines = wrote_lines
+        out.included = included
+        out.stream_path = str(stream)
+
+        tmp_manifest = root / f".manifest.json.{os.getpid()}.tmp"
+        try:
+            tmp_manifest.write_text(
+                json.dumps(out.to_json(), indent=2, sort_keys=True), encoding="utf-8"
+            )
+            os.replace(tmp_manifest, manifest_file)
+        except OSError as exc:
+            tmp_manifest.unlink(missing_ok=True)
+            logger.warning("could not write restore manifest: %s", exc)
+            _rollback_finalization()
+            out.wrote_bytes = 0
+            out.wrote_lines = 0
+            out.included = []
+            out.rotated_paths = []
+            out.stream_path = ""
+            out.manifest_path = ""
+            out.error = f"could not write {manifest_file}: {exc}"
         return out
-
-    try:
-        os.replace(tmp_stream, stream)
-        for tmp_rot, final_path, key in staged_rotated:
-            os.replace(tmp_rot, final_path)
-            out.rotated_paths.append(str(final_path))
-            included.append(key)
-    except OSError as exc:
-        tmp_stream.unlink(missing_ok=True)
-        for tmp_rot, _final_path, _key in staged_rotated:
-            tmp_rot.unlink(missing_ok=True)
-        out.error = f"could not finalize {stream}: {exc}"
-        out.manifest_path = ""
-        return out
-
-    out.wrote_bytes = wrote_bytes
-    out.wrote_lines = wrote_lines
-    out.included = included
-    out.stream_path = str(stream)
-
-    manifest_file = root / "manifest.json"
-    tmp_manifest = root / f".manifest.json.{os.getpid()}.tmp"
-    try:
-        tmp_manifest.write_text(
-            json.dumps(out.to_json(), indent=2, sort_keys=True), encoding="utf-8"
-        )
-        os.replace(tmp_manifest, manifest_file)
-    except OSError as exc:
-        tmp_manifest.unlink(missing_ok=True)
-        logger.warning("could not write restore manifest: %s", exc)
-        out.manifest_path = ""
-    return out
+    finally:
+        if claimed_lock:
+            claim_lock.unlink(missing_ok=True)
 
 
 def _read_for_restore(
