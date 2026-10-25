@@ -836,6 +836,33 @@ class TestRenderRecordSearch(unittest.TestCase):
             records.render_record_search("eval", [])
         st_mock.expander.assert_not_called()
 
+    def test_reconcile_prunes_stale_citations_across_slots_unless_eval_has_separate_records(self) -> None:
+        from app.documents import DocumentPage, ExtractedDocument
+
+        records, st_mock, session, _SearchResult = self._widget_mock("", {})
+        doc = ExtractedDocument(
+            filename="clinic.pdf",
+            pages=[DocumentPage("clinic.pdf", 2, "Updated note: shoulder pain only.")],
+        )
+        session["citation_index"] = [
+            {"excerpt": "**knee** pain noted", "source": "clinic.pdf p.2"},
+            {"excerpt": "shoulder pain only", "source": "clinic.pdf p.2"},
+        ]
+        with _patch_st(records, st_mock):
+            # When source_records_eval holds separate eval records, a draft-slot reconcile
+            # must not wipe eval citations prematurely.
+            session["source_records_eval"] = {"Upload files": [doc]}
+            records._reconcile_search_and_citations("draft", [])
+            self.assertEqual(len(session["citation_index"]), 2)
+
+            # When source_records_eval is empty, non-eval slot reconcile prunes stale citations.
+            session.pop("source_records_eval", None)
+            records._reconcile_search_and_citations("draft", [doc])
+            self.assertEqual(
+                session["citation_index"],
+                [{"excerpt": "shoulder pain only", "source": "clinic.pdf p.2"}],
+            )
+
 
 class TestRenderCitationIndexExport(unittest.TestCase):
     """F2.S2 — CSV/JSON download buttons for the accumulated citation index."""

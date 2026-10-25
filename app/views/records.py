@@ -176,7 +176,7 @@ def _reconcile_search_and_citations(slot: str, documents: list[Any]) -> None:
         if len(kept_results) != len(results_any):
             st.session_state[results_key] = kept_results
 
-    if slot == "eval":
+    if slot == "eval" or not st.session_state.get("source_records_eval"):
         from ..exporter import parse_source
 
         index_any: Any = st.session_state.get(CITATION_INDEX_KEY)
