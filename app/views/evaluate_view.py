@@ -39,6 +39,8 @@ from ..evaluate import (
     build_evidence_dashboard,
     compute_score_band,
     coverage_lines,
+    _citation_index_snapshot,
+    _UNSET_CONTEXT,
     evaluation_report_markdown,
     rubric_and_positive_sources,
     run_evaluation,
@@ -654,6 +656,7 @@ def _run_evaluation_queued(
             request_id=rid,
             record_sources=_sources,
             witness=dict(witness or {}),
+            citations=_citation_index_snapshot(records),
         ),
         request_id=rid,
         condition=_condition,
@@ -1611,7 +1614,11 @@ def _render_evaluation_results(eval_result: Any) -> None:
                         f"- {fact_dict.get('fact', '')} _(source: {fact_dict.get('source', '')})_"
                     , container=st, method="write")
 
+    factual_context: Any = _UNSET_CONTEXT
+    if rubric_is_complete(eval_result):
         if evaluation_is_complete(eval_result) and (eval_result.revised_statement or eval_result.revision_changes):
+            from ..factual_integrity import attach_review, context_for_result, review_markdown
+            factual_context = context_for_result(eval_result)
             with st.expander("📝 Suggested improvements — proposed rewrite", expanded=True):
                 if eval_result.revision_notes:
                     pilot.display(eval_result.revision_notes, container=st, method="info")
@@ -1626,8 +1633,7 @@ def _render_evaluation_results(eval_result: Any) -> None:
                         for c in eval_result.revision_changes
                     ]
                     pilot.dataframe(st, change_rows, width="stretch", hide_index=True)
-                    from ..factual_integrity import attach_review, review_markdown
-                    attach_review(eval_result, eval_result.revised_statement)
+                    attach_review(eval_result, eval_result.revised_statement, context=factual_context)
                     with st.expander("Factual checks for proposed edits"):
                         for edit in eval_result.factual_review.get("proposed_edits", []):
                             # Plain text: model changes and witness excerpts cannot render controls.
@@ -1652,7 +1658,9 @@ def _render_evaluation_results(eval_result: Any) -> None:
                     on_change=pilot.invalidate_exports, args=("eval",),
                 )
                 from .factual_review import render_factual_review
-                factual_confirmed = render_factual_review(eval_result, revised, slot="eval")
+                factual_confirmed = render_factual_review(
+                    eval_result, revised, slot="eval", context=factual_context
+                )
                 export_confirmed = factual_confirmed and pilot.confirm_export(revised)
                 if pilot.enabled():
                     from .text_export import render_text_export
@@ -1679,7 +1687,11 @@ def _render_evaluation_results(eval_result: Any) -> None:
     _render_medical_timeline(eval_result, request_reference=_result_reference())
 
     with st.expander("Full markdown report"):
-        pilot.display(evaluation_report_markdown(eval_result), container=st, method="markdown")
+        pilot.display(
+            evaluation_report_markdown(eval_result, context=factual_context),
+            container=st,
+            method="markdown",
+        )
     pilot.file_download(
         "⬇️ Download evaluation report (.md)",
         data=evaluation_report_markdown(eval_result, include_rewrite=False).encode("utf-8"),

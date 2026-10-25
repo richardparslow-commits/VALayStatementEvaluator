@@ -283,6 +283,7 @@ def merge_records(sources: dict[str, list[ExtractedDocument]]) -> MergedRecordSe
     source_labels: list[list[str]] = []
     reserved_names = {doc.filename for docs in sources.values() for doc in docs}
     used_names: set[str] = set()
+    next_suffix: dict[str, int] = {}
     sources_merged = 0
     for source_label, docs in sources.items():
         if not docs:
@@ -304,10 +305,15 @@ def merge_records(sources: dict[str, list[ExtractedDocument]]) -> MergedRecordSe
             if doc.filename in used_names:
                 base_name = f"{source_label}/{doc.filename}"
                 filename = base_name
-                suffix = 2
-                while filename in reserved_names or filename in used_names:
-                    filename = f"{base_name} ({suffix})"
-                    suffix += 1
+                if filename in reserved_names or filename in used_names:
+                    suffix = next_suffix.get(base_name, 2)
+                    while True:
+                        candidate = f"{base_name} ({suffix})"
+                        suffix += 1
+                        if candidate not in reserved_names and candidate not in used_names:
+                            filename = candidate
+                            break
+                    next_suffix[base_name] = suffix
                 retained = replace(
                     doc, filename=filename,
                     pages=[replace(page, filename=filename) for page in doc.pages],

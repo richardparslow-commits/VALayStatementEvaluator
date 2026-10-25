@@ -607,6 +607,39 @@ class TestRecovery(unittest.TestCase):
         backend.set_recovery_index("req_dist", record.job_id)
         self.assertEqual(backend.lookup_by_request_id("req_dist"), record.job_id)
 
+    def test_submit_job_requeues_when_inputs_change_while_prior_job_runs(self):
+        backend = _PresetBackend()
+        first = _job(request_id="req_1")
+        st.session_state["va_lse_pending_job_eval"] = "job_inflight_1"
+        st.session_state["va_lse_pending_request_eval"] = "req_1"
+        st.session_state["_va_lse_pending_input_sig_eval"] = job_runner._job_input_signature(
+            KIND_EVALUATE, first
+        )
+        second = EvaluateJob(
+            statement_text="Updated observation.",
+            records=_docs(),
+            request_id="req_2",
+            record_sources=["Upload"],
+        )
+        with patch.object(job_runner, "get_job_backend", return_value=backend), patch.object(
+            config, "JOB_QUEUE_UI_POLL_SECONDS", 0.01
+        ):
+            out = job_runner.submit_job(
+                slot="eval",
+                job=second,
+                request_id="req_2",
+                condition=None,
+                sources=["Upload"],
+                files=1,
+                pages=1,
+                action_label="Evaluation",
+            )
+        self.assertIsNotNone(out)
+        assert out is not None
+        self.assertTrue(out.ok)
+        self.assertIn("Updated observation.", backend.last_payload)
+        self.assertFalse(st.session_state.get("va_lse_auto_wait_eval", False))
+
 
 class _QueuedOutcome(job_runner.QueueOutcome):
     """A QueueOutcome-like stand-in for submit_job's poll result.

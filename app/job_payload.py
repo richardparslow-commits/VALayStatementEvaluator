@@ -507,6 +507,7 @@ class EvaluateJob:
     # span, so the worker's spans join that trace instead of starting a new one.
     # Empty whenever tracing is off — see app/tracing.py.
     trace_context: dict[str, str] = field(default_factory=dict)
+    citations: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -600,6 +601,14 @@ def _job_envelope(kind: str, job: EvaluateJob | DraftJob) -> dict[str, Any]:
         # payloads stay byte-identical.
         if job.witness:
             base["witness"] = dict(job.witness)
+        if job.citations:
+            base["citations"] = [
+                {"source": str(row["source"]), "excerpt": str(row["excerpt"])}
+                for row in job.citations
+                if isinstance(row, dict)
+                and isinstance(row.get("source"), str)
+                and isinstance(row.get("excerpt"), str)
+            ]
     else:
         base["observations"] = job.observations
         base["condition"] = job.condition
@@ -670,10 +679,26 @@ def decode_job(
     # replace bad values with defaults. Requests must never be repaired silently.
     job: EvaluateJob | DraftJob
     if kind == KIND_EVALUATE:
+        raw_citations = data.get("citations")
+        if raw_citations is not None and not isinstance(raw_citations, list):
+            raise PayloadError("job payload citations must be a list")
+        citations: list[dict[str, str]] = []
+        for row in raw_citations or []:
+            # Malformed rows are rejected, not dropped: losing a citation silently
+            # ships a report whose Sources section disagrees with the web pod's.
+            if not isinstance(row, dict):
+                raise PayloadError("job payload citations must be objects")
+            row_source, row_excerpt = row.get("source"), row.get("excerpt")
+            if not isinstance(row_source, str) or not isinstance(row_excerpt, str):
+                raise PayloadError(
+                    "job payload citations must carry string source and excerpt"
+                )
+            citations.append({"source": row_source, "excerpt": row_excerpt})
         job = EvaluateJob(
             statement_text=data.get("statement_text", ""), records=records,
             request_id=request_id, record_sources=sources,
             witness=data.get("witness", {}), trace_context=_str_map(data.get("trace_context")),
+            citations=citations,
         )
     elif kind == KIND_DRAFT:
         job = DraftJob(

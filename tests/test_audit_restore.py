@@ -883,7 +883,21 @@ class TestRestoreAtomicAndConcurrency(unittest.TestCase):
             (Path(dst_dir) / ".restore.lock").write_text("locked", encoding="utf-8")
             rep = audit_restore.restore_backup(dest, target=dst_dir, force=False)
             self.assertTrue(rep.refused)
-            self.assertNotEqual(rep.error, "")
+            self.assertIn(".restore.lock", rep.error)
+
+    def test_stale_pid_lock_is_cleaned_automatically(self) -> None:
+        with tempfile.TemporaryDirectory() as src_dir, tempfile.TemporaryDirectory() as dst_dir:
+            dest = audit_backup.FilesystemDestination(src_dir)
+            line1 = b'{"ts":"2026-01-01T00:00:00Z","action":"a"}\n'
+            sha1 = hashlib.sha256(line1).hexdigest()[:12]
+            live_key = f"audit/2026/01/01/live-audit.log-0-{len(line1)}-{sha1}.jsonl"
+            dest.put_object(live_key, line1)
+            (Path(dst_dir) / ".restore.lock").write_text("99999999\n", encoding="utf-8")
+            with mock.patch("app.audit_restore.os.kill", side_effect=ProcessLookupError):
+                rep = audit_restore.restore_backup(dest, target=dst_dir, force=False)
+            self.assertFalse(rep.refused)
+            self.assertEqual(rep.error, "")
+            self.assertEqual((Path(dst_dir) / "restored.jsonl").read_bytes(), line1)
 
 
 if __name__ == "__main__":

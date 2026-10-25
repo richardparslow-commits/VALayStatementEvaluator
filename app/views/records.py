@@ -113,23 +113,52 @@ def _forget_source_records(slot: str, label: str) -> None:
         store.pop(label, None)
 
 
+def _slot_loaded_documents(slot: str, documents: list[Any]) -> list[Any]:
+    """Return all currently loaded documents across every source for ``slot``."""
+    combined: list[Any] = list(documents or [])
+    seen_ids = {id(d) for d in combined}
+    store = st.session_state.get(f"source_records_{slot}")
+    if isinstance(store, dict) and store:
+        for src_docs in store.values():
+            if isinstance(src_docs, list):
+                for d in src_docs:
+                    if id(d) not in seen_ids:
+                        combined.append(d)
+                        seen_ids.add(id(d))
+    return combined
+
+
 def _reconcile_search_and_citations(slot: str, documents: list[Any]) -> None:
     """Prune stale search results and citation_index entries when records change."""
+    results_key = f"search_results_{slot}"
+    results_any: Any = st.session_state.get(results_key)
+    has_results = isinstance(results_any, list) and bool(results_any)
+
+    reconcile_citations = slot == "eval" or not st.session_state.get("source_records_eval")
+    index_any: Any = st.session_state.get(CITATION_INDEX_KEY) if reconcile_citations else None
+    has_index = isinstance(index_any, list) and bool(index_any)
+
+    eval_res = st.session_state.get("eval_result") if reconcile_citations else None
+    rep_citations = getattr(eval_res, "report_citations", None) if eval_res is not None else None
+    has_rep_citations = isinstance(rep_citations, list) and bool(rep_citations)
+
+    if not has_results and not has_index and not has_rep_citations:
+        return
+
     from ..exporter import build_record_excerpt_matcher, filter_grounded_citations
 
-    matcher = build_record_excerpt_matcher(documents or [])
+    slot_docs = _slot_loaded_documents(slot, documents)
+    matcher = build_record_excerpt_matcher(slot_docs)
     if matcher is None:
         # Unit-test MagicMock placeholder documents: do not filter by content.
         return
 
-    results_key = f"search_results_{slot}"
-    results_any: Any = st.session_state.get(results_key)
-    if isinstance(results_any, list):
+    if has_results and isinstance(results_any, list):
         kept_results = []
         for r in results_any:
             fname = getattr(r, "filename", None)
             if not isinstance(fname, str) or not fname:
-                if documents:
+                if slot_docs:
                     kept_results.append(r)
                 continue
             r_page = getattr(r, "page", None)
@@ -139,16 +168,17 @@ def _reconcile_search_and_citations(slot: str, documents: list[Any]) -> None:
         if len(kept_results) != len(results_any):
             st.session_state[results_key] = kept_results
 
-    if slot == "eval" or not st.session_state.get("source_records_eval"):
-        index_any: Any = st.session_state.get(CITATION_INDEX_KEY)
-        if isinstance(index_any, list) and index_any:
+    if reconcile_citations:
+        if has_index and isinstance(index_any, list):
             valid_dicts = [item for item in index_any if isinstance(item, dict)]
-            kept_citations = filter_grounded_citations(valid_dicts, documents or [])
+            kept_citations = filter_grounded_citations(valid_dicts, slot_docs)
             if len(kept_citations) != len(index_any):
                 st.session_state[CITATION_INDEX_KEY] = kept_citations
-                eval_res = st.session_state.get("eval_result")
-                if eval_res is not None and isinstance(getattr(eval_res, "report_citations", None), list):
-                    eval_res.report_citations = list(kept_citations)
+        if has_rep_citations and isinstance(rep_citations, list) and eval_res is not None:
+            valid_rep = [item for item in rep_citations if isinstance(item, dict)]
+            kept_rep = filter_grounded_citations(valid_rep, slot_docs)
+            if len(kept_rep) != len(rep_citations):
+                eval_res.report_citations = kept_rep
 
 
 def records_uploader(slot: str) -> list:
@@ -530,8 +560,8 @@ def render_record_search(slot: str, documents: list[Any]) -> None:
     on a result adds its excerpt + source to ``citation_index`` in
     ``session_state`` (read by ``build_report``/CSV-JSON export in F2.S2).
     """
-    _reconcile_search_and_citations(slot, documents)
     if not documents:
+        _reconcile_search_and_citations(slot, documents)
         return
 
     impression_key = f"search_impression_sent_{slot}"

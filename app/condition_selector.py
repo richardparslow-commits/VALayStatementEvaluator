@@ -272,8 +272,11 @@ def render_condition_selector(slot: str, feature_id: str) -> dict[str, Any]:
             st.session_state[f"forced_topics_{slot}"] = forced_topics
             if slot == "draft":
                 joined_conds = ", ".join(c for _, c in conditions_pairs if c)
-                st.session_state["draft_condition"] = joined_conds
-                st.session_state["_draft_condition_prefilled"] = joined_conds
+                current_cond = str(st.session_state.get("draft_condition", "") or "").strip()
+                prev_prefilled = str(st.session_state.get("_draft_condition_prefilled", "") or "").strip()
+                if not current_cond or current_cond == prev_prefilled:
+                    st.session_state["draft_condition"] = joined_conds
+                    st.session_state["_draft_condition_prefilled"] = joined_conds
             try:
                 track_interaction(
                     feature_id,

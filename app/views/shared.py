@@ -461,7 +461,7 @@ def audit_condition_for_slot(slot: str) -> str:
                     names.append(item.strip())
             names = [n for n in names if n]
             if names:
-                return ", ".join(names)[:120]
+                return ", ".join(names)
     except Exception:  # noqa: BLE001
         pass
     return ""

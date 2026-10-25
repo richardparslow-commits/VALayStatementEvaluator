@@ -280,14 +280,22 @@ def compare(text: str, context: dict[str, Any] | None,
     if context is None or not context.get("complete"):
         result["issues"] = ["Original inputs are unavailable or exceed the comparison limit. Re-run with the original inputs before marking this text reviewed."]
         return result
-    sources = {s["id"]: s for s in context["sources"]}
-    source_keys = {sid: _key(s["text"]) for sid, s in sources.items()}
-    exact_index: dict[str, list[str]] = {}
-    inverted: dict[str, set[str]] = {}
-    for sid, key in source_keys.items():
-        exact_index.setdefault(key, []).append(sid)
-        for word in set(key.split()):
-            inverted.setdefault(word, set()).add(sid)
+    cache_key = (id(context), str(context.get("hash", "")), id(_key))
+    cached_index = _CONTEXT_INDEX_CACHE.get(cache_key)
+    if cached_index is None:
+        built_sources: dict[str, Any] = {s["id"]: s for s in context["sources"]}
+        built_keys: dict[str, str] = {sid: _key(s["text"]) for sid, s in built_sources.items()}
+        built_exact: dict[str, list[str]] = {}
+        built_inverted: dict[str, set[str]] = {}
+        for sid, key in built_keys.items():
+            built_exact.setdefault(key, []).append(sid)
+            for word in set(key.split()):
+                built_inverted.setdefault(word, set()).add(sid)
+        if len(_CONTEXT_INDEX_CACHE) >= 32:
+            _CONTEXT_INDEX_CACHE.clear()
+        cached_index = (built_sources, built_keys, built_exact, built_inverted)
+        _CONTEXT_INDEX_CACHE[cache_key] = cached_index
+    sources, source_keys, exact_index, inverted = cached_index
     used: set[str] = set()
     for ordinal, span in enumerate(_spans(text)):
         if ordinal >= MAX_SPANS:
@@ -374,17 +382,25 @@ def compare(text: str, context: dict[str, Any] | None,
     return result
 
 
-def attach_review(result: Any, text: str) -> None:
-    context = context_for_result(result)
-    result.factual_review = compare(text, context)
+_UNSET = object()
+_CONTEXT_INDEX_CACHE: dict[
+    tuple[int, str, int],
+    tuple[dict[str, Any], dict[str, str], dict[str, list[str]], dict[str, set[str]]],
+] = {}
+
+
+def attach_review(result: Any, text: str, *, context: Any = _UNSET) -> dict[str, Any] | None:
+    ctx = context_for_result(result) if context is _UNSET else context
+    result.factual_review = compare(text, ctx)
     edits = []
     for i, change in enumerate(getattr(result, "revision_changes", []), 1):
         if isinstance(change, dict) and isinstance(change.get("revised"), str):
-            comparison = compare(change["revised"], context, require_account_coverage=False)
+            comparison = compare(change["revised"], ctx, require_account_coverage=False)
             # One shared ledger per result, not one full copy per proposed edit.
             comparison.pop("ledger")
             edits.append({"index": i, "comparison": comparison})
     result.factual_review["proposed_edits"] = edits
+    return ctx
 
 
 def review_notice(review: dict[str, Any] | None) -> str:

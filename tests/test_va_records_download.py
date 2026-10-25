@@ -448,6 +448,17 @@ class TestWizardFlow(unittest.TestCase):
 
         self.assertIn("kept", str(ctx.exception))
 
+    def test_successful_redownload_replaces_existing_pdf(self) -> None:
+        page = _FakePage(payload=b"%PDF-1.4\nnew export")
+        with TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "out"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            existing = out_dir / "VA_medical_records.pdf"
+            existing.write_bytes(b"%PDF-1.4\nold export")
+            saved = _downloader(page, Path(tmp)).run()
+            self.assertEqual(saved, existing)
+            self.assertEqual(saved.read_bytes(), b"%PDF-1.4\nnew export")
+
     def test_failed_download_does_not_overwrite_existing_pdf(self) -> None:
         page = _FakePage(payload=b"<!DOCTYPE html><html>Session expired</html>")
         with TemporaryDirectory() as tmp:

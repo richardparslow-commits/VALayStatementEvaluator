@@ -914,10 +914,44 @@ def records_from_local_path(path: str) -> tuple[list[ExtractedDocument], list[st
             f"No supported record files (.pdf/.txt/.md/.docx/.zip) found in: {root}"
         )
 
+    per_file_limit = config.MAX_UPLOAD_BYTES
+    total_limit = config.MAX_TOTAL_UPLOAD_BYTES
     documents: list[ExtractedDocument] = []
     skipped: list[str] = []
+    accepted: list[tuple[Path, str, int]] = []
     for file in files:
-        extracted, problems = _expand_and_extract(label_for(file), file.read_bytes())
+        label = label_for(file)
+        try:
+            sz = file.stat().st_size
+        except OSError as exc:
+            skipped.append(f"✖️ {label}: could not stat file ({exc}).")
+            continue
+        if sz > per_file_limit:
+            skipped.append(
+                f"✖️ {label}: {sz // 1_048_576} MB exceeds the per-file limit "
+                f"({per_file_limit // 1_048_576} MB). Reduce or split this file."
+            )
+        else:
+            accepted.append((file, label, sz))
+
+    total = sum(sz for _, _, sz in accepted)
+    if total > total_limit and accepted:
+        by_size = sorted(accepted, key=lambda item: item[2])
+        kept_labels: set[str] = set()
+        running = 0
+        for file, label, sz in by_size:
+            if running + sz <= total_limit:
+                kept_labels.add(label)
+                running += sz
+            else:
+                skipped.append(
+                    f"✖️ {label}: batch total would exceed {total_limit // 1_048_576} MB — file skipped. "
+                    "Remove some files or raise VA_LSE_MAX_TOTAL_UPLOAD_BYTES."
+                )
+        accepted = [item for item in accepted if item[1] in kept_labels]
+
+    for file, label, _sz in accepted:
+        extracted, problems = _expand_and_extract(label, file.read_bytes())
         documents.extend(extracted)
         skipped.extend(problems)
     if not documents:
