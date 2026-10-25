@@ -181,6 +181,42 @@ class TestExecuteJobSuccess(_WorkerCase):
         # Usage must travel with the result: the results panel reports on it.
         self.assertGreater(run.usage.totals().calls, 0)
 
+    def test_evaluate_job_stores_the_submitted_citations_in_the_report(self):
+        """The web pod collects citations; the stored report must still cite them.
+
+        The worker receives whatever the submitter snapshotted, so this drives the
+        real job through the queue and reads the result back the way the results
+        panel does — filtering included, since a citation for a document the worker
+        never received cannot survive into the report.
+        """
+        job = _evaluate_job()
+        job.citations = [
+            {"source": "a.txt p.1", "excerpt": "EVT knee pain noted during service."},
+            {"source": "a.txt p.1", "excerpt": "EVT brace prescribed."},
+            {"source": "a.txt p.1", "excerpt": "obsolete line from a previous upload"},
+            {"source": "gone.pdf p.1", "excerpt": "EVT knee pain noted during service."},
+        ]
+        record = self.backend.enqueue(
+            KIND_EVALUATE, encode_job(KIND_EVALUATE, job), request_id=job.request_id
+        )
+        claimed = self.backend.claim([KIND_EVALUATE], worker_id="w1")
+
+        ok = worker.execute_job(claimed[0], claimed[1], self.backend, llm=_UsageStub())
+
+        self.assertTrue(ok)
+        run = decode_result(self.backend.get_result(record.job_id))
+        self.assertEqual(
+            run.result.report_citations,
+            [
+                {"source": "a.txt p.1", "excerpt": "EVT knee pain noted during service."},
+                {"source": "a.txt p.1", "excerpt": "EVT brace prescribed."},
+            ],
+        )
+        self.assertIn("## Sources", run.result.report_markdown)
+        self.assertIn("EVT brace prescribed.", run.result.report_markdown)
+        self.assertNotIn("obsolete line from a previous upload", run.result.report_markdown)
+        self.assertNotIn("gone.pdf", run.result.report_markdown)
+
     def test_draft_job_stores_a_decodable_result(self):
         job = _draft_job()
         record = self.backend.enqueue(KIND_DRAFT, encode_job(KIND_DRAFT, job), request_id=job.request_id)
