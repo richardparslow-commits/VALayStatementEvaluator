@@ -68,8 +68,12 @@ def effective_credit_rates() -> tuple[dict[str, float | None], str]:
         cfg_settings = config.load_settings()
         if cfg_settings.model_main:
             main_models.add(cfg_settings.model_main)
+        if getattr(cfg_settings, "fallback_model_main", ""):
+            main_models.add(cfg_settings.fallback_model_main)
         if cfg_settings.model_fast:
             fast_models.add(cfg_settings.model_fast)
+        if getattr(cfg_settings, "fallback_model_fast", ""):
+            fast_models.add(cfg_settings.fallback_model_fast)
     except Exception:  # noqa: BLE001
         pass
     try:
@@ -77,8 +81,12 @@ def effective_credit_rates() -> tuple[dict[str, float | None], str]:
         if sess_settings is not None:
             if getattr(sess_settings, "model_main", ""):
                 main_models.add(sess_settings.model_main)
+            if getattr(sess_settings, "fallback_model_main", ""):
+                main_models.add(sess_settings.fallback_model_main)
             if getattr(sess_settings, "model_fast", ""):
                 fast_models.add(sess_settings.model_fast)
+            if getattr(sess_settings, "fallback_model_fast", ""):
+                fast_models.add(sess_settings.fallback_model_fast)
     except Exception:  # noqa: BLE001
         pass
     rates: dict[str, float | None] = {}

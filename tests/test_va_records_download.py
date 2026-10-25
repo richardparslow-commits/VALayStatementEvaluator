@@ -445,7 +445,21 @@ class TestWizardFlow(unittest.TestCase):
             kept = sorted(p.name for p in (Path(tmp) / "out").iterdir())
         self.assertIn("not a PDF", str(ctx.exception))
         self.assertEqual(kept, ["VA_medical_records.pdf"])
+
         self.assertIn("kept", str(ctx.exception))
+
+    def test_failed_download_does_not_overwrite_existing_pdf(self) -> None:
+        page = _FakePage(payload=b"<!DOCTYPE html><html>Session expired</html>")
+        with TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "out"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            existing = out_dir / "VA_medical_records.pdf"
+            good_bytes = b"%PDF-1.7\nexisting valid pdf content\n%%EOF\n"
+            existing.write_bytes(good_bytes)
+            with self.assertRaises(vrd.DownloadError):
+                _downloader(page, Path(tmp)).run()
+            self.assertEqual(existing.read_bytes(), good_bytes)
+            self.assertTrue((out_dir / "VA_medical_records.failed.pdf").exists())
 
 
 class TestSignInWait(unittest.TestCase):

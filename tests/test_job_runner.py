@@ -187,6 +187,7 @@ class TestSubmitAndPoll(unittest.TestCase):
         self.assertEqual(st.session_state.get("eval_request_id"), "req_q1")
         # The pending marker must be cleared so the tab does not re-attach.
         self.assertNotIn("va_lse_pending_job_eval", st.session_state)
+        self.assertNotIn("va_lse_pending_request_eval", st.session_state)
 
     def test_queued_payload_carries_the_run_inputs(self):
         backend = _PresetBackend()

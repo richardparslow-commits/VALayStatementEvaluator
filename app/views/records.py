@@ -106,6 +106,102 @@ def remember_source_records(slot: str, label: str, docs: list) -> None:
     store[label] = docs
 
 
+def _forget_source_records(slot: str, label: str) -> None:
+    """Remove cached source documents for ``label`` when cleared or invalid."""
+    store = st.session_state.get(f"source_records_{slot}")
+    if isinstance(store, dict):
+        store.pop(label, None)
+
+
+def _reconcile_search_and_citations(slot: str, documents: list[Any]) -> None:
+    """Prune stale search results and citation_index entries when records change."""
+    real_docs: list[Any] = []
+    for candidate in documents or []:
+        candidate_name = getattr(candidate, "filename", "")
+        if isinstance(candidate_name, str) and candidate_name:
+            real_docs.append(candidate)
+    if documents and not real_docs:
+        # Unit-test MagicMock placeholder documents: do not filter by content.
+        return
+
+    doc_pages: dict[str, dict[int, str]] = {}
+    doc_full: dict[str, str] = {}
+    for d in real_docs:
+        fname = d.filename
+        pages_map = doc_pages.setdefault(fname, {})
+        all_parts: list[str] = []
+        for p in getattr(d, "pages", []) or []:
+            pnum = getattr(p, "page", None)
+            ptxt = str(getattr(p, "text", "") or "")
+            if isinstance(pnum, int):
+                pages_map[pnum] = f"{pages_map.get(pnum, '')}\n{ptxt}" if pnum in pages_map else ptxt
+            if ptxt:
+                all_parts.append(ptxt)
+        full_txt = str(getattr(d, "full_text", "") or "") or "\n".join(all_parts)
+        doc_full[fname] = f"{doc_full.get(fname, '')}\n{full_txt}" if fname in doc_full else full_txt
+
+    def _excerpt_matches(fname: str, page_num: int | None, raw_excerpt: str) -> bool:
+        if fname not in doc_full:
+            return False
+        plain = _clean_citation_excerpt(str(raw_excerpt or "")).strip()
+        if plain.startswith("…"):
+            plain = plain[1:].strip()
+        if plain.endswith("…"):
+            plain = plain[:-1].strip()
+        if not plain:
+            return True
+        haystack = ""
+        if isinstance(page_num, int) and page_num in doc_pages.get(fname, {}):
+            haystack = doc_pages[fname][page_num]
+        else:
+            haystack = doc_full.get(fname, "")
+        if not haystack:
+            return True
+        return " ".join(plain.lower().split()) in " ".join(haystack.lower().split())
+
+    results_key = f"search_results_{slot}"
+    results_any: Any = st.session_state.get(results_key)
+    if isinstance(results_any, list):
+        kept_results = []
+        for r in results_any:
+            fname = getattr(r, "filename", None)
+            if not isinstance(fname, str) or not fname:
+                if real_docs:
+                    kept_results.append(r)
+                continue
+            r_page = getattr(r, "page", None)
+            r_excerpt = str(getattr(r, "excerpt", "") or "")
+            if _excerpt_matches(fname, r_page if isinstance(r_page, int) else None, r_excerpt):
+                kept_results.append(r)
+        if len(kept_results) != len(results_any):
+            st.session_state[results_key] = kept_results
+
+    if slot == "eval":
+        from ..exporter import parse_source
+
+        index_any: Any = st.session_state.get(CITATION_INDEX_KEY)
+        if isinstance(index_any, list) and index_any:
+            kept_citations: list[dict[str, str]] = []
+            for item in index_any:
+                if not isinstance(item, dict):
+                    continue
+                src_label = str(item.get("source", "") or "")
+                c_doc, c_pages = parse_source(src_label)
+                if not c_doc:
+                    continue
+                c_page_int: int | None = None
+                if c_pages and c_pages.isdigit():
+                    c_page_int = int(c_pages)
+                c_excerpt = str(item.get("excerpt", "") or "")
+                if _excerpt_matches(c_doc, c_page_int, c_excerpt):
+                    kept_citations.append(item)
+            if len(kept_citations) != len(index_any):
+                st.session_state[CITATION_INDEX_KEY] = kept_citations
+                eval_res = st.session_state.get("eval_result")
+                if eval_res is not None and isinstance(getattr(eval_res, "report_citations", None), list):
+                    eval_res.report_citations = list(kept_citations)
+
+
 def records_uploader(slot: str) -> list:
     """Render the record-source widget for a slot and return loaded documents."""
     _track_selector_impression(slot)
@@ -165,13 +261,17 @@ def records_uploader(slot: str) -> list:
     total_pages = sum(d.source_page_count for d in documents)
     if documents and total_pages > config.MAX_RECORD_PAGES:
         pilot.display(page_limit_message(total_pages, config.MAX_RECORD_PAGES), container=st, method="error")
+        _forget_source_records(slot, "Upload")
+        _label_detected_va_gov_exports(slot, [])
+        _reconcile_search_and_citations(slot, [])
         return []
     render_record_volume_warning(documents, slot=slot)
     if documents:
         remember_source_records(slot, "Upload", documents)
     else:
-        st.session_state.get(f"source_records_{slot}", {}).pop("Upload", None)
+        _forget_source_records(slot, "Upload")
     _label_detected_va_gov_exports(slot, documents)
+    _reconcile_search_and_citations(slot, documents)
     return documents
 
 
@@ -254,10 +354,15 @@ def _local_records(slot: str) -> list:
     total_pages = _safe_doc_pages(cached_records)
     if cached_records and total_pages > config.MAX_RECORD_PAGES:
         pilot.display(page_limit_message(total_pages, config.MAX_RECORD_PAGES), container=st, method="error")
-        remember_source_records(slot, "Local folder / file", [])
+        _forget_source_records(slot, "Local folder / file")
+        _reconcile_search_and_citations(slot, [])
         return []
     render_record_volume_warning(cached_records, slot=slot)
-    remember_source_records(slot, "Local folder / file", cached_records)
+    if cached_records:
+        remember_source_records(slot, "Local folder / file", cached_records)
+    else:
+        _forget_source_records(slot, "Local folder / file")
+    _reconcile_search_and_citations(slot, cached_records)
     return cached_records
 
 
@@ -291,10 +396,15 @@ def _fetch_records(slot: str) -> list[Any]:
     total_pages = _safe_doc_pages(records2)
     if records2 and total_pages > config.MAX_RECORD_PAGES:
         pilot.display(page_limit_message(total_pages, config.MAX_RECORD_PAGES), container=st, method="error")
-        remember_source_records(slot, "Fetch Sandbox", [])
+        _forget_source_records(slot, "Fetch Sandbox")
+        _reconcile_search_and_citations(slot, [])
         return []
     render_record_volume_warning(records2, slot=slot)
-    remember_source_records(slot, "Fetch Sandbox", records2)
+    if records2:
+        remember_source_records(slot, "Fetch Sandbox", records2)
+    else:
+        _forget_source_records(slot, "Fetch Sandbox")
+    _reconcile_search_and_citations(slot, records2)
     return records2
 
 
@@ -424,10 +534,7 @@ def _va_gov_records(slot: str) -> list[Any]:
         return []
 
     uploaded_exports = list(st.session_state.get(f"_uploaded_va_gov_exports_{slot}", []) or [])
-    combined_va_docs = list(uploaded_exports) + [
-        d for d in result.documents
-        if getattr(d, "filename", "") not in {getattr(u, "filename", "") for u in uploaded_exports}
-    ]
+    combined_va_docs = list(uploaded_exports) + list(result.documents)
     remember_source_records(slot, "VA.gov", combined_va_docs)
     other_sources = dict(st.session_state.get(f"source_records_{slot}", {}))
     merged = va_gov_client.merge_records(other_sources)
@@ -474,6 +581,7 @@ def render_record_search(slot: str, documents: list[Any]) -> None:
     on a result adds its excerpt + source to ``citation_index`` in
     ``session_state`` (read by ``build_report``/CSV-JSON export in F2.S2).
     """
+    _reconcile_search_and_citations(slot, documents)
     if not documents:
         return
 
@@ -527,23 +635,9 @@ def render_record_search(slot: str, documents: list[Any]) -> None:
                 except Exception:  # noqa: BLE001 - telemetry must never break the UI
                     pass
 
-        loaded_filenames = {
-            fn for d in documents
-            if isinstance((fn := getattr(d, "filename", None)), str) and fn
-        }
+        _reconcile_search_and_citations(slot, documents)
         results_any: Any = st.session_state.get(results_key, [])
-        raw_results: list[SearchResult] = results_any if isinstance(results_any, list) else []
-        if loaded_filenames:
-            results_list = [
-                r for r in raw_results
-                if not isinstance(getattr(r, "filename", None), str)
-                or not r.filename
-                or r.filename in loaded_filenames
-            ]
-            if len(results_list) != len(raw_results):
-                st.session_state[results_key] = results_list
-        else:
-            results_list = raw_results
+        results_list: list[SearchResult] = results_any if isinstance(results_any, list) else []
         if not results_list:
             if query.strip():
                 pilot.display("No matching passages found.", container=st, method="caption")

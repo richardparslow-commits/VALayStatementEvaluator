@@ -114,8 +114,9 @@ specific cause can be found in the logs — no run fails without a trace.
 | ``logs/app.log`` | Structured application log (when file logging is enabled via ``VA_LSE_LOG_DIR``). |
 
 **Reading a reference:** search any of these files for the id, e.g.
-``grep req_4f8a2b1c9d0e logs/runs.jsonl`` — or use **Look up a reference**
-below, which does the search for you and needs no shell access to the server.
+``grep req_4f8a2b1c9d0e logs/runs.jsonl`` (or, when operator diagnostics are
+enabled with ``VA_LSE_OPERATOR_DIAGNOSTICS=1``, use the **Look up a reference**
+panel below).
 A failed run also carries its own **What happened?** expander, so the lines for
 that particular failure are usually one click from the error itself.
 Each event line includes a UTC timestamp, the action (``draft``/``evaluate``/
@@ -145,6 +146,13 @@ def _render_reference_lookup() -> None:
     it. The user's own session is the authorization.
     """
     if not pilot.operator_allowed():
+        if not pilot.enabled():
+            pilot.display(
+                "Operator diagnostics are switched off on this deployment "
+                "(set `VA_LSE_OPERATOR_DIAGNOSTICS=1` to enable reference lookup).",
+                container=st,
+                method="caption",
+            )
         return
     pilot.display(
         "Paste a reference from an error message — the whole message works — to see "
