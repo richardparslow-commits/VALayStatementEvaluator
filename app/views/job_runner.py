@@ -63,7 +63,7 @@ logger = get_logger("app.views.job_runner")
 _PENDING_KEY = "va_lse_pending_job_{slot}"
 _REQUEST_ID_KEY = "va_lse_pending_request_{slot}"
 _INPUT_SIG_KEY = "_va_lse_pending_input_sig_{slot}"
-_IN_FLIGHT_WARN_BOXES: dict[str, Any] = {}
+_WARN_BOX_KEY = "_va_lse_inflight_warning_{slot}"
 _RESULT_KEYS: dict[str, tuple[str, str, str]] = {
     "eval": ("eval_result", "eval_usage", "eval_request_id"),
     "draft": ("draft_result", "draft_usage", "draft_request_id"),
@@ -98,6 +98,10 @@ def _pending_request_key(slot: str) -> str:
 
 def _pending_input_key(slot: str) -> str:
     return _INPUT_SIG_KEY.format(slot=slot)
+
+
+def _warn_box_key(slot: str) -> str:
+    return _WARN_BOX_KEY.format(slot=slot)
 
 
 def _job_input_signature(kind: str, job: EvaluateJob | DraftJob | None) -> str | None:
@@ -420,7 +424,9 @@ def submit_job(
                     container=st,
                     method="warning",
                 )
-            _IN_FLIGHT_WARN_BOXES[slot] = warn_box
+            # Held in this session's state, not a module global: a process-wide
+            # registry would let one browser session clear another's warning.
+            st.session_state[_warn_box_key(slot)] = warn_box
             st.session_state[f"_va_lse_resume_wait_{slot}"] = existing
             return None
 
@@ -637,7 +643,7 @@ def resume_pending_job(slot: str, *, action_label: str) -> None:
             _render_failure(outcome, action_label)
         return
     auto_wait = st.session_state.pop(f"_va_lse_resume_wait_{slot}", None) == job_id
-    warn_box = _IN_FLIGHT_WARN_BOXES.pop(slot, None)
+    warn_box = st.session_state.pop(_warn_box_key(slot), None)
     notice_box = st.empty()
     wait_clicked = False
     if not auto_wait:
