@@ -215,19 +215,21 @@ class TestRubricPipeline(unittest.TestCase):
             self.assertNotIn(("chat_json", "revision"), llm.calls)
 
     def test_partial_report_preserves_independent_source_snapshot(self):
-        citations = [{"source": "synthetic.pdf p.7", "excerpt": "Synthetic source appendix excerpt."}]
+        # Grounded in the evaluated record: the report snapshot prunes citations whose
+        # document or excerpt is absent from the records that produced the evaluation.
+        citations = [{"source": "a.txt p.1", "excerpt": "Knee pain noted during service."}]
         with patch("app.evaluate.st") as st_mock:
             st_mock.session_state.get.return_value = citations
             result, _ = self._run(complete_rubric({key: 999 for key in DIMENSION_LABELS}))
-        citations[0]["source"] = "CHANGED_SOURCE_SENTINEL"
+        citations[0]["excerpt"] = "CHANGED_EXCERPT_SENTINEL"
         report = evaluation_report_markdown(result)
         self.assertIn("## Sources", report)
-        self.assertIn("synthetic.pdf p.7", report)
-        self.assertIn("Synthetic source appendix excerpt.", report)
-        self.assertNotIn("CHANGED_SOURCE_SENTINEL", report)
+        self.assertIn("a.txt p.1", report)
+        self.assertIn("Knee pain noted during service.", report)
+        self.assertNotIn("CHANGED_EXCERPT_SENTINEL", report)
         restored = evaluation_from_json(evaluation_to_json(result))
         self.assertEqual(restored.report_citations, result.report_citations)
-        self.assertIn("Synthetic source appendix excerpt.", evaluation_report_markdown(restored))
+        self.assertIn("Knee pain noted during service.", evaluation_report_markdown(restored))
 
 
 class TestRubricSavedResults(unittest.TestCase):

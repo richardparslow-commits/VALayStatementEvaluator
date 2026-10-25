@@ -349,6 +349,27 @@ class TestCitationIndexSnapshot(unittest.TestCase):
             mock_st.session_state.get.return_value = "not-a-list"
             self.assertEqual(_citation_index_snapshot(), [])
 
+    def test_filters_stale_citations_against_supplied_records(self):
+        from app.documents import DocumentPage, ExtractedDocument
+
+        citations = [
+            {"source": "visit.txt p.1", "excerpt": "**knee** pain since 2019"},
+            {"source": "visit.txt p.1", "excerpt": "obsolete excerpt from old upload"},
+            {"source": "removed.pdf p.2", "excerpt": "some other text"},
+        ]
+        records = [
+            ExtractedDocument(
+                filename="visit.txt",
+                pages=[DocumentPage("visit.txt", 1, "Patient reports knee pain since 2019.")],
+            )
+        ]
+        with patch("app.evaluate.st") as mock_st:
+            mock_st.session_state.get.return_value = citations
+            self.assertEqual(
+                _citation_index_snapshot(records),
+                [{"source": "visit.txt p.1", "excerpt": "**knee** pain since 2019"}],
+            )
+
 
 class TestVerifyClaims(unittest.TestCase):
     @staticmethod
@@ -614,6 +635,33 @@ class TestContradictionDowngradeReason(unittest.TestCase):
             item, evidence_absent=False, claim_text="My name is Mike Doe."
         )
         self.assertIn("veteran/patient", reason)
+
+    def test_third_person_witness_identity_paraphrases_are_downgraded(self):
+        cases = [
+            (
+                "The writer's name is Mike Doe.",
+                "The medical record identifies the veteran as John Q. Sample.",
+            ),
+            (
+                "The witness is Mike Doe.",
+                "The patient's name is John Q. Sample, whereas the statement names Mike Doe.",
+            ),
+            (
+                "Declarant's name is Mike Doe.",
+                "Records are for veteran John Q. Sample rather than Mike Doe.",
+            ),
+        ]
+        for claim_text, note_text in cases:
+            with self.subTest(claim_text=claim_text):
+                item = {
+                    "verdict": "CONTRADICTED",
+                    "record_reference": "sample_medical_records.txt b.1",
+                    "note": note_text,
+                }
+                reason = _contradiction_downgrade_reason(
+                    item, evidence_absent=False, claim_text=claim_text
+                )
+                self.assertIn("veteran/patient", reason)
 
 
 class TestVerifyPromptContract(unittest.TestCase):

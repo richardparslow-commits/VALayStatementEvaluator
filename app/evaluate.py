@@ -1047,7 +1047,7 @@ def _run_evaluation(
     with tracing.phase_span("report"), PhaseTimer(logger, "report", request_id=rid):
         with phase_timer("report"):
             report(0.96, "Step 8/8 — Building the report…")
-            result.report_citations = _citation_index_snapshot()
+            result.report_citations = _citation_index_snapshot(records)
             result.report_markdown = build_report(result, statement_text)
     report(1.0, "Evaluation complete." if evaluation_is_complete(result)
            else "Partial evaluation retained — scoring or topic analysis incomplete.")
@@ -1098,12 +1098,13 @@ def _score_rubric(llm: LLMService, result: EvaluationResult, statement: str) -> 
         return
 
 
-def _citation_index_snapshot() -> list[dict[str, str]]:
+def _citation_index_snapshot(records: list[Any] | None = None) -> list[dict[str, str]]:
     """Best-effort read of ``citation_index`` from session state.
 
-    Guarded because this pipeline can run outside an active Streamlit script
-    context (e.g. offline tests, CLI usage) where ``st.session_state`` raises
-    instead of returning a default.
+    When ``records`` is supplied, filters out stale citations whose source document
+    or excerpt is not present in ``records``. Guarded because this pipeline can run
+    outside an active Streamlit script context (e.g. offline tests, CLI usage)
+    where ``st.session_state`` raises instead of returning a default.
     """
     try:
         citations = st.session_state.get("citation_index", [])
@@ -1111,11 +1112,58 @@ def _citation_index_snapshot() -> list[dict[str, str]]:
         return []
     if not isinstance(citations, list):
         return []
-    return [
+    rows = [
         {"source": row["source"], "excerpt": row["excerpt"]}
         for row in citations if isinstance(row, dict)
         and isinstance(row.get("source"), str) and isinstance(row.get("excerpt"), str)
     ]
+    if not records or not rows:
+        return rows
+    doc_pages: dict[str, dict[int, str]] = {}
+    doc_full: dict[str, str] = {}
+    for candidate in records:
+        if isinstance(candidate, dict):
+            fname = candidate.get("filename") or candidate.get("name") or ""
+            full_txt = str(candidate.get("full_text") or candidate.get("text") or "")
+            pages_iter: list[Any] = []
+        else:
+            fname = getattr(candidate, "filename", "")
+            full_txt = str(getattr(candidate, "full_text", "") or "")
+            pages_iter = list(getattr(candidate, "pages", []) or [])
+        if not isinstance(fname, str) or not fname:
+            continue
+        pages_map = doc_pages.setdefault(fname, {})
+        all_parts: list[str] = []
+        for p in pages_iter:
+            pnum = getattr(p, "page", None)
+            ptxt = str(getattr(p, "text", "") or "")
+            if isinstance(pnum, int):
+                pages_map[pnum] = f"{pages_map.get(pnum, '')}\n{ptxt}" if pnum in pages_map else ptxt
+            if ptxt:
+                all_parts.append(ptxt)
+        combined = full_txt or "\n".join(all_parts)
+        doc_full[fname] = f"{doc_full.get(fname, '')}\n{combined}" if fname in doc_full else combined
+    if not doc_full:
+        return rows
+    from .exporter import parse_source
+
+    filtered: list[dict[str, str]] = []
+    for row in rows:
+        c_doc, c_pages = parse_source(row["source"])
+        if not c_doc or c_doc not in doc_full:
+            continue
+        plain = re.sub(r"\*\*|__", "", row["excerpt"]).strip().strip("…").strip()
+        if not plain:
+            filtered.append(row)
+            continue
+        page_num = int(c_pages) if c_pages and c_pages.isdigit() else None
+        if isinstance(page_num, int) and page_num in doc_pages.get(c_doc, {}):
+            haystack = doc_pages[c_doc][page_num]
+        else:
+            haystack = doc_full.get(c_doc, "")
+        if not haystack or " ".join(plain.lower().split()) in " ".join(haystack.lower().split()):
+            filtered.append(row)
+    return filtered
 
 
 def _analyze_topics(
@@ -1361,8 +1409,20 @@ def _contradiction_downgrade_reason(
     note_text = str(verification.get("note", ""))
     if (
         claim_text
-        and re.search(r"\b(?:my name is|i am (?:the|a|his|her)|phone\s*:|i certify that)\b", claim_text, re.IGNORECASE)
-        and re.search(r"\b(?:patient|veteran)\b.*\bnot\b|\bidentifies the patient as\b", note_text, re.IGNORECASE)
+        and re.search(
+            r"\b(?:my name is|i am (?:the|a|an|his|her)|phone\s*:|i certify that|"
+            r"(?:the\s+)?(?:writer|witness|author|declarant)(?:'s)?\s+name\s+is|"
+            r"(?:the\s+)?(?:writer|witness|author|declarant)\s+is)\b",
+            claim_text,
+            re.IGNORECASE,
+        )
+        and re.search(
+            r"\b(?:patient|veteran)\b.*\b(?:not|rather than|instead of|whereas)\b|"
+            r"\bidentifies the (?:veteran(?:/patient)?|patient(?:/veteran)?) as\b|"
+            r"\b(?:patient|veteran)(?:'s)? name is\b",
+            note_text,
+            re.IGNORECASE,
+        )
     ):
         return (
             "the medical record identifies the veteran/patient, which does not conflict "
