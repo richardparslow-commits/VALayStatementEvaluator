@@ -37,6 +37,16 @@ class TestRecordSearchPruning(unittest.TestCase):
         at.run()
         self.assertFalse(at.exception)
 
+    def _search_and_export(self, at, query: str, position: int) -> None:  # noqa: ANN001
+        at.text_input(key="search_query_eval").set_value(query)
+        at.run()
+        at.button(key="search_submit_eval").click()
+        at.run()
+        self.assertFalse(at.exception)
+        at.button(key=f"search_export_eval_{position}").click()
+        at.run()
+        self.assertFalse(at.exception)
+
     def test_replacing_a_record_prunes_its_results_and_citations(self) -> None:
         at = self._app()
         at.run()
@@ -47,15 +57,8 @@ class TestRecordSearchPruning(unittest.TestCase):
         )
 
         # Search for the symptom and export the hit into the citation index.
-        at.text_input(key="search_query_eval").set_value("knee")
-        at.run()
-        at.button(key="search_submit_eval").click()
-        at.run()
-        self.assertFalse(at.exception)
+        self._search_and_export(at, "knee", 0)
         self.assertEqual(len(at.session_state["search_results_eval"]), 1)
-        at.button(key="search_export_eval_0").click()
-        at.run()
-        self.assertFalse(at.exception)
         self.assertEqual(
             [citation["source"] for citation in at.session_state["citation_index"]],
             ["visit.txt p.1"],
@@ -74,6 +77,45 @@ class TestRecordSearchPruning(unittest.TestCase):
         rendered = " ".join(element.value for element in at.markdown)
         self.assertNotIn("Knee pain after lifting", rendered)
         self.assertNotIn("Citation index", rendered)
+
+    def test_replacing_an_upload_keeps_a_va_gov_citation(self) -> None:
+        """A VA.gov citation must survive a replacement in the upload source.
+
+        A VA.gov fetch needs the veteran's own login, so the test seeds what that
+        successful fetch leaves behind — the stored records, the fetch marker that
+        keeps the uploader from forgetting the source, and the citation the panel
+        exported for it earlier in the session. From there every widget and every
+        state change is the app's own.
+        """
+        from app.documents import document_from_text
+
+        va_doc = document_from_text(
+            "va_problem_list.txt", "VA problem list: chronic lumbar strain noted."
+        )
+        va_citation = {
+            "source": "va_problem_list.txt p.1",
+            "excerpt": "VA problem list: chronic lumbar strain noted.",
+        }
+        at = self._app()
+        at.run()
+        at.session_state["source_records_eval"] = {"VA.gov": [va_doc]}
+        at.session_state["va_gov_fetch_eval"] = True
+        at.session_state["citation_index"] = [dict(va_citation)]
+
+        self._upload(at, "Knee pain after lifting in 2014.")
+        self.assertEqual(at.session_state["citation_index"], [va_citation])
+
+        self._search_and_export(at, "knee", 0)
+        self.assertEqual(
+            [citation["source"] for citation in at.session_state["citation_index"]],
+            ["va_problem_list.txt p.1", "visit.txt p.1"],
+        )
+
+        # The upload's citation is stale now, the VA.gov one is not: reconcile must
+        # keep the source the user still has loaded.
+        self._upload(at, "Updated note: shoulder impingement only.")
+        self.assertEqual(at.session_state["citation_index"], [va_citation])
+        self.assertEqual(at.session_state["search_results_eval"], [])
 
 
 if __name__ == "__main__":
