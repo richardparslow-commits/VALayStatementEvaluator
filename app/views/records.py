@@ -203,15 +203,13 @@ def records_uploader(slot: str) -> list:
                               key=f"pilot_consent_{slot}")
         if not consent:
             return []
-    if source == "Fetch Sandbox":
-        return _fetch_records(slot)
-    if source == "VA.gov":
-        return _va_gov_records(slot)
-    if source == "Local folder / file":
-        return _local_records(slot)
-
-    files = st.file_uploader(
-        "Upload medical records (PDF, TXT, MD, DOCX, or a ZIP of them — multiple allowed)",
+    # The uploader has to stay mounted on every run, even while another source is
+    # selected: Streamlit discards the value of a widget that is not rendered, and
+    # a remounted file uploader comes back empty — silently dropping the files the
+    # user already loaded, plus the stored records and citations that point at
+    # them. While another source is showing it waits in a collapsed panel.
+    uploader_options: dict[str, Any] = dict(
+        label="Upload medical records (PDF, TXT, MD, DOCX, or a ZIP of them — multiple allowed)",
         type=["pdf", "txt", "md", "docx", "zip"],
         accept_multiple_files=True,
         key=f"files_{slot}",
@@ -220,6 +218,37 @@ def records_uploader(slot: str) -> list:
              "are refused; keep the original and upload a passive copy."
              if pilot.enabled() else None,
     )
+    if source in ("Fetch Sandbox", "VA.gov", "Local folder / file"):
+        # Another source is showing: keep the uploads the user already loaded, and
+        # leave their stored records untouched. Looking at VA.gov does not replace
+        # or clear a file that was uploaded a moment ago.
+        retained_uploads = list(st.session_state.get(f"files_{slot}") or [])
+        stored_uploads = (st.session_state.get(f"source_records_{slot}") or {}).get("Upload")
+        if retained_uploads:
+            with st.expander(
+                f"📎 {len(retained_uploads)} uploaded record file(s) kept "
+                "while you use this source"
+            ):
+                kept_uploads = st.file_uploader(**uploader_options)
+            if not kept_uploads:
+                # Removed from the kept panel: those records are gone, so their
+                # stored documents and citations have to go with them.
+                _forget_upload_source(slot)
+        elif stored_uploads:
+            # The last file was removed from the kept panel on the run before, so
+            # the uploader is not mounted any more; the records it produced must
+            # not outlive it.
+            _forget_upload_source(slot)
+        if source == "Fetch Sandbox":
+            return _fetch_records(slot)
+        if source == "VA.gov":
+            return _va_gov_records(slot)
+        if source == "Local folder / file":
+            return _local_records(slot)
+        return []
+
+    files = st.file_uploader(**uploader_options)
+
     # Enforce upload size caps before extraction so the tight 50 MB default
     # surfaces as a clear message rather than a downstream failure.
     if files:
@@ -240,18 +269,23 @@ def records_uploader(slot: str) -> list:
     total_pages = sum(d.source_page_count for d in documents)
     if documents and total_pages > config.MAX_RECORD_PAGES:
         pilot.display(page_limit_message(total_pages, config.MAX_RECORD_PAGES), container=st, method="error")
-        _forget_source_records(slot, "Upload")
-        _label_detected_va_gov_exports(slot, [])
-        _reconcile_search_and_citations(slot, [])
+        _forget_upload_source(slot)
         return []
     render_record_volume_warning(documents, slot=slot)
     if documents:
         remember_source_records(slot, "Upload", documents)
+        _label_detected_va_gov_exports(slot, documents)
+        _reconcile_search_and_citations(slot, documents)
     else:
-        _forget_source_records(slot, "Upload")
-    _label_detected_va_gov_exports(slot, documents)
-    _reconcile_search_and_citations(slot, documents)
+        _forget_upload_source(slot)
     return documents
+
+
+def _forget_upload_source(slot: str) -> None:
+    """Drop everything the upload source contributed, and what pointed at it."""
+    _forget_source_records(slot, "Upload")
+    _label_detected_va_gov_exports(slot, [])
+    _reconcile_search_and_citations(slot, [])
 
 
 def _label_detected_va_gov_exports(slot: str, documents: list[Any]) -> None:

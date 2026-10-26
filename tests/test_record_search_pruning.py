@@ -18,6 +18,13 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 from log_isolation import isolate_app_logs  # noqa: E402
 
+# A VA.gov "Download your medical records" export: VA.gov markers plus a
+# records context, which is what the uploader's source detection keys on.
+_VA_GOV_EXPORT = (
+    "Download your medical records\nva.gov | My HealtheVet\n"
+    "Facility: VA Medical Center\nProvider: Smith, John MD\n"
+)
+
 
 class TestRecordSearchPruning(unittest.TestCase):
     def setUp(self) -> None:
@@ -44,6 +51,11 @@ class TestRecordSearchPruning(unittest.TestCase):
         at.run()
         self.assertFalse(at.exception)
         at.button(key=f"search_export_eval_{position}").click()
+        at.run()
+        self.assertFalse(at.exception)
+
+    def _switch_source(self, at, source: str) -> None:  # noqa: ANN001
+        at.radio(key="records_source_eval").set_value(source)
         at.run()
         self.assertFalse(at.exception)
 
@@ -116,6 +128,75 @@ class TestRecordSearchPruning(unittest.TestCase):
         self._upload(at, "Updated note: shoulder impingement only.")
         self.assertEqual(at.session_state["citation_index"], [va_citation])
         self.assertEqual(at.session_state["search_results_eval"], [])
+
+    def test_switching_source_away_and_back_keeps_records_and_citations(self) -> None:
+        """Looking at another source must not unload the files already uploaded.
+
+        Streamlit drops the value of a widget it stops rendering, so an uploader
+        that is only built on one branch of the source radio comes back empty:
+        the records, their search hits and their citations all vanish without the
+        user touching the uploader.
+        """
+        at = self._app()
+        at.run()
+        self._upload(at, "Knee pain after lifting in 2014.")
+        self._search_and_export(at, "knee", 0)
+
+        self._switch_source(at, "VA.gov")
+        self.assertEqual(
+            [doc.full_text for doc in at.session_state["source_records_eval"]["Upload"]],
+            ["Knee pain after lifting in 2014."],
+        )
+        self.assertEqual(
+            [citation["source"] for citation in at.session_state["citation_index"]],
+            ["visit.txt p.1"],
+        )
+
+        self._switch_source(at, "Upload files")
+        self.assertEqual(
+            [doc.full_text for doc in at.session_state["source_records_eval"]["Upload"]],
+            ["Knee pain after lifting in 2014."],
+        )
+        self.assertEqual(len(at.session_state["search_results_eval"]), 1)
+        self.assertEqual(
+            [citation["source"] for citation in at.session_state["citation_index"]],
+            ["visit.txt p.1"],
+        )
+        self.assertIn("Knee", at.session_state["citation_index"][0]["excerpt"])
+
+    def test_switching_source_keeps_a_va_gov_export_grouping(self) -> None:
+        """An uploaded VA.gov export stays labelled after a source detour."""
+        at = self._app()
+        at.run()
+        at.file_uploader(key="files_eval").set_value(
+            [("va_records.txt", _VA_GOV_EXPORT.encode(), "text/plain")]
+        )
+        at.run()
+        self.assertIn("VA.gov", at.session_state["source_records_eval"])
+
+        self._switch_source(at, "VA.gov")
+        self._switch_source(at, "Upload files")
+
+        store = at.session_state["source_records_eval"]
+        self.assertEqual([doc.filename for doc in store["VA.gov"]], ["va_records.txt"])
+        self.assertEqual([doc.filename for doc in store["Upload"]], ["va_records.txt"])
+
+    def test_clearing_the_kept_uploads_panel_forgets_the_records(self) -> None:
+        """Removing the files from the kept panel still clears what they produced."""
+        at = self._app()
+        at.run()
+        self._upload(at, "Knee pain after lifting in 2014.")
+        self._search_and_export(at, "knee", 0)
+        self._switch_source(at, "VA.gov")
+        kept = [block for block in at.expander if "kept" in (block.label or "")]
+        self.assertTrue(kept, msg=[block.label for block in at.expander])
+
+        at.file_uploader(key="files_eval").set_value([])
+        at.run()
+        self.assertFalse(at.exception)
+        self.assertEqual(at.session_state["source_records_eval"], {})
+        self.assertEqual(at.session_state["search_results_eval"], [])
+        self.assertEqual(at.session_state["citation_index"], [])
 
 
 if __name__ == "__main__":
