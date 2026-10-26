@@ -21,6 +21,73 @@ def call(args, **kwargs):
     return subprocess.run(args, check=True, capture_output=True, timeout=120, **kwargs)
 
 
+def wait_for_distinct_engine(env, application_id, *, timeout=60, clock=time.monotonic,
+                             sleep=time.sleep, run=subprocess.run):
+    """Return the dedicated daemon's engine id, once it differs from the app's.
+
+    A zero exit from ``docker info`` is not enough to trust a reply: while the
+    second daemon is still coming up, the CLI can answer for the application's
+    daemon (or fall back to a default socket), and that identity must never be
+    recorded as the parser engine's. Both an unreachable endpoint and a reply
+    that still names the application engine are retried until ``timeout``, then
+    reported with both identities instead of asserting on the first answer.
+    """
+    deadline = clock() + timeout
+    attempts = 0
+    reported = set()
+    last_reply = ''
+    last_error = ''
+    while clock() < deadline:
+        attempts += 1
+        try:
+            result = run(['docker', 'info', '--format', '{{.ID}}'], env=env,
+                         capture_output=True, timeout=10)
+        except subprocess.TimeoutExpired:
+            result = None
+            last_error = 'docker info timed out'
+        if result is not None and result.returncode == 0:
+            candidate = result.stdout.decode(errors='replace').strip()
+            if candidate and candidate != application_id:
+                return candidate
+            last_reply = candidate
+            if candidate not in reported:
+                reported.add(candidate)
+                print(f'Synthetic parser daemon is not distinct yet (attempt {attempts}): '
+                      f'{candidate or "<empty engine id>"} is the application engine.')
+        elif result is not None:
+            last_error = result.stderr.decode(errors='replace').strip()[-500:]
+        sleep(.5)
+    details = (f'after {attempts} attempt(s) in {timeout}s on {env.get("DOCKER_HOST")}; '
+               f'application engine id {application_id!r}, last reply {last_reply or "<none>"!r}')
+    if last_error:
+        details += f', last error {last_error!r}'
+    raise RuntimeError(
+        'Synthetic dedicated TLS engine did not become a distinct engine ' + details
+        + '; inspect the private CI daemon log above.'
+    )
+
+
+def _report_startup_failure(directory, tls, address):
+    """Print bounded diagnostics for a dedicated daemon that never came up.
+
+    Daemon setup uses only synthetic credentials/data. These tails contain no key
+    contents; the reason is exposed instead of leaving a bare assertion.
+    """
+    print((directory / 'daemon.log').read_text(errors='replace')[-8000:])
+    print((directory / 'containerd.log').read_text(errors='replace')[-3000:])
+    context = ssl.create_default_context(cafile=str(tls / 'ca.pem'))
+    context.load_cert_chain(str(tls / 'cert.pem'), str(tls / 'key.pem'))
+    connection = http.client.HTTPSConnection(address, 2376, timeout=5, context=context)
+    try:
+        connection.request('GET', '/_ping')
+        reply = connection.getresponse()
+        print('Synthetic direct verified TLS ping:', reply.status, reply.read(64).decode(errors='replace'))
+    except (OSError, ssl.SSLError) as exc:
+        print('Synthetic direct verified TLS ping refused:', type(exc).__name__, str(exc))
+    finally:
+        connection.close()
+
+
 def setup(directory):
     directory.mkdir(mode=0o700)
     tls = directory / 'client'
@@ -78,36 +145,11 @@ def setup(directory):
                           '--bridge=va-parser-ci', '--iptables=false', '--ip-masq=false', '--ip-forward=false',
                           '--label=va-lse-purpose=parser-only'], stdout=log, stderr=log,
                          env={'PATH': os.environ['PATH']}, start_new_session=True)
-    deadline = time.monotonic() + 60
-    while time.monotonic() < deadline:
-        try:
-            result = subprocess.run(['docker', 'info', '--format', '{{.ID}}'], env=env, capture_output=True, timeout=10)
-        except subprocess.TimeoutExpired:
-            result = None
-        if result is not None and result.returncode == 0:
-            engine_id = result.stdout.decode().strip()
-            break
-        time.sleep(.5)
-    else:
-        # Daemon setup uses only synthetic credentials/data. Bounded diagnostics
-        # contain no key contents; expose the reason instead of blind retries.
-        print((directory / 'daemon.log').read_text(errors='replace')[-8000:])
-        print((directory / 'containerd.log').read_text(errors='replace')[-3000:])
-        if result is not None:
-            print(result.stderr.decode(errors='replace')[-2000:])
-        context = ssl.create_default_context(cafile=str(tls / 'ca.pem'))
-        context.load_cert_chain(str(tls / 'cert.pem'), str(tls / 'key.pem'))
-        connection = http.client.HTTPSConnection(address, 2376, timeout=5, context=context)
-        try:
-            connection.request('GET', '/_ping')
-            reply = connection.getresponse()
-            print('Synthetic direct verified TLS ping:', reply.status, reply.read(64).decode(errors='replace'))
-        except (OSError, ssl.SSLError) as exc:
-            print('Synthetic direct verified TLS ping refused:', type(exc).__name__, str(exc))
-        finally:
-            connection.close()
-        raise RuntimeError('Synthetic dedicated TLS engine did not start; inspect private CI daemon log.')
-    assert engine_id and engine_id != application_id
+    try:
+        engine_id = wait_for_distinct_engine(env, application_id)
+    except RuntimeError:
+        _report_startup_failure(directory, tls, address)
+        raise
     # Fail setup if the independent application bridge was changed/removed.
     call(['ip', 'link', 'show', networks[0]['Options'].get('com.docker.network.bridge.name', 'docker0')])
     image = call(['docker', 'image', 'inspect', 'va-lse-parser:ci', '--format', '{{.Id}}']).stdout.decode().strip()
