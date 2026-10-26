@@ -1,10 +1,12 @@
-"""UI-level test: replacing a record prunes its search results and citations.
+"""UI-level tests: record pruning and retention across both workflow slots.
 
 Runs the real app through Streamlit's AppTest harness — real widgets, real
-session state, real extraction — rather than a mocked ``st``. The panel's
-pruning lives in the interaction between the uploader's reconcile call and the
-citation index, and a mocked session cannot show whether the widgets the user
-sees end up agreeing with the state that was pruned.
+session state, real extraction — rather than a mocked ``st``. Pruning lives in
+the interaction between the uploader's reconcile call and the citation index,
+and retention depends on whether the uploader is still mounted on a run; a
+mocked session can show neither, nor whether the widgets the user sees agree
+with the state that was pruned. Evaluate and Draft are both covered: they share
+``records_uploader`` but keep their state under different slot keys.
 """
 import sys
 import unittest
@@ -54,8 +56,8 @@ class TestRecordSearchPruning(unittest.TestCase):
         at.run()
         self.assertFalse(at.exception)
 
-    def _switch_source(self, at, source: str) -> None:  # noqa: ANN001
-        at.radio(key="records_source_eval").set_value(source)
+    def _switch_source(self, at, source: str, slot: str = "eval") -> None:  # noqa: ANN001
+        at.radio(key=f"records_source_{slot}").set_value(source)
         at.run()
         self.assertFalse(at.exception)
 
@@ -197,6 +199,61 @@ class TestRecordSearchPruning(unittest.TestCase):
         self.assertEqual(at.session_state["source_records_eval"], {})
         self.assertEqual(at.session_state["search_results_eval"], [])
         self.assertEqual(at.session_state["citation_index"], [])
+
+    def test_switching_source_away_and_back_keeps_draft_uploads(self) -> None:
+        """The Draft tab uses the same uploader, so the same retention holds there.
+
+        Draft has no search panel, so the record store and the rendered "Loaded"
+        summary are what proves the files survived; the VA.gov label is checked
+        because it is derived from the upload itself.
+        """
+        at = self._app()
+        at.run()
+        at.file_uploader(key="files_draft").set_value(
+            [("va_records.txt", _VA_GOV_EXPORT.encode(), "text/plain")]
+        )
+        at.run()
+        self.assertEqual(
+            [
+                doc.filename
+                for doc in at.session_state["source_records_draft"]["VA.gov"]
+            ],
+            ["va_records.txt"],
+        )
+
+        self._switch_source(at, "VA.gov", "draft")
+        kept = [block for block in at.expander if "kept" in (block.label or "")]
+        self.assertTrue(kept, msg=[block.label for block in at.expander])
+        self.assertEqual(
+            [
+                doc.filename
+                for doc in at.session_state["source_records_draft"]["VA.gov"]
+            ],
+            ["va_records.txt"],
+        )
+
+        self._switch_source(at, "Upload files", "draft")
+        store = at.session_state["source_records_draft"]
+        self.assertEqual([doc.filename for doc in store["Upload"]], ["va_records.txt"])
+        self.assertEqual([doc.filename for doc in store["VA.gov"]], ["va_records.txt"])
+        successes = " ".join(message.value for message in at.success)
+        self.assertIn("Loaded 1 record file(s)", successes)
+
+    def test_clearing_the_draft_kept_panel_forgets_its_records(self) -> None:
+        """Removing the draft's files from the kept panel clears the draft store."""
+        at = self._app()
+        at.run()
+        at.file_uploader(key="files_draft").set_value(
+            [("draft_visit.txt", b"Knee pain after lifting in 2014.", "text/plain")]
+        )
+        at.run()
+        self.assertIn("Upload", at.session_state["source_records_draft"])
+
+        self._switch_source(at, "VA.gov", "draft")
+        at.file_uploader(key="files_draft").set_value([])
+        at.run()
+        self.assertFalse(at.exception)
+        self.assertEqual(at.session_state["source_records_draft"], {})
 
 
 if __name__ == "__main__":
