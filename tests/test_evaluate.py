@@ -663,6 +663,37 @@ class TestContradictionDowngradeReason(unittest.TestCase):
                 )
                 self.assertIn("veteran/patient", reason)
 
+    def test_a_veterans_own_name_mismatch_stays_contradicted(self) -> None:
+        """The witness-identity exemption does not apply when the writer is the veteran."""
+        item = {
+            "verdict": "CONTRADICTED",
+            "record_reference": "sample_medical_records.txt b.1",
+            "note": "The record identifies the patient as John Q. Sample, not Mike Doe.",
+        }
+        self.assertEqual(
+            _contradiction_downgrade_reason(
+                item,
+                evidence_absent=False,
+                claim_text="My name is Mike Doe.",
+                writer_role="veteran",
+            ),
+            "",
+        )
+
+    def test_the_exemption_still_applies_to_a_third_party_witness(self) -> None:
+        item = {
+            "verdict": "CONTRADICTED",
+            "record_reference": "sample_medical_records.txt b.1",
+            "note": "The record identifies the patient as John Q. Sample, not Mike Doe.",
+        }
+        reason = _contradiction_downgrade_reason(
+            item,
+            evidence_absent=False,
+            claim_text="My name is Mike Doe.",
+            writer_role="spouse",
+        )
+        self.assertIn("veteran/patient", reason)
+
 
 class TestVerifyPromptContract(unittest.TestCase):
     """What the prompt must say for the code's rule to be followable.

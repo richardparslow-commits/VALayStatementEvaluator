@@ -598,7 +598,11 @@ def _run_draft_flow(
         return
     finally:
         exit_run()
-    _finish_draft_run(rid, llm, result, t0, _profiler_run, _audit_condition_d, _audit_sources_d, _audit_files_d, _audit_pages_d)
+    _finish_draft_run(
+        rid, llm, result, t0, _profiler_run, _audit_condition_d, _audit_sources_d,
+        _audit_files_d, _audit_pages_d,
+        witness_role=str(witness.get("relationship", "")),
+    )
 
 
 def _handle_draft_abort(
@@ -692,6 +696,7 @@ def _finish_draft_run(
     sources: list[str] | None,
     files: int,
     pages: int,
+    witness_role: str = "",
 ) -> None:
     """Log/audit success and stash the result for the results renderer."""
     duration_ms = int((time.perf_counter() - t0) * 1000)
@@ -747,6 +752,7 @@ def _finish_draft_run(
         profiler_run.run_end_mono = time.monotonic()
         profiler_run.emit()
         get_profiler().record_run(profiler_run)
+    _remember_draft_export_labels(condition, witness_role)
     st.session_state.draft_result = result
     st.session_state.draft_usage = llm.usage
     st.session_state.draft_request_id = rid
@@ -757,6 +763,22 @@ def _finish_draft_run(
 
 
 # ------------------------------------------------------------------ results UI
+_DRAFT_EXPORT_CONDITION_KEY = "_draft_export_condition"
+_DRAFT_EXPORT_WITNESS_ROLE_KEY = "_draft_export_witness_role"
+
+
+def _remember_draft_export_labels(condition: str | None, witness_role: str | None) -> None:
+    """Store the Step 2 labels the finished statement was actually drafted for.
+
+    The PDF header belongs to the statement on screen, not to whatever the live
+    Step 2 widgets hold when someone clicks Export. Keeping the draft's own
+    labels also survives the condition selector refilling ``draft_condition``
+    when its Proceed button is used.
+    """
+    st.session_state[_DRAFT_EXPORT_CONDITION_KEY] = str(condition or "").strip()
+    st.session_state[_DRAFT_EXPORT_WITNESS_ROLE_KEY] = str(witness_role or "").strip()
+
+
 def _render_pdf_export(statement_text: str) -> None:
     """Render the "export final statement as PDF" download button.
 
@@ -773,8 +795,16 @@ def _render_pdf_export(statement_text: str) -> None:
             pass
         st.session_state[impression_key] = True
 
-    condition = str(st.session_state.get("draft_condition", "") or "").strip() or audit_condition_for_slot("draft")
-    witness_role = str(st.session_state.get("draft_rel", "") or "")
+    # Prefer the values captured when the draft finished; a live Step 2 change after
+    # that point would otherwise relabel the PDF of the statement already on screen.
+    if _DRAFT_EXPORT_CONDITION_KEY in st.session_state:
+        condition = str(st.session_state.get(_DRAFT_EXPORT_CONDITION_KEY) or "").strip()
+    else:
+        condition = str(st.session_state.get("draft_condition", "") or "").strip() or audit_condition_for_slot("draft")
+    if _DRAFT_EXPORT_WITNESS_ROLE_KEY in st.session_state:
+        witness_role = str(st.session_state.get(_DRAFT_EXPORT_WITNESS_ROLE_KEY) or "")
+    else:
+        witness_role = str(st.session_state.get("draft_rel", "") or "")
     try:
         pdf_bytes = generate_statement_pdf(statement_text, condition, witness_role)
     except Exception as exc:  # noqa: BLE001 - PDF generation is best-effort in the UI

@@ -3321,5 +3321,145 @@ class TestResearchEmptyAudit(unittest.TestCase):
         self.assertNotIn("{}", markdown, "the raw audit object was rendered as the answer")
 
 
+class TestResearchCitationUrlSafety(unittest.TestCase):
+    """A citation's url is model/web-controlled text; it must not become Markdown."""
+
+    def _render(self, url: str):
+        import app.views.research_view as research_view
+        from app.perplexity_agent import Citation, GroundedAnswer
+
+        st_mock, _ = _fake_streamlit()
+        answer = GroundedAnswer(
+            text="Answer.",
+            citations=[Citation(url=url, title="Source")],
+        )
+        with _patch_st(research_view, st_mock), patch(
+            "app.pilot.enabled", return_value=False
+        ):
+            research_view._render_answer(answer)
+        return [str(call.args[0]) for call in st_mock.markdown.call_args_list]
+
+    def test_a_crafted_url_cannot_close_the_link_and_open_an_image(self) -> None:
+        markdown = self._render(
+            "http://x) ![](http://127.0.0.1:17033/__beacon?leak=1"
+        )
+        citation_line = next(line for line in markdown if "Source" in line)
+        self.assertNotIn("![", citation_line)
+        self.assertEqual(citation_line.count("]("), 1, citation_line)
+        self.assertIn("%29", citation_line, "the url's ')' was not percent-encoded")
+
+    def test_a_non_web_url_is_rendered_as_text_without_a_link(self) -> None:
+        markdown = self._render("javascript:alert(1)")
+        citation_line = next(line for line in markdown if "Source" in line)
+        self.assertNotIn("](", citation_line)
+
+
+class TestCurrencyReportImageSafety(unittest.TestCase):
+    def test_a_stale_verdict_cannot_inject_an_auto_fetching_image(self) -> None:
+        import app.views.research_view as research_view
+        from app import knowledge_currency as currency
+
+        report = currency.CurrencyReport(
+            checked_at="2026-01-01",
+            fingerprint="fp",
+            verdicts=(
+                currency.TopicVerdict(
+                    topic="A",
+                    status=currency.STATUS_CHANGED,
+                    note="Check this ![x](http://127.0.0.1:9/beacon)",
+                    authority="![y](http://127.0.0.1:9/authority)",
+                ),
+            ),
+        )
+        st_mock, _ = _fake_streamlit()
+        with _patch_st(research_view, st_mock), patch(
+            "app.pilot.enabled", return_value=False
+        ):
+            research_view._render_currency_report(report)
+
+        rendered = " ".join(str(call.args[0]) for call in st_mock.markdown.call_args_list)
+        self.assertNotIn("![", rendered)
+        self.assertIn("image: x", rendered)
+
+
+class TestVaGovRetryKeepsPartialSet(unittest.TestCase):
+    def _result(self, documents):
+        from app.va_gov_client import VaGovFetchResult
+
+        return VaGovFetchResult(
+            documents=documents,
+            retrieved=len(documents),
+            expected=3,
+            partial=True,
+            error_message="VA.gov record service error (HTTP 500).",
+        )
+
+    def test_an_empty_retry_keeps_the_records_already_fetched(self) -> None:
+        from app.views.records import _result_after_va_gov_retry
+
+        previous = self._result([document_from_text("va.pdf", "record text")])
+        fresh = self._result([])
+        self.assertIs(_result_after_va_gov_retry(previous, fresh), previous)
+
+    def test_a_retry_with_records_replaces_the_previous_set(self) -> None:
+        from app.views.records import _result_after_va_gov_retry
+
+        previous = self._result([document_from_text("old.pdf", "old text")])
+        fresh = self._result([document_from_text("new.pdf", "new text")])
+        self.assertIs(_result_after_va_gov_retry(previous, fresh), fresh)
+
+    def test_a_first_failed_fetch_is_still_stored(self) -> None:
+        from app.views.records import _result_after_va_gov_retry
+
+        fresh = self._result([])
+        self.assertIs(_result_after_va_gov_retry(None, fresh), fresh)
+
+
+class TestPdfExportLabels(unittest.TestCase):
+    def test_the_pdf_uses_the_labels_the_draft_was_written_for(self) -> None:
+        import app.views.draft_view as draft_view
+
+        st_mock, session = _fake_streamlit()
+        # Live Step 2 widgets have moved on since the draft finished.
+        session["draft_condition"] = "Fibromyalgia"
+        session["draft_rel"] = "Coworker / supervisor"
+        session[draft_view._DRAFT_EXPORT_CONDITION_KEY] = "Lumbar strain"
+        session[draft_view._DRAFT_EXPORT_WITNESS_ROLE_KEY] = "Spouse"
+        with _patch_st(draft_view, st_mock), patch.object(
+            draft_view, "generate_statement_pdf", return_value=b"%PDF-1.4"
+        ) as generate, patch.object(draft_view, "track_impression"), patch.object(
+            draft_view.pilot, "file_download", return_value=False
+        ):
+            draft_view._render_pdf_export("I am the spouse of the veteran.")
+
+        generate.assert_called_once_with(
+            "I am the spouse of the veteran.", "Lumbar strain", "Spouse"
+        )
+
+    def test_without_captured_labels_the_live_step_two_values_are_used(self) -> None:
+        import app.views.draft_view as draft_view
+
+        st_mock, session = _fake_streamlit()
+        session["draft_condition"] = "Tinnitus"
+        session["draft_rel"] = "Friend"
+        with _patch_st(draft_view, st_mock), patch.object(
+            draft_view, "generate_statement_pdf", return_value=b"%PDF-1.4"
+        ) as generate, patch.object(draft_view, "track_impression"), patch.object(
+            draft_view.pilot, "file_download", return_value=False
+        ):
+            draft_view._render_pdf_export("Statement.")
+
+        generate.assert_called_once_with("Statement.", "Tinnitus", "Friend")
+
+    def test_finishing_a_draft_records_its_labels(self) -> None:
+        import app.views.draft_view as draft_view
+
+        st_mock, session = _fake_streamlit()
+        with _patch_st(draft_view, st_mock):
+            draft_view._remember_draft_export_labels(" Lumbar strain ", " Spouse ")
+        self.assertEqual(session[draft_view._DRAFT_EXPORT_CONDITION_KEY], "Lumbar strain")
+        self.assertEqual(session[draft_view._DRAFT_EXPORT_WITNESS_ROLE_KEY], "Spouse")
+
+
 if __name__ == "__main__":
     unittest.main()

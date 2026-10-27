@@ -24,6 +24,7 @@ nobody can diagnose.
 from __future__ import annotations
 
 import re
+from urllib.parse import quote, urlsplit
 
 from .. import pilot
 
@@ -268,12 +269,22 @@ def _render_currency_report(report: currency.CurrencyReport) -> None:
         , container=st, method="warning")
         for verdict in report.stale:
             suffix = f" — {verdict.authority}" if verdict.authority else ""
-            pilot.display(f"- **{verdict.topic} — {verdict.label}:** {verdict.note}{suffix}", container=st, method="markdown")
+            pilot.display(
+                f"- **{_defang_markdown_images(verdict.topic)} — "
+                f"{_defang_markdown_images(verdict.label)}:** "
+                f"{_defang_markdown_images(verdict.note)}"
+                f"{_defang_markdown_images(suffix)}",
+                container=st,
+                method="markdown",
+            )
     if report.unconfirmed:
         pilot.display(
             "**Not established either way** (primary sources conflicted, or the check "
             "could not confirm): "
-            + ", ".join(f"{v.topic} — {v.label}" for v in report.unconfirmed)
+            + ", ".join(
+                f"{_defang_markdown_images(v.topic)} — {_defang_markdown_images(v.label)}"
+                for v in report.unconfirmed
+            )
         , container=st, method="info")
 
 
@@ -608,6 +619,34 @@ def _defang_markdown_images(text: object) -> str:
     return cleaned
 
 
+def _safe_markdown_url(url: object) -> str:
+    """A citation target that cannot escape Markdown link syntax.
+
+    Defanging the free-text fields is not enough for the URL: a value carrying
+    ``) ![](http://host/beacon`` closes the ``[label](url)`` link and the remainder
+    parses as an image, which the browser then fetches. Only a real http(s) URL
+    with a host is rendered as a link, and every character that can end the link
+    or start another Markdown construct is percent-encoded. Anything else returns
+    an empty target so the caller shows inert text instead of a link.
+    """
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    # Keep only characters that are harmless inside the parentheses of a link.
+    # ``(``, ``)``, ``[``, ``]``, ``!``, quotes, backticks, angle brackets and
+    # whitespace are all encoded; a pre-existing percent escape is preserved.
+    # Encoding happens before parsing as well: ``urlsplit`` raises "Invalid IPv6
+    # URL" on a stray bracket, and a crafted address must never crash the render.
+    encoded = quote(raw, safe=":/?#@$&'*+,;=%")
+    try:
+        parsed = urlsplit(encoded)
+    except ValueError:
+        return ""
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return encoded
+
+
 def _render_answer(answer: GroundedAnswer) -> None:
     """Render prose, structured findings, and the sources — in that order."""
     # An empty audit object is still a structured answer: it must reach the
@@ -623,7 +662,13 @@ def _render_answer(answer: GroundedAnswer) -> None:
             for index, citation in enumerate(answer.citations, start=1):
                 date = f" — {_defang_markdown_images(citation.date)}" if citation.date else ""
                 safe_label = _defang_markdown_images(citation.label()).replace("[", "(").replace("]", ")")
-                pilot.display(f"{index}. [{safe_label}]({citation.url}){date}", container=st, method="markdown")
+                safe_url = _safe_markdown_url(citation.url)
+                if safe_url:
+                    pilot.display(f"{index}. [{safe_label}]({safe_url}){date}", container=st, method="markdown")
+                else:
+                    # No usable address: show the label as inert text rather than a
+                    # link built from something that is not a web URL.
+                    pilot.display(f"{index}. {safe_label}{date}", container=st, method="markdown")
                 if citation.snippet:
                     pilot.display(_defang_markdown_images(citation.snippet[:280]), container=st, method="caption")
     else:

@@ -1018,7 +1018,8 @@ def _run_evaluation(
             report(0.60, "Step 3/7 — Verifying each claim against the records…")
             assert result.digest is not None  # set by records:review above
             result.verifications, result.evidence_gaps = _verify_claims(
-                llm, result.claims, result.digest, records, report
+                llm, result.claims, result.digest, records, report,
+                writer_role=result.writer_role,
             )
             result.verification_policy = SOURCE_REFERENCE_POLICY
 
@@ -1343,7 +1344,10 @@ def _draft_revision(
 
 
 def _contradiction_downgrade_reason(
-    verification: dict, evidence_absent: bool, claim_text: str = ""
+    verification: dict,
+    evidence_absent: bool,
+    claim_text: str = "",
+    writer_role: str = "",
 ) -> str:
     """Why a CONTRADICTED verdict cannot stand, or ``""`` when it can.
 
@@ -1375,8 +1379,17 @@ def _contradiction_downgrade_reason(
             "record text that makes it, so it is a record-coverage gap."
         )
     note_text = str(verification.get("note", ""))
+    # The identity exemption is for a third-party witness whose own name is compared
+    # with the patient named in someone else's records. When the writer *is* the
+    # veteran, the same mismatch is a real conflict (it can even mean the records
+    # belong to the wrong person), so the exemption must not apply. The claims step
+    # records writer_role from the statement; without it this backstop would treat
+    # every first-person name claim as a witness self-identification.
+    role_words = re.sub(r"[^a-z ]", "", str(writer_role or "").casefold()).strip()
+    writer_is_veteran = role_words in {"veteran", "the veteran", "self"}
     if (
-        claim_text
+        not writer_is_veteran
+        and claim_text
         and re.search(
             r"\b(?:my name is|i am (?:the|a|an|his|her)|phone\s*:|i certify that|"
             r"(?:the\s+)?(?:writer|witness|author|declarant)(?:'s)?\s+name\s+is|"
@@ -1463,6 +1476,8 @@ def _verify_claims(
     digest: MedicalDigest,
     records: list[ExtractedDocument],
     report: ProgressCallback,
+    *,
+    writer_role: str = "",
 ) -> tuple[list[dict], list[dict]]:
     """Verify claims in small batches so each prompt stays focused.
 
@@ -1555,7 +1570,10 @@ def _verify_claims(
         for item in verified:
             claim_id = item["id"]
             downgrade_reason = _contradiction_downgrade_reason(
-                item, evidence_absent, claim_text=claim_text_by_id.get(claim_id, "")
+                item,
+                evidence_absent,
+                claim_text=claim_text_by_id.get(claim_id, ""),
+                writer_role=writer_role,
             )
             if downgrade_reason:
                 item = dict(item)
