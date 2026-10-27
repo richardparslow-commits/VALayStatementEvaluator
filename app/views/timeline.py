@@ -16,6 +16,23 @@ from ..documents import ExtractedDocument
 from .shared import render_usage_summary
 
 
+def _clear_timeline_filters(all_types: list[str], providers: list[str]) -> None:
+    """Reset every timeline filter to its default value.
+
+    Streamlit refuses to assign a widget's session-state key after that widget
+    was created in the same script run. Running this as the Clear button's
+    ``on_click`` callback is the one point where the reset happens before the
+    widgets are built, so the next run renders with the defaults instead of
+    raising ``StreamlitAPIException``.
+    """
+    st.session_state.timeline_date_from = None
+    st.session_state.timeline_date_to = None
+    st.session_state.timeline_show_gaps = False
+    st.session_state.timeline_fact_types = list(all_types)
+    st.session_state.timeline_providers = list(providers)
+    st.session_state.timeline_sort_order = "Chronological (oldest first)"
+
+
 def render_timeline_tab(digest: medical_review.MedicalDigest) -> None:
     """Render the medical record timeline tab with filters and event details.
 
@@ -101,17 +118,13 @@ def render_timeline_tab(digest: medical_review.MedicalDigest) -> None:
         )
 
         apply_filters = st.button("Apply filters", type="primary")
-        clear_filters = st.button("Clear all filters")
-
-        if clear_filters:
-            st.session_state.timeline_date_from = None
-            st.session_state.timeline_date_to = None
-            st.session_state.timeline_show_gaps = False
-            st.session_state.timeline_fact_types = all_types
-            st.session_state.timeline_providers = providers
-            st.session_state.timeline_sort_order = "Chronological (oldest first)"
-            # Re-run to clear the view
-            st.rerun()
+        # The reset must run before the widgets above are rebuilt, so it belongs
+        # in the callback rather than in this branch of the script.
+        st.button(
+            "Clear all filters",
+            on_click=_clear_timeline_filters,
+            args=(all_types, providers),
+        )
 
     # Apply filters
     date_from_str = _date_to_string(date_from) if date_from else None

@@ -147,7 +147,13 @@ def _reconcile_search_and_citations(slot: str, documents: list[Any]) -> None:
 
     from ..exporter import build_record_excerpt_matcher, filter_grounded_citations
 
-    slot_docs = _slot_loaded_documents(slot, documents)
+    # Ground against the records this render actually has active. The store can
+    # still hold documents from a source the user has switched away from, and
+    # those must not keep their excerpts alive in the panels or the export.
+    # Only a caller with no documents at all (the kept panel has just forgotten
+    # a source) falls back to the store: that is still the set loaded for the
+    # slot, and it is what prunes the records of the source being removed.
+    slot_docs = list(documents or []) or _slot_loaded_documents(slot, [])
     matcher = build_record_excerpt_matcher(slot_docs)
     if matcher is None:
         # Unit-test MagicMock placeholder documents: do not filter by content.
@@ -230,7 +236,19 @@ def records_uploader(slot: str) -> list:
                 "while you use this source"
             ):
                 kept_uploads = st.file_uploader(**uploader_options)
-            if not kept_uploads:
+            if kept_uploads:
+                # A partial removal changes the stored set too: re-extract what
+                # still remains (per-file extraction is cached) and rewrite the
+                # 'Upload' entry, or the removed file keeps being merged from the
+                # stale extraction taken before it was dropped.
+                kept_documents = extract_uploads(kept_uploads, slot)
+                if kept_documents:
+                    remember_source_records(slot, "Upload", kept_documents)
+                    _label_detected_va_gov_exports(slot, kept_documents)
+                    _reconcile_search_and_citations(slot, [])
+                else:
+                    _forget_upload_source(slot)
+            else:
                 # Removed from the kept panel: those records are gone, so their
                 # stored documents and citations have to go with them.
                 _forget_upload_source(slot)

@@ -610,7 +610,10 @@ def _defang_markdown_images(text: object) -> str:
 
 def _render_answer(answer: GroundedAnswer) -> None:
     """Render prose, structured findings, and the sources — in that order."""
-    if not answer.findings:
+    # An empty audit object is still a structured answer: it must reach the
+    # findings renderer so its missing fields are reported, rather than falling
+    # through to the prose branch and showing the raw "{}" as the answer.
+    if answer.findings is None:
         pilot.display(_defang_markdown_images(answer.text), container=st, method="markdown")
     else:
         _render_findings(answer.findings)

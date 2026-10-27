@@ -92,14 +92,16 @@ class TestRecordSearchPruning(unittest.TestCase):
         self.assertNotIn("Knee pain after lifting", rendered)
         self.assertNotIn("Citation index", rendered)
 
-    def test_replacing_an_upload_keeps_a_va_gov_citation(self) -> None:
-        """A VA.gov citation must survive a replacement in the upload source.
+    def test_a_citation_from_a_source_no_longer_active_is_dropped(self) -> None:
+        """Grounding follows the source in use, not every source still cached.
 
         A VA.gov fetch needs the veteran's own login, so the test seeds what that
         successful fetch leaves behind — the stored records, the fetch marker that
         keeps the uploader from forgetting the source, and the citation the panel
-        exported for it earlier in the session. From there every widget and every
-        state change is the app's own.
+        exported for it earlier in the session. The moment the user selects Upload
+        files and loads a different record, that VA.gov excerpt no longer belongs
+        to the record set being searched or exported. From there every widget and
+        every state change is the app's own.
         """
         from app.documents import document_from_text
 
@@ -117,19 +119,17 @@ class TestRecordSearchPruning(unittest.TestCase):
         at.session_state["citation_index"] = [dict(va_citation)]
 
         self._upload(at, "Knee pain after lifting in 2014.")
-        self.assertEqual(at.session_state["citation_index"], [va_citation])
+        self.assertEqual(at.session_state["citation_index"], [])
 
         self._search_and_export(at, "knee", 0)
         self.assertEqual(
             [citation["source"] for citation in at.session_state["citation_index"]],
-            ["va_problem_list.txt p.1", "visit.txt p.1"],
+            ["visit.txt p.1"],
         )
 
-        # The upload's citation is stale now, the VA.gov one is not: reconcile must
-        # keep the source the user still has loaded.
+        # The upload's citation is stale now, so replacing its file drops it too.
         self._upload(at, "Updated note: shoulder impingement only.")
-        self.assertEqual(at.session_state["citation_index"], [va_citation])
-        self.assertEqual(at.session_state["search_results_eval"], [])
+        self.assertEqual(at.session_state["citation_index"], [])
 
     def test_switching_source_away_and_back_keeps_records_and_citations(self) -> None:
         """Looking at another source must not unload the files already uploaded.
@@ -182,6 +182,52 @@ class TestRecordSearchPruning(unittest.TestCase):
         store = at.session_state["source_records_eval"]
         self.assertEqual([doc.filename for doc in store["VA.gov"]], ["va_records.txt"])
         self.assertEqual([doc.filename for doc in store["Upload"]], ["va_records.txt"])
+
+    def test_removing_one_kept_file_rewrites_the_upload_record_set(self) -> None:
+        """A partial removal must rewrite the stored set, not only empty it.
+
+        While another source is showing, the kept panel is the only uploader. If
+        one of two files is removed there, the stored 'Upload' entry has to become
+        the remaining file; leaving the earlier two-file extraction in place lets
+        the removed file be merged back into the VA.gov record set.
+        """
+        at = self._app()
+        at.run()
+        at.file_uploader(key="files_eval").set_value(
+            [
+                ("knee.txt", b"Knee pain after lifting in 2014.", "text/plain"),
+                ("ear.txt", b"Tinnitus worsened later that year.", "text/plain"),
+            ]
+        )
+        at.run()
+        self.assertFalse(at.exception)
+        self.assertEqual(
+            sorted(
+                doc.filename for doc in at.session_state["source_records_eval"]["Upload"]
+            ),
+            ["ear.txt", "knee.txt"],
+        )
+
+        self._search_and_export(at, "tinnitus", 0)
+        self.assertEqual(
+            [citation["source"] for citation in at.session_state["citation_index"]],
+            ["ear.txt p.1"],
+        )
+
+        self._switch_source(at, "VA.gov")
+        at.file_uploader(key="files_eval").set_value(
+            [("knee.txt", b"Knee pain after lifting in 2014.", "text/plain")]
+        )
+        at.run()
+        self.assertFalse(at.exception)
+        self.assertEqual(
+            [
+                doc.filename
+                for doc in at.session_state["source_records_eval"]["Upload"]
+            ],
+            ["knee.txt"],
+        )
+        self.assertEqual(at.session_state["citation_index"], [])
 
     def test_clearing_the_kept_uploads_panel_forgets_the_records(self) -> None:
         """Removing the files from the kept panel still clears what they produced."""
