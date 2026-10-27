@@ -427,22 +427,56 @@ def progress_widgets(llm: LLMClient | None = None, *, request_id: str | None = N
     return bar, update
 
 
+def _same_document(stored: Any, record: Any) -> bool:
+    """True when ``stored`` is the document (or a renamed copy of it).
+
+    A merge renames a colliding document, so identity alone is not enough; the
+    text is compared instead of the name, which would also match two different
+    sources that happen to use the same file name.
+    """
+    if stored is record:
+        return True
+    stored_text = getattr(stored, "full_text", None)
+    record_text = getattr(record, "full_text", None)
+    return (
+        isinstance(stored_text, str)
+        and bool(stored_text)
+        and isinstance(record_text, str)
+        and stored_text == record_text
+    )
+
+
 def audit_record_meta(slot: str, records: list[Any]) -> tuple[list[str], int, int]:
-    """Return (record_sources, file_count, page_count) for audit events."""
+    """Return (record_sources, file_count, page_count) for audit events.
+
+    The sources are derived from ``records`` — the documents this run actually
+    uses. The session's source store only supplies the label for each of them: a
+    source the user has switched away from stays cached there, and must not be
+    reported as part of a run it contributed nothing to.
+    """
+    documents = [record for record in records or [] if record is not None]
+    sources: list[str] = []
     try:
         store_any: Any = st.session_state.get(f"source_records_{slot}", {})
-        if isinstance(store_any, dict) and store_any:
-            sources = [str(k) for k in store_any.keys() if str(k).strip()]
-        else:
-            sources = []
+        if isinstance(store_any, dict) and store_any and documents:
+            for label, stored in store_any.items():
+                name = str(label).strip()
+                if not name or not isinstance(stored, list):
+                    continue
+                if any(
+                    _same_document(entry, record)
+                    for entry in stored
+                    for record in documents
+                ) and name not in sources:
+                    sources.append(name)
     except Exception:  # noqa: BLE001
         sources = []
-    # Fallback label when store is empty but records exist (e.g. direct upload in tests).
-    if not sources and records:
+    # Fallback label when the store cannot place the records (e.g. direct upload in tests).
+    if not sources and documents:
         sources = ["Upload"]
-    files = len(records)
+    files = len(documents)
     try:
-        pages = sum(len(getattr(d, "pages", [])) for d in records)
+        pages = sum(len(getattr(d, "pages", [])) for d in documents)
     except Exception:  # noqa: BLE001
         pages = 0
     return sources, files, pages

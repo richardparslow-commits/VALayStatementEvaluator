@@ -69,15 +69,23 @@ _SOURCE_PATTERNS = (
     # "[filename — page 3]" / "filename — page 3" / "filename - pages 3-4"
     # and the block-addressed form for .txt/.md/.docx ("filename — block 2").
     re.compile(
-        r"^\[?(?P<doc>[^;]+?)\s*[—-]\s*(?:pages?|blocks?)\s*(?P<pages>[\d,\-\s]+)\]?$",
+        r"^\[?(?P<doc>.+?)\s*[—-]\s*(?:pages?|blocks?)\s*(?P<pages>[\d,\-\s]+)\]?$",
         re.IGNORECASE,
     ),
     # "filename p.3" / "filename b.2" (app.documents.DocumentPage.label), plus
     # the chunk-span form the digest now emits: "clinic.pdf p.3-p.9".
     re.compile(
-        r"^(?P<doc>[^;]+?)\s+[pb]\.(?P<pages>\d+(?:\s*-\s*(?:[pb]\.)?\d+|\s*,\s*(?:[pb]\.)?\d+)*)$",
+        r"^(?P<doc>.+?)\s+[pb]\.(?P<pages>\d+(?:\s*-\s*(?:[pb]\.)?\d+|\s*,\s*(?:[pb]\.)?\d+)*)$",
         re.IGNORECASE,
     ),
+)
+
+
+# A document name may itself contain a semicolon. A *joined* citation of several
+# files ("a.txt p.1; b.txt p.1") also does, so a "document" that still carries a
+# page marker followed by the join is treated as the whole multi-file label.
+_JOINED_SOURCE_RE = re.compile(
+    r"\s(?:[pb]\.\s*\d|(?:pages?|blocks?)\s+\d)", re.IGNORECASE
 )
 
 
@@ -100,6 +108,8 @@ def parse_source(source: str) -> tuple[str, str]:
         match = pattern.match(text)
         if match:
             doc = match.group("doc").strip(" [")
+            if _JOINED_SOURCE_RE.search(doc):
+                return text, ""
             raw_pages = re.sub(r"\s+", "", match.group("pages"))
             pages = re.sub(r"[pb]\.", "", raw_pages, flags=re.IGNORECASE).replace(",", ", ")
             return doc, pages
@@ -113,8 +123,13 @@ _EXCERPT_OMISSION_RE = re.compile(
 
 
 def _normalize_excerpt_text(text: str) -> str:
-    cleaned = _EXCERPT_OMISSION_RE.sub(" ", str(text or ""))
-    cleaned = re.sub(r"\*\*|__", "", cleaned).strip().strip("…").strip()
+    # Strip the bold markup before looking for omission markers: search
+    # highlighting can land inside a marker (``[**Later** text omitted]``), and
+    # the marker pattern only matches the untouched wording. Removing ``**``
+    # first restores the marker so it is removed like any other.
+    cleaned = re.sub(r"\*\*|__", "", str(text or ""))
+    cleaned = _EXCERPT_OMISSION_RE.sub(" ", cleaned)
+    cleaned = cleaned.strip().strip("…").strip()
     return " ".join(cleaned.lower().split())
 
 

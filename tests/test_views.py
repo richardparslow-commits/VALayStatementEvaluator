@@ -260,14 +260,27 @@ class TestAuditMeta(unittest.TestCase):
         self.assertEqual(pages, 4)
         self.assertEqual(sources, ["Upload"])  # fallback label
 
-    def test_audit_record_meta_uses_source_store(self) -> None:
+    def test_audit_record_meta_ignores_a_source_the_run_did_not_use(self) -> None:
+        """A source still cached in the store is not a source of this run."""
+        import app.views.shared as shared
+
+        st_mock, session = _fake_streamlit()
+        upload = MagicMock(pages=["p1"])
+        va_doc = MagicMock(pages=["p2"])
+        session["source_records_eval"] = {"VA.gov": [va_doc], "Upload": [upload]}
+        with _patch_st(shared, st_mock):
+            sources, files, pages = shared.audit_record_meta("eval", [upload])
+        self.assertEqual(sources, ["Upload"])
+        self.assertEqual((files, pages), (1, 1))
+
+    def test_audit_record_meta_without_records_names_no_source(self) -> None:
         import app.views.shared as shared
 
         st_mock, session = _fake_streamlit()
         session["source_records_eval"] = {"VA.gov": [MagicMock(pages=["p1"])]}
         with _patch_st(shared, st_mock):
             sources, files, pages = shared.audit_record_meta("eval", [])
-        self.assertEqual(sources, ["VA.gov"])
+        self.assertEqual(sources, [])
         self.assertEqual((files, pages), (0, 0))
 
     def test_audit_condition_for_slot_reads_selector_state(self) -> None:
@@ -3287,6 +3300,25 @@ class TestRecordReadingPanel(unittest.TestCase):
                 [c["source"] for c in eval_res.report_citations],
                 ["va_record.pdf p.1"],
             )
+
+
+class TestResearchEmptyAudit(unittest.TestCase):
+    def test_an_empty_audit_warns_instead_of_rendering_braces(self) -> None:
+        """An empty audit object is structured output, not prose to print."""
+        import app.views.research_view as research_view
+        from app.perplexity_agent import GroundedAnswer
+
+        st_mock, _ = _fake_streamlit()
+        answer = GroundedAnswer(text="{}", findings={})
+        with _patch_st(research_view, st_mock), patch(
+            "app.pilot.enabled", return_value=False
+        ):
+            research_view._render_answer(answer)
+
+        warnings = " ".join(str(call.args[0]) for call in st_mock.warning.call_args_list)
+        self.assertIn("Structured audit is incomplete", warnings)
+        markdown = [str(call.args[0]) for call in st_mock.markdown.call_args_list]
+        self.assertNotIn("{}", markdown, "the raw audit object was rendered as the answer")
 
 
 if __name__ == "__main__":

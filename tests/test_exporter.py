@@ -47,6 +47,12 @@ class TestParseSource(unittest.TestCase):
     def test_p_dot_format(self) -> None:
         self.assertEqual(exporter.parse_source("records.pdf p.12"), ("records.pdf", "12"))
 
+    def test_semicolon_in_a_document_name_is_kept(self) -> None:
+        self.assertEqual(
+            exporter.parse_source("knee; ortho follow-up.txt p.1"),
+            ("knee; ortho follow-up.txt", "1"),
+        )
+
     def test_unparseable_source_falls_back_to_raw_string(self) -> None:
         self.assertEqual(exporter.parse_source("chunk 2/9"), ("chunk 2/9", ""))
 
@@ -211,6 +217,39 @@ class TestExportFactsEntryPoint(unittest.TestCase):
             args = mock_track.call_args[0]
             self.assertEqual(args[0], exporter.FEATURE_ID)
             self.assertIsInstance(args[1], RuntimeError)
+
+    def test_grounding_keeps_an_excerpt_from_a_semicolon_filename(self) -> None:
+        from app.documents import document_from_text
+
+        doc = document_from_text(
+            "knee; ortho follow-up.txt", "Tinnitus worsened later that year."
+        )
+        citation = {
+            "source": "knee; ortho follow-up.txt p.1",
+            "excerpt": "Tinnitus worsened later that year.",
+        }
+        self.assertEqual(exporter.filter_grounded_citations([citation], [doc]), [citation])
+
+    def test_a_bolded_omission_marker_is_still_an_omission_marker(self) -> None:
+        """Search highlighting can bold a query word inside the marker."""
+        from app.documents import document_from_text
+
+        doc = document_from_text(
+            "long.txt", "The tinnitus worsened later that year."
+        )
+        matcher = exporter.build_record_excerpt_matcher([doc])
+        self.assertIsNotNone(matcher)
+        assert matcher is not None
+        self.assertEqual(exporter._normalize_excerpt_text("[**Later** text omitted]"), "")
+        self.assertTrue(
+            matcher(
+                "long.txt",
+                1,
+                "[Earlier text omitted]\nThe tinnitus worsened **later** that year."
+                "\n[**Later** text omitted]",
+            ),
+            "a marker bolded by the search highlight must not make the excerpt look ungrounded",
+        )
 
     def test_excerpt_matcher_matches_markdown_emphasis_and_omission_markers(self) -> None:
         from app.documents import document_from_text
