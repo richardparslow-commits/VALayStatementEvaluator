@@ -3382,6 +3382,48 @@ class TestCurrencyReportImageSafety(unittest.TestCase):
         self.assertIn("image: x", rendered)
 
 
+class TestEvaluateCurrencyImageSafety(unittest.TestCase):
+    """The Evaluate tab renders the same stored verdicts as Research; it must defang them too."""
+
+    def test_a_stale_verdict_cannot_inject_an_auto_fetching_image(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+        from app import knowledge_currency as currency
+
+        flag = currency.CurrencyFlag(
+            state=currency.STATE_FRESH,
+            stale=(
+                currency.TopicVerdict(
+                    topic="A",
+                    status=currency.STATUS_CHANGED,
+                    note="Check this ![x](http://127.0.0.1:9/beacon)",
+                    authority="![y](http://127.0.0.1:9/authority)",
+                ),
+            ),
+            unconfirmed=(
+                currency.TopicVerdict(topic="B", status=currency.STATUS_UNCONFIRMED),
+            ),
+        )
+        st_mock, _ = _fake_streamlit()
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "_case_topic_letters", return_value=["A", "B"]
+        ), patch.object(
+            evaluate_view, "_framework_currency_ttl_days", return_value=30
+        ), patch.object(
+            evaluate_view.currency, "case_currency_flag", return_value=flag
+        ), patch("app.pilot.enabled", return_value=False):
+            evaluate_view._render_framework_currency_flags(object())
+
+        rendered = " ".join(
+            str(call.args[0])
+            for method in ("markdown", "info")
+            for call in getattr(st_mock, method).call_args_list
+        )
+        self.assertIn("Could not be confirmed as current", rendered)
+        self.assertNotIn("![", rendered)
+        self.assertIn("image: x", rendered)
+        self.assertIn("image: y", rendered)
+
+
 class TestVaGovRetryKeepsPartialSet(unittest.TestCase):
     def _result(self, documents):
         from app.va_gov_client import VaGovFetchResult
