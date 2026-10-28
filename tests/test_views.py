@@ -3502,6 +3502,91 @@ class TestPdfExportLabels(unittest.TestCase):
         self.assertEqual(session[draft_view._DRAFT_EXPORT_CONDITION_KEY], "Lumbar strain")
         self.assertEqual(session[draft_view._DRAFT_EXPORT_WITNESS_ROLE_KEY], "Spouse")
 
+    def test_a_queued_or_recovered_result_carries_its_own_labels(self) -> None:
+        """Retained inputs survive the queue, so a new session still labels the PDF."""
+        import app.views.draft_view as draft_view
+        from app.draft import DraftResult
+        from app.job_payload import draft_from_json, draft_to_json
+
+        result = draft_from_json(
+            draft_to_json(
+                DraftResult(
+                    draft="Statement.",
+                    factual_inputs={
+                        "witness": {
+                            "relationship": "Spouse",
+                            "Claimed condition": "Lumbar strain",
+                        }
+                    },
+                )
+            )
+        )
+        st_mock, session = _fake_streamlit()
+        # A recovered session has no captured labels, and Step 2 may hold
+        # whatever the browser defaulted to; neither may relabel this result.
+        session["draft_condition"] = "Fibromyalgia"
+        session["draft_rel"] = "Coworker / supervisor"
+        with _patch_st(draft_view, st_mock), patch.object(
+            draft_view, "generate_statement_pdf", return_value=b"%PDF-1.4"
+        ) as generate, patch.object(draft_view, "track_impression"), patch.object(
+            draft_view.pilot, "file_download", return_value=False
+        ):
+            draft_view._render_pdf_export("Statement.", result)
+
+        generate.assert_called_once_with("Statement.", "Lumbar strain", "Spouse")
+
+    def test_the_results_panel_hands_the_result_to_the_pdf_export(self) -> None:
+        """The call site must pass the displayed result, not rely on session capture."""
+        import app.views.draft_view as draft_view
+        import app.views.factual_review as factual_review
+        from app.draft import DraftResult
+
+        result = DraftResult(draft="Statement.")
+        st_mock, _ = _fake_streamlit()
+        st_mock.columns.return_value = [MagicMock(), MagicMock()]
+        st_mock.text_area.return_value = "Statement."
+        with _patch_st(draft_view, st_mock), patch.object(
+            draft_view, "render_usage_summary"
+        ), patch.object(
+            draft_view, "render_follow_up_questions"
+        ), patch.object(
+            factual_review, "render_factual_review", return_value=True
+        ), patch.object(
+            draft_view.pilot, "enabled", return_value=False
+        ), patch.object(
+            draft_view.pilot, "confirm_export", return_value=True
+        ), patch.object(
+            draft_view.pilot, "file_download", return_value=False
+        ), patch.object(draft_view, "_render_pdf_export") as pdf:
+            draft_view._render_draft_results(result)
+
+        pdf.assert_called_once_with("Statement.", result)
+
+    def test_a_result_beats_labels_captured_by_an_earlier_in_process_draft(self) -> None:
+        import app.views.draft_view as draft_view
+        from app.draft import DraftResult
+
+        st_mock, session = _fake_streamlit()
+        session[draft_view._DRAFT_EXPORT_CONDITION_KEY] = "Tinnitus"
+        session[draft_view._DRAFT_EXPORT_WITNESS_ROLE_KEY] = "Friend"
+        result = DraftResult(
+            draft="Statement.",
+            factual_inputs={
+                "witness": {
+                    "relationship": "Spouse",
+                    "Claimed condition": "Lumbar strain",
+                }
+            },
+        )
+        with _patch_st(draft_view, st_mock), patch.object(
+            draft_view, "generate_statement_pdf", return_value=b"%PDF-1.4"
+        ) as generate, patch.object(draft_view, "track_impression"), patch.object(
+            draft_view.pilot, "file_download", return_value=False
+        ):
+            draft_view._render_pdf_export("Statement.", result)
+
+        generate.assert_called_once_with("Statement.", "Lumbar strain", "Spouse")
+
 
 if __name__ == "__main__":
     unittest.main()
