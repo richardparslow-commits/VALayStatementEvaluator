@@ -611,26 +611,28 @@ def _safe_markdown_url(url: object) -> str:
     Defanging the free-text fields is not enough for the URL: a value carrying
     ``) ![](http://host/beacon`` closes the ``[label](url)`` link and the remainder
     parses as an image, which the browser then fetches. Only a real http(s) URL
-    with a host is rendered as a link, and every character that can end the link
-    or start another Markdown construct is percent-encoded. Anything else returns
-    an empty target so the caller shows inert text instead of a link.
+    with a host is rendered as a link, and every character that can close the
+    destination or form image syntax is percent-encoded. Brackets stay literal
+    for a parser-valid IPv6 host; a malformed bracket returns an empty target so
+    the caller shows inert text instead of a link.
     """
     raw = str(url or "").strip()
     if not raw:
         return ""
-    # Keep only characters that are harmless inside the parentheses of a link.
-    # ``(``, ``)``, ``[``, ``]``, ``!``, quotes, backticks, angle brackets and
-    # whitespace are all encoded; a pre-existing percent escape is preserved.
-    # Encoding happens before parsing as well: ``urlsplit`` raises "Invalid IPv6
-    # URL" on a stray bracket, and a crafted address must never crash the render.
-    encoded = quote(raw, safe=":/?#@$&'*+,;=%")
+    # Parse the raw value first: ``urlsplit`` raises "Invalid IPv6 URL" on a
+    # malformed bracket, and only a URL the parser understands is usable. That
+    # keeps a genuine IPv6 host ("http://[::1]:8000/x") clickable while an
+    # address whose brackets do not form a host is shown as inert text.
     try:
-        parsed = urlsplit(encoded)
+        parsed = urlsplit(raw)
     except ValueError:
         return ""
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
         return ""
-    return encoded
+    # Encode everything that can end the link or start another Markdown construct.
+    # Brackets stay literal for the IPv6 host validated above (they cannot end a
+    # destination); ``!`` is encoded, so they cannot form image syntax either.
+    return quote(raw, safe=":/?#@$&'*+,;=%[]")
 
 
 def _render_answer(answer: GroundedAnswer) -> None:

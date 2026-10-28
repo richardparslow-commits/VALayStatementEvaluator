@@ -3340,18 +3340,45 @@ class TestResearchCitationUrlSafety(unittest.TestCase):
         return [str(call.args[0]) for call in st_mock.markdown.call_args_list]
 
     def test_a_crafted_url_cannot_close_the_link_and_open_an_image(self) -> None:
+        # The payload's brackets make urlsplit reject the value as an invalid
+        # IPv6 host, so it degrades to inert text; either way it must not become
+        # a second link or an image.
         markdown = self._render(
             "http://x) ![](http://127.0.0.1:17033/__beacon?leak=1"
         )
         citation_line = next(line for line in markdown if "Source" in line)
         self.assertNotIn("![", citation_line)
-        self.assertEqual(citation_line.count("]("), 1, citation_line)
+        self.assertLessEqual(citation_line.count("]("), 1, citation_line)
+
+    def test_a_closing_paren_in_a_url_is_percent_encoded(self) -> None:
+        markdown = self._render("https://example.com/a)b")
+        citation_line = next(line for line in markdown if "Source" in line)
         self.assertIn("%29", citation_line, "the url's ')' was not percent-encoded")
+        self.assertEqual(citation_line.count("]("), 1, citation_line)
 
     def test_a_non_web_url_is_rendered_as_text_without_a_link(self) -> None:
         markdown = self._render("javascript:alert(1)")
         citation_line = next(line for line in markdown if "Source" in line)
         self.assertNotIn("](", citation_line)
+
+    def test_an_ipv6_host_stays_a_usable_link(self) -> None:
+        """Encoding the brackets would leave a destination the browser cannot parse."""
+        markdown = self._render("http://[::1]:8000/record")
+        citation_line = next(line for line in markdown if "Source" in line)
+        self.assertIn("(http://[::1]:8000/record)", citation_line)
+
+    def test_a_malformed_bracket_is_inert_text(self) -> None:
+        markdown = self._render("http://[::1:8000/record")
+        citation_line = next(line for line in markdown if "Source" in line)
+        self.assertNotIn("](", citation_line)
+
+    def test_brackets_cannot_start_an_image(self) -> None:
+        markdown = self._render(
+            "https://example.com/a![](http://127.0.0.1:9/beacon)"
+        )
+        citation_line = next(line for line in markdown if "Source" in line)
+        self.assertNotIn("![", citation_line)
+        self.assertEqual(citation_line.count("]("), 1, citation_line)
 
 
 class TestCurrencyReportImageSafety(unittest.TestCase):
