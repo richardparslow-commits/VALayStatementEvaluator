@@ -694,6 +694,56 @@ class TestContradictionDowngradeReason(unittest.TestCase):
         )
         self.assertIn("veteran/patient", reason)
 
+    def test_veteran_role_variants_keep_the_contradiction(self) -> None:
+        """The claims model's compound labels must not reopen the exemption."""
+        item = {
+            "verdict": "CONTRADICTED",
+            "record_reference": "sample_medical_records.txt b.1",
+            "note": "The record identifies the patient as John Q. Sample, not Mike Doe.",
+        }
+        for role in (
+            "Veteran",
+            "the veteran",
+            "veteran (self)",
+            "veteran/claimant",
+            "self",
+            "veteran's own statement",
+            "US veteran",
+        ):
+            with self.subTest(role=role):
+                self.assertEqual(
+                    _contradiction_downgrade_reason(
+                        item,
+                        evidence_absent=False,
+                        claim_text="My name is Mike Doe.",
+                        writer_role=role,
+                    ),
+                    "",
+                )
+
+    def test_a_third_party_label_that_mentions_the_veteran_keeps_the_exemption(self) -> None:
+        """A label like "spouse of the veteran" still means a witness, not the veteran."""
+        item = {
+            "verdict": "CONTRADICTED",
+            "record_reference": "sample_medical_records.txt b.1",
+            "note": "The record identifies the patient as John Q. Sample, not Mike Doe.",
+        }
+        for role in (
+            "spouse of the veteran",
+            "veteran spouse",
+            "veteran family member",
+            "friend",
+            "other",
+        ):
+            with self.subTest(role=role):
+                reason = _contradiction_downgrade_reason(
+                    item,
+                    evidence_absent=False,
+                    claim_text="My name is Mike Doe.",
+                    writer_role=role,
+                )
+                self.assertIn("veteran/patient", reason)
+
 
 class TestVerifyPromptContract(unittest.TestCase):
     """What the prompt must say for the code's rule to be followable.

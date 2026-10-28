@@ -1343,6 +1343,35 @@ def _draft_revision(
     report(0.94, "Improvement suggestions drafted.")
 
 
+# Words that qualify a veteran label without changing who the writer is. The
+# claims prompt asks for "veteran", but models return compounds such as
+# "veteran (self)", "veteran/claimant" or "the veteran's own statement".
+_VETERAN_ROLE_QUALIFIERS = frozenset({
+    "veteran", "self", "claimant", "applicant", "writer", "own", "statement",
+    "us", "american", "former", "disabled", "combat", "himself", "herself",
+    "s",
+})
+
+
+def _writer_is_veteran_role(writer_role: str) -> bool:
+    """Whether the claims step's role label means the writer is the veteran.
+
+    Only an unambiguous veteran/self label counts. A label that mentions the
+    veteran but names a third party ("spouse of the veteran", "veteran spouse",
+    "veteran family member") is deliberately *not* treated as the veteran: the
+    witness-identity exemption is what those writers need, and misclassifying
+    them would turn their own name into a false contradiction. Unknown compounds
+    are treated the same conservative way.
+    """
+    words = set(re.sub(r"[^a-z]+", " ", str(writer_role or "").casefold()).split())
+    words -= {"the", "a", "an"}
+    if not words:
+        return False
+    if words == {"self"}:
+        return True
+    return "veteran" in words and words <= _VETERAN_ROLE_QUALIFIERS
+
+
 def _contradiction_downgrade_reason(
     verification: dict,
     evidence_absent: bool,
@@ -1385,8 +1414,7 @@ def _contradiction_downgrade_reason(
     # belong to the wrong person), so the exemption must not apply. The claims step
     # records writer_role from the statement; without it this backstop would treat
     # every first-person name claim as a witness self-identification.
-    role_words = re.sub(r"[^a-z ]", "", str(writer_role or "").casefold()).strip()
-    writer_is_veteran = role_words in {"veteran", "the veteran", "self"}
+    writer_is_veteran = _writer_is_veteran_role(writer_role)
     if (
         not writer_is_veteran
         and claim_text
