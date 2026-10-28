@@ -598,7 +598,11 @@ def _run_draft_flow(
         return
     finally:
         exit_run()
-    _finish_draft_run(rid, llm, result, t0, _profiler_run, _audit_condition_d, _audit_sources_d, _audit_files_d, _audit_pages_d)
+    _finish_draft_run(
+        rid, llm, result, t0, _profiler_run, _audit_condition_d, _audit_sources_d,
+        _audit_files_d, _audit_pages_d,
+        witness_role=str(witness.get("relationship", "")),
+    )
 
 
 def _handle_draft_abort(
@@ -692,6 +696,7 @@ def _finish_draft_run(
     sources: list[str] | None,
     files: int,
     pages: int,
+    witness_role: str = "",
 ) -> None:
     """Log/audit success and stash the result for the results renderer."""
     duration_ms = int((time.perf_counter() - t0) * 1000)
@@ -747,6 +752,7 @@ def _finish_draft_run(
         profiler_run.run_end_mono = time.monotonic()
         profiler_run.emit()
         get_profiler().record_run(profiler_run)
+    _remember_draft_export_labels(condition, witness_role)
     st.session_state.draft_result = result
     st.session_state.draft_usage = llm.usage
     st.session_state.draft_request_id = rid
@@ -757,7 +763,53 @@ def _finish_draft_run(
 
 
 # ------------------------------------------------------------------ results UI
-def _render_pdf_export(statement_text: str) -> None:
+_DRAFT_EXPORT_CONDITION_KEY = "_draft_export_condition"
+_DRAFT_EXPORT_WITNESS_ROLE_KEY = "_draft_export_witness_role"
+
+
+def _remember_draft_export_labels(condition: str | None, witness_role: str | None) -> None:
+    """Store the Step 2 labels the finished statement was actually drafted for.
+
+    The PDF header belongs to the statement on screen, not to whatever the live
+    Step 2 widgets hold when someone clicks Export. Keeping the draft's own
+    labels also survives the condition selector refilling ``draft_condition``
+    when its Proceed button is used.
+
+    This is the fallback for a result that carries no labels of its own; the
+    preferred source is :func:`_draft_export_labels_from_result`, which survives
+    the queue and a recovered browser session.
+    """
+    st.session_state[_DRAFT_EXPORT_CONDITION_KEY] = str(condition or "").strip()
+    st.session_state[_DRAFT_EXPORT_WITNESS_ROLE_KEY] = str(witness_role or "").strip()
+
+
+def _draft_export_labels_from_result(result: Any) -> tuple[str, str]:
+    """The Step 2 labels the displayed draft was actually written for.
+
+    ``DraftResult.factual_inputs`` retains the witness dict the run was given,
+    with the claimed condition merged in by the pipeline. That copy is serialized
+    with the result, so a queued result — or one recovered by reference after a
+    reload — carries its own labels and the PDF header no longer depends on Step 2
+    widgets that may have moved on, or no longer exist.
+
+    Returns ``("", "")`` for an older result without retained inputs; the caller
+    then falls back to the session capture and finally the live widgets.
+    """
+    retained = getattr(result, "factual_inputs", None)
+    if not isinstance(retained, dict):
+        return "", ""
+    witness = retained.get("witness")
+    if not isinstance(witness, dict):
+        return "", ""
+    condition = witness.get("Claimed condition")
+    relationship = witness.get("relationship")
+    return (
+        condition.strip() if isinstance(condition, str) else "",
+        relationship.strip() if isinstance(relationship, str) else "",
+    )
+
+
+def _render_pdf_export(statement_text: str, draft_result: Any = None) -> None:
     """Render the "export final statement as PDF" download button.
 
     Fires the telemetry required for the Final Statement PDF Export feature
@@ -773,8 +825,23 @@ def _render_pdf_export(statement_text: str) -> None:
             pass
         st.session_state[impression_key] = True
 
-    condition = str(st.session_state.get("draft_condition", "") or "").strip() or audit_condition_for_slot("draft")
-    witness_role = str(st.session_state.get("draft_rel", "") or "")
+    # The result's own retained inputs are authoritative: they survive the queue
+    # and recovery, and a live Step 2 change after the draft must not relabel the
+    # PDF of the statement already on screen. The session capture is the fallback
+    # for older results, then the live widgets for results predating both.
+    result_condition, result_witness_role = _draft_export_labels_from_result(draft_result)
+    if result_condition:
+        condition = result_condition
+    elif _DRAFT_EXPORT_CONDITION_KEY in st.session_state:
+        condition = str(st.session_state.get(_DRAFT_EXPORT_CONDITION_KEY) or "").strip()
+    else:
+        condition = str(st.session_state.get("draft_condition", "") or "").strip() or audit_condition_for_slot("draft")
+    if result_witness_role:
+        witness_role = result_witness_role
+    elif _DRAFT_EXPORT_WITNESS_ROLE_KEY in st.session_state:
+        witness_role = str(st.session_state.get(_DRAFT_EXPORT_WITNESS_ROLE_KEY) or "")
+    else:
+        witness_role = str(st.session_state.get("draft_rel", "") or "")
     try:
         pdf_bytes = generate_statement_pdf(statement_text, condition, witness_role)
     except Exception as exc:  # noqa: BLE001 - PDF generation is best-effort in the UI
@@ -877,7 +944,7 @@ def _render_draft_results(draft_result: Any) -> None:
         mime="text/markdown",
      container=col_b)
     if export_confirmed and not pilot.enabled():
-        _render_pdf_export(edited)
+        _render_pdf_export(edited, draft_result)
 
     if draft_result.digest:
         with st.expander("Medical record digest used for grounding"):

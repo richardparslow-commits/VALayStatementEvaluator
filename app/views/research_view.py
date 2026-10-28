@@ -23,7 +23,7 @@ nobody can diagnose.
 """
 from __future__ import annotations
 
-import re
+from urllib.parse import quote, urlsplit
 
 from .. import pilot
 
@@ -51,7 +51,12 @@ from ..research_questions import (
 )
 from ..run_log import run_log_event
 from .ops import render_failure_detail
-from .shared import check_shutdown_gate, ensure_request_id, report_failure
+from .shared import (
+    check_shutdown_gate,
+    defang_markdown_images,
+    ensure_request_id,
+    report_failure,
+)
 
 logger = get_logger("app.views.research_view")
 
@@ -268,12 +273,22 @@ def _render_currency_report(report: currency.CurrencyReport) -> None:
         , container=st, method="warning")
         for verdict in report.stale:
             suffix = f" — {verdict.authority}" if verdict.authority else ""
-            pilot.display(f"- **{verdict.topic} — {verdict.label}:** {verdict.note}{suffix}", container=st, method="markdown")
+            pilot.display(
+                f"- **{defang_markdown_images(verdict.topic)} — "
+                f"{defang_markdown_images(verdict.label)}:** "
+                f"{defang_markdown_images(verdict.note)}"
+                f"{defang_markdown_images(suffix)}",
+                container=st,
+                method="markdown",
+            )
     if report.unconfirmed:
         pilot.display(
             "**Not established either way** (primary sources conflicted, or the check "
             "could not confirm): "
-            + ", ".join(f"{v.topic} — {v.label}" for v in report.unconfirmed)
+            + ", ".join(
+                f"{defang_markdown_images(v.topic)} — {defang_markdown_images(v.label)}"
+                for v in report.unconfirmed
+            )
         , container=st, method="info")
 
 
@@ -590,22 +605,34 @@ def _render_last_result() -> None:
         _render_answer(answer)
 
 
-_MD_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)]*)\)")
-_HTML_IMG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
+def _safe_markdown_url(url: object) -> str:
+    """A citation target that cannot escape Markdown link syntax.
 
-
-def _defang_markdown_images(text: object) -> str:
-    """Neutralize Markdown/HTML image embeds so untrusted answers cannot auto-fetch URLs."""
-    if text is None:
-        return ""
-    raw = str(text)
+    Defanging the free-text fields is not enough for the URL: a value carrying
+    ``) ![](http://host/beacon`` closes the ``[label](url)`` link and the remainder
+    parses as an image, which the browser then fetches. Only a real http(s) URL
+    with a host is rendered as a link, and every character that can close the
+    destination or form image syntax is percent-encoded. Brackets stay literal
+    for a parser-valid IPv6 host; a malformed bracket returns an empty target so
+    the caller shows inert text instead of a link.
+    """
+    raw = str(url or "").strip()
     if not raw:
         return ""
-    cleaned = _MD_IMAGE_RE.sub(
-        lambda m: f"[image: {m.group(1) or 'external'}]", raw
-    )
-    cleaned = _HTML_IMG_RE.sub("[image]", cleaned)
-    return cleaned
+    # Parse the raw value first: ``urlsplit`` raises "Invalid IPv6 URL" on a
+    # malformed bracket, and only a URL the parser understands is usable. That
+    # keeps a genuine IPv6 host ("http://[::1]:8000/x") clickable while an
+    # address whose brackets do not form a host is shown as inert text.
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return ""
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return ""
+    # Encode everything that can end the link or start another Markdown construct.
+    # Brackets stay literal for the IPv6 host validated above (they cannot end a
+    # destination); ``!`` is encoded, so they cannot form image syntax either.
+    return quote(raw, safe=":/?#@$&'*+,;=%[]")
 
 
 def _render_answer(answer: GroundedAnswer) -> None:
@@ -614,18 +641,24 @@ def _render_answer(answer: GroundedAnswer) -> None:
     # findings renderer so its missing fields are reported, rather than falling
     # through to the prose branch and showing the raw "{}" as the answer.
     if answer.findings is None:
-        pilot.display(_defang_markdown_images(answer.text), container=st, method="markdown")
+        pilot.display(defang_markdown_images(answer.text), container=st, method="markdown")
     else:
         _render_findings(answer.findings)
 
     if answer.citations:
         with st.expander(pilot.text_label(f"Sources ({answer.citation_count})"), expanded=True):
             for index, citation in enumerate(answer.citations, start=1):
-                date = f" — {_defang_markdown_images(citation.date)}" if citation.date else ""
-                safe_label = _defang_markdown_images(citation.label()).replace("[", "(").replace("]", ")")
-                pilot.display(f"{index}. [{safe_label}]({citation.url}){date}", container=st, method="markdown")
+                date = f" — {defang_markdown_images(citation.date)}" if citation.date else ""
+                safe_label = defang_markdown_images(citation.label()).replace("[", "(").replace("]", ")")
+                safe_url = _safe_markdown_url(citation.url)
+                if safe_url:
+                    pilot.display(f"{index}. [{safe_label}]({safe_url}){date}", container=st, method="markdown")
+                else:
+                    # No usable address: show the label as inert text rather than a
+                    # link built from something that is not a web URL.
+                    pilot.display(f"{index}. {safe_label}{date}", container=st, method="markdown")
                 if citation.snippet:
-                    pilot.display(_defang_markdown_images(citation.snippet[:280]), container=st, method="caption")
+                    pilot.display(defang_markdown_images(citation.snippet[:280]), container=st, method="caption")
     else:
         pilot.display(
             "No sources were returned for this answer. Treat it as unverified: the "
@@ -673,7 +706,7 @@ def _render_findings(findings: dict[str, object]) -> None:
             value = findings.get(key)
             if isinstance(value, str) and value.strip():
                 pilot.display(
-                    f"**{label}:** {_defang_markdown_images(value)}",
+                    f"**{label}:** {defang_markdown_images(value)}",
                     container=st,
                     method="markdown",
                 )
@@ -688,7 +721,7 @@ def _render_findings(findings: dict[str, object]) -> None:
                 pilot.display(f"**{label}**", container=st, method="markdown")
                 for item in values:
                     pilot.display(
-                        f"- {_defang_markdown_images(item)}",
+                        f"- {defang_markdown_images(item)}",
                         container=st,
                         method="markdown",
                     )

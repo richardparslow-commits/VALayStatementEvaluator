@@ -439,6 +439,19 @@ def _fetch_records(slot: str) -> list[Any]:
     return records2
 
 
+def _result_after_va_gov_retry(previous: Any, fresh: Any) -> Any:
+    """Choose what to keep after a VA.gov retry.
+
+    A retry whose last attempt fails comes back with no documents. Writing that
+    over the previous result would discard records already retrieved and remove
+    the "Continue with available VA.gov records" path, so an empty retry leaves
+    the earlier partial set in place.
+    """
+    if previous is not None and not getattr(fresh, "documents", None):
+        return previous
+    return fresh
+
+
 def _va_gov_records(slot: str) -> list[Any]:
     """VA.gov source: per-session secure login + consent, then automatic fetch.
 
@@ -550,7 +563,11 @@ def _va_gov_records(slot: str) -> list[Any]:
         if col_retry.button("Retry VA.gov fetch", key=f"va_gov_retry_{slot}"):
             session_any: Any = st.session_state.get(f"va_gov_session_{slot}")
             if session_any is not None:
-                st.session_state[f"va_gov_fetch_{slot}"] = va_gov_client.fetch_va_records(session_any)
+                previous_result = st.session_state.get(f"va_gov_fetch_{slot}")
+                fresh_result = va_gov_client.fetch_va_records(session_any)
+                st.session_state[f"va_gov_fetch_{slot}"] = _result_after_va_gov_retry(
+                    previous_result, fresh_result
+                )
                 st.session_state.pop(f"va_gov_accept_partial_{slot}", None)
                 st.session_state.pop(f"va_gov_confirm_{slot}", None)
                 st.rerun()

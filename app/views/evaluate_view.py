@@ -87,6 +87,7 @@ from .shared import (
     check_endpoint_gate,
     check_shutdown_gate,
     check_upload_limits,
+    defang_markdown_images,
     ensure_request_id,
     extract_uploads,
     format_error_for_user,
@@ -1430,14 +1431,27 @@ def _render_framework_currency_flags(eval_result: Any) -> None:
             "tab, and see app/knowledge/ before revising a statement from them:"
         , container=st, method="warning")
         for verdict in flag.stale:
+            # These fields are model output from the paid currency check; defang them
+            # exactly as the Research tab does, or a crafted note/authority becomes an
+            # auto-fetching Markdown image in this tab too.
             suffix = f" — {verdict.authority}" if verdict.authority else ""
-            pilot.display(f"- **{verdict.topic} — {verdict.label}:** {verdict.note}{suffix}", container=st, method="markdown")
+            pilot.display(
+                f"- **{defang_markdown_images(verdict.topic)} — "
+                f"{defang_markdown_images(verdict.label)}:** "
+                f"{defang_markdown_images(verdict.note)}"
+                f"{defang_markdown_images(suffix)}",
+                container=st,
+                method="markdown",
+            )
 
     if flag.unconfirmed:
         pilot.display(
             "❓ **Could not be confirmed as current** (the check found conflicting sources "
             "or could not confirm): "
-            + ", ".join(f"{v.topic} — {v.label}" for v in flag.unconfirmed)
+            + ", ".join(
+                f"{defang_markdown_images(v.topic)} — {defang_markdown_images(v.label)}"
+                for v in flag.unconfirmed
+            )
         , container=st, method="info")
 
     if flag.verified:

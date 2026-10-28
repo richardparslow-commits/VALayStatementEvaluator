@@ -3321,5 +3321,299 @@ class TestResearchEmptyAudit(unittest.TestCase):
         self.assertNotIn("{}", markdown, "the raw audit object was rendered as the answer")
 
 
+class TestResearchCitationUrlSafety(unittest.TestCase):
+    """A citation's url is model/web-controlled text; it must not become Markdown."""
+
+    def _render(self, url: str):
+        import app.views.research_view as research_view
+        from app.perplexity_agent import Citation, GroundedAnswer
+
+        st_mock, _ = _fake_streamlit()
+        answer = GroundedAnswer(
+            text="Answer.",
+            citations=[Citation(url=url, title="Source")],
+        )
+        with _patch_st(research_view, st_mock), patch(
+            "app.pilot.enabled", return_value=False
+        ):
+            research_view._render_answer(answer)
+        return [str(call.args[0]) for call in st_mock.markdown.call_args_list]
+
+    def test_a_crafted_url_cannot_close_the_link_and_open_an_image(self) -> None:
+        # The payload's brackets make urlsplit reject the value as an invalid
+        # IPv6 host, so it degrades to inert text; either way it must not become
+        # a second link or an image.
+        markdown = self._render(
+            "http://x) ![](http://127.0.0.1:17033/__beacon?leak=1"
+        )
+        citation_line = next(line for line in markdown if "Source" in line)
+        self.assertNotIn("![", citation_line)
+        self.assertLessEqual(citation_line.count("]("), 1, citation_line)
+
+    def test_a_closing_paren_in_a_url_is_percent_encoded(self) -> None:
+        markdown = self._render("https://example.com/a)b")
+        citation_line = next(line for line in markdown if "Source" in line)
+        self.assertIn("%29", citation_line, "the url's ')' was not percent-encoded")
+        self.assertEqual(citation_line.count("]("), 1, citation_line)
+
+    def test_a_non_web_url_is_rendered_as_text_without_a_link(self) -> None:
+        markdown = self._render("javascript:alert(1)")
+        citation_line = next(line for line in markdown if "Source" in line)
+        self.assertNotIn("](", citation_line)
+
+    def test_an_ipv6_host_stays_a_usable_link(self) -> None:
+        """Encoding the brackets would leave a destination the browser cannot parse."""
+        markdown = self._render("http://[::1]:8000/record")
+        citation_line = next(line for line in markdown if "Source" in line)
+        self.assertIn("(http://[::1]:8000/record)", citation_line)
+
+    def test_a_malformed_bracket_is_inert_text(self) -> None:
+        markdown = self._render("http://[::1:8000/record")
+        citation_line = next(line for line in markdown if "Source" in line)
+        self.assertNotIn("](", citation_line)
+
+    def test_brackets_cannot_start_an_image(self) -> None:
+        markdown = self._render(
+            "https://example.com/a![](http://127.0.0.1:9/beacon)"
+        )
+        citation_line = next(line for line in markdown if "Source" in line)
+        self.assertNotIn("![", citation_line)
+        self.assertEqual(citation_line.count("]("), 1, citation_line)
+
+
+class TestCurrencyReportImageSafety(unittest.TestCase):
+    def test_a_stale_verdict_cannot_inject_an_auto_fetching_image(self) -> None:
+        import app.views.research_view as research_view
+        from app import knowledge_currency as currency
+
+        report = currency.CurrencyReport(
+            checked_at="2026-01-01",
+            fingerprint="fp",
+            verdicts=(
+                currency.TopicVerdict(
+                    topic="A",
+                    status=currency.STATUS_CHANGED,
+                    note="Check this ![x](http://127.0.0.1:9/beacon)",
+                    authority="![y](http://127.0.0.1:9/authority)",
+                ),
+            ),
+        )
+        st_mock, _ = _fake_streamlit()
+        with _patch_st(research_view, st_mock), patch(
+            "app.pilot.enabled", return_value=False
+        ):
+            research_view._render_currency_report(report)
+
+        rendered = " ".join(str(call.args[0]) for call in st_mock.markdown.call_args_list)
+        self.assertNotIn("![", rendered)
+        self.assertIn("image: x", rendered)
+
+
+class TestEvaluateCurrencyImageSafety(unittest.TestCase):
+    """The Evaluate tab renders the same stored verdicts as Research; it must defang them too."""
+
+    def test_a_stale_verdict_cannot_inject_an_auto_fetching_image(self) -> None:
+        import app.views.evaluate_view as evaluate_view
+        from app import knowledge_currency as currency
+
+        flag = currency.CurrencyFlag(
+            state=currency.STATE_FRESH,
+            stale=(
+                currency.TopicVerdict(
+                    topic="A",
+                    status=currency.STATUS_CHANGED,
+                    note="Check this ![x](http://127.0.0.1:9/beacon)",
+                    authority="![y](http://127.0.0.1:9/authority)",
+                ),
+            ),
+            unconfirmed=(
+                currency.TopicVerdict(topic="B", status=currency.STATUS_UNCONFIRMED),
+            ),
+        )
+        st_mock, _ = _fake_streamlit()
+        with _patch_st(evaluate_view, st_mock), patch.object(
+            evaluate_view, "_case_topic_letters", return_value=["A", "B"]
+        ), patch.object(
+            evaluate_view, "_framework_currency_ttl_days", return_value=30
+        ), patch.object(
+            evaluate_view.currency, "case_currency_flag", return_value=flag
+        ), patch("app.pilot.enabled", return_value=False):
+            evaluate_view._render_framework_currency_flags(object())
+
+        rendered = " ".join(
+            str(call.args[0])
+            for method in ("markdown", "info")
+            for call in getattr(st_mock, method).call_args_list
+        )
+        self.assertIn("Could not be confirmed as current", rendered)
+        self.assertNotIn("![", rendered)
+        self.assertIn("image: x", rendered)
+        self.assertIn("image: y", rendered)
+
+
+class TestVaGovRetryKeepsPartialSet(unittest.TestCase):
+    def _result(self, documents):
+        from app.va_gov_client import VaGovFetchResult
+
+        return VaGovFetchResult(
+            documents=documents,
+            retrieved=len(documents),
+            expected=3,
+            partial=True,
+            error_message="VA.gov record service error (HTTP 500).",
+        )
+
+    def test_an_empty_retry_keeps_the_records_already_fetched(self) -> None:
+        from app.views.records import _result_after_va_gov_retry
+
+        previous = self._result([document_from_text("va.pdf", "record text")])
+        fresh = self._result([])
+        self.assertIs(_result_after_va_gov_retry(previous, fresh), previous)
+
+    def test_a_retry_with_records_replaces_the_previous_set(self) -> None:
+        from app.views.records import _result_after_va_gov_retry
+
+        previous = self._result([document_from_text("old.pdf", "old text")])
+        fresh = self._result([document_from_text("new.pdf", "new text")])
+        self.assertIs(_result_after_va_gov_retry(previous, fresh), fresh)
+
+    def test_a_first_failed_fetch_is_still_stored(self) -> None:
+        from app.views.records import _result_after_va_gov_retry
+
+        fresh = self._result([])
+        self.assertIs(_result_after_va_gov_retry(None, fresh), fresh)
+
+
+class TestPdfExportLabels(unittest.TestCase):
+    def test_the_pdf_uses_the_labels_the_draft_was_written_for(self) -> None:
+        import app.views.draft_view as draft_view
+
+        st_mock, session = _fake_streamlit()
+        # Live Step 2 widgets have moved on since the draft finished.
+        session["draft_condition"] = "Fibromyalgia"
+        session["draft_rel"] = "Coworker / supervisor"
+        session[draft_view._DRAFT_EXPORT_CONDITION_KEY] = "Lumbar strain"
+        session[draft_view._DRAFT_EXPORT_WITNESS_ROLE_KEY] = "Spouse"
+        with _patch_st(draft_view, st_mock), patch.object(
+            draft_view, "generate_statement_pdf", return_value=b"%PDF-1.4"
+        ) as generate, patch.object(draft_view, "track_impression"), patch.object(
+            draft_view.pilot, "file_download", return_value=False
+        ):
+            draft_view._render_pdf_export("I am the spouse of the veteran.")
+
+        generate.assert_called_once_with(
+            "I am the spouse of the veteran.", "Lumbar strain", "Spouse"
+        )
+
+    def test_without_captured_labels_the_live_step_two_values_are_used(self) -> None:
+        import app.views.draft_view as draft_view
+
+        st_mock, session = _fake_streamlit()
+        session["draft_condition"] = "Tinnitus"
+        session["draft_rel"] = "Friend"
+        with _patch_st(draft_view, st_mock), patch.object(
+            draft_view, "generate_statement_pdf", return_value=b"%PDF-1.4"
+        ) as generate, patch.object(draft_view, "track_impression"), patch.object(
+            draft_view.pilot, "file_download", return_value=False
+        ):
+            draft_view._render_pdf_export("Statement.")
+
+        generate.assert_called_once_with("Statement.", "Tinnitus", "Friend")
+
+    def test_finishing_a_draft_records_its_labels(self) -> None:
+        import app.views.draft_view as draft_view
+
+        st_mock, session = _fake_streamlit()
+        with _patch_st(draft_view, st_mock):
+            draft_view._remember_draft_export_labels(" Lumbar strain ", " Spouse ")
+        self.assertEqual(session[draft_view._DRAFT_EXPORT_CONDITION_KEY], "Lumbar strain")
+        self.assertEqual(session[draft_view._DRAFT_EXPORT_WITNESS_ROLE_KEY], "Spouse")
+
+    def test_a_queued_or_recovered_result_carries_its_own_labels(self) -> None:
+        """Retained inputs survive the queue, so a new session still labels the PDF."""
+        import app.views.draft_view as draft_view
+        from app.draft import DraftResult
+        from app.job_payload import draft_from_json, draft_to_json
+
+        result = draft_from_json(
+            draft_to_json(
+                DraftResult(
+                    draft="Statement.",
+                    factual_inputs={
+                        "witness": {
+                            "relationship": "Spouse",
+                            "Claimed condition": "Lumbar strain",
+                        }
+                    },
+                )
+            )
+        )
+        st_mock, session = _fake_streamlit()
+        # A recovered session has no captured labels, and Step 2 may hold
+        # whatever the browser defaulted to; neither may relabel this result.
+        session["draft_condition"] = "Fibromyalgia"
+        session["draft_rel"] = "Coworker / supervisor"
+        with _patch_st(draft_view, st_mock), patch.object(
+            draft_view, "generate_statement_pdf", return_value=b"%PDF-1.4"
+        ) as generate, patch.object(draft_view, "track_impression"), patch.object(
+            draft_view.pilot, "file_download", return_value=False
+        ):
+            draft_view._render_pdf_export("Statement.", result)
+
+        generate.assert_called_once_with("Statement.", "Lumbar strain", "Spouse")
+
+    def test_the_results_panel_hands_the_result_to_the_pdf_export(self) -> None:
+        """The call site must pass the displayed result, not rely on session capture."""
+        import app.views.draft_view as draft_view
+        import app.views.factual_review as factual_review
+        from app.draft import DraftResult
+
+        result = DraftResult(draft="Statement.")
+        st_mock, _ = _fake_streamlit()
+        st_mock.columns.return_value = [MagicMock(), MagicMock()]
+        st_mock.text_area.return_value = "Statement."
+        with _patch_st(draft_view, st_mock), patch.object(
+            draft_view, "render_usage_summary"
+        ), patch.object(
+            draft_view, "render_follow_up_questions"
+        ), patch.object(
+            factual_review, "render_factual_review", return_value=True
+        ), patch.object(
+            draft_view.pilot, "enabled", return_value=False
+        ), patch.object(
+            draft_view.pilot, "confirm_export", return_value=True
+        ), patch.object(
+            draft_view.pilot, "file_download", return_value=False
+        ), patch.object(draft_view, "_render_pdf_export") as pdf:
+            draft_view._render_draft_results(result)
+
+        pdf.assert_called_once_with("Statement.", result)
+
+    def test_a_result_beats_labels_captured_by_an_earlier_in_process_draft(self) -> None:
+        import app.views.draft_view as draft_view
+        from app.draft import DraftResult
+
+        st_mock, session = _fake_streamlit()
+        session[draft_view._DRAFT_EXPORT_CONDITION_KEY] = "Tinnitus"
+        session[draft_view._DRAFT_EXPORT_WITNESS_ROLE_KEY] = "Friend"
+        result = DraftResult(
+            draft="Statement.",
+            factual_inputs={
+                "witness": {
+                    "relationship": "Spouse",
+                    "Claimed condition": "Lumbar strain",
+                }
+            },
+        )
+        with _patch_st(draft_view, st_mock), patch.object(
+            draft_view, "generate_statement_pdf", return_value=b"%PDF-1.4"
+        ) as generate, patch.object(draft_view, "track_impression"), patch.object(
+            draft_view.pilot, "file_download", return_value=False
+        ):
+            draft_view._render_pdf_export("Statement.", result)
+
+        generate.assert_called_once_with("Statement.", "Lumbar strain", "Spouse")
+
+
 if __name__ == "__main__":
     unittest.main()

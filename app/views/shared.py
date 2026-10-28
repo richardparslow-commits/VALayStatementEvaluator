@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from .. import pilot
 
+import re
 import traceback
 from datetime import datetime, timezone
 from typing import Any
@@ -506,3 +507,29 @@ def render_condition_selector_for_slot(slot: str) -> None:
     from ..condition_selector import render_condition_selector
 
     render_condition_selector(slot, FEATURE_ID)
+
+
+_MD_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)]*)\)")
+_HTML_IMG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
+
+
+def defang_markdown_images(text: object) -> str:
+    """Neutralise Markdown/HTML images in model- or record-derived text.
+
+    Streamlit renders Markdown images even with ``unsafe_allow_html`` off, and a
+    Markdown image is fetched by the browser as soon as it renders. Any text that
+    came from a model or a document must therefore lose its image syntax before it
+    reaches a ``markdown``/``info``/``warning`` display: ``![alt](url)`` becomes
+    ``[image: alt]`` and an ``<img>`` tag becomes ``[image]``. Both tabs that show
+    currency verdicts use this, so a note or authority cannot beacon out.
+    """
+    if text is None:
+        return ""
+    raw = str(text)
+    if not raw:
+        return ""
+    cleaned = _MD_IMAGE_RE.sub(
+        lambda m: f"[image: {m.group(1) or 'external'}]", raw
+    )
+    cleaned = _HTML_IMG_RE.sub("[image]", cleaned)
+    return cleaned

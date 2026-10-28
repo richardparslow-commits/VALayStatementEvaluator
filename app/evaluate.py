@@ -1018,7 +1018,8 @@ def _run_evaluation(
             report(0.60, "Step 3/7 — Verifying each claim against the records…")
             assert result.digest is not None  # set by records:review above
             result.verifications, result.evidence_gaps = _verify_claims(
-                llm, result.claims, result.digest, records, report
+                llm, result.claims, result.digest, records, report,
+                writer_role=result.writer_role,
             )
             result.verification_policy = SOURCE_REFERENCE_POLICY
 
@@ -1342,8 +1343,40 @@ def _draft_revision(
     report(0.94, "Improvement suggestions drafted.")
 
 
+# Words that qualify a veteran label without changing who the writer is. The
+# claims prompt asks for "veteran", but models return compounds such as
+# "veteran (self)", "veteran/claimant" or "the veteran's own statement".
+_VETERAN_ROLE_QUALIFIERS = frozenset({
+    "veteran", "self", "claimant", "applicant", "writer", "own", "statement",
+    "us", "american", "former", "disabled", "combat", "himself", "herself",
+    "s",
+})
+
+
+def _writer_is_veteran_role(writer_role: str) -> bool:
+    """Whether the claims step's role label means the writer is the veteran.
+
+    Only an unambiguous veteran/self label counts. A label that mentions the
+    veteran but names a third party ("spouse of the veteran", "veteran spouse",
+    "veteran family member") is deliberately *not* treated as the veteran: the
+    witness-identity exemption is what those writers need, and misclassifying
+    them would turn their own name into a false contradiction. Unknown compounds
+    are treated the same conservative way.
+    """
+    words = set(re.sub(r"[^a-z]+", " ", str(writer_role or "").casefold()).split())
+    words -= {"the", "a", "an"}
+    if not words:
+        return False
+    if words == {"self"}:
+        return True
+    return "veteran" in words and words <= _VETERAN_ROLE_QUALIFIERS
+
+
 def _contradiction_downgrade_reason(
-    verification: dict, evidence_absent: bool, claim_text: str = ""
+    verification: dict,
+    evidence_absent: bool,
+    claim_text: str = "",
+    writer_role: str = "",
 ) -> str:
     """Why a CONTRADICTED verdict cannot stand, or ``""`` when it can.
 
@@ -1375,8 +1408,16 @@ def _contradiction_downgrade_reason(
             "record text that makes it, so it is a record-coverage gap."
         )
     note_text = str(verification.get("note", ""))
+    # The identity exemption is for a third-party witness whose own name is compared
+    # with the patient named in someone else's records. When the writer *is* the
+    # veteran, the same mismatch is a real conflict (it can even mean the records
+    # belong to the wrong person), so the exemption must not apply. The claims step
+    # records writer_role from the statement; without it this backstop would treat
+    # every first-person name claim as a witness self-identification.
+    writer_is_veteran = _writer_is_veteran_role(writer_role)
     if (
-        claim_text
+        not writer_is_veteran
+        and claim_text
         and re.search(
             r"\b(?:my name is|i am (?:the|a|an|his|her)|phone\s*:|i certify that|"
             r"(?:the\s+)?(?:writer|witness|author|declarant)(?:'s)?\s+name\s+is|"
@@ -1463,6 +1504,8 @@ def _verify_claims(
     digest: MedicalDigest,
     records: list[ExtractedDocument],
     report: ProgressCallback,
+    *,
+    writer_role: str = "",
 ) -> tuple[list[dict], list[dict]]:
     """Verify claims in small batches so each prompt stays focused.
 
@@ -1555,7 +1598,10 @@ def _verify_claims(
         for item in verified:
             claim_id = item["id"]
             downgrade_reason = _contradiction_downgrade_reason(
-                item, evidence_absent, claim_text=claim_text_by_id.get(claim_id, "")
+                item,
+                evidence_absent,
+                claim_text=claim_text_by_id.get(claim_id, ""),
+                writer_role=writer_role,
             )
             if downgrade_reason:
                 item = dict(item)
