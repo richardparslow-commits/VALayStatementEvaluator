@@ -23,6 +23,7 @@ import time
 import unittest
 import urllib.error
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -452,6 +453,129 @@ class TestResponsesWireCall(unittest.TestCase):
             {"role": "user", "content": "hello"},
         ])
         self.assertNotIn("max_output_tokens", kwargs)
+
+
+class TestIncompleteRuntimeOutput(unittest.TestCase):
+    def setUp(self) -> None:
+        from app.circuit_breaker import reset_all_for_tests
+
+        reset_all_for_tests()
+        self.addCleanup(reset_all_for_tests)
+        wait = patch("app.llm.wait_with_cancellation")
+        wait.start()
+        self.addCleanup(wait.stop)
+
+    def _client(self, response, *, responses=False):
+        from app.circuit_breaker import reset_all_for_tests
+
+        reset_all_for_tests()
+        client = TestResponsesWireCall()._client("https://test.invalid/v1")
+        client._call_openai = MagicMock(return_value=(response, responses))
+        return client
+
+    @staticmethod
+    def _chat(text, reason):
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=text), finish_reason=reason)],
+            usage=SimpleNamespace(prompt_tokens=11, completion_tokens=7),
+        )
+
+    def test_chat_length_is_rejected_even_with_valid_json(self):
+        for text in ("My symptoms began and then", '{"facts": []}', ""):
+            with self.subTest(text=text):
+                client = self._client(self._chat(text, "length"))
+                with self.assertRaises(llm.LLMError):
+                    client.chat_json("sys", "user") if text.startswith("{") else client.chat("sys", "user")
+                self.assertEqual(client._call_openai.call_count, 1)
+                self.assertEqual(client.usage.summary()["prompt_tokens"], 11)
+                self.assertEqual(client.usage.summary()["completion_tokens"], 7)
+
+    def test_responses_output_limit_is_rejected_with_or_without_text(self):
+        for text in ("Unfinished statement", '{"facts": []}', ""):
+            with self.subTest(text=text):
+                body = _responses_body(text=text, status="incomplete")
+                body["incomplete_details"] = {"reason": "max_output_tokens"}
+                client = self._client(body, responses=True)
+                with self.assertRaises(llm.LLMError):
+                    client.chat_json("sys", "user") if text.startswith("{") else client.chat("sys", "user")
+                self.assertEqual(client._call_openai.call_count, 1)
+                self.assertEqual(client.usage.summary()["prompt_tokens"], 11)
+
+    def test_typed_responses_incomplete_is_rejected(self):
+        body = SimpleNamespace(
+            status="incomplete", output_text="Unfinished statement", output=[],
+            incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+            usage=SimpleNamespace(input_tokens=11, output_tokens=7),
+        )
+        client = self._client(body, responses=True)
+        with self.assertRaises(llm.LLMError):
+            client.chat("sys", "user")
+
+    def test_nonterminal_or_failed_responses_do_not_publish_partial_text(self):
+        for status in ("failed", "cancelled", "in_progress", "queued"):
+            with self.subTest(status=status):
+                client = self._client(_responses_body(text="Partial text", status=status), responses=True)
+                with self.assertRaises(llm.LLMError):
+                    client.chat("sys", "user")
+
+    def test_incomplete_message_is_rejected_even_if_run_says_completed(self):
+        body = _responses_body()
+        body["output"][0]["status"] = "incomplete"
+        client = self._client(body, responses=True)
+        with self.assertRaises(llm.LLMError):
+            client.chat("sys", "user")
+
+    def test_transient_incomplete_retries_but_returns_only_completed_text(self):
+        client = self._client(None, responses=True)
+        client._call_openai.side_effect = [
+            (_responses_body(text="Partial text", status="incomplete"), True),
+            (_responses_body(text="Complete text"), True),
+        ]
+        self.assertEqual(client.chat("sys", "user"), "Complete text")
+        self.assertEqual(client._call_openai.call_count, 2)
+        self.assertEqual(client.usage.summary()["prompt_tokens"], 22)
+
+    def test_filtered_or_tool_call_output_is_not_a_finished_text_answer(self):
+        for reason in ("content_filter", "tool_calls", "function_call"):
+            with self.subTest(reason=reason):
+                client = self._client(self._chat("Partial text", reason))
+                with self.assertRaises(llm.LLMError):
+                    client.chat("sys", "user")
+
+    def test_completed_answers_are_unchanged(self):
+        for response, responses in [(self._chat("Complete text", "stop"), False),
+                                    (_responses_body("Complete text"), True)]:
+            client = self._client(response, responses=responses)
+            self.assertEqual(client.chat("sys", "user"), "Complete text")
+            self.assertEqual(client.usage.summary()["prompt_tokens"], 11)
+
+    def test_cutoff_never_fails_over_reasks_or_reports_success(self):
+        client = self._client(self._chat('{"facts": []}', "length"))
+        client._endpoint_candidates = MagicMock(return_value=["primary", "fallback"])
+        with patch("app.llm.metrics.observe_llm_call") as calls:
+            with self.assertRaises(llm.LLMIncompleteResponseError) as caught:
+                client.chat_json("sys", "user", max_tokens=123, phase="records:digest")
+        self.assertNotIn('{"facts"', str(caught.exception))
+        self.assertEqual(client._call_openai.call_count, 1)
+        self.assertEqual(client._call_openai.call_args.args[5], 123)
+        self.assertEqual(calls.call_count, 1)
+        self.assertEqual(calls.call_args.args[:2], ("records:digest", "error"))
+
+    def test_transient_incomplete_exhaustion_never_returns_partial_text(self):
+        client = self._client(_responses_body("Private partial text", status="incomplete"), responses=True)
+        with self.assertRaises(llm.LLMUpstreamError) as caught:
+            client.chat("sys", "user")
+        self.assertNotIn("Private partial text", str(caught.exception))
+        self.assertEqual(client._call_openai.call_count, llm.MAX_RETRIES)
+        self.assertEqual(client.usage.summary()["prompt_tokens"], 11 * llm.MAX_RETRIES)
+
+    def test_missing_terminal_metadata_remains_compatible(self):
+        body = _responses_body("Complete answer")
+        del body["status"]
+        for response, responses in [(_chat_response("Complete answer"), False), (body, True)]:
+            with self.subTest(responses=responses):
+                client = self._client(response, responses=responses)
+                self.assertEqual(client.chat("sys", "user"), "Complete answer")
 
 
 # ------------------------------------------------------------------- the probe

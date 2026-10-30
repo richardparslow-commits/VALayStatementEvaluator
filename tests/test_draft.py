@@ -692,6 +692,52 @@ class TestRunDraftReviewFailure(unittest.TestCase):
 
     @patch("app.draft.review_medical_records")
     @patch("app.draft.load_knowledge", return_value="k")
+    def test_wire_truncation_blocks_draft_and_preserves_original_on_review(self, _mk, mock_review):
+        from types import SimpleNamespace
+        from app.circuit_breaker import reset_all_for_tests
+        from app.config import Settings
+        from app.llm import LLMClient
+
+        mock_review.return_value = _fake_digest()
+        reset_all_for_tests()
+        self.addCleanup(reset_all_for_tests)
+        settings = Settings(
+            api_key="test-key", base_url="https://test.invalid/v1",
+            model_main="main-model", model_fast="fast-model",
+            fetch_api_key="", fetch_base_url="", fetch_records_path="",
+        )
+        wire = LLMClient(settings)
+        partial = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content="Unfinished private statement"),
+                finish_reason="length",
+            )],
+            usage=SimpleNamespace(prompt_tokens=11, completion_tokens=7),
+        )
+        wire._call_openai = MagicMock(return_value=(partial, False))
+
+        def truncated(system, user, kwargs):
+            return wire.chat(system, user, **kwargs)
+
+        drafting = _FakeLLM(overrides={"draft": truncated})
+        with self.assertRaises(DraftingError) as caught:
+            run_draft(drafting, [_doc()], WITNESS, "Daily pain observed.", "knee pain", "Service connection")
+        self.assertEqual(caught.exception.error_kind, "incomplete_response")
+        self.assertFalse(caught.exception.retryable)
+        self.assertNotIn("Unfinished private statement", caught.exception.format_for_user())
+        self.assertNotIn(("chat_json", "review"), drafting.calls)
+        self.assertEqual(wire._call_openai.call_count, 1)
+
+        reviewing = _FakeLLM(overrides={"review": truncated})
+        result = run_draft(reviewing, [_doc()], WITNESS, "Daily pain observed.", "knee pain", "Service connection")
+        self.assertEqual(result.output_statement, result.draft)
+        self.assertTrue(result.draft)
+        self.assertEqual(result.final_statement, "")
+        self.assertTrue(any("skipped" in issue.lower() for issue in result.review_issues))
+        self.assertEqual(wire._call_openai.call_count, 2)
+
+    @patch("app.draft.review_medical_records")
+    @patch("app.draft.load_knowledge", return_value="k")
     def test_review_llm_error_keeps_draft(self, _mk, mock_review):
         from app.llm import LLMError
 

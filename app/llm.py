@@ -154,6 +154,7 @@ __all__ = [
     "LLMClient",
     "LLMService",
     "LLMError",
+    "LLMIncompleteResponseError",
     "LLMConfigurationError",
     "LLMUpstreamError",
     "LLMTimeoutError",
@@ -688,6 +689,50 @@ def _responses_usage_tokens(body: Any) -> tuple[int | None, int | None]:
     return prompt, completion
 
 
+def _response_completion_error(body: Any, *, responses: bool) -> LLMError | None:
+    """Reject explicit unfinished output before it reaches text or JSON consumers.
+
+    Some compatible gateways omit terminal metadata. Keep that compatibility,
+    but never infer completion from nonempty text or syntactically valid JSON.
+    Error messages deliberately exclude the partial answer.
+    """
+    if not responses:
+        choices = _responses_field(body, "choices")
+        reason = _responses_field(choices[0], "finish_reason") if choices else None
+        if reason == "length":
+            return LLMIncompleteResponseError(
+                "The model reached its output token limit. The partial answer was not accepted. "
+                "Reduce the requested output or review the configured output budget."
+            )
+        if isinstance(reason, str) and reason != "stop":
+            return LLMIncompleteResponseError(
+                "The model did not finish a text answer. The partial answer was not accepted."
+            )
+        return None
+
+    details = _responses_field(body, "incomplete_details")
+    reason = _responses_field(details, "reason")
+    if reason in ("max_output_tokens", "max_messages", "content_filter", "steered"):
+        return LLMIncompleteResponseError(
+            "The model stopped at a generation limit or restriction. The partial answer was not "
+            "accepted. Review the input and configured output budget before retrying."
+        )
+    status = _responses_status(body)
+    if status and status != "completed":
+        # Preserve bounded retries for provider interruptions without an explicit
+        # deterministic limit, including interruptions that returned some text.
+        return _responses_empty_error(body)
+    items = _responses_field(body, "output")
+    if isinstance(items, (list, tuple)):
+        for item in items:
+            item_status = _responses_field(item, "status")
+            if isinstance(item_status, str) and item_status != "completed":
+                return LLMIncompleteResponseError(
+                    "The model returned an unfinished output item. The partial answer was not accepted."
+                )
+    return None
+
+
 def _chat_output_text(response: Any) -> str:
     """Answer text from an SDK Chat Completions response, or "" when there is none."""
     try:
@@ -954,6 +999,12 @@ def _usage_tokens(response: Any) -> tuple[int | None, int | None]:
 
 class LLMError(RuntimeError):
     """Raised when the LLM call ultimately fails or returns unusable output."""
+
+
+class LLMIncompleteResponseError(LLMError):
+    """Explicit incomplete output cannot trigger a paid re-ask or failover."""
+
+    retriable = False
 
 
 class LLMConfigurationError(LLMError):
@@ -1821,6 +1872,10 @@ class LLMClient:
                 if not note:
                     raise
                 raise type(exc)(f"{exc} {note}") from exc
+            except LLMIncompleteResponseError:
+                # An explicit output cutoff requires caller intervention;
+                # switching endpoints must not silently spend another budget.
+                raise
             except LLMAuthError:
                 # A credential verdict, not an endpoint outage: the fallback
                 # would be refused the same way (its key defaults to this one,
@@ -1985,9 +2040,6 @@ class LLMClient:
                         _responses_output_text(response) if responses
                         else _chat_output_text(response)
                     )
-                    if not content:
-                        raise _responses_empty_error(response) if responses \
-                            else LLMError("Model returned an empty response.")
                     prompt_tokens, completion_tokens = (
                         _responses_usage_tokens(response) if responses
                         else _usage_tokens(response)
@@ -2002,6 +2054,12 @@ class LLMClient:
                         prompt_tokens=prompt_tokens,
                         completion_tokens=completion_tokens,
                     )
+                    completion_error = _response_completion_error(response, responses=responses)
+                    if completion_error is not None:
+                        raise completion_error
+                    if not content:
+                        raise _responses_empty_error(response) if responses \
+                            else LLMError("Model returned an empty response.")
                     duration_ms = int((time.perf_counter() - attempt_t0) * 1000)
                     total_ms = int((time.perf_counter() - t0) * 1000)
                     logger.info(
@@ -2223,7 +2281,8 @@ class LLMClient:
     #: closing bracket — bypass this cap: they are deterministic failures worth
     #: recovering at any size, and are re-asked with a doubled output budget
     #: (capped at JSON_REASK_MAX_TOKENS), because the identical budget is what
-    #: truncated them in the first place.
+    #: truncated them in the first place. This is a heuristic for gateways that
+    #: omit a cutoff flag; explicit unfinished responses fail in chat() first.
     JSON_REASK_MAX_CHARS = 32_768
 
     #: Output-budget ceiling for a truncation re-ask. A reasoning model can
@@ -2260,7 +2319,9 @@ class LLMClient:
         responses above ``JSON_REASK_MAX_CHARS`` are not re-asked (an oversized
         essay is a wrong output mode, not noise). Truncated JSON is the
         exception: it bypasses the cap and is re-asked with a doubled output
-        budget, because the identical budget is what truncated it.
+        budget, because the identical budget is what truncated it. Explicit
+        unfinished-response metadata is rejected by chat() before parsing and
+        cannot trigger this heuristic repair.
         """
         json_system = system + "\n\nRespond with ONLY valid JSON — no markdown fences, no commentary."
         text = self.chat(

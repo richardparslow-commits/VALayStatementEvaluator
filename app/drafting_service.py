@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from .request_validation import MAX_OBSERVATIONS_PAYLOAD_CHARS, RequestValidationError, validate_draft_request
-from .llm import LLMConfigurationError, LLMError, LLMParseError, LLMTimeoutError, LLMUpstreamError
+from .llm import LLMConfigurationError, LLMError, LLMIncompleteResponseError, LLMParseError, LLMTimeoutError, LLMUpstreamError
 from .pilot import PilotBlocked
 
 MAX_DRAFT_OBSERVATIONS_PAYLOAD_CHARS = MAX_OBSERVATIONS_PAYLOAD_CHARS
@@ -94,6 +94,15 @@ def map_drafting_exception(exc: Exception, *, request_id: str, phase: str) -> Dr
             request_id=request_id,
             error_kind="upstream_timeout",
             retryable=True,
+            diagnostics=f"{phase}: {type(exc).__name__}: {exc}",
+        )
+    if isinstance(exc, LLMIncompleteResponseError):
+        return DraftingUpstreamError(
+            "The drafting service returned an unfinished answer. No partial statement was accepted. "
+            "Review the input and output limit settings before retrying.",
+            request_id=request_id,
+            error_kind="incomplete_response",
+            retryable=False,
             diagnostics=f"{phase}: {type(exc).__name__}: {exc}",
         )
     if isinstance(exc, LLMParseError):

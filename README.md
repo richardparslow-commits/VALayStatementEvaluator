@@ -449,6 +449,15 @@ Every run shows a live usage line in the progress caption and, after completion,
 draft/review on the Draft tab). Token counts are estimates based on prompt length and model
 output, using the provider's reported usage when the endpoint supplies it.
 
+Model answers explicitly marked unfinished are rejected even when they contain readable
+text or valid JSON. This applies to Chat Completions finish reasons and Responses run/output
+statuses. Output-limit and restriction failures do not automatically increase the output
+budget, re-ask, or switch endpoints; provider interruptions without a known limit keep the
+existing bounded retry policy. Usage includes rejected responses when a response was received.
+A rejected initial draft stops drafting; a rejected optional self-review keeps the original
+draft and reports that review was skipped. Compatible gateways that omit completion metadata
+remain supported, so an unreported cutoff cannot be detected by these checks.
+
 Because providers don't publish a fixed credits-per-1M-token rate (QwenCloud Token Plan's
 changes; Perplexity bills per token in USD), you can provide one two ways:
 
